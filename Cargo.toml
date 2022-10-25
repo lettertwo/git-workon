@@ -6,3 +6,8 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+anyhow = "1.0.66"
+clap = { version = "4.0.18", features = ["derive", "color", "wrap_help", "unicode", "env"] }
+clap-verbosity-flag = "2.0.0"
+env_logger = "0.9.1"
+log = "0.4.17"
