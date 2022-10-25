@@ -5,7 +5,7 @@ use log::{debug, info};
 
 // use std::ffi::OsStr;
 // use std::ffi::OsString;
-// use std::path::PathBuf;
+use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -29,6 +29,10 @@ struct Worktree {
 // TODO: Default subcommand? https://github.com/clap-rs/clap/issues/975#issuecomment-1012701551
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Create a new bare repository and an initial worktree.
+    Init {
+        name: Option<PathBuf>,
+    },
     /// Select a worktree to work on.
     Worktree(Worktree),
 
@@ -77,6 +81,9 @@ fn main() -> Result<()> {
     debug!("This is a debug message");
 
     match &cli.command {
+        Some(Commands::Init { name }) => {
+            info!("Initializing worktree {:#?}", name);
+        }
         Some(Commands::List {}) => {
             info!("Listing worktrees");
         }
