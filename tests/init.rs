@@ -1,14 +1,39 @@
-use assert_cmd::{prelude::*, Command};
+use assert_cmd::Command;
 use assert_fs::{prelude::*, TempDir};
 use predicates::prelude::*;
 
 #[test]
-fn init() -> Result<(), Box<dyn std::error::Error>> {
+fn init_default() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("git-workon")?;
     cmd.current_dir(&temp).arg("init").assert().success();
 
-    temp.child(".git").assert(predicate::path::is_dir());
+    temp.child(".bare/index").assert(predicate::path::missing());
+    temp.child(".bare/config").assert(predicate::str::contains("bare = true"));
+    temp.child(".git").assert(predicate::path::is_file());
+    temp.child(".git").assert(predicate::str::contains("gitdir: ./.bare"));
+    temp.child("main").assert(predicate::path::is_dir());
+
+    temp.close()?;
+    Ok(())
+}
+
+#[test]
+fn init_with_name() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("git-workon")?;
+    cmd.current_dir(&temp).arg("init").arg("test").assert().success();
+
+    temp.child(".bare").assert(predicate::path::missing());
+    temp.child(".git").assert(predicate::path::missing());
+    temp.child("main").assert(predicate::path::missing());
+
+    temp.child("test/.bare/index").assert(predicate::path::missing());
+    temp.child("test/.bare/config").assert(predicate::str::contains("bare = true"));
+    temp.child("test/.git").assert(predicate::path::is_file());
+    temp.child("test/.git").assert(predicate::str::contains("gitdir: ./.bare"));
+    temp.child("test/main").assert(predicate::path::is_dir());
+
     temp.close()?;
     Ok(())
 }

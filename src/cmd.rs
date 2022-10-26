@@ -1,10 +1,9 @@
-use anyhow::{bail, Ok, Result};
-use clap::{Args, Subcommand};
-use log::{debug, info, trace};
+mod init;
 
-// use std::ffi::OsStr;
-// use std::ffi::OsString;
-use std::path::PathBuf;
+use anyhow::{bail, Result};
+use clap::{Args, Subcommand};
+
+use self::init::Init;
 
 pub trait Run {
     fn run(&self) -> Result<()>;
@@ -43,6 +42,11 @@ pub struct Clone {
 
 impl Run for Clone {
     fn run(&self) -> Result<()> {
+        // 1. git clone --bare --single-branch <atlassian-url>.git .bare
+        // 2. $ echo "gitdir: ./.bare" > .git
+        // 3. $ git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+        // 4. $ git fetch
+        // 5. $ git worktree add --track main origin/main
         bail!("Clone Not implemented");
     }
 }
@@ -72,19 +76,11 @@ pub struct CopyUntracked {
 
 impl Run for CopyUntracked {
     fn run(&self) -> Result<()> {
-        bail!("copyuntracked from={} to={} not implemented!", self.from, self.to);
-    }
-}
-
-/// Create a new bare repository and an initial worktree.
-#[derive(Debug, Args)]
-pub struct Init {
-    pub name: Option<PathBuf>,
-}
-
-impl Run for Init {
-    fn run(&self) -> Result<()> {
-        bail!("init name={:?} not implemented!", self.name);
+        bail!(
+            "copyuntracked from={} to={} not implemented!",
+            self.from,
+            self.to
+        );
     }
 }
 
