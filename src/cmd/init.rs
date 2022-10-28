@@ -4,16 +4,11 @@ use std::{
 };
 
 use anyhow::{Result, Ok};
-use clap::Args;
 use git2::{Repository, WorktreeAddOptions};
 
-use super::Run;
+use crate::cli::Init;
 
-/// Create a new bare repository and an initial worktree.
-#[derive(Debug, Args)]
-pub struct Init {
-    pub name: Option<PathBuf>,
-}
+use super::Run;
 
 impl Run for Init {
     fn run(&self) -> Result<()> {

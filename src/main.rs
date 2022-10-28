@@ -1,31 +1,12 @@
+mod cli;
 mod cmd;
 
 use std::process::ExitCode;
-
 use clap::Parser;
-use clap_verbosity_flag::{InfoLevel, Verbosity};
 use log::error;
 
-use crate::cmd::{Cmd, Worktree};
-
-#[derive(Debug, Parser)]
-#[clap(
-    about,
-    author,
-    bin_name = env!("CARGO_PKG_NAME"),
-    disable_help_subcommand = true,
-    propagate_version = true,
-    version,
-)]
-
-struct Cli {
-    #[clap(flatten)]
-    pub verbose: Verbosity<InfoLevel>,
-    #[command(subcommand)]
-    pub command: Option<Cmd>,
-    #[clap(flatten)]
-    pub worktree: Worktree,
-}
+use crate::cli::Cli;
+use crate::cmd::Run;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
