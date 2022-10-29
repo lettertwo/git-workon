@@ -9,7 +9,6 @@ use clap_verbosity_flag::{InfoLevel, Verbosity};
     about,
     author,
     bin_name = env!("CARGO_PKG_NAME"),
-    disable_help_subcommand = true,
     propagate_version = true,
     version,
 )]
