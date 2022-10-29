@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{Result, Ok};
+use anyhow::{Ok, Result};
 use git2::{Repository, WorktreeAddOptions};
 
 use crate::cli::Init;
