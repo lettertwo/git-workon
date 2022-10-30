@@ -1,5 +1,6 @@
 mod cli;
 mod cmd;
+mod util;
 
 use std::process::ExitCode;
 use clap::Parser;
