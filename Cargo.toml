@@ -1,26 +1,47 @@
 [package]
-name = "git-workon"
-version = "0.1.0"
+authors = ["Eric Eldredge <lettertwo@gmail.com>"]
+categories = ["command-line-utilities", "git"]
+description = "A git plugin for managing worktrees"
 edition = "2021"
+homepage = "https://github.com/lettertwo/git-workon"
+keywords = ["cli", "git", "worktree", "workon"]
+license = "MIT"
+name = "git-workon"
+readme = "README.md"
+repository = "https://github.com/lettertwo/git-workon"
+rust-version = "1.64"
+version = "0.1.0"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
-[dependencies]
+[workspace.dependencies]
 anyhow = "1.0.66"
-clap = { version = "4.0.18", features = ["derive", "color", "wrap_help", "unicode", "env"] }
-clap-verbosity-flag = "2.0.0"
-env_logger = "0.9.1"
-git2 = "0.15.0"
-log = "0.4.17"
-
-[dev-dependencies]
 assert_cmd = { version = "2.0.5", features = ["color", "color-auto"] }
 assert_fs = { version = "1.0.7", features = ["color", "color-auto"] }
-predicates = { version = "2.1.1", features = ["color", "color-auto"] }
-
-[build-dependencies]
 clap = { version = "4.0.18", features = ["derive", "color", "wrap_help", "unicode", "env"] }
 clap-verbosity-flag = "2.0.0"
 clap_complete = "4.0.3"
 clap_complete_fig = "4.0.1"
 clap_mangen = "0.2.3"
+env_logger = "0.9.1"
+git2 = "0.15.0"
+log = "0.4.17"
+predicates = { version = "2.1.1", features = ["color", "color-auto"] }
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap-verbosity-flag.workspace = true
+env_logger.workspace = true
+git2.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+assert_fs.workspace = true
+predicates.workspace = true
+
+[build-dependencies]
+clap.workspace = true
+clap-verbosity-flag.workspace = true
+clap_complete.workspace = true
+clap_complete_fig.workspace = true
+clap_mangen.workspace = true
