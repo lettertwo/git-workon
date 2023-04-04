@@ -9,22 +9,22 @@ license = "MIT"
 name = "git-workon"
 readme = "README.md"
 repository = "https://github.com/lettertwo/git-workon"
-rust-version = "1.64"
+rust-version = "1.68.2"
 version = "0.1.0"
 
 [workspace.dependencies]
-anyhow = "1.0.66"
-assert_cmd = { version = "2.0.5", features = ["color", "color-auto"] }
-assert_fs = { version = "1.0.7", features = ["color", "color-auto"] }
-clap = { version = "4.0.18", features = ["derive", "color", "wrap_help", "unicode", "env"] }
-clap-verbosity-flag = "2.0.0"
-clap_complete = "4.0.3"
-clap_complete_fig = "4.0.1"
-clap_mangen = "0.2.3"
-env_logger = "0.9.1"
-git2 = "0.15.0"
+anyhow = "1.0.70"
+assert_cmd = { version = "2.0.10", features = ["color", "color-auto"] }
+assert_fs = { version = "1.0.12", features = ["color", "color-auto"] }
+clap = { version = "4.2.1", features = ["derive", "color", "wrap_help", "unicode", "env"] }
+clap-verbosity-flag = "2.0.1"
+clap_complete = "4.2.0"
+clap_complete_fig = "4.2.0"
+clap_mangen = "0.2.10"
+env_logger = "0.10.0"
+git2 = "0.17.0"
 log = "0.4.17"
-predicates = { version = "2.1.1", features = ["color", "color-auto"] }
+predicates = { version = "3.0.2" }
 
 [dependencies]
 anyhow.workspace = true

@@ -1,0 +1,1 @@
+- [ ] support pruning worktrees for 'gone' branches (`git branch -vv | rg ': gone]'`)
