@@ -1,16 +1,18 @@
-[package]
+[workspace]
+resolver = "2"
+default-members = ["git-workon"]
+members = [
+  "git-workon",
+  "git-workon-lib",
+]
+
+[workspace.package]
 authors = ["Eric Eldredge <lettertwo@gmail.com>"]
-categories = ["command-line-utilities", "git"]
-description = "A git plugin for managing worktrees"
 edition = "2021"
 homepage = "https://github.com/lettertwo/git-workon"
-keywords = ["cli", "git", "worktree", "workon"]
 license = "MIT"
-name = "git-workon"
-readme = "README.md"
 repository = "https://github.com/lettertwo/git-workon"
 rust-version = "1.68.2"
-version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0.70"
@@ -24,28 +26,9 @@ clap_mangen = "0.2.10"
 dialoguer = "0.10.3"
 env_logger = "0.10.0"
 git2_credentials = { version = "0.11.0", features = ["ui4dialoguer"] }
-git2 = "0.16.0"
+git2 = { version = "0.17", default-features = false }
 log = "0.4.17"
 predicates = { version = "3.0.2" }
 
-[dependencies]
-anyhow.workspace = true
-clap.workspace = true
-clap-verbosity-flag.workspace = true
-dialoguer.workspace = true
-env_logger.workspace = true
-git2.workspace = true
-git2_credentials.workspace = true
-log.workspace = true
-
-[dev-dependencies]
-assert_cmd.workspace = true
-assert_fs.workspace = true
-predicates.workspace = true
-
-[build-dependencies]
-clap.workspace = true
-clap-verbosity-flag.workspace = true
-clap_complete.workspace = true
-clap_complete_fig.workspace = true
-clap_mangen.workspace = true
+[patch.crates-io]
+git2_credentials = { git = "https://github.com/davidB/git2_credentials.git", branch = "dependabot/cargo/git2-tw-0.17" }

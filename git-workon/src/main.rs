@@ -1,6 +1,5 @@
 mod cli;
 mod cmd;
-mod util;
 
 use clap::Parser;
 use log::error;

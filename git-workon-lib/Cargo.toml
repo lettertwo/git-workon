@@ -1,0 +1,28 @@
+[package]
+authors.workspace = true
+categories = ["git"]
+description = "API for managing worktrees"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["git", "worktree", "workon"]
+license.workspace = true
+name = "git-workon-lib"
+readme = "README.md"
+repository.workspace = true
+version = "0.1.0"
+
+[lib]
+name = "workon"
+
+[dependencies]
+anyhow.workspace = true
+dialoguer.workspace = true
+env_logger.workspace = true
+git2.workspace = true 
+git2_credentials.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+assert_fs.workspace = true
+predicates.workspace = true
+

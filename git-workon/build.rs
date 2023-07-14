@@ -1,10 +1,4 @@
-use std::{
-    env::var_os,
-    fs::write,
-    io::{self, ErrorKind::NotFound},
-    path::PathBuf,
-    process::Command,
-};
+use std::{env::var_os, fs::write, io, process::Command};
 
 fn main() -> std::io::Result<()> {
     let pkg_version = env!("CARGO_PKG_VERSION");

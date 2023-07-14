@@ -1,0 +1,45 @@
+[package]
+authors.workspace = true
+categories = ["command-line-utilities", "git"]
+description = "A git plugin for managing worktrees"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["cli", "git", "worktree", "workon"]
+license.workspace = true
+name = "git-workon"
+readme = "README.md"
+repository.workspace = true
+version = "0.1.0"
+# include = [
+#   "build.rs",
+#   "src/**/*",
+#   "Cargo.toml",
+#   "Cargo.lock",
+#   "LICENSE*",
+#   "README.md",
+#   "benches/**/*",
+#   "examples/**/*"
+# ]
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+clap-verbosity-flag.workspace = true
+clap_complete.workspace = true
+clap_complete_fig.workspace = true
+clap_mangen.workspace = true
+env_logger.workspace = true
+log.workspace = true
+git-workon-lib = { version = "0.1.0", path = "../git-workon-lib" }
+
+[dev-dependencies]
+assert_cmd.workspace = true
+assert_fs.workspace = true
+predicates.workspace = true
+
+[build-dependencies]
+clap.workspace = true
+clap-verbosity-flag.workspace = true
+clap_complete.workspace = true
+clap_complete_fig.workspace = true
+clap_mangen.workspace = true
