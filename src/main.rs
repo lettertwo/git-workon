@@ -2,9 +2,9 @@ mod cli;
 mod cmd;
 mod util;
 
-use std::process::ExitCode;
 use clap::Parser;
 use log::error;
+use std::process::ExitCode;
 
 use crate::cli::Cli;
 use crate::cmd::Run;

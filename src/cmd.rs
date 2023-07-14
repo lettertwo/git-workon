@@ -8,7 +8,7 @@ mod switch;
 
 use anyhow::{bail, Result};
 
-use crate::cli::{Cmd, Clone, CopyUntracked, List, New, Prune, Switch};
+use crate::cli::{Clone, Cmd, CopyUntracked, List, New, Prune, Switch};
 
 pub trait Run {
     fn run(&self) -> Result<()>;

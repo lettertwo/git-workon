@@ -36,6 +36,7 @@ pub enum Cmd {
 #[derive(Debug, Args)]
 pub struct Clone {
     pub url: String,
+    pub path: Option<PathBuf>,
 }
 
 /// Copy any untracked files in <from> to <to>.
@@ -64,7 +65,7 @@ pub struct CopyUntracked {
 /// Create a new bare repository and an initial worktree.
 #[derive(Debug, Args)]
 pub struct Init {
-    pub name: Option<PathBuf>,
+    pub path: Option<PathBuf>,
 }
 
 /// List worktrees.

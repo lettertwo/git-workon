@@ -21,8 +21,10 @@ clap-verbosity-flag = "2.0.1"
 clap_complete = "4.2.0"
 clap_complete_fig = "4.2.0"
 clap_mangen = "0.2.10"
+dialoguer = "0.10.3"
 env_logger = "0.10.0"
-git2 = "0.17.0"
+git2_credentials = { version = "0.11.0", features = ["ui4dialoguer"] }
+git2 = "0.16.0"
 log = "0.4.17"
 predicates = { version = "3.0.2" }
 
@@ -30,8 +32,10 @@ predicates = { version = "3.0.2" }
 anyhow.workspace = true
 clap.workspace = true
 clap-verbosity-flag.workspace = true
+dialoguer.workspace = true
 env_logger.workspace = true
 git2.workspace = true
+git2_credentials.workspace = true
 log.workspace = true
 
 [dev-dependencies]
