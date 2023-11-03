@@ -15,12 +15,12 @@ version = "0.1.0"
 name = "workon"
 
 [dependencies]
-anyhow.workspace = true
 dialoguer.workspace = true
 env_logger.workspace = true
 git2.workspace = true 
 git2_credentials.workspace = true
 log.workspace = true
+miette.workspace = true
 
 [dev-dependencies]
 assert_fs.workspace = true

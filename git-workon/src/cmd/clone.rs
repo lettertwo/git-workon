@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
 use log::debug;
+use miette::Result;
 use workon::clone;
 
 use crate::cli::Clone;

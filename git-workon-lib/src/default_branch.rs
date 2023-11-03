@@ -1,5 +1,5 @@
-use anyhow::{bail, ensure, Ok, Result};
 use git2::{Direction, Remote, RemoteCallbacks, Repository};
+use miette::{bail, ensure, IntoDiagnostic, Result};
 
 use super::get_remote_callbacks;
 
@@ -31,10 +31,12 @@ impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
     pub fn get_name(self) -> Result<String> {
         match self.remote {
             Some(mut remote) => {
-                let mut cxn = remote.connect_auth(Direction::Fetch, self.callbacks, None)?;
+                let mut cxn = remote
+                    .connect_auth(Direction::Fetch, self.callbacks, None)
+                    .into_diagnostic()?;
                 ensure!(cxn.connected(), "Remote is not connected");
 
-                match cxn.default_branch()?.as_str() {
+                match cxn.default_branch().into_diagnostic()?.as_str() {
                     Some(default_branch) => Ok(default_branch
                         .strip_prefix("refs/heads/")
                         .unwrap_or(default_branch)
@@ -46,7 +48,7 @@ impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
                 }
             }
             None => {
-                let config = self.repo.config()?;
+                let config = self.repo.config().into_diagnostic()?;
                 let defaultbranch = config.get_str("init.defaultbranch").unwrap_or("main");
                 Ok(defaultbranch.to_string())
             }

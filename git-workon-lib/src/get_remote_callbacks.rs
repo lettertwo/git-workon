@@ -1,10 +1,10 @@
-use anyhow::Result;
 use git2::{Config, RemoteCallbacks};
 use git2_credentials::CredentialHandler;
+use miette::{IntoDiagnostic, Result};
 
 pub fn get_remote_callbacks<'a>() -> Result<RemoteCallbacks<'a>> {
     let mut callbacks = RemoteCallbacks::new();
-    let git_config = Config::open_default()?;
+    let git_config = Config::open_default().into_diagnostic()?;
     let mut credential_handler = CredentialHandler::new(git_config);
 
     callbacks.credentials(move |url, username, allowed| {

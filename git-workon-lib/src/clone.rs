@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
 use git2::{build::RepoBuilder, FetchOptions, Repository};
 use log::debug;
+use miette::{IntoDiagnostic, Result};
 
 use crate::{add_worktree, convert_to_bare, get_default_branch_name, get_remote_callbacks};
 
@@ -51,7 +51,7 @@ pub fn clone(path: PathBuf, url: &str) -> Result<Repository> {
     debug!("Cloning {} into {}", url, path.display());
 
     // 1. git clone --single-branch <url>.git <path>/.bare
-    let repo = builder.clone(&url, &path)?;
+    let repo = builder.clone(&url, &path).into_diagnostic()?;
     // 2. $ echo "gitdir: ./.bare" > .git
     // 3. $ git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
     let repo = convert_to_bare(repo)?;

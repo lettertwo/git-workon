@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use miette::{bail, Result};
 
 use crate::cli::New;
 

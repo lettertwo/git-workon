@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use anyhow::{Ok, Result};
 use log::debug;
+use miette::Result;
 use workon::init;
 
 use crate::cli::Init;

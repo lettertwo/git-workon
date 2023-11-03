@@ -22,15 +22,15 @@ version = "0.1.0"
 # ]
 
 [dependencies]
-anyhow.workspace = true
 clap.workspace = true
 clap-verbosity-flag.workspace = true
 clap_complete.workspace = true
 clap_complete_fig.workspace = true
 clap_mangen.workspace = true
 env_logger.workspace = true
+git-workon-lib.workspace = true
 log.workspace = true
-git-workon-lib = { version = "0.1.0", path = "../git-workon-lib" }
+miette.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

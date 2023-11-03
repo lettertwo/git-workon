@@ -6,7 +6,7 @@ mod new;
 mod prune;
 mod switch;
 
-use anyhow::Result;
+use miette::Result;
 
 use crate::cli::Cmd;
 
