@@ -15,19 +15,19 @@ repository = "https://github.com/lettertwo/git-workon"
 rust-version = "1.68.2"
 
 [workspace.dependencies]
-assert_cmd = { version = "2.0.12", features = ["color", "color-auto"] }
-assert_fs = { version = "1.0.13", features = ["color", "color-auto"] }
-clap = { version = "4.4.7", features = ["derive", "color", "wrap_help", "unicode", "env"] }
-clap-verbosity-flag = "2.0.1"
-clap_complete = "4.2.0"
-clap_complete_fig = "4.2.0"
-clap_mangen = "0.2.10"
+assert_cmd = { version = "2.0.14", features = ["color", "color-auto"] }
+assert_fs = { version = "1.1.1", features = ["color", "color-auto"] }
+clap = { version = "4.5.4", features = ["derive", "color", "wrap_help", "unicode", "env"] }
+clap-verbosity-flag = "2.2.0"
+clap_complete = "4.5.2"
+clap_complete_fig = "4.5.0"
+clap_mangen = "0.2.20"
 dialoguer = "0.11.0"
-env_logger = "0.10.0"
+env_logger = "0.11.3"
 git-workon-lib = { version = "0.1.0", path = "./git-workon-lib" }
 git2_credentials = { version = "0.13.0", features = ["ui4dialoguer"] }
-git2 = { version = "0.18.1", default-features = false }
+git2 = { version = "0.18.3", default-features = false }
 log = "0.4.17"
-miette = { version = "5.10.0", features = ["fancy"] }
-predicates = { version = "3.0.4" }
-thiserror = "1.0.50"
+miette = { version = "7.2.0", features = ["fancy"] }
+predicates = { version = "3.1.0" }
+thiserror = "1.0.58"
