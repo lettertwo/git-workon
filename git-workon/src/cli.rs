@@ -16,7 +16,7 @@ pub struct Cli {
     #[clap(flatten)]
     pub verbose: Verbosity<InfoLevel>,
     #[command(subcommand)]
-    pub command: Cmd,
+    pub command: Option<Cmd>,
     #[clap(flatten)]
     pub switch: Switch,
 }
