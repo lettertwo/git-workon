@@ -6,7 +6,7 @@ use super::Run;
 
 impl Run for CopyUntracked {
     fn run(&self) -> Result<()> {
-        bail!(
+        unimplemented!(
             "copyuntracked from={} to={} not implemented!",
             self.from,
             self.to

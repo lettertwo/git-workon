@@ -34,7 +34,7 @@ impl Run for New {
         let name = match &self.name {
             Some(name) => name,
             None => {
-                bail!("Interactive new not implemented!");
+                unimplemented!("Interactive new not implemented!");
             }
         };
         let repo = get_repo(None)?;

@@ -4,8 +4,9 @@ use crate::cli::Prune;
 
 use super::Run;
 
+
 impl Run for Prune {
     fn run(&self) -> Result<()> {
-        bail!("prune not implemented!");
+        unimplemented!("prune not implemented!");
     }
 }

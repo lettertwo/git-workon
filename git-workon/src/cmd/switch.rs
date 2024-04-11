@@ -6,6 +6,6 @@ use super::Run;
 
 impl Run for Switch {
     fn run(&self) -> Result<()> {
-        bail!("worktree name={:?} not implemented!", self.name);
+        unimplemented!("switch {:?} not implemented!", self.name);
     }
 }
