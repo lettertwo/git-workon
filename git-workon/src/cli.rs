@@ -18,18 +18,18 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Cmd>,
     #[clap(flatten)]
-    pub switch: Switch,
+    pub find: Find,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
     Clone(Clone),
     CopyUntracked(CopyUntracked),
+    Find(Find),
     Init(Init),
     List(List),
     New(New),
     Prune(Prune),
-    Switch(Switch),
 }
 
 /// Perform a bare clone of a repository and create an initial worktree.
@@ -82,11 +82,11 @@ pub struct New {
 #[derive(Debug, Args)]
 pub struct Prune {}
 
-/// Select a worktree to work on.
+/// Find a worktree to work on.
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
-pub struct Switch {
-    /// The name of the worktree to work on.
+pub struct Find {
+    /// A partial name of a worktree.
     pub name: Option<String>,
 }
 

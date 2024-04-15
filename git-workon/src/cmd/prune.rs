@@ -1,4 +1,5 @@
-use miette::{bail, Result};
+use miette::Result;
+use workon::WorktreeDescriptor;
 
 use crate::cli::Prune;
 
@@ -16,7 +17,7 @@ use super::Run;
 //     && git push --delete origin bdo/browser-reporter`
 
 impl Run for Prune {
-    fn run(&self) -> Result<()> {
+    fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         unimplemented!("prune not implemented!");
     }
 }

@@ -1,15 +1,14 @@
 use std::path::PathBuf;
 
-use log::debug;
 use miette::Result;
-use workon::clone;
+use workon::{add_worktree, clone, get_default_branch_name, WorktreeDescriptor};
 
 use crate::cli::Clone;
 
 use super::Run;
 
 impl Run for Clone {
-    fn run(&self) -> Result<()> {
+    fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let path = self.path.clone().unwrap_or_else(|| {
             PathBuf::from(
                 self.url
@@ -20,8 +19,9 @@ impl Run for Clone {
                     .trim_end_matches(".git"),
             )
         });
-        clone(path, &self.url)?;
-        debug!("Done");
-        Ok(())
+
+        let repo = clone(path, &self.url)?;
+        let default_branch = get_default_branch_name(&repo, repo.find_remote("origin").ok())?;
+        add_worktree(&repo, &default_branch).map(Some)
     }
 }

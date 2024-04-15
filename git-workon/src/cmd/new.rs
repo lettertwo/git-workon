@@ -1,7 +1,7 @@
-use miette::{bail, Result};
+use miette::Result;
 
 use crate::cli::New;
-use workon::{add_worktree, get_repo};
+use workon::{add_worktree, get_repo, WorktreeDescriptor};
 
 use super::Run;
 
@@ -30,7 +30,7 @@ use super::Run;
 // suggest rebuilds, or re-running install, etc, if the base artifacts are much older than the new worktree HEAD.
 
 impl Run for New {
-    fn run(&self) -> Result<()> {
+    fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let name = match &self.name {
             Some(name) => name,
             None => {
@@ -38,14 +38,6 @@ impl Run for New {
             }
         };
         let repo = get_repo(None)?;
-
-        match add_worktree(&repo, &name) {
-            Ok(worktree) => {
-                println!("Created worktree at: {}", worktree.path().display());
-            }
-            Err(e) => bail!(e),
-        };
-
-        Ok(())
+        add_worktree(&repo, &name).map(Some)
     }
 }

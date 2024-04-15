@@ -16,8 +16,16 @@ fn main() -> Result<()> {
         .init();
 
     if cli.command.is_none() {
-        cli.command = Some(Cmd::Switch(cli.switch));
+        cli.command = Some(Cmd::Find(cli.find));
     }
 
-    cli.command.unwrap().run()
+    let worktree = cli.command.unwrap().run()?;
+
+    if let Some(worktree) = worktree {
+        if let Some(path_str) = worktree.path().to_str() {
+            println!("{}", path_str);
+        }
+    }
+
+    Ok(())
 }

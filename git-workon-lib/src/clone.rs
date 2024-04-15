@@ -4,7 +4,7 @@ use git2::{build::RepoBuilder, FetchOptions, Repository};
 use log::debug;
 use miette::{IntoDiagnostic, Result};
 
-use crate::{add_worktree, convert_to_bare, get_default_branch_name, get_remote_callbacks};
+use crate::{convert_to_bare, get_default_branch_name, get_remote_callbacks};
 
 pub fn clone(path: PathBuf, url: &str) -> Result<Repository> {
     debug!("path {}", path.display());
@@ -54,11 +54,5 @@ pub fn clone(path: PathBuf, url: &str) -> Result<Repository> {
     let repo = builder.clone(&url, &path).into_diagnostic()?;
     // 2. $ echo "gitdir: ./.bare" > .git
     // 3. $ git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
-    let repo = convert_to_bare(repo)?;
-    // 4. $ git fetch
-    // 5. $ git worktree add --track <branch> origin/<branch>
-    let default_branch = get_default_branch_name(&repo, repo.find_remote("origin").ok())?;
-    add_worktree(&repo, &default_branch)?;
-
-    Ok(repo)
+    convert_to_bare(repo)
 }

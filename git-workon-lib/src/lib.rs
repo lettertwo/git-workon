@@ -1,21 +1,19 @@
-mod add_worktree;
 mod clone;
 mod convert_to_bare;
 mod default_branch;
 mod empty_commit;
 mod get_remote_callbacks;
 mod get_repo;
-mod get_worktrees;
 mod init;
 mod workon_root;
+mod worktree;
 
-pub use crate::add_worktree::*;
 pub use crate::clone::*;
 pub use crate::convert_to_bare::*;
 pub use crate::default_branch::*;
 pub use crate::empty_commit::*;
 pub use crate::get_remote_callbacks::*;
 pub use crate::get_repo::*;
-pub use crate::get_worktrees::*;
 pub use crate::init::*;
 pub use crate::workon_root::*;
+pub use crate::worktree::*;

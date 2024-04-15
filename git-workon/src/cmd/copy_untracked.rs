@@ -1,11 +1,12 @@
-use miette::{bail, Result};
+use miette::Result;
+use workon::WorktreeDescriptor;
 
 use crate::cli::CopyUntracked;
 
 use super::Run;
 
 impl Run for CopyUntracked {
-    fn run(&self) -> Result<()> {
+    fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         unimplemented!(
             "copyuntracked from={} to={} not implemented!",
             self.from,
