@@ -1,0 +1,19 @@
+[package]
+authors.workspace = true
+description = "Test fixture utility for git-workon"
+edition.workspace = true
+license.workspace = true
+name = "git-workon-fixture"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+assert_fs.workspace = true
+env_logger.workspace = true
+git-workon-lib.workspace = true
+git2.workspace = true
+git2_credentials.workspace = true
+log.workspace = true
+miette.workspace = true
+predicates.workspace = true
