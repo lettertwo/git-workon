@@ -1,4 +1,4 @@
-use std::{env::var_os, fs::write, io, process::Command};
+use std::{env::var_os, fs::create_dir_all, fs::write, io, process::Command};
 
 fn main() -> std::io::Result<()> {
     let pkg_version = env!("CARGO_PKG_VERSION");
@@ -47,12 +47,14 @@ fn generate_manpages() -> io::Result<()> {
 
     use cli::Cli;
 
-    let path = format!("man/{}.1", env!("CARGO_PKG_NAME"));
+    let dir = "man";
+    let path = format!("{}/{}.1", dir, env!("CARGO_PKG_NAME"));
     let cmd = Cli::command();
     let man = Man::new(cmd);
     let mut buffer: Vec<u8> = Default::default();
     man.render(&mut buffer)?;
 
+    create_dir_all(dir)?;
     write(&path, buffer)?;
 
     println!("cargo:warning=generated manpage: {:?}", &path);
@@ -74,6 +76,8 @@ fn generate_completions() -> io::Result<()> {
     let cmd = &mut Cli::command();
     let bin_name = env!("CARGO_PKG_NAME");
     let out_dir = "contrib/completions";
+
+    create_dir_all(out_dir)?;
 
     println!(
         "cargo:warning=generated completions: {:?}",
