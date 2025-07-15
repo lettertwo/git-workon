@@ -499,6 +499,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-workon-fixture"
+version = "0.1.0"
+dependencies = [
+ "assert_fs",
+ "env_logger",
+ "git-workon-lib",
+ "git2",
+ "git2_credentials",
+ "log",
+ "miette",
+ "predicates",
+]
+
+[[package]]
 name = "git-workon-lib"
 version = "0.1.0"
 dependencies = [

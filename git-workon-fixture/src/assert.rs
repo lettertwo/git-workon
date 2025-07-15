@@ -15,7 +15,7 @@ impl FixtureAssert for crate::fixture::Repository {
         I: IntoFixturePredicate<P>,
         P: Predicate<git2::Repository>,
     {
-        assert(self, predicate);
+        assert(self.repo(), predicate);
         self
     }
 }
@@ -41,9 +41,11 @@ where
 }
 
 #[track_caller]
-fn assert<P>(repo: &crate::fixture::Repository, pred: P)
+fn assert<I, P>(repo: &git2::Repository, pred: I)
 where
+    I: IntoFixturePredicate<P>,
     P: Predicate<git2::Repository>,
 {
-    pred.eval(repo);
+    let predicate = pred.into_repository();
+    assert!(predicate.eval(repo));
 }

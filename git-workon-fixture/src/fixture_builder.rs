@@ -35,19 +35,29 @@ impl<'fixture> FixtureBuilder<'fixture> {
 
     pub fn build(self) -> Result<Fixture> {
         let path = TempDir::new().into_diagnostic()?;
-        let repo = git2::Repository::init(&path).into_diagnostic()?;
-        match self.bare {
-            true => {
-                // git config core.bare true
-                let mut config = repo.config().into_diagnostic()?;
-                config.set_bool("core.bare", true).into_diagnostic()?;
-            }
-            false => match self.worktree {
-                Some(worktree) => {}
-                None => {}
-            },
-        }
+        let repo = if self.bare {
+            git2::Repository::init_bare(&path).into_diagnostic()?
+        } else {
+            git2::Repository::init(&path).into_diagnostic()?
+        };
+
+        let mut config = repo.config().into_diagnostic()?;
+
+        config
+            .set_str("user.name", "git-workon-fixture")
+            .into_diagnostic()?;
+
+        config
+            .set_str("user.email", "git-workon-fixture@fake.com")
+            .into_diagnostic()?;
+
         empty_commit(&repo)?;
         Ok(Fixture::new(Repository::new(repo), path))
+    }
+}
+
+impl<'fixture> Default for FixtureBuilder<'fixture> {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -9,6 +9,10 @@ impl Repository {
         Self { repo }
     }
 
+    pub fn repo(&self) -> &git2::Repository {
+        &self.repo
+    }
+
     pub fn head(&self) -> Reference {
         Reference::new(self.repo.head().ok())
     }
