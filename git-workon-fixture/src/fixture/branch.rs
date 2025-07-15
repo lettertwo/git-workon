@@ -6,4 +6,8 @@ impl<'repo> Branch<'repo> {
     pub fn new(branch: Option<git2::Branch<'repo>>) -> Self {
         Self { branch }
     }
+
+    pub fn unwrap(&self) -> Option<&git2::Branch<'repo>> {
+        self.branch.as_ref()
+    }
 }

@@ -1,34 +1,15 @@
-use std::fmt;
+mod has_branch;
+mod head_commit_message_contains;
+mod head_commit_parent_count;
+mod head_matches;
+mod is_bare;
+mod is_empty;
+mod is_worktree;
 
-use predicates::prelude::Predicate;
-use predicates::reflection::PredicateReflection;
-
-pub struct EmptyPredicate {
-    empty: bool,
-}
-
-pub fn empty() -> EmptyPredicate {
-    EmptyPredicate { empty: true }
-}
-
-pub fn not_empty() -> EmptyPredicate {
-    EmptyPredicate { empty: false }
-}
-
-pub struct ExistsPredicate {
-    exists: bool,
-}
-
-impl PredicateReflection for EmptyPredicate {}
-
-impl fmt::Display for EmptyPredicate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", if self.empty { "empty" } else { "not empty" })
-    }
-}
-
-impl Predicate<git2::Repository> for EmptyPredicate {
-    fn eval(&self, repo: &git2::Repository) -> bool {
-        repo.is_empty().unwrap() == self.empty
-    }
-}
+pub use self::has_branch::*;
+pub use self::head_commit_message_contains::*;
+pub use self::head_commit_parent_count::*;
+pub use self::head_matches::*;
+pub use self::is_bare::*;
+pub use self::is_empty::*;
+pub use self::is_worktree::*;

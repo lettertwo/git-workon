@@ -9,7 +9,7 @@ impl Repository {
         Self { repo }
     }
 
-    pub fn repo(&self) -> &git2::Repository {
+    pub fn unwrap(&self) -> &git2::Repository {
         &self.repo
     }
 
