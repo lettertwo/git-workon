@@ -34,7 +34,12 @@ impl<'fixture> FixtureBuilder<'fixture> {
     }
 
     pub fn build(self) -> Result<Fixture> {
-        let path = TempDir::new().into_diagnostic()?;
+        let tmpdir = TempDir::new().into_diagnostic()?;
+        let path = tmpdir.path().join(if self.bare {
+            ".bare"
+        } else {
+            self.default_branch
+        });
         let repo = if self.bare {
             git2::Repository::init_bare(&path).into_diagnostic()?
         } else {
@@ -52,7 +57,44 @@ impl<'fixture> FixtureBuilder<'fixture> {
             .into_diagnostic()?;
 
         empty_commit(&repo)?;
-        Ok(Fixture::new(Repository::new(repo), path))
+
+        if repo
+            .find_branch(self.default_branch, git2::BranchType::Local)
+            .is_err()
+        {
+            let head = repo.head().into_diagnostic()?;
+            let head_ref = head.shorthand().unwrap_or("");
+            if head_ref != self.default_branch {
+                if let Ok(mut branch) = repo.find_branch(head_ref, git2::BranchType::Local) {
+                    branch.rename(self.default_branch, true).into_diagnostic()?;
+                }
+                if !self.bare {
+                    repo.set_head(&format!("refs/heads/{}", self.default_branch))
+                        .into_diagnostic()?;
+                }
+            }
+        }
+
+        match self.worktree {
+            Some(worktree) if worktree != self.default_branch || self.bare => {
+                let worktree_path = tmpdir.path().join(worktree);
+
+                let mut worktree_opts = git2::WorktreeAddOptions::new();
+                worktree_opts.checkout_existing(self.bare);
+
+                repo.worktree(worktree, &worktree_path, Some(&worktree_opts))
+                    .into_diagnostic()?;
+
+                let worktree_repo =
+                    Repository::new(git2::Repository::open(&worktree_path).into_diagnostic()?);
+
+                Ok(Fixture::new(worktree_repo, worktree_path, tmpdir))
+            }
+            Some(worktree) if worktree == self.default_branch && !self.bare => {
+                Err(miette::miette!("Cannot create a worktree with the same name as the default branch ({}) in a non-bare repository", self.default_branch))
+            }
+            Some(_) | None => Ok(Fixture::new(Repository::new(repo), path, tmpdir)),
+        }
     }
 }
 

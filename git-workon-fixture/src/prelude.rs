@@ -3,8 +3,9 @@ pub use crate::{
     fixture::{Branch, Fixture, Reference, Repository},
     fixture_builder::FixtureBuilder,
     predicates::{
-        HasBranchPredicate, HeadCommitMessageContainsPredicate, HeadCommitParentCountPredicate,
-        HeadMatchesPredicate, IsBarePredicate, IsEmptyPredicate, IsWorktreePredicate,
+        HasBranchPredicate, HasWorktreePredicate, HeadCommitMessageContainsPredicate,
+        HeadCommitParentCountPredicate, HeadMatchesPredicate, IsBarePredicate, IsEmptyPredicate,
+        IsWorktreePredicate,
     },
 };
 
@@ -19,8 +20,8 @@ pub use predicates::prelude::{
 pub mod predicate {
     pub mod repo {
         pub use crate::predicates::{
-            has_branch, head_commit_message_contains, head_commit_parent_count, head_matches,
-            is_bare, is_empty, is_worktree,
+            has_branch, has_worktree, head_commit_message_contains, head_commit_parent_count,
+            head_matches, is_bare, is_empty, is_worktree,
         };
     }
     // Re-export predicates for convenience

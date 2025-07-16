@@ -2,6 +2,9 @@ mod branch;
 mod reference;
 mod repository;
 
+use std::path::PathBuf;
+
+use assert_fs::fixture::ChildPath;
 use assert_fs::TempDir;
 use miette::{IntoDiagnostic, Result};
 
@@ -11,31 +14,35 @@ pub use self::repository::*;
 
 pub struct Fixture {
     pub repo: Option<Repository>,
-    pub path: Option<TempDir>,
+    pub path: Option<PathBuf>,
+    tempdir: Option<TempDir>,
 }
 
 impl Fixture {
-    pub fn new(repo: Repository, path: TempDir) -> Self {
+    pub fn new(repo: Repository, path: PathBuf, tempdir: TempDir) -> Self {
         Self {
             repo: Some(repo),
+            tempdir: Some(tempdir),
             path: Some(path),
         }
     }
 
     pub fn with<F>(&self, f: F)
     where
-        F: FnOnce(&Repository, &TempDir),
+        F: FnOnce(&Repository, &ChildPath),
     {
         let repo = self.repo.as_ref().unwrap();
         let path = self.path.as_ref().unwrap();
-        f(repo, path);
+        let path_child = ChildPath::new(path);
+        f(repo, &path_child);
     }
 
     pub fn destroy(&mut self) -> Result<()> {
-        if let Some(path) = self.path.take() {
-            path.close().into_diagnostic()?
+        if let Some(tempdir) = self.tempdir.take() {
+            tempdir.close().into_diagnostic()?
         }
         self.path = None;
+        self.tempdir = None;
         self.repo = None;
         Ok(())
     }
