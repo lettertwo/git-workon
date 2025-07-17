@@ -1,5 +1,6 @@
 use std::fmt;
 
+use git2::Repository;
 use predicates::prelude::Predicate;
 use predicates::reflection::PredicateReflection;
 
@@ -13,8 +14,8 @@ impl fmt::Display for IsEmptyPredicate {
     }
 }
 
-impl Predicate<git2::Repository> for IsEmptyPredicate {
-    fn eval(&self, repo: &git2::Repository) -> bool {
+impl Predicate<Repository> for IsEmptyPredicate {
+    fn eval(&self, repo: &Repository) -> bool {
         repo.is_empty().unwrap()
     }
 }

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use git2::{BranchType, Repository};
 use predicates::prelude::Predicate;
 use predicates::reflection::PredicateReflection;
 
@@ -15,10 +16,9 @@ impl fmt::Display for HasBranchPredicate {
     }
 }
 
-impl Predicate<git2::Repository> for HasBranchPredicate {
-    fn eval(&self, repo: &git2::Repository) -> bool {
-        repo.find_branch(&self.name, git2::BranchType::Local)
-            .is_ok()
+impl Predicate<Repository> for HasBranchPredicate {
+    fn eval(&self, repo: &Repository) -> bool {
+        repo.find_branch(&self.name, BranchType::Local).is_ok()
     }
 }
 

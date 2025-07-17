@@ -1,5 +1,6 @@
 use std::fmt;
 
+use git2::Repository;
 use predicates::prelude::Predicate;
 use predicates::reflection::PredicateReflection;
 
@@ -15,8 +16,8 @@ impl fmt::Display for HasWorktreePredicate {
     }
 }
 
-impl Predicate<git2::Repository> for HasWorktreePredicate {
-    fn eval(&self, repo: &git2::Repository) -> bool {
+impl Predicate<Repository> for HasWorktreePredicate {
+    fn eval(&self, repo: &Repository) -> bool {
         repo.find_worktree(&self.name).is_ok()
     }
 }

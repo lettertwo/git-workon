@@ -1,5 +1,6 @@
 use std::fmt;
 
+use git2::Repository;
 use predicates::prelude::Predicate;
 use predicates::reflection::PredicateReflection;
 
@@ -15,8 +16,8 @@ impl fmt::Display for HeadMatchesPredicate {
     }
 }
 
-impl Predicate<git2::Repository> for HeadMatchesPredicate {
-    fn eval(&self, repo: &git2::Repository) -> bool {
+impl Predicate<Repository> for HeadMatchesPredicate {
+    fn eval(&self, repo: &Repository) -> bool {
         match repo.head() {
             Ok(head) => head
                 .name()

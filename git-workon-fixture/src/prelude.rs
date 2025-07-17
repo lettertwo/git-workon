@@ -1,6 +1,6 @@
 pub use crate::{
     assert::{FixtureAssert, IntoFixturePredicate},
-    fixture::{Branch, Fixture, Reference, Repository},
+    fixture::Fixture,
     fixture_builder::FixtureBuilder,
     predicates::{
         HasBranchPredicate, HasWorktreePredicate, HeadCommitMessageContainsPredicate,

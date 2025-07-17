@@ -1,16 +1,9 @@
-mod branch;
-mod reference;
-mod repository;
-
 use std::path::PathBuf;
 
 use assert_fs::fixture::ChildPath;
 use assert_fs::TempDir;
+use git2::Repository;
 use miette::{IntoDiagnostic, Result};
-
-pub use self::branch::*;
-pub use self::reference::*;
-pub use self::repository::*;
 
 pub struct Fixture {
     pub repo: Option<Repository>,

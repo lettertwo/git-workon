@@ -1,19 +1,18 @@
 #[cfg(test)]
 mod fixture_builder {
+    use git2::BranchType;
     use git_workon_fixture::prelude::*;
 
     #[test]
     fn default() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().build()?;
-        let repo = fixture.repo.as_ref().unwrap();
-
-        let git_repo = repo.unwrap();
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("main", git2::BranchType::Local);
+        let branch = git_repo.find_branch("main", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'main' should exist");
 
         // Check that the branch has an initial commit with no parent
@@ -56,17 +55,13 @@ mod fixture_builder {
     #[test]
     fn bare() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).build()?;
-
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(git_repo.is_bare(), "Repo should be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("main", git2::BranchType::Local);
+        let branch = git_repo.find_branch("main", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'main' should exist");
 
         // Check that the branch has an initial commit with no parent
@@ -113,22 +108,17 @@ mod fixture_builder {
     fn default_branch() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().default_branch("develop").build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("develop", git2::BranchType::Local);
+        let branch = git_repo.find_branch("develop", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'develop' should exist");
 
         assert!(
-            git_repo
-                .find_branch("main", git2::BranchType::Local)
-                .is_err(),
+            git_repo.find_branch("main", BranchType::Local).is_err(),
             "Main branch should not exist when default branch is set"
         );
 
@@ -177,22 +167,17 @@ mod fixture_builder {
             .default_branch("develop")
             .build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(git_repo.is_bare(), "Repo should be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("develop", git2::BranchType::Local);
+        let branch = git_repo.find_branch("develop", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'develop' should exist");
 
         assert!(
-            git_repo
-                .find_branch("main", git2::BranchType::Local)
-                .is_err(),
+            git_repo.find_branch("main", BranchType::Local).is_err(),
             "Main branch should not exist when default branch is set"
         );
 
@@ -241,20 +226,17 @@ mod fixture_builder {
     fn worktree() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().worktree("dev").build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("main", git2::BranchType::Local);
+        let branch = git_repo.find_branch("main", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'main' should exist");
 
         // Check that the worktree branch exists
-        let worktree_branch = git_repo.find_branch("dev", git2::BranchType::Local);
+        let worktree_branch = git_repo.find_branch("dev", BranchType::Local);
         assert!(
             worktree_branch.is_ok(),
             "Worktree branch 'dev' should exist"
@@ -314,22 +296,17 @@ mod fixture_builder {
             .default_branch("develop")
             .build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("develop", git2::BranchType::Local);
+        let branch = git_repo.find_branch("develop", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'develop' should exist");
 
         assert!(
-            git_repo
-                .find_branch("main", git2::BranchType::Local)
-                .is_ok(),
+            git_repo.find_branch("main", BranchType::Local).is_ok(),
             "Main branch should exist because worktree is set to main"
         );
 
@@ -379,16 +356,13 @@ mod fixture_builder {
     fn worktree_bare() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).worktree("dev").build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("main", git2::BranchType::Local);
+        let branch = git_repo.find_branch("main", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'main' should exist");
 
         // Check that the branch has an initial commit with no parent
@@ -438,20 +412,17 @@ mod fixture_builder {
             .worktree("dev")
             .build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("develop", git2::BranchType::Local);
+        let branch = git_repo.find_branch("develop", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'develop' should exist");
 
         // Check that the worktree branch exists
-        let worktree_branch = git_repo.find_branch("dev", git2::BranchType::Local);
+        let worktree_branch = git_repo.find_branch("dev", BranchType::Local);
         assert!(
             worktree_branch.is_ok(),
             "Worktree branch 'dev' should exist"
@@ -500,16 +471,13 @@ mod fixture_builder {
     fn worktree_bare_matching_default_branch() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("main", git2::BranchType::Local);
+        let branch = git_repo.find_branch("main", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'main' should exist");
 
         // Check that the branch has an initial commit with no parent
@@ -558,16 +526,13 @@ mod fixture_builder {
             .worktree("dev")
             .build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Direct assertions on git2::Repository
-        let git_repo = repo.unwrap(); // Access the inner git2::Repository
+        let git_repo = fixture.repo.as_ref().unwrap();
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
 
         // Check that the default branch exists
-        let branch = git_repo.find_branch("dev", git2::BranchType::Local);
+        let branch = git_repo.find_branch("dev", BranchType::Local);
         assert!(branch.is_ok(), "Default branch 'dev' should exist");
 
         // Check that the branch has an initial commit with no parent
