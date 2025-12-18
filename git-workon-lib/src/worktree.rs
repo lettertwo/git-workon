@@ -1,4 +1,4 @@
-use std::{fmt, path::Path};
+use std::{fmt, fs::create_dir_all, path::Path};
 
 use git2::{Repository, Worktree};
 use miette::{IntoDiagnostic, Result};
@@ -7,6 +7,15 @@ use git2::WorktreeAddOptions;
 use log::debug;
 
 use super::workon_root;
+
+/// Options for creating a new worktree
+#[derive(Debug, Clone, Default)]
+pub struct AddWorktreeOptions {
+    /// Create an orphan branch (no parent commits)
+    pub orphan: bool,
+    /// Detach HEAD in the new working tree
+    pub detach: bool,
+}
 
 pub struct WorktreeDescriptor {
     worktree: Worktree,
@@ -102,33 +111,51 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
         .collect()
 }
 
-pub fn add_worktree(repo: &Repository, branch_name: &str) -> Result<WorktreeDescriptor> {
+pub fn add_worktree(
+    repo: &Repository,
+    branch_name: &str,
+    options: &AddWorktreeOptions,
+) -> Result<WorktreeDescriptor> {
     // git worktree add <branch>
-    debug!("looking for local branch {:?}", branch_name);
+    debug!(
+        "adding worktree for branch {:?} with options: {:?}",
+        branch_name, options
+    );
 
-    let branch = repo
-        .find_branch(branch_name, git2::BranchType::Local)
-        .into_diagnostic()
-        .or_else(|e| {
-            debug!("local branch not found: {:?}", e);
-            debug!("looking for remote branch {:?}", branch_name);
-            repo.find_branch(branch_name, git2::BranchType::Remote)
-                .into_diagnostic()
-                .map_err(|e| {
-                    debug!("remote branch not found: {:?}", e);
-                    e
-                })
-        })
-        .ok()
-        .unwrap_or_else(|| {
-            debug!("creating new local branch {:?}", branch_name);
-            let commit = repo.head().unwrap().peel_to_commit().unwrap();
-            repo.branch(branch_name, &commit, false)
-                .into_diagnostic()
-                .unwrap()
-        });
+    let reference = if options.orphan {
+        debug!("creating orphan branch {:?}", branch_name);
+        // For orphan branches, create a reference that points to an empty tree
+        // This mimics `git worktree add --orphan`
+        None
+    } else if options.detach {
+        debug!("creating detached HEAD worktree at {:?}", branch_name);
+        // For detached worktrees, we don't create or use a branch reference
+        None
+    } else {
+        let branch = repo
+            .find_branch(branch_name, git2::BranchType::Local)
+            .into_diagnostic()
+            .or_else(|e| {
+                debug!("local branch not found: {:?}", e);
+                debug!("looking for remote branch {:?}", branch_name);
+                repo.find_branch(branch_name, git2::BranchType::Remote)
+                    .into_diagnostic()
+                    .map_err(|e| {
+                        debug!("remote branch not found: {:?}", e);
+                        e
+                    })
+            })
+            .ok()
+            .unwrap_or_else(|| {
+                debug!("creating new local branch {:?}", branch_name);
+                let commit = repo.head().unwrap().peel_to_commit().unwrap();
+                repo.branch(branch_name, &commit, false)
+                    .into_diagnostic()
+                    .unwrap()
+            });
 
-    let reference = branch.into_reference();
+        Some(branch.into_reference())
+    };
 
     let root = workon_root(repo)?;
 
@@ -141,8 +168,15 @@ pub fn add_worktree(repo: &Repository, branch_name: &str) -> Result<WorktreeDesc
 
     let worktree_path = root.join(branch_name);
 
+    // Create parent directories if the branch name contains slashes
+    if let Some(parent) = worktree_path.parent() {
+        create_dir_all(parent).into_diagnostic()?;
+    }
+
     let mut opts = WorktreeAddOptions::new();
-    opts.reference(Some(&reference));
+    if let Some(ref r) = reference {
+        opts.reference(Some(r));
+    }
 
     debug!(
         "adding worktree {} at {}",
@@ -150,7 +184,8 @@ pub fn add_worktree(repo: &Repository, branch_name: &str) -> Result<WorktreeDesc
         worktree_path.display()
     );
 
-    repo.worktree(worktree_name, worktree_path.as_path(), Some(&opts))
+    repo
+        .worktree(worktree_name, worktree_path.as_path(), Some(&opts))
         .map(WorktreeDescriptor::of)
         .into_diagnostic()
 }

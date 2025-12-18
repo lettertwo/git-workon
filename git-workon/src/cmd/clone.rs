@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use miette::Result;
-use workon::{add_worktree, clone, get_default_branch_name, WorktreeDescriptor};
+use workon::{add_worktree, AddWorktreeOptions, clone, get_default_branch_name, WorktreeDescriptor};
 
 use crate::cli::Clone;
 
@@ -22,6 +22,6 @@ impl Run for Clone {
 
         let repo = clone(path, &self.url)?;
         let default_branch = get_default_branch_name(&repo, repo.find_remote("origin").ok())?;
-        add_worktree(&repo, &default_branch).map(Some)
+        add_worktree(&repo, &default_branch, &AddWorktreeOptions::default()).map(Some)
     }
 }

@@ -93,3 +93,33 @@ fn new_orphan_worktree() -> Result<(), Box<dyn std::error::Error>> {
     temp.close()?;
     Ok(())
 }
+
+#[test]
+fn new_detached_worktree() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // First initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create a detached worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("--detach")
+        .arg("detached")
+        .assert()
+        .success();
+
+    // Verify the new worktree directory exists
+    temp.child("detached").assert(predicate::path::is_dir());
+
+    // Open the repository and verify the main branch exists
+    let repo = Repository::open(temp.path().join(".bare"))?;
+    repo.assert(predicate::repo::is_bare());
+    repo.assert(predicate::repo::has_branch("main"));
+
+    temp.close()?;
+    Ok(())
+}

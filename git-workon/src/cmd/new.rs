@@ -1,7 +1,7 @@
 use miette::Result;
 
 use crate::cli::New;
-use workon::{add_worktree, get_repo, WorktreeDescriptor};
+use workon::{add_worktree, AddWorktreeOptions, get_repo, WorktreeDescriptor};
 
 use super::Run;
 
@@ -38,6 +38,10 @@ impl Run for New {
             }
         };
         let repo = get_repo(None)?;
-        add_worktree(&repo, name).map(Some)
+        let options = AddWorktreeOptions {
+            orphan: self.orphan,
+            detach: self.detach,
+        };
+        add_worktree(&repo, name, &options).map(Some)
     }
 }
