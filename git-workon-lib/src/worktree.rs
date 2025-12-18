@@ -184,8 +184,29 @@ pub fn add_worktree(
         worktree_path.display()
     );
 
-    repo
+    let worktree = repo
         .worktree(worktree_name, worktree_path.as_path(), Some(&opts))
-        .map(WorktreeDescriptor::of)
-        .into_diagnostic()
+        .into_diagnostic()?;
+
+    // For orphan branches, we need to manually set up HEAD to point to the new branch
+    // and clear the index, since libgit2 doesn't have direct support for --orphan
+    if options.orphan {
+        debug!("setting up orphan branch {:?}", branch_name);
+
+        // Open the worktree as a repository
+        let worktree_repo = Repository::open(&worktree_path).into_diagnostic()?;
+
+        // Set HEAD to be a symbolic reference to the new branch
+        let branch_ref = format!("refs/heads/{}", branch_name);
+        worktree_repo.set_head(&branch_ref).into_diagnostic()?;
+
+        // Clear the index to start with an empty working tree
+        let mut index = worktree_repo.index().into_diagnostic()?;
+        index.clear().into_diagnostic()?;
+        index.write().into_diagnostic()?;
+
+        debug!("orphan branch setup complete for {:?}", branch_name);
+    }
+
+    Ok(WorktreeDescriptor::of(worktree))
 }
