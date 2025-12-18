@@ -8,13 +8,21 @@ use log::debug;
 
 use super::workon_root;
 
-/// Options for creating a new worktree
-#[derive(Debug, Clone, Default)]
-pub struct AddWorktreeOptions {
-    /// Create an orphan branch (no parent commits)
-    pub orphan: bool,
-    /// Detach HEAD in the new working tree
-    pub detach: bool,
+/// Type of branch to create for a new worktree
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchType {
+    /// Normal branch - track existing or create from HEAD
+    Normal,
+    /// Orphan branch - independent history with initial empty commit
+    Orphan,
+    /// Detached HEAD
+    Detached,
+}
+
+impl Default for BranchType {
+    fn default() -> Self {
+        BranchType::Normal
+    }
 }
 
 pub struct WorktreeDescriptor {
@@ -114,47 +122,50 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
 pub fn add_worktree(
     repo: &Repository,
     branch_name: &str,
-    options: &AddWorktreeOptions,
+    branch_type: BranchType,
 ) -> Result<WorktreeDescriptor> {
     // git worktree add <branch>
     debug!(
-        "adding worktree for branch {:?} with options: {:?}",
-        branch_name, options
+        "adding worktree for branch {:?} with type: {:?}",
+        branch_name, branch_type
     );
 
-    let reference = if options.orphan {
-        debug!("creating orphan branch {:?}", branch_name);
-        // For orphan branches, create a reference that points to an empty tree
-        // This mimics `git worktree add --orphan`
-        None
-    } else if options.detach {
-        debug!("creating detached HEAD worktree at {:?}", branch_name);
-        // For detached worktrees, we don't create or use a branch reference
-        None
-    } else {
-        let branch = repo
-            .find_branch(branch_name, git2::BranchType::Local)
-            .into_diagnostic()
-            .or_else(|e| {
-                debug!("local branch not found: {:?}", e);
-                debug!("looking for remote branch {:?}", branch_name);
-                repo.find_branch(branch_name, git2::BranchType::Remote)
-                    .into_diagnostic()
-                    .map_err(|e| {
-                        debug!("remote branch not found: {:?}", e);
-                        e
-                    })
-            })
-            .ok()
-            .unwrap_or_else(|| {
-                debug!("creating new local branch {:?}", branch_name);
-                let commit = repo.head().unwrap().peel_to_commit().unwrap();
-                repo.branch(branch_name, &commit, false)
-                    .into_diagnostic()
-                    .unwrap()
-            });
+    let reference = match branch_type {
+        BranchType::Orphan => {
+            debug!("creating orphan branch {:?}", branch_name);
+            // For orphan branches, we'll create the branch after the worktree
+            None
+        }
+        BranchType::Detached => {
+            debug!("creating detached HEAD worktree at {:?}", branch_name);
+            // For detached worktrees, we don't create or use a branch reference
+            None
+        }
+        BranchType::Normal => {
+            let branch = repo
+                .find_branch(branch_name, git2::BranchType::Local)
+                .into_diagnostic()
+                .or_else(|e| {
+                    debug!("local branch not found: {:?}", e);
+                    debug!("looking for remote branch {:?}", branch_name);
+                    repo.find_branch(branch_name, git2::BranchType::Remote)
+                        .into_diagnostic()
+                        .map_err(|e| {
+                            debug!("remote branch not found: {:?}", e);
+                            e
+                        })
+                })
+                .ok()
+                .unwrap_or_else(|| {
+                    debug!("creating new local branch {:?}", branch_name);
+                    let commit = repo.head().unwrap().peel_to_commit().unwrap();
+                    repo.branch(branch_name, &commit, false)
+                        .into_diagnostic()
+                        .unwrap()
+                });
 
-        Some(branch.into_reference())
+            Some(branch.into_reference())
+        }
     };
 
     let root = workon_root(repo)?;
@@ -188,22 +199,72 @@ pub fn add_worktree(
         .worktree(worktree_name, worktree_path.as_path(), Some(&opts))
         .into_diagnostic()?;
 
-    // For orphan branches, we need to manually set up HEAD to point to the new branch
-    // and clear the index, since libgit2 doesn't have direct support for --orphan
-    if options.orphan {
-        debug!("setting up orphan branch {:?}", branch_name);
+    // For orphan branches, create an initial empty commit with no parent
+    if branch_type == BranchType::Orphan {
+        debug!("setting up orphan branch {:?} with initial empty commit", branch_name);
 
-        // Open the worktree as a repository
+        use std::fs;
+
+        // First, manually set HEAD to point to the new branch as a symbolic reference
+        // This ensures we're not trying to update an existing branch
+        let git_dir = repo.path().join("worktrees").join(worktree_name);
+        let head_path = git_dir.join("HEAD");
+        let branch_ref = format!("ref: refs/heads/{}\n", branch_name);
+        fs::write(&head_path, branch_ref.as_bytes()).into_diagnostic()?;
+
+        // Remove any existing branch ref that libgit2 may have created
+        let branch_ref_path = repo.path().join("refs/heads").join(branch_name);
+        let _ = fs::remove_file(&branch_ref_path);
+
+        // Open the worktree repository
         let worktree_repo = Repository::open(&worktree_path).into_diagnostic()?;
 
-        // Set HEAD to be a symbolic reference to the new branch
-        let branch_ref = format!("refs/heads/{}", branch_name);
-        worktree_repo.set_head(&branch_ref).into_diagnostic()?;
+        // Remove all files from the working directory (but keep .git)
+        for entry in fs::read_dir(&worktree_path).into_diagnostic()? {
+            let entry = entry.into_diagnostic()?;
+            let path = entry.path();
+            if path.file_name() != Some(std::ffi::OsStr::new(".git")) {
+                if path.is_dir() {
+                    fs::remove_dir_all(&path).into_diagnostic()?;
+                } else {
+                    fs::remove_file(&path).into_diagnostic()?;
+                }
+            }
+        }
 
-        // Clear the index to start with an empty working tree
+        // Clear the index to start fresh
         let mut index = worktree_repo.index().into_diagnostic()?;
         index.clear().into_diagnostic()?;
         index.write().into_diagnostic()?;
+
+        // Create an empty tree for the initial commit
+        let tree_id = index.write_tree().into_diagnostic()?;
+        let tree = worktree_repo.find_tree(tree_id).into_diagnostic()?;
+
+        // Create signature for the commit
+        let config = worktree_repo.config().into_diagnostic()?;
+        let sig = worktree_repo
+            .signature()
+            .or_else(|_| {
+                // Fallback if no git config is set
+                git2::Signature::now(
+                    config.get_string("user.name").unwrap_or_else(|_| "git-workon".to_string()).as_str(),
+                    config.get_string("user.email").unwrap_or_else(|_| "git-workon@localhost".to_string()).as_str(),
+                )
+            })
+            .into_diagnostic()?;
+
+        // Create initial commit with no parents (orphan)
+        worktree_repo
+            .commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "Initial commit",
+                &tree,
+                &[], // No parents - this makes it an orphan
+            )
+            .into_diagnostic()?;
 
         debug!("orphan branch setup complete for {:?}", branch_name);
     }

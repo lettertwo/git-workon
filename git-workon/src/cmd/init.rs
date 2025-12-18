@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use miette::Result;
-use workon::{add_worktree, AddWorktreeOptions, get_default_branch_name, init, WorktreeDescriptor};
+use workon::{add_worktree, BranchType, get_default_branch_name, init, WorktreeDescriptor};
 
 use crate::cli::Init;
 
@@ -12,6 +12,6 @@ impl Run for Init {
         let path = self.path.clone().unwrap_or_else(|| PathBuf::from("."));
         let repo = init(path)?;
         let default_branch = get_default_branch_name(&repo, None)?;
-        add_worktree(&repo, &default_branch, &AddWorktreeOptions::default()).map(Some)
+        add_worktree(&repo, &default_branch, BranchType::default()).map(Some)
     }
 }
