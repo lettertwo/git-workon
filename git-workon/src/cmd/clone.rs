@@ -14,7 +14,7 @@ impl Run for Clone {
                 self.url
                     .trim_end_matches('/')
                     .split('/')
-                    .last()
+                    .next_back()
                     .unwrap_or(".")
                     .trim_end_matches(".git"),
             )

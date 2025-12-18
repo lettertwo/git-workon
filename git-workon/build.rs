@@ -1,5 +1,8 @@
 use std::{env::var_os, fs::create_dir_all, fs::write, io, process::Command};
 
+#[path = "src/cli.rs"]
+mod cli;
+
 fn main() -> std::io::Result<()> {
     let pkg_version = env!("CARGO_PKG_VERSION");
     let version = match var_os("PROFILE") {
@@ -21,7 +24,7 @@ fn main() -> std::io::Result<()> {
 fn git_version() -> Option<String> {
     let dir = env!("CARGO_MANIFEST_DIR");
     let mut git = Command::new("git");
-    git.args(&[
+    git.args([
         "-C",
         dir,
         "describe",
@@ -39,13 +42,10 @@ fn git_version() -> Option<String> {
 }
 
 fn generate_manpages() -> io::Result<()> {
-    #[path = "src/cli.rs"]
-    mod cli;
-
     use clap::CommandFactory;
     use clap_mangen::Man;
 
-    use cli::Cli;
+    use crate::cli::Cli;
 
     let dir = "man";
     let path = format!("{}/{}.1", dir, env!("CARGO_PKG_NAME"));
@@ -63,15 +63,12 @@ fn generate_manpages() -> io::Result<()> {
 }
 
 fn generate_completions() -> io::Result<()> {
-    #[path = "src/cli.rs"]
-    mod cli;
-
     use clap::CommandFactory;
     use clap_complete::generate_to;
     use clap_complete::shells::{Bash, Elvish, Fish, PowerShell, Zsh};
     use clap_complete_fig::Fig;
 
-    use cli::Cli;
+    use crate::cli::Cli;
 
     let cmd = &mut Cli::command();
     let bin_name = env!("CARGO_PKG_NAME");

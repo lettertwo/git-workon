@@ -10,7 +10,6 @@ pub fn empty_commit(repo: &Repository) -> Result<Oid> {
         })
         .into_diagnostic()?;
     ensure!(tree.is_empty(), "Expected an empty index!");
-    Ok(repo
-        .commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
-        .into_diagnostic()?)
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+        .into_diagnostic()
 }

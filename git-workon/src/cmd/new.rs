@@ -38,6 +38,6 @@ impl Run for New {
             }
         };
         let repo = get_repo(None)?;
-        add_worktree(&repo, &name).map(Some)
+        add_worktree(&repo, name).map(Some)
     }
 }

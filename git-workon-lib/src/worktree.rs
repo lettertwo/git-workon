@@ -15,7 +15,7 @@ pub struct WorktreeDescriptor {
 impl WorktreeDescriptor {
     pub fn new(repo: &Repository, name: &str) -> Result<Self> {
         Ok(Self {
-            worktree: repo.find_worktree(&name).into_diagnostic()?,
+            worktree: repo.find_worktree(name).into_diagnostic()?,
         })
     }
 
@@ -114,9 +114,9 @@ pub fn add_worktree(repo: &Repository, branch_name: &str) -> Result<WorktreeDesc
             debug!("looking for remote branch {:?}", branch_name);
             repo.find_branch(branch_name, git2::BranchType::Remote)
                 .into_diagnostic()
-                .or_else(|e| {
+                .map_err(|e| {
                     debug!("remote branch not found: {:?}", e);
-                    Err(e)
+                    e
                 })
         })
         .ok()
@@ -151,6 +151,6 @@ pub fn add_worktree(repo: &Repository, branch_name: &str) -> Result<WorktreeDesc
     );
 
     repo.worktree(worktree_name, worktree_path.as_path(), Some(&opts))
-        .map(|worktree| WorktreeDescriptor::of(worktree))
+        .map(WorktreeDescriptor::of)
         .into_diagnostic()
 }
