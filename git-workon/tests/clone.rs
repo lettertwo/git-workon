@@ -1,45 +1,96 @@
 use assert_cmd::Command;
-use assert_fs::{prelude::*, TempDir};
-use predicates::prelude::*;
+use assert_fs::TempDir;
+use git2::Repository;
+use git_workon_fixture::prelude::*;
 
-// 1. git clone --bare --single-branch <atlassian-url>.git .bare
-// 2. $ echo "gitdir: ./.bare" > .git
-// 3. $ git config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
-// 4. $ git fetch
-// 5. $ git worktree add --track main origin/main
 #[test]
 fn clone_default() -> Result<(), Box<dyn std::error::Error>> {
-    // TODO: Create some fixtures, e.g., bare repo to clone from.
-    let temp = TempDir::new()?;
+    // Create a bare repository to act as the remote
+    let remote = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    // Create a temp directory for the clone destination
+    let clone_dest = TempDir::new()?;
+
+    // Clone the remote repository
     let mut cmd = Command::cargo_bin("git-workon")?;
-    cmd.current_dir(&temp).arg("clone").assert().success();
+    cmd.current_dir(&clone_dest)
+        .arg("clone")
+        .arg(remote.path.as_ref().unwrap().to_str().unwrap())
+        .assert()
+        .success();
 
-    // temp.child(".bare/index").assert(predicate::path::missing());
-    // temp.child(".bare/config").assert(predicate::str::contains("bare = true"));
-    // temp.child(".git").assert(predicate::path::is_file());
-    // temp.child(".git").assert(predicate::str::contains("gitdir: ./.bare"));
-    // temp.child("main").assert(predicate::path::is_dir());
+    // Verify file system structure
+    clone_dest
+        .child(".bare/index")
+        .assert(predicate::path::missing());
+    clone_dest.child(".git").assert(predicate::path::is_file());
+    clone_dest
+        .child(".git")
+        .assert(predicate::str::contains("gitdir: ./.bare"));
+    clone_dest.child("main").assert(predicate::path::is_dir());
 
-    temp.close()?;
+    // Open the repository and verify git state
+    let repo = Repository::open(clone_dest.path().join(".bare"))?;
+    repo.assert(predicate::repo::is_bare());
+    repo.assert(predicate::repo::has_branch("main"));
+    repo.assert(predicate::repo::has_remote("origin"));
+    repo.assert(predicate::repo::has_remote_branch("origin/main"));
+    repo.assert(predicate::repo::has_config(
+        "remote.origin.fetch",
+        Some("+refs/heads/*:refs/remotes/origin/*"),
+    ));
+
+    clone_dest.close()?;
     Ok(())
 }
 
 #[test]
 fn clone_with_name() -> Result<(), Box<dyn std::error::Error>> {
-    // let temp = TempDir::new()?;
-    // let mut cmd = Command::cargo_bin("git-workon")?;
-    // cmd.current_dir(&temp).arg("init").arg("test").assert().success();
-    //
-    // temp.child(".bare").assert(predicate::path::missing());
-    // temp.child(".git").assert(predicate::path::missing());
-    // temp.child("main").assert(predicate::path::missing());
-    //
-    // temp.child("test/.bare/index").assert(predicate::path::missing());
-    // temp.child("test/.bare/config").assert(predicate::str::contains("bare = true"));
-    // temp.child("test/.git").assert(predicate::path::is_file());
-    // temp.child("test/.git").assert(predicate::str::contains("gitdir: ./.bare"));
-    // temp.child("test/main").assert(predicate::path::is_dir());
-    //
-    // temp.close()?;
+    // Create a bare repository to act as the remote
+    let remote = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    // Create a temp directory for the clone destination
+    let temp = TempDir::new()?;
+
+    // Clone the remote repository with a custom directory name
+    let mut cmd = Command::cargo_bin("git-workon")?;
+    cmd.current_dir(&temp)
+        .arg("clone")
+        .arg(remote.path.as_ref().unwrap().to_str().unwrap())
+        .arg("myrepo")
+        .assert()
+        .success();
+
+    // Verify nothing was created in the root temp directory
+    temp.child(".bare").assert(predicate::path::missing());
+    temp.child(".git").assert(predicate::path::missing());
+    temp.child("main").assert(predicate::path::missing());
+
+    // Verify file system structure under the custom directory name
+    temp.child("myrepo/.bare/index")
+        .assert(predicate::path::missing());
+    temp.child("myrepo/.git").assert(predicate::path::is_file());
+    temp.child("myrepo/.git")
+        .assert(predicate::str::contains("gitdir: ./.bare"));
+    temp.child("myrepo/main").assert(predicate::path::is_dir());
+
+    // Open the repository and verify git state
+    let repo = Repository::open(temp.path().join("myrepo/.bare"))?;
+    repo.assert(predicate::repo::is_bare());
+    repo.assert(predicate::repo::has_branch("main"));
+    repo.assert(predicate::repo::has_remote("origin"));
+    repo.assert(predicate::repo::has_remote_branch("origin/main"));
+    repo.assert(predicate::repo::has_config(
+        "remote.origin.fetch",
+        Some("+refs/heads/*:refs/remotes/origin/*"),
+    ));
+
+    temp.close()?;
     Ok(())
 }

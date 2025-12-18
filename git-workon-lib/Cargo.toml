@@ -25,3 +25,4 @@ miette.workspace = true
 [dev-dependencies]
 assert_fs.workspace = true
 predicates.workspace = true
+git-workon-fixture.workspace = true
