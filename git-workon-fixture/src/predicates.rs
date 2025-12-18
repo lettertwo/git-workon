@@ -1,4 +1,8 @@
 mod has_branch;
+mod has_config;
+mod has_remote;
+mod has_remote_branch;
+mod has_remote_url;
 mod has_worktree;
 mod head_commit_message_contains;
 mod head_commit_parent_count;
@@ -8,6 +12,10 @@ mod is_empty;
 mod is_worktree;
 
 pub use self::has_branch::*;
+pub use self::has_config::*;
+pub use self::has_remote::*;
+pub use self::has_remote_branch::*;
+pub use self::has_remote_url::*;
 pub use self::has_worktree::*;
 pub use self::head_commit_message_contains::*;
 pub use self::head_commit_parent_count::*;
