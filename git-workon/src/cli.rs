@@ -93,6 +93,11 @@ pub struct Prune {
     pub dry_run: bool,
     #[arg(short, long, help = "Skip confirmation prompts")]
     pub yes: bool,
+    #[arg(
+        long,
+        help = "Also prune worktrees where the remote tracking branch is gone"
+    )]
+    pub gone: bool,
 }
 
 /// Find a worktree to work on.
