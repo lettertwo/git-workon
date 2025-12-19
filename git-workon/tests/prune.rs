@@ -47,7 +47,8 @@ fn prune_removes_worktree_for_deleted_branch() -> Result<(), Box<dyn std::error:
 
     // Delete the branch manually using git2 (force delete since it's checked out in a worktree)
     let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.find_reference(&format!("refs/heads/feature"))?.delete()?;
+    repo.find_reference(&format!("refs/heads/feature"))?
+        .delete()?;
 
     // Run prune - should remove the worktree
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
@@ -85,7 +86,8 @@ fn prune_dry_run_does_not_remove_anything() -> Result<(), Box<dyn std::error::Er
 
     // Delete the branch manually (force delete since it's checked out in a worktree)
     let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.find_reference(&format!("refs/heads/feature"))?.delete()?;
+    repo.find_reference(&format!("refs/heads/feature"))?
+        .delete()?;
 
     // Run prune with --dry-run
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
@@ -126,7 +128,8 @@ fn prune_handles_multiple_stale_worktrees() -> Result<(), Box<dyn std::error::Er
     // Delete all the feature branches (force delete)
     let repo = Repository::open(temp.path().join(".bare"))?;
     for name in &["feature-1", "feature-2", "feature-3"] {
-        repo.find_reference(&format!("refs/heads/{}", name))?.delete()?;
+        repo.find_reference(&format!("refs/heads/{}", name))?
+            .delete()?;
     }
 
     // Run prune
@@ -175,7 +178,8 @@ fn prune_preserves_worktrees_with_existing_branches() -> Result<(), Box<dyn std:
 
     // Delete only one branch (force delete)
     let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.find_reference(&format!("refs/heads/delete-me"))?.delete()?;
+    repo.find_reference(&format!("refs/heads/delete-me"))?
+        .delete()?;
 
     // Run prune
     let mut prune_cmd = Command::cargo_bin("git-workon")?;

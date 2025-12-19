@@ -9,20 +9,15 @@ use log::debug;
 use super::workon_root;
 
 /// Type of branch to create for a new worktree
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BranchType {
     /// Normal branch - track existing or create from HEAD
+    #[default]
     Normal,
     /// Orphan branch - independent history with initial empty commit
     Orphan,
     /// Detached HEAD
     Detached,
-}
-
-impl Default for BranchType {
-    fn default() -> Self {
-        BranchType::Normal
-    }
 }
 
 pub struct WorktreeDescriptor {
@@ -48,9 +43,45 @@ impl WorktreeDescriptor {
         self.worktree.path()
     }
 
-    pub fn branch(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.branch()
+    /// Returns the branch name if the worktree is on a branch, or None if detached.
+    ///
+    /// This reads the HEAD file from the worktree's git directory to determine
+    /// if HEAD points to a branch reference or directly to a commit SHA.
+    pub fn branch(&self) -> Result<Option<String>> {
+        use std::fs;
+
+        // Get the path to the worktree's HEAD file
+        let git_dir = self.worktree.path().join(".git");
+        let head_path = if git_dir.is_file() {
+            // Linked worktree - read .git file to find actual git directory
+            let git_file_content = fs::read_to_string(&git_dir).into_diagnostic()?;
+            let git_dir_path = git_file_content
+                .strip_prefix("gitdir: ")
+                .and_then(|s| s.trim().strip_suffix('\n').or(Some(s.trim())))
+                .ok_or_else(|| miette::miette!("Invalid .git file format"))?;
+            Path::new(git_dir_path).join("HEAD")
+        } else {
+            // Main worktree
+            git_dir.join("HEAD")
+        };
+
+        let head_content = fs::read_to_string(&head_path).into_diagnostic()?;
+
+        // HEAD file contains either:
+        // - "ref: refs/heads/branch-name" for a branch
+        // - A direct SHA for detached HEAD
+        if let Some(ref_line) = head_content.strip_prefix("ref: ") {
+            let ref_name = ref_line.trim();
+            Ok(ref_name.strip_prefix("refs/heads/").map(|s| s.to_string()))
+        } else {
+            // Direct SHA - detached HEAD
+            Ok(None)
+        }
+    }
+
+    /// Returns true if the worktree has a detached HEAD (not on a branch).
+    pub fn is_detached(&self) -> Result<bool> {
+        Ok(self.branch()?.is_none())
     }
 
     pub fn status(&self) -> Option<&str> {
@@ -199,9 +230,37 @@ pub fn add_worktree(
         .worktree(worktree_name, worktree_path.as_path(), Some(&opts))
         .into_diagnostic()?;
 
+    // For detached worktrees, set HEAD to point directly to a commit SHA
+    if branch_type == BranchType::Detached {
+        debug!("setting up detached HEAD for worktree {:?}", branch_name);
+
+        use std::fs;
+
+        // Get the current HEAD commit SHA
+        let head_commit = repo
+            .head()
+            .into_diagnostic()?
+            .peel_to_commit()
+            .into_diagnostic()?;
+        let commit_sha = head_commit.id().to_string();
+
+        // Write the commit SHA directly to the worktree's HEAD file
+        let git_dir = repo.path().join("worktrees").join(worktree_name);
+        let head_path = git_dir.join("HEAD");
+        fs::write(&head_path, format!("{}\n", commit_sha).as_bytes()).into_diagnostic()?;
+
+        debug!(
+            "detached HEAD setup complete for worktree {:?} at {}",
+            branch_name, commit_sha
+        );
+    }
+
     // For orphan branches, create an initial empty commit with no parent
     if branch_type == BranchType::Orphan {
-        debug!("setting up orphan branch {:?} with initial empty commit", branch_name);
+        debug!(
+            "setting up orphan branch {:?} with initial empty commit",
+            branch_name
+        );
 
         use std::fs;
 
@@ -248,8 +307,14 @@ pub fn add_worktree(
             .or_else(|_| {
                 // Fallback if no git config is set
                 git2::Signature::now(
-                    config.get_string("user.name").unwrap_or_else(|_| "git-workon".to_string()).as_str(),
-                    config.get_string("user.email").unwrap_or_else(|_| "git-workon@localhost".to_string()).as_str(),
+                    config
+                        .get_string("user.name")
+                        .unwrap_or_else(|_| "git-workon".to_string())
+                        .as_str(),
+                    config
+                        .get_string("user.email")
+                        .unwrap_or_else(|_| "git-workon@localhost".to_string())
+                        .as_str(),
                 )
             })
             .into_diagnostic()?;

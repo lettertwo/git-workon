@@ -80,7 +80,11 @@ mod tests {
 
         // Verify the branch has exactly one commit (the initial empty commit)
         let head_commit = head.peel_to_commit()?;
-        assert_eq!(head_commit.parent_count(), 0, "Orphan branch should have no parent commits");
+        assert_eq!(
+            head_commit.parent_count(),
+            0,
+            "Orphan branch should have no parent commits"
+        );
         assert_eq!(head_commit.message(), Some("Initial commit"));
 
         // Verify the commit tree is empty
@@ -112,6 +116,94 @@ mod tests {
         assert_eq!(worktree.name(), Some("detached"));
 
         repo.assert(predicate::repo::has_worktree("detached"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_worktree_branch_normal() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a normal worktree
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Verify branch() returns the correct branch name
+        assert_eq!(worktree.branch()?, Some("feature".to_string()));
+
+        // Verify is_detached() returns false
+        assert_eq!(worktree.is_detached()?, false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_worktree_branch_with_slashes() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a worktree with slashes in the branch name
+        let worktree = add_worktree(&repo, "user/feature-branch", BranchType::Normal)?;
+
+        // Verify branch() returns the full branch name with slashes
+        assert_eq!(worktree.branch()?, Some("user/feature-branch".to_string()));
+
+        // Verify is_detached() returns false
+        assert_eq!(worktree.is_detached()?, false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_worktree_branch_orphan() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add an orphan worktree
+        let worktree = add_worktree(&repo, "docs", BranchType::Orphan)?;
+
+        // Verify branch() returns the correct branch name
+        assert_eq!(worktree.branch()?, Some("docs".to_string()));
+
+        // Verify is_detached() returns false (orphan is still on a branch)
+        assert_eq!(worktree.is_detached()?, false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_worktree_branch_detached() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a detached worktree
+        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+
+        // Verify branch() returns None for detached HEAD
+        assert_eq!(worktree.branch()?, None);
+
+        // Verify is_detached() returns true
+        assert_eq!(worktree.is_detached()?, true);
 
         Ok(())
     }
