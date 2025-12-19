@@ -27,8 +27,10 @@ clap-verbosity-flag.workspace = true
 clap_complete.workspace = true
 clap_complete_fig.workspace = true
 clap_mangen.workspace = true
+dialoguer.workspace = true
 env_logger.workspace = true
 git-workon-lib.workspace = true
+git2.workspace = true
 log.workspace = true
 miette.workspace = true
 

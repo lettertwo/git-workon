@@ -84,7 +84,12 @@ pub struct New {
 
 /// Prune stale worktrees.
 #[derive(Debug, Args)]
-pub struct Prune {}
+pub struct Prune {
+    #[arg(short = 'n', long, help = "Show what would be pruned without actually removing anything")]
+    pub dry_run: bool,
+    #[arg(short, long, help = "Skip confirmation prompts")]
+    pub yes: bool,
+}
 
 /// Find a worktree to work on.
 #[derive(Debug, Args)]

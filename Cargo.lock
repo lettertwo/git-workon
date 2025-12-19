@@ -491,6 +491,7 @@ dependencies = [
  "clap_complete",
  "clap_complete_fig",
  "clap_mangen",
+ "dialoguer",
  "env_logger",
  "git-workon-fixture",
  "git-workon-lib",
