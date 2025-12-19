@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use miette::Result;
-use workon::{add_worktree, BranchType, clone, get_default_branch_name, WorktreeDescriptor};
+use workon::{add_worktree, clone, get_default_branch_name, BranchType, WorktreeDescriptor};
 
 use crate::cli::Clone;
 

@@ -21,7 +21,8 @@ fn new_creates_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .success();
 
     // Verify the new worktree directory exists
-    temp.child("feature-branch").assert(predicate::path::is_dir());
+    temp.child("feature-branch")
+        .assert(predicate::path::is_dir());
 
     // Open the repository and verify git state
     let repo = Repository::open(temp.path().join(".bare"))?;
@@ -109,15 +110,21 @@ fn new_orphan_worktree() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify the branch has exactly one commit (the initial empty commit)
     let head_commit = head.peel_to_commit()?;
-    assert_eq!(head_commit.parent_count(), 0, "Orphan branch should have no parent commits");
+    assert_eq!(
+        head_commit.parent_count(),
+        0,
+        "Orphan branch should have no parent commits"
+    );
 
     // Verify the index is empty
     let index = orphan_repo.index()?;
     assert_eq!(index.len(), 0, "Orphan worktree index should be empty");
 
     // Verify the working directory doesn't contain files from main
-    assert!(!temp.path().join("docs/test.txt").exists(),
-            "Orphan worktree should not have files from parent branch");
+    assert!(
+        !temp.path().join("docs/test.txt").exists(),
+        "Orphan worktree should not have files from parent branch"
+    );
 
     temp.close()?;
     Ok(())

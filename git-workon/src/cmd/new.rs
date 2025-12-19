@@ -1,7 +1,7 @@
 use miette::Result;
 
 use crate::cli::New;
-use workon::{add_worktree, BranchType, get_repo, WorktreeDescriptor};
+use workon::{add_worktree, get_repo, BranchType, WorktreeDescriptor};
 
 use super::Run;
 
