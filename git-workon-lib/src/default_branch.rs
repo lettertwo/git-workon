@@ -64,3 +64,37 @@ pub fn get_default_branch_name(repo: &Repository, remote: Option<Remote>) -> Res
     }
     default_branch.get_name()
 }
+
+/// Get the default branch name for a repository, validated to exist.
+///
+/// This function:
+/// 1. Checks the `init.defaultBranch` config
+/// 2. Falls back to "main" if it exists
+/// 3. Falls back to "master" if it exists
+/// 4. Returns an error if none exist
+pub fn get_default_branch(repo: &Repository) -> Result<String> {
+    // Check init.defaultBranch config
+    if let Ok(config) = repo.config() {
+        if let Ok(default_branch) = config.get_string("init.defaultBranch") {
+            // Verify the configured branch exists
+            if repo
+                .find_branch(&default_branch, git2::BranchType::Local)
+                .is_ok()
+            {
+                return Ok(default_branch);
+            }
+        }
+    }
+
+    // Fall back to "main" if it exists
+    if repo.find_branch("main", git2::BranchType::Local).is_ok() {
+        return Ok("main".to_string());
+    }
+
+    // Fall back to "master" if it exists
+    if repo.find_branch("master", git2::BranchType::Local).is_ok() {
+        return Ok("master".to_string());
+    }
+
+    bail!("Could not determine default branch: neither 'main' nor 'master' exist, and init.defaultBranch is not configured")
+}

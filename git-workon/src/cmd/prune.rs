@@ -1,7 +1,7 @@
 use dialoguer::Confirm;
 use git2::BranchType;
 use miette::{IntoDiagnostic, Result};
-use workon::{get_repo, get_worktrees, WorktreeDescriptor};
+use workon::{get_default_branch, get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::Prune;
 
@@ -48,6 +48,30 @@ impl Run for Prune {
                                 worktree_path: wt.path().to_path_buf(),
                                 branch_name,
                                 reason: PruneReason::RemoteGone,
+                            },
+                        )),
+                        _ => None,
+                    }
+                } else if let Some(ref merged_target) = self.merged {
+                    // Branch exists - check if merged into target (only if --merged flag is set)
+                    let target_branch = if merged_target.is_empty() {
+                        // Use default branch
+                        match get_default_branch(&repo) {
+                            Ok(b) => b,
+                            Err(_) => return None, // Can't determine default branch
+                        }
+                    } else {
+                        merged_target.clone()
+                    };
+
+                    match wt.is_merged_into(&target_branch) {
+                        Ok(true) => Some((
+                            wt,
+                            PruneCandidate {
+                                worktree_name: wt.name()?.to_string(),
+                                worktree_path: wt.path().to_path_buf(),
+                                branch_name,
+                                reason: PruneReason::Merged(target_branch),
                             },
                         )),
                         _ => None,
@@ -160,6 +184,7 @@ impl Run for Prune {
 enum PruneReason {
     BranchDeleted,
     RemoteGone,
+    Merged(String),
 }
 
 impl std::fmt::Display for PruneReason {
@@ -167,6 +192,7 @@ impl std::fmt::Display for PruneReason {
         match self {
             PruneReason::BranchDeleted => write!(f, "branch deleted"),
             PruneReason::RemoteGone => write!(f, "remote gone"),
+            PruneReason::Merged(target) => write!(f, "merged into {}", target),
         }
     }
 }

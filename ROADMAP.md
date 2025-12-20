@@ -8,17 +8,18 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 ### Implemented ✅
 
-- **Core Commands**: `clone`, `init`, `list`, `new` (with name), `find` (with name)
+- **Core Commands**: `clone`, `init`, `list`, `new` (with name), `find` (with name), `prune`
+- **Prune Features**: `--gone`, `--merged`, `--dry-run`, safety checks with `--allow-dirty`/`--allow-unpushed`
 - **Branch Types**: Normal branches, orphan branches (with initial commit), detached HEAD
 - **Features**: Bare repo + worktrees pattern, namespace support (slashes in branch names)
+- **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged detection
 - **Testing**: Comprehensive test suite for core functionality
 
 ### Not Implemented ❌
 
-- **Commands**: `prune`, `copy-untracked`
-- **Interactive Modes**: `find` and `new` without arguments
-- **Metadata**: WorktreeDescriptor methods (branch info, remote tracking, status)
-- **Fuzzy Finding**: Smart branch name matching
+- **Commands**: `copy-untracked`
+- **Interactive Modes**: `find` and `new` without arguments, fuzzy matching
+- **Additional Metadata**: WorktreeDescriptor methods for commit info, remote tracking details, URLs
 - **Shell Integration**: Fast directory switching like zoxide
 
 ---
@@ -37,8 +38,8 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [x] Add `--dry-run` flag to preview what would be deleted
   - [x] Add interactive confirmation for destructive operations
   - [x] Add safety checks (dirty/unpushed) with --allow-\* overrides
-  - [ ] Add --merged flag for branches merged to main
-  - [ ] Write tests for prune scenarios
+  - [x] Add --merged flag for branches merged to main
+  - [x] Write tests for prune scenarios
 
 ### 1.2 WorktreeDescriptor Metadata (In Progress)
 
@@ -49,6 +50,7 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [x] Implement `is_detached()` - return detached HEAD status (bonus)
   - [x] Implement `is_dirty()` - return true if worktree has uncommitted changes
   - [x] Implement `has_unpushed_commits()` - return true if branch has unpushed commits
+  - [x] Implement `is_merged_into()` - return true if branch is merged into target
   - [x] Add tests for branch metadata methods
   - [ ] Implement `head_commit()` - return current commit hash
   - [ ] Implement `remote()` - return remote tracking info
@@ -57,16 +59,17 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [ ] Implement `remote_status()` - return ahead/behind status
   - [ ] Implement remote URL methods
 
-### 1.3 Enhanced Find Command
+### 1.3 CopyUntracked Command
 
-- **Priority**: Medium
-- **Description**: Improve worktree discovery
+- **Priority**: Low-Medium
+- **Description**: Copy untracked/ignored files between worktrees
 - **Tasks**:
-  - [ ] Add fuzzy matching for branch names
-  - [ ] Handle multiple matches (show list, let user pick)
-  - [ ] Add `--list` flag to show all worktrees with metadata
-  - [ ] Consider prefix/suffix matching strategies
-  - [ ] Write tests for fuzzy matching
+  - [ ] Implement basic file copying
+  - [ ] Add macOS `clonefile` optimization (copy-on-write)
+  - [ ] Add Linux `cp --reflink` support
+  - [ ] Handle large file scenarios
+  - [ ] Add progress reporting for large copies
+  - [ ] Write tests for copy operations
 
 ---
 
@@ -74,20 +77,24 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 **Goal**: Make git-workon fast and ergonomic for daily use
 
-### 2.1 Interactive Modes
+### 2.1 Interactive Modes & Enhanced Find
 
 - **Priority**: High
-- **Description**: Add interactive selection when arguments not provided
+- **Description**: Add interactive selection and improve worktree discovery
 - **Research**: Evaluate `skim` vs `fzf` integration
   - skim: Rust library, can be embedded
   - fzf: External dependency, more widely used
 - **Tasks**:
   - [ ] Research and choose interactive library (skim vs fzf)
-  - [ ] Implement interactive `find` (list all worktrees)
-  - [ ] Implement interactive `new` (prompt for name)
+  - [ ] Implement interactive `find` (list all worktrees when no name provided)
+  - [ ] Implement interactive `new` (prompt for name when not provided)
+  - [ ] Add fuzzy matching for branch names in find
+  - [ ] Handle multiple matches (show list, let user pick)
+  - [ ] Add `--list` flag to show all worktrees with metadata
   - [ ] Add filtering and search in interactive mode
   - [ ] Show metadata in interactive list (branch, status, age)
-  - [ ] Write tests for interactive flows
+  - [ ] Consider prefix/suffix matching strategies
+  - [ ] Write tests for interactive flows and fuzzy matching
 
 ### 2.2 Shell Integration
 
@@ -101,18 +108,6 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [ ] Add `cd` integration for automatic worktree switching
   - [ ] Write documentation for shell setup
   - [ ] Consider adding `git-workon jump` command
-
-### 2.3 CopyUntracked Command
-
-- **Priority**: Low-Medium
-- **Description**: Copy untracked/ignored files between worktrees
-- **Tasks**:
-  - [ ] Implement basic file copying
-  - [ ] Add macOS `clonefile` optimization (copy-on-write)
-  - [ ] Add Linux `cp --reflink` support
-  - [ ] Handle large file scenarios
-  - [ ] Add progress reporting for large copies
-  - [ ] Write tests for copy operations
 
 ---
 

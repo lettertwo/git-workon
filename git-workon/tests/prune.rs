@@ -582,3 +582,194 @@ fn prune_gone_with_allow_unpushed_removes_worktrees_with_unpushed_commits(
     temp.close()?;
     Ok(())
 }
+
+#[test]
+fn prune_merged_removes_merged_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // Initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create a feature worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Add a commit to feature branch
+    let repo = Repository::open(temp.path().join(".bare"))?;
+    let feature_repo = Repository::open(temp.path().join("feature"))?;
+    std::fs::write(temp.path().join("feature/feature.txt"), "feature")?;
+    let mut index = feature_repo.index()?;
+    index.add_path(std::path::Path::new("feature.txt"))?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = feature_repo.find_tree(tree_id)?;
+    let sig = git2::Signature::now("Test", "test@test.com")?;
+    let parent = feature_repo.head()?.peel_to_commit()?;
+    let feature_commit_oid = feature_repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "Feature commit",
+        &tree,
+        &[&parent],
+    )?;
+
+    // Fast-forward main to include the feature commit (simulating merge)
+    let feature_commit = repo.find_commit(feature_commit_oid)?;
+    repo.find_branch("main", git2::BranchType::Local)?
+        .get_mut()
+        .set_target(feature_commit.id(), "Fast-forward to feature")?;
+
+    // Run prune --merged
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&temp)
+        .arg("prune")
+        .arg("--merged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"))
+        .stdout(predicate::str::contains("merged into main"));
+
+    // Verify worktree is gone
+    temp.child("feature").assert(predicate::path::missing());
+
+    temp.close()?;
+    Ok(())
+}
+
+#[test]
+fn prune_merged_skips_unmerged_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // Initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create a feature worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Add a commit to feature branch (not merged)
+    let feature_repo = Repository::open(temp.path().join("feature"))?;
+    std::fs::write(temp.path().join("feature/feature.txt"), "feature")?;
+    let mut index = feature_repo.index()?;
+    index.add_path(std::path::Path::new("feature.txt"))?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = feature_repo.find_tree(tree_id)?;
+    let sig = git2::Signature::now("Test", "test@test.com")?;
+    let parent = feature_repo.head()?.peel_to_commit()?;
+    feature_repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "Feature commit",
+        &tree,
+        &[&parent],
+    )?;
+
+    // Run prune --merged (should not prune unmerged branch)
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&temp)
+        .arg("prune")
+        .arg("--merged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No worktrees to prune"));
+
+    // Verify worktree still exists
+    temp.child("feature").assert(predicate::path::is_dir());
+
+    temp.close()?;
+    Ok(())
+}
+
+#[test]
+fn prune_merged_with_specific_target() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // Initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create develop and feature worktrees
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("develop")
+        .assert()
+        .success();
+
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Add a commit to feature branch
+    let repo = Repository::open(temp.path().join(".bare"))?;
+    let feature_repo = Repository::open(temp.path().join("feature"))?;
+    std::fs::write(temp.path().join("feature/feature.txt"), "feature")?;
+    let mut index = feature_repo.index()?;
+    index.add_path(std::path::Path::new("feature.txt"))?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = feature_repo.find_tree(tree_id)?;
+    let sig = git2::Signature::now("Test", "test@test.com")?;
+    let parent = feature_repo.head()?.peel_to_commit()?;
+    let feature_commit_oid = feature_repo.commit(
+        Some("HEAD"),
+        &sig,
+        &sig,
+        "Feature commit",
+        &tree,
+        &[&parent],
+    )?;
+
+    // Fast-forward develop to include the feature commit
+    let feature_commit = repo.find_commit(feature_commit_oid)?;
+    repo.find_branch("develop", git2::BranchType::Local)?
+        .get_mut()
+        .set_target(feature_commit.id(), "Fast-forward to feature")?;
+
+    // Run prune --merged=develop
+    // Note: Both main and feature will be pruned since they're both merged into develop
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&temp)
+        .arg("prune")
+        .arg("--merged=develop")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 2 worktree"))
+        .stdout(predicate::str::contains("merged into develop"));
+
+    // Verify feature and main worktrees are gone
+    temp.child("feature").assert(predicate::path::missing());
+    temp.child("main").assert(predicate::path::missing());
+
+    // Verify develop worktree still exists
+    temp.child("develop").assert(predicate::path::is_dir());
+
+    temp.close()?;
+    Ok(())
+}

@@ -448,4 +448,162 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_is_merged_into_same_commit() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a feature worktree at the same commit as main
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Verify feature is merged into main (same commit)
+        assert_eq!(worktree.is_merged_into("main")?, true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_merged_into_with_additional_commits() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a feature worktree
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Add a commit to feature branch
+        let worktree_repo = Repository::open(worktree.path())?;
+        std::fs::write(worktree.path().join("test.txt"), "test")?;
+        let mut index = worktree_repo.index()?;
+        index.add_path(std::path::Path::new("test.txt"))?;
+        index.write()?;
+        let tree_id = index.write_tree()?;
+        let tree = worktree_repo.find_tree(tree_id)?;
+        let sig = git2::Signature::now("Test", "test@test.com")?;
+        let parent = worktree_repo.head()?.peel_to_commit()?;
+        worktree_repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Feature commit",
+            &tree,
+            &[&parent],
+        )?;
+
+        // Verify feature is NOT merged into main (has additional commits)
+        assert_eq!(worktree.is_merged_into("main")?, false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_merged_into_after_fast_forward() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a feature worktree
+        let feature_wt = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Add a commit to feature branch
+        let feature_repo = Repository::open(feature_wt.path())?;
+        std::fs::write(feature_wt.path().join("feature.txt"), "feature")?;
+        let mut index = feature_repo.index()?;
+        index.add_path(std::path::Path::new("feature.txt"))?;
+        index.write()?;
+        let tree_id = index.write_tree()?;
+        let tree = feature_repo.find_tree(tree_id)?;
+        let sig = git2::Signature::now("Test", "test@test.com")?;
+        let parent = feature_repo.head()?.peel_to_commit()?;
+        let feature_commit_oid = feature_repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Feature commit",
+            &tree,
+            &[&parent],
+        )?;
+
+        // Fast-forward main to include the feature commit
+        let feature_commit = repo.find_commit(feature_commit_oid)?;
+        repo.find_branch("main", git2::BranchType::Local)?
+            .get_mut()
+            .set_target(feature_commit.id(), "Fast-forward to feature")?;
+
+        // Verify feature is now merged into main (same commit)
+        assert_eq!(feature_wt.is_merged_into("main")?, true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_merged_into_target_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a feature worktree
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Verify returns false when target branch doesn't exist
+        assert_eq!(worktree.is_merged_into("nonexistent")?, false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_merged_into_same_branch() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a main worktree
+        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+
+        // Verify main is not considered merged into itself
+        assert_eq!(worktree.is_merged_into("main")?, false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_merged_into_detached_head() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a detached worktree
+        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+
+        // Verify detached HEAD returns false
+        assert_eq!(worktree.is_merged_into("main")?, false);
+
+        Ok(())
+    }
 }

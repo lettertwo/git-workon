@@ -100,6 +100,15 @@ pub struct Prune {
     pub gone: bool,
     #[arg(
         long,
+        value_name = "BRANCH",
+        num_args = 0..=1,
+        default_missing_value = "",
+        require_equals = false,
+        help = "Also prune worktrees merged into BRANCH (or default branch)"
+    )]
+    pub merged: Option<String>,
+    #[arg(
+        long,
         help = "Allow pruning worktrees with uncommitted changes (dirty working tree)"
     )]
     pub allow_dirty: bool,

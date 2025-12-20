@@ -159,6 +159,69 @@ impl WorktreeDescriptor {
         Ok(ahead > 0)
     }
 
+    /// Returns true if the worktree's branch has been merged into the target branch.
+    ///
+    /// A branch is considered merged if its HEAD commit is reachable from the target branch,
+    /// meaning all commits in this branch exist in the target branch's history.
+    ///
+    /// Returns false if:
+    /// - The worktree is detached (no branch)
+    /// - The target branch doesn't exist
+    /// - The branch has commits not in the target branch
+    ///
+    /// Returns true if:
+    /// - All commits in this branch are reachable from the target branch
+    pub fn is_merged_into(&self, target_branch: &str) -> Result<bool> {
+        // Get the branch name - return false if detached
+        let branch_name = match self.branch()? {
+            Some(name) => name,
+            None => return Ok(false), // Detached HEAD, no branch to check
+        };
+
+        // Don't consider the target branch as merged into itself
+        if branch_name == target_branch {
+            return Ok(false);
+        }
+
+        // Open the bare repository (not the worktree) to check actual branch states
+        // The worktree's .git points to the commondir (bare repo)
+        let worktree_repo = Repository::open(self.path()).into_diagnostic()?;
+        let commondir = worktree_repo.commondir();
+        let repo = Repository::open(commondir).into_diagnostic()?;
+
+        // Find the current branch
+        let current_branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => return Ok(false), // Branch doesn't exist
+        };
+
+        // Find the target branch
+        let target = match repo.find_branch(target_branch, git2::BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => return Ok(false), // Target branch doesn't exist
+        };
+
+        // Get commit OIDs
+        let current_oid = current_branch
+            .get()
+            .target()
+            .ok_or_else(|| miette::miette!("Could not get current branch target"))?;
+        let target_oid = target
+            .get()
+            .target()
+            .ok_or_else(|| miette::miette!("Could not get target branch target"))?;
+
+        // If they point to the same commit, the branch is merged
+        if current_oid == target_oid {
+            return Ok(true);
+        }
+
+        // Check if current branch's commit is reachable from target
+        // This means target is a descendant of (or equal to) current
+        repo.graph_descendant_of(target_oid, current_oid)
+            .into_diagnostic()
+    }
+
     pub fn status(&self) -> Option<&str> {
         unimplemented!()
         // self.worktree.status()
