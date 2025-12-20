@@ -27,30 +27,35 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 **Goal**: Complete essential commands for daily worktree management
 
-### 1.1 Prune Command
+### 1.1 Prune Command ✅ COMPLETE
 
 - **Priority**: High
 - **Description**: Remove stale worktrees and clean up branches
 - **Tasks**:
-  - [ ] Implement basic prune (remove worktrees for deleted branches)
-  - [ ] Add `--gone` flag to prune branches deleted on remote
-  - [ ] Add `--dry-run` flag to preview what would be deleted
-  - [ ] Add interactive confirmation for destructive operations
+  - [x] Implement basic prune (remove worktrees for deleted branches)
+  - [x] Add `--gone` flag to prune branches deleted on remote
+  - [x] Add `--dry-run` flag to preview what would be deleted
+  - [x] Add interactive confirmation for destructive operations
+  - [x] Add safety checks (dirty/unpushed) with --allow-\* overrides
+  - [ ] Add --merged flag for branches merged to main
   - [ ] Write tests for prune scenarios
 
-### 1.2 WorktreeDescriptor Metadata
+### 1.2 WorktreeDescriptor Metadata (In Progress)
 
 - **Priority**: Medium-High
 - **Description**: Expose worktree metadata for tooling
 - **Tasks**:
-  - [ ] Implement `branch()` - return branch name
+  - [x] Implement `branch()` - return branch name
+  - [x] Implement `is_detached()` - return detached HEAD status (bonus)
+  - [x] Implement `is_dirty()` - return true if worktree has uncommitted changes
+  - [x] Implement `has_unpushed_commits()` - return true if branch has unpushed commits
+  - [x] Add tests for branch metadata methods
   - [ ] Implement `head_commit()` - return current commit hash
   - [ ] Implement `remote()` - return remote tracking info
   - [ ] Implement `remote_branch()` - return remote branch name
   - [ ] Implement `status()` - return worktree status (clean/dirty)
   - [ ] Implement `remote_status()` - return ahead/behind status
   - [ ] Implement remote URL methods
-  - [ ] Add tests for metadata methods
 
 ### 1.3 Enhanced Find Command
 

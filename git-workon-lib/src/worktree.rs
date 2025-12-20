@@ -84,6 +84,81 @@ impl WorktreeDescriptor {
         Ok(self.branch()?.is_none())
     }
 
+    /// Returns true if the worktree has uncommitted changes (dirty working tree).
+    ///
+    /// This includes:
+    /// - Modified files (staged or unstaged)
+    /// - New untracked files
+    /// - Deleted files
+    pub fn is_dirty(&self) -> Result<bool> {
+        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let statuses = repo.statuses(None).into_diagnostic()?;
+        Ok(!statuses.is_empty())
+    }
+
+    /// Returns true if the worktree's branch has unpushed commits (ahead of upstream).
+    ///
+    /// Returns false if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    /// - The branch is up to date with upstream
+    ///
+    /// Returns true if:
+    /// - The branch has commits ahead of its upstream
+    /// - The upstream is configured but the remote reference is gone (conservative)
+    pub fn has_unpushed_commits(&self) -> Result<bool> {
+        // Get the branch name - return false if detached
+        let branch_name = match self.branch()? {
+            Some(name) => name,
+            None => return Ok(false), // Detached HEAD, no branch to check
+        };
+
+        // Open the repository (use the bare repo, not the worktree)
+        let repo = Repository::open(self.path()).into_diagnostic()?;
+
+        // Find the local branch
+        let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => return Ok(false), // Branch doesn't exist
+        };
+
+        // Check if upstream is configured via git config
+        let config = repo.config().into_diagnostic()?;
+        let remote_key = format!("branch.{}.remote", branch_name);
+
+        // If no upstream is configured, there can't be unpushed commits
+        let _remote = match config.get_string(&remote_key) {
+            Ok(r) => r,
+            Err(_) => return Ok(false), // No remote configured
+        };
+
+        // Get the upstream branch
+        let upstream = match branch.upstream() {
+            Ok(u) => u,
+            Err(_) => {
+                // Upstream is configured but ref is gone - conservatively assume unpushed
+                return Ok(true);
+            }
+        };
+
+        // Get the local and upstream commit OIDs
+        let local_oid = branch
+            .get()
+            .target()
+            .ok_or_else(|| miette::miette!("Could not get local branch target"))?;
+        let upstream_oid = upstream
+            .get()
+            .target()
+            .ok_or_else(|| miette::miette!("Could not get upstream branch target"))?;
+
+        // Check if local is ahead of upstream
+        let (ahead, _behind) = repo
+            .graph_ahead_behind(local_oid, upstream_oid)
+            .into_diagnostic()?;
+
+        Ok(ahead > 0)
+    }
+
     pub fn status(&self) -> Option<&str> {
         unimplemented!()
         // self.worktree.status()

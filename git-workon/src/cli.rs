@@ -98,6 +98,13 @@ pub struct Prune {
         help = "Also prune worktrees where the remote tracking branch is gone"
     )]
     pub gone: bool,
+    #[arg(
+        long,
+        help = "Allow pruning worktrees with uncommitted changes (dirty working tree)"
+    )]
+    pub allow_dirty: bool,
+    #[arg(long, help = "Allow pruning worktrees with unpushed commits")]
+    pub allow_unpushed: bool,
 }
 
 /// Find a worktree to work on.

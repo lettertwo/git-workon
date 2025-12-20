@@ -257,6 +257,7 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
         .current_dir(&temp)
         .arg("prune")
         .arg("--gone")
+        .arg("--allow-unpushed")
         .arg("--yes")
         .assert()
         .success()
@@ -347,6 +348,7 @@ fn prune_gone_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         .current_dir(&temp)
         .arg("prune")
         .arg("--gone")
+        .arg("--allow-unpushed")
         .arg("--dry-run")
         .assert()
         .success()
@@ -355,6 +357,227 @@ fn prune_gone_dry_run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify worktree still exists
     temp.child("feature").assert(predicate::path::is_dir());
+
+    temp.close()?;
+    Ok(())
+}
+
+#[test]
+fn prune_skips_dirty_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // Initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create a new worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Create a file in the worktree (uncommitted change)
+    std::fs::write(temp.path().join("feature/test.txt"), "test content")?;
+
+    // Delete the branch
+    let repo = Repository::open(temp.path().join(".bare"))?;
+    repo.find_reference("refs/heads/feature")?.delete()?;
+
+    // Run prune - should skip dirty worktree
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&temp)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped worktrees"))
+        .stdout(predicate::str::contains("uncommitted changes"))
+        .stdout(predicate::str::contains("No worktrees to prune"));
+
+    // Verify worktree still exists
+    temp.child("feature").assert(predicate::path::is_dir());
+
+    temp.close()?;
+    Ok(())
+}
+
+#[test]
+fn prune_with_allow_dirty_removes_dirty_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // Initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create a new worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Create a file in the worktree (uncommitted change)
+    std::fs::write(temp.path().join("feature/test.txt"), "test content")?;
+
+    // Delete the branch
+    let repo = Repository::open(temp.path().join(".bare"))?;
+    repo.find_reference("refs/heads/feature")?.delete()?;
+
+    // Run prune with --allow-dirty
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&temp)
+        .arg("prune")
+        .arg("--allow-dirty")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify worktree is gone
+    temp.child("feature").assert(predicate::path::missing());
+
+    temp.close()?;
+    Ok(())
+}
+
+#[test]
+fn prune_gone_skips_worktrees_with_unpushed_commits() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // Initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create a new worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Set up remote tracking
+    let repo = Repository::open(temp.path().join(".bare"))?;
+    repo.remote("origin", temp.path().join(".bare").to_str().unwrap())?;
+
+    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
+    let commit = feature_branch.get().peel_to_commit()?;
+    repo.reference(
+        "refs/remotes/origin/feature",
+        commit.id(),
+        false,
+        "create remote ref",
+    )?;
+    repo.find_branch("feature", git2::BranchType::Local)?
+        .set_upstream(Some("origin/feature"))?;
+
+    // Create a new commit in the worktree (unpushed)
+    let worktree_repo = Repository::open(temp.path().join("feature"))?;
+    std::fs::write(temp.path().join("feature/test.txt"), "test")?;
+    let mut index = worktree_repo.index()?;
+    index.add_path(std::path::Path::new("test.txt"))?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = worktree_repo.find_tree(tree_id)?;
+    let sig = git2::Signature::now("Test", "test@test.com")?;
+    let parent = worktree_repo.head()?.peel_to_commit()?;
+    worktree_repo.commit(Some("HEAD"), &sig, &sig, "New commit", &tree, &[&parent])?;
+
+    // Delete the REMOTE branch (local branch still exists with unpushed commit)
+    repo.find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    // Run prune --gone (without --allow-unpushed)
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&temp)
+        .arg("prune")
+        .arg("--gone")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped worktrees"))
+        .stdout(predicate::str::contains("unpushed commits"))
+        .stdout(predicate::str::contains("No worktrees to prune"));
+
+    // Verify worktree still exists
+    temp.child("feature").assert(predicate::path::is_dir());
+
+    temp.close()?;
+    Ok(())
+}
+
+#[test]
+fn prune_gone_with_allow_unpushed_removes_worktrees_with_unpushed_commits(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
+
+    // Initialize a repository
+    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    init_cmd.current_dir(&temp).arg("init").assert().success();
+
+    // Create a new worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&temp)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Set up remote tracking
+    let repo = Repository::open(temp.path().join(".bare"))?;
+    repo.remote("origin", temp.path().join(".bare").to_str().unwrap())?;
+
+    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
+    let commit = feature_branch.get().peel_to_commit()?;
+    repo.reference(
+        "refs/remotes/origin/feature",
+        commit.id(),
+        false,
+        "create remote ref",
+    )?;
+    repo.find_branch("feature", git2::BranchType::Local)?
+        .set_upstream(Some("origin/feature"))?;
+
+    // Create a new commit in the worktree (unpushed)
+    let worktree_repo = Repository::open(temp.path().join("feature"))?;
+    std::fs::write(temp.path().join("feature/test.txt"), "test")?;
+    let mut index = worktree_repo.index()?;
+    index.add_path(std::path::Path::new("test.txt"))?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = worktree_repo.find_tree(tree_id)?;
+    let sig = git2::Signature::now("Test", "test@test.com")?;
+    let parent = worktree_repo.head()?.peel_to_commit()?;
+    worktree_repo.commit(Some("HEAD"), &sig, &sig, "New commit", &tree, &[&parent])?;
+
+    // Delete the REMOTE branch (local branch still exists with unpushed commit)
+    repo.find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    // Run prune --gone with --allow-unpushed
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&temp)
+        .arg("prune")
+        .arg("--gone")
+        .arg("--allow-unpushed")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify worktree is gone
+    temp.child("feature").assert(predicate::path::missing());
 
     temp.close()?;
     Ok(())

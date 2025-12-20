@@ -12,8 +12,8 @@ impl Run for Prune {
         let repo = get_repo(None)?;
         let worktrees = get_worktrees(&repo)?;
 
-        // Find worktrees that should be pruned
-        let to_prune: Vec<PruneCandidate> = worktrees
+        // Find worktrees that should be pruned (with their descriptors for safety checks)
+        let candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = worktrees
             .iter()
             .filter_map(|wt| {
                 // Get the branch name - skip detached worktrees and worktrees with errors
@@ -29,21 +29,27 @@ impl Run for Prune {
 
                 if !branch_exists {
                     // Branch is deleted - always prune
-                    Some(PruneCandidate {
-                        worktree_name: wt.name()?.to_string(),
-                        worktree_path: wt.path().to_path_buf(),
-                        branch_name,
-                        reason: PruneReason::BranchDeleted,
-                    })
-                } else if self.gone {
-                    // Branch exists - check if upstream is gone (only if --gone flag is set)
-                    match is_upstream_gone(&repo, &branch_name) {
-                        Ok(true) => Some(PruneCandidate {
+                    Some((
+                        wt,
+                        PruneCandidate {
                             worktree_name: wt.name()?.to_string(),
                             worktree_path: wt.path().to_path_buf(),
                             branch_name,
-                            reason: PruneReason::RemoteGone,
-                        }),
+                            reason: PruneReason::BranchDeleted,
+                        },
+                    ))
+                } else if self.gone {
+                    // Branch exists - check if upstream is gone (only if --gone flag is set)
+                    match is_upstream_gone(&repo, &branch_name) {
+                        Ok(true) => Some((
+                            wt,
+                            PruneCandidate {
+                                worktree_name: wt.name()?.to_string(),
+                                worktree_path: wt.path().to_path_buf(),
+                                branch_name,
+                                reason: PruneReason::RemoteGone,
+                            },
+                        )),
                         _ => None,
                     }
                 } else {
@@ -51,6 +57,59 @@ impl Run for Prune {
                 }
             })
             .collect();
+
+        // Apply safety checks to filter out unsafe worktrees
+        let mut skipped: Vec<(PruneCandidate, String)> = Vec::new();
+        let to_prune: Vec<PruneCandidate> = candidates
+            .into_iter()
+            .filter_map(|(wt, candidate)| {
+                // Check for uncommitted changes
+                if !self.allow_dirty {
+                    match wt.is_dirty() {
+                        Ok(true) => {
+                            skipped.push((
+                                candidate,
+                                "has uncommitted changes, use --allow-dirty to override"
+                                    .to_string(),
+                            ));
+                            return None;
+                        }
+                        Err(_) => {
+                            skipped.push((candidate, "could not check status".to_string()));
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Check for unpushed commits
+                if !self.allow_unpushed {
+                    match wt.has_unpushed_commits() {
+                        Ok(true) => {
+                            skipped.push((
+                                candidate,
+                                "has unpushed commits, use --allow-unpushed to override"
+                                    .to_string(),
+                            ));
+                            return None;
+                        }
+                        Err(_) => {}
+                        _ => {}
+                    }
+                }
+
+                Some(candidate)
+            })
+            .collect();
+
+        // Display skipped worktrees
+        if !skipped.is_empty() {
+            println!("Skipped worktrees (unsafe to prune):");
+            for (candidate, reason) in &skipped {
+                println!("  {} ({})", candidate.worktree_path.display(), reason);
+            }
+            println!();
+        }
 
         if to_prune.is_empty() {
             println!("No worktrees to prune");
