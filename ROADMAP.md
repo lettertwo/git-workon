@@ -41,23 +41,22 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [x] Add --merged flag for branches merged to main
   - [x] Write tests for prune scenarios
 
-### 1.2 WorktreeDescriptor Metadata (In Progress)
+### 1.2 WorktreeDescriptor Metadata ✅ COMPLETE
 
 - **Priority**: Medium-High
 - **Description**: Expose worktree metadata for tooling
 - **Tasks**:
   - [x] Implement `branch()` - return branch name
-  - [x] Implement `is_detached()` - return detached HEAD status (bonus)
+  - [x] Implement `is_detached()` - return detached HEAD status
   - [x] Implement `is_dirty()` - return true if worktree has uncommitted changes
   - [x] Implement `has_unpushed_commits()` - return true if branch has unpushed commits
   - [x] Implement `is_merged_into()` - return true if branch is merged into target
   - [x] Add tests for branch metadata methods
-  - [ ] Implement `head_commit()` - return current commit hash
-  - [ ] Implement `remote()` - return remote tracking info
-  - [ ] Implement `remote_branch()` - return remote branch name
-  - [ ] Implement `status()` - return worktree status (clean/dirty)
-  - [ ] Implement `remote_status()` - return ahead/behind status
-  - [ ] Implement remote URL methods
+  - [x] Implement `head_commit()` - return current commit hash
+  - [x] Implement `remote()` - return remote name
+  - [x] Implement `remote_branch()` - return upstream branch name
+  - [x] Implement remote URL methods (`remote_url()`, `remote_fetch_url()`, `remote_push_url()`)
+  - [x] Write tests for all metadata methods
 
 ### 1.3 CopyUntracked Command
 

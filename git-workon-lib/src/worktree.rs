@@ -222,49 +222,151 @@ impl WorktreeDescriptor {
             .into_diagnostic()
     }
 
-    pub fn status(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.status()
+    /// Returns the commit hash (SHA) of the worktree's current HEAD.
+    ///
+    /// Returns None if HEAD cannot be resolved (e.g., empty repository).
+    pub fn head_commit(&self) -> Result<Option<String>> {
+        let repo = Repository::open(self.path()).into_diagnostic()?;
+
+        // Try to resolve HEAD to a commit and extract the OID immediately
+        let commit_oid = match repo.head() {
+            Ok(head) => match head.peel_to_commit() {
+                Ok(commit) => Some(commit.id()),
+                Err(_) => return Ok(None), // HEAD exists but can't resolve to commit
+            },
+            Err(_) => return Ok(None), // No HEAD (unborn branch)
+        };
+
+        Ok(commit_oid.map(|oid| oid.to_string()))
     }
 
-    pub fn head_commit(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.head_commit()
+    /// Returns the name of the remote that the worktree's branch tracks (e.g., "origin").
+    ///
+    /// Returns None if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    pub fn remote(&self) -> Result<Option<String>> {
+        // Get the branch name - return None if detached
+        let branch_name = match self.branch()? {
+            Some(name) => name,
+            None => return Ok(None), // Detached HEAD, no branch to check
+        };
+
+        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let config = repo.config().into_diagnostic()?;
+
+        // Check for branch.<name>.remote in git config
+        let remote_key = format!("branch.{}.remote", branch_name);
+        match config.get_string(&remote_key) {
+            Ok(remote) => Ok(Some(remote)),
+            Err(_) => Ok(None), // No remote configured
+        }
     }
 
-    pub fn remote(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.remote()
+    /// Returns the full name of the upstream remote branch (e.g., "refs/remotes/origin/main").
+    ///
+    /// Returns None if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    pub fn remote_branch(&self) -> Result<Option<String>> {
+        // Get the branch name - return None if detached
+        let branch_name = match self.branch()? {
+            Some(name) => name,
+            None => return Ok(None), // Detached HEAD, no branch to check
+        };
+
+        let repo = Repository::open(self.path()).into_diagnostic()?;
+
+        // Find the local branch and get its upstream, extracting the name immediately
+        let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => return Ok(None), // Branch doesn't exist
+        };
+
+        let upstream_name = match branch.upstream() {
+            Ok(upstream) => match upstream.name() {
+                Ok(Some(name)) => Some(name.to_string()),
+                _ => None,
+            },
+            Err(_) => return Ok(None), // No upstream configured
+        };
+
+        Ok(upstream_name)
     }
 
-    pub fn remote_branch(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.remote_branch()
+    /// Returns the default URL for the remote (usually the fetch URL).
+    ///
+    /// Returns None if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    /// - The remote has no URL configured
+    pub fn remote_url(&self) -> Result<Option<String>> {
+        // Get the remote name
+        let remote_name = match self.remote()? {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        let repo = Repository::open(self.path()).into_diagnostic()?;
+
+        // Find the remote and extract the URL immediately
+        let url = match repo.find_remote(&remote_name) {
+            Ok(remote) => remote.url().map(|s| s.to_string()),
+            Err(_) => return Ok(None), // Remote doesn't exist
+        };
+
+        Ok(url)
     }
 
-    pub fn remote_status(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.remote_status()
+    /// Returns the fetch URL for the remote.
+    ///
+    /// Returns None if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    /// - The remote has no fetch URL configured
+    pub fn remote_fetch_url(&self) -> Result<Option<String>> {
+        // Get the remote name
+        let remote_name = match self.remote()? {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        let repo = Repository::open(self.path()).into_diagnostic()?;
+
+        // Find the remote and extract the fetch URL immediately
+        let url = match repo.find_remote(&remote_name) {
+            Ok(remote) => remote.url().map(|s| s.to_string()),
+            Err(_) => return Ok(None), // Remote doesn't exist
+        };
+
+        Ok(url)
     }
 
-    pub fn remote_head_commit(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.remote_head_commit()
-    }
+    /// Returns the push URL for the remote.
+    ///
+    /// Returns None if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    /// - The remote has no push URL configured (falls back to fetch URL)
+    pub fn remote_push_url(&self) -> Result<Option<String>> {
+        // Get the remote name
+        let remote_name = match self.remote()? {
+            Some(name) => name,
+            None => return Ok(None),
+        };
 
-    pub fn remote_url(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.remote_url()
-    }
+        let repo = Repository::open(self.path()).into_diagnostic()?;
 
-    pub fn remote_fetch_url(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.remote_fetch_url()
-    }
+        // Find the remote and extract the push URL (or fallback to fetch URL) immediately
+        let url = match repo.find_remote(&remote_name) {
+            Ok(remote) => remote
+                .pushurl()
+                .or_else(|| remote.url())
+                .map(|s| s.to_string()),
+            Err(_) => return Ok(None), // Remote doesn't exist
+        };
 
-    pub fn remote_push_url(&self) -> Option<&str> {
-        unimplemented!()
-        // self.worktree.remote_push_url()
+        Ok(url)
     }
 }
 

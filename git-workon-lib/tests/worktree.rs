@@ -606,4 +606,342 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_head_commit_normal_branch() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a new worktree
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Verify head_commit returns a SHA
+        let commit_sha = worktree.head_commit()?;
+        assert!(commit_sha.is_some());
+
+        // Verify it's a valid 40-character hex string
+        let sha = commit_sha.unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_head_commit_detached_head() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a detached worktree
+        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+
+        // Verify head_commit returns a SHA even for detached HEAD
+        let commit_sha = worktree.head_commit()?;
+        assert!(commit_sha.is_some());
+
+        // Verify it's a valid 40-character hex string
+        let sha = commit_sha.unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_head_commit_orphan_branch() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add an orphan worktree
+        let worktree = add_worktree(&repo, "docs", BranchType::Orphan)?;
+
+        // Verify head_commit returns a SHA for orphan branch
+        let commit_sha = worktree.head_commit()?;
+        assert!(commit_sha.is_some());
+
+        // Verify it's a valid 40-character hex string
+        let sha = commit_sha.unwrap();
+        assert_eq!(sha.len(), 40);
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_with_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+
+        // Create a bare "origin" repository
+        let origin_fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let origin_path = origin_fixture.path.as_ref().unwrap();
+
+        // Create a local bare repo and add origin as remote
+        let local_fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let local_path = local_fixture.path.as_ref().unwrap();
+
+        // Add origin remote
+        Command::new("git")
+            .args([
+                "-C",
+                local_path.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                origin_path.to_str().unwrap(),
+            ])
+            .output()?;
+
+        // Fetch from origin
+        Command::new("git")
+            .args(["-C", local_path.to_str().unwrap(), "fetch", "origin"])
+            .output()?;
+
+        // Set upstream for main branch
+        Command::new("git")
+            .args([
+                "-C",
+                local_path.to_str().unwrap(),
+                "branch",
+                "--set-upstream-to=origin/main",
+                "main",
+            ])
+            .output()?;
+
+        let repo = Repository::open(local_path)?;
+
+        // Add a worktree for the main branch
+        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+
+        // Verify remote returns "origin"
+        assert_eq!(worktree.remote()?, Some("origin".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_without_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a new worktree without upstream
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Verify remote returns None
+        assert_eq!(worktree.remote()?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_detached_head() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a detached worktree
+        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+
+        // Verify remote returns None for detached HEAD
+        assert_eq!(worktree.remote()?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_branch_with_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+
+        // Create a bare "origin" repository
+        let origin_fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let origin_path = origin_fixture.path.as_ref().unwrap();
+
+        // Create a local bare repo and add origin as remote
+        let local_fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let local_path = local_fixture.path.as_ref().unwrap();
+
+        // Add origin remote
+        Command::new("git")
+            .args([
+                "-C",
+                local_path.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                origin_path.to_str().unwrap(),
+            ])
+            .output()?;
+
+        // Fetch from origin
+        Command::new("git")
+            .args(["-C", local_path.to_str().unwrap(), "fetch", "origin"])
+            .output()?;
+
+        // Set upstream for main branch
+        Command::new("git")
+            .args([
+                "-C",
+                local_path.to_str().unwrap(),
+                "branch",
+                "--set-upstream-to=origin/main",
+                "main",
+            ])
+            .output()?;
+
+        let repo = Repository::open(local_path)?;
+
+        // Add a worktree for the main branch
+        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+
+        // Verify remote_branch returns the upstream branch name
+        // Note: git may return shorthand "origin/main" or full "refs/remotes/origin/main"
+        let remote_branch = worktree.remote_branch()?;
+        assert!(remote_branch.is_some());
+        let branch = remote_branch.unwrap();
+        assert!(
+            branch == "origin/main" || branch == "refs/remotes/origin/main",
+            "Expected 'origin/main' or 'refs/remotes/origin/main', got '{}'",
+            branch
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_branch_without_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a new worktree without upstream
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Verify remote_branch returns None
+        assert_eq!(worktree.remote_branch()?, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_url_with_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        use std::process::Command;
+
+        // Create a bare "origin" repository
+        let origin_fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let origin_path = origin_fixture.path.as_ref().unwrap();
+
+        // Create a local bare repo and add origin as remote
+        let local_fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let local_path = local_fixture.path.as_ref().unwrap();
+
+        // Add origin remote
+        Command::new("git")
+            .args([
+                "-C",
+                local_path.to_str().unwrap(),
+                "remote",
+                "add",
+                "origin",
+                origin_path.to_str().unwrap(),
+            ])
+            .output()?;
+
+        // Fetch from origin
+        Command::new("git")
+            .args(["-C", local_path.to_str().unwrap(), "fetch", "origin"])
+            .output()?;
+
+        // Set upstream for main branch
+        Command::new("git")
+            .args([
+                "-C",
+                local_path.to_str().unwrap(),
+                "branch",
+                "--set-upstream-to=origin/main",
+                "main",
+            ])
+            .output()?;
+
+        let repo = Repository::open(local_path)?;
+
+        // Add a worktree for the main branch
+        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+
+        // Verify remote_url returns the origin path
+        let remote_url = worktree.remote_url()?;
+        assert!(remote_url.is_some());
+        assert_eq!(remote_url.unwrap(), origin_path.to_str().unwrap());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_url_without_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        // Create a bare fixture with a default branch
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+
+        // Add a new worktree without upstream
+        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+
+        // Verify remote_url returns None
+        assert_eq!(worktree.remote_url()?, None);
+
+        Ok(())
+    }
 }
