@@ -11,10 +11,7 @@ mod tests {
 
         // Clone into a new dir using the clone logic
         let dir = TempDir::new()?;
-        let repo = clone(
-            dir.to_path_buf(),
-            remote.path.as_ref().unwrap().to_str().unwrap(),
-        )?;
+        let repo = clone(dir.to_path_buf(), remote.cwd()?.to_str().unwrap())?;
 
         repo.assert(predicate::repo::is_bare());
         repo.assert(predicate::repo::has_branch("main"));

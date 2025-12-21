@@ -12,10 +12,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature-branch", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature-branch", BranchType::Normal)?;
 
         // Verify the worktree was created
         assert!(worktree.path().exists());
@@ -36,10 +36,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a worktree with slashes in the name
-        let worktree = add_worktree(&repo, "user/feature-branch", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "user/feature-branch", BranchType::Normal)?;
 
         // Verify the worktree was created
         assert!(worktree.path().exists());
@@ -60,10 +60,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add an orphan worktree
-        let worktree = add_worktree(&repo, "docs", BranchType::Orphan)?;
+        let worktree = add_worktree(repo, "docs", BranchType::Orphan)?;
 
         // Verify the worktree was created
         assert!(worktree.path().exists());
@@ -106,10 +106,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a detached worktree
-        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+        let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify the worktree was created
         assert!(worktree.path().exists());
@@ -128,10 +128,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a normal worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify branch() returns the correct branch name
         assert_eq!(worktree.branch()?, Some("feature".to_string()));
@@ -150,10 +150,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a worktree with slashes in the branch name
-        let worktree = add_worktree(&repo, "user/feature-branch", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "user/feature-branch", BranchType::Normal)?;
 
         // Verify branch() returns the full branch name with slashes
         assert_eq!(worktree.branch()?, Some("user/feature-branch".to_string()));
@@ -172,10 +172,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add an orphan worktree
-        let worktree = add_worktree(&repo, "docs", BranchType::Orphan)?;
+        let worktree = add_worktree(repo, "docs", BranchType::Orphan)?;
 
         // Verify branch() returns the correct branch name
         assert_eq!(worktree.branch()?, Some("docs".to_string()));
@@ -194,10 +194,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a detached worktree
-        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+        let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify branch() returns None for detached HEAD
         assert_eq!(worktree.branch()?, None);
@@ -216,10 +216,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify the worktree is clean
         assert_eq!(worktree.is_dirty()?, false);
@@ -236,19 +236,13 @@ mod tests {
             .worktree("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Create and commit a file in main worktree
-        let main_path = fixture
-            .path
-            .as_ref()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("main");
+        let main_path = fixture.root()?.join("main");
         std::fs::write(main_path.join("test.txt"), "original content")?;
 
-        let worktree_repo = Repository::open(&main_path)?;
+        let worktree_repo = fixture.repo()?;
         let mut index = worktree_repo.index()?;
         index.add_path(std::path::Path::new("test.txt"))?;
         index.write()?;
@@ -259,7 +253,7 @@ mod tests {
         worktree_repo.commit(Some("HEAD"), &sig, &sig, "Add test file", &tree, &[&parent])?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify the worktree is clean
         assert_eq!(worktree.is_dirty()?, false);
@@ -281,10 +275,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify the worktree is clean
         assert_eq!(worktree.is_dirty()?, false);
@@ -306,10 +300,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify no unpushed commits (no upstream configured)
         assert_eq!(worktree.has_unpushed_commits()?, false);
@@ -326,13 +320,13 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Create a remote (pointing to the bare repo itself)
-        repo.remote("origin", fixture.path.as_ref().unwrap().to_str().unwrap())?;
+        repo.remote("origin", fixture.cwd()?.to_str().unwrap())?;
 
         // Set up upstream tracking
         let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
@@ -364,13 +358,13 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Create a remote (pointing to the bare repo itself)
-        repo.remote("origin", fixture.path.as_ref().unwrap().to_str().unwrap())?;
+        repo.remote("origin", fixture.cwd()?.to_str().unwrap())?;
 
         // Set up upstream tracking
         let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
@@ -414,10 +408,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Set up upstream tracking with config (but no actual remote ref)
         let mut config = repo.config()?;
@@ -438,10 +432,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a detached worktree
-        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+        let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify no unpushed commits (detached HEAD has no branch)
         assert_eq!(worktree.has_unpushed_commits()?, false);
@@ -457,10 +451,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a feature worktree at the same commit as main
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify feature is merged into main (same commit)
         assert_eq!(worktree.is_merged_into("main")?, true);
@@ -476,10 +470,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a feature worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Add a commit to feature branch
         let worktree_repo = Repository::open(worktree.path())?;
@@ -514,10 +508,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a feature worktree
-        let feature_wt = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let feature_wt = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Add a commit to feature branch
         let feature_repo = Repository::open(feature_wt.path())?;
@@ -558,10 +552,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a feature worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify returns false when target branch doesn't exist
         assert_eq!(worktree.is_merged_into("nonexistent")?, false);
@@ -577,10 +571,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a main worktree
-        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "main", BranchType::Normal)?;
 
         // Verify main is not considered merged into itself
         assert_eq!(worktree.is_merged_into("main")?, false);
@@ -596,10 +590,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a detached worktree
-        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+        let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify detached HEAD returns false
         assert_eq!(worktree.is_merged_into("main")?, false);
@@ -615,10 +609,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify head_commit returns a SHA
         let commit_sha = worktree.head_commit()?;
@@ -640,10 +634,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a detached worktree
-        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+        let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify head_commit returns a SHA even for detached HEAD
         let commit_sha = worktree.head_commit()?;
@@ -665,10 +659,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add an orphan worktree
-        let worktree = add_worktree(&repo, "docs", BranchType::Orphan)?;
+        let worktree = add_worktree(repo, "docs", BranchType::Orphan)?;
 
         // Verify head_commit returns a SHA for orphan branch
         let commit_sha = worktree.head_commit()?;
@@ -692,7 +686,7 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let origin_path = origin_fixture.path.as_ref().unwrap();
+        let origin_path = origin_fixture.cwd()?;
 
         // Create a local bare repo and add origin as remote
         let local_fixture = FixtureBuilder::new()
@@ -700,7 +694,7 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let local_path = local_fixture.path.as_ref().unwrap();
+        let local_path = local_fixture.cwd()?;
 
         // Add origin remote
         Command::new("git")
@@ -730,10 +724,10 @@ mod tests {
             ])
             .output()?;
 
-        let repo = Repository::open(local_path)?;
+        let repo = local_fixture.repo()?;
 
         // Add a worktree for the main branch
-        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "main", BranchType::Normal)?;
 
         // Verify remote returns "origin"
         assert_eq!(worktree.remote()?, Some("origin".to_string()));
@@ -749,10 +743,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree without upstream
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify remote returns None
         assert_eq!(worktree.remote()?, None);
@@ -768,10 +762,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a detached worktree
-        let worktree = add_worktree(&repo, "detached", BranchType::Detached)?;
+        let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify remote returns None for detached HEAD
         assert_eq!(worktree.remote()?, None);
@@ -789,7 +783,7 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let origin_path = origin_fixture.path.as_ref().unwrap();
+        let origin_path = origin_fixture.cwd()?;
 
         // Create a local bare repo and add origin as remote
         let local_fixture = FixtureBuilder::new()
@@ -797,7 +791,7 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let local_path = local_fixture.path.as_ref().unwrap();
+        let local_path = local_fixture.cwd()?;
 
         // Add origin remote
         Command::new("git")
@@ -827,10 +821,10 @@ mod tests {
             ])
             .output()?;
 
-        let repo = Repository::open(local_path)?;
+        let repo = local_fixture.repo()?;
 
         // Add a worktree for the main branch
-        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "main", BranchType::Normal)?;
 
         // Verify remote_branch returns the upstream branch name
         // Note: git may return shorthand "origin/main" or full "refs/remotes/origin/main"
@@ -854,10 +848,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree without upstream
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify remote_branch returns None
         assert_eq!(worktree.remote_branch()?, None);
@@ -875,7 +869,7 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let origin_path = origin_fixture.path.as_ref().unwrap();
+        let origin_path = origin_fixture.cwd()?;
 
         // Create a local bare repo and add origin as remote
         let local_fixture = FixtureBuilder::new()
@@ -883,7 +877,7 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let local_path = local_fixture.path.as_ref().unwrap();
+        let local_path = local_fixture.cwd()?;
 
         // Add origin remote
         Command::new("git")
@@ -913,10 +907,10 @@ mod tests {
             ])
             .output()?;
 
-        let repo = Repository::open(local_path)?;
+        let repo = local_fixture.repo()?;
 
         // Add a worktree for the main branch
-        let worktree = add_worktree(&repo, "main", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "main", BranchType::Normal)?;
 
         // Verify remote_url returns the origin path
         let remote_url = worktree.remote_url()?;
@@ -934,10 +928,10 @@ mod tests {
             .default_branch("main")
             .build()?;
 
-        let repo = Repository::open(fixture.path.as_ref().unwrap())?;
+        let repo = fixture.repo()?;
 
         // Add a new worktree without upstream
-        let worktree = add_worktree(&repo, "feature", BranchType::Normal)?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify remote_url returns None
         assert_eq!(worktree.remote_url()?, None);

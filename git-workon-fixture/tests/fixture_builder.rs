@@ -1,12 +1,14 @@
 #[cfg(test)]
 mod fixture_builder {
+    use std::ffi::OsStr;
+
     use git2::{BranchType, Repository};
     use git_workon_fixture::prelude::*;
 
     #[test]
     fn default() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().build()?;
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -32,22 +34,21 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
-            path.child(".git").assert(predicate::path::is_dir());
-            path.child(".git/config")
-                .assert(predicate::str::contains("bare = false"));
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        dir.child(".git").assert(predicate::path::is_dir());
+        dir.child(".git/config")
+            .assert(predicate::str::contains("bare = false"));
 
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree().not());
-            repo.assert(predicate::repo::has_branch("main"));
-            repo.assert(predicate::repo::head_matches("main"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree().not());
+        fixture.assert(predicate::repo::has_branch("main"));
+        fixture.assert(predicate::repo::head_matches("main"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -55,7 +56,7 @@ mod fixture_builder {
     #[test]
     fn bare() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).build()?;
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(git_repo.is_bare(), "Repo should be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -81,25 +82,22 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        // Shoud not have a .git directory in a bare repo
+        dir.child(".git").assert(predicate::path::missing());
+        dir.child("config")
+            .assert(predicate::str::contains("bare = true"));
 
-            // Shoud not have a .git directory in a bare repo
-            path.child(".git").assert(predicate::path::missing());
-
-            path.child("config")
-                .assert(predicate::str::contains("bare = true"));
-
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare());
-            repo.assert(predicate::repo::is_worktree().not());
-            repo.assert(predicate::repo::has_branch("main"));
-            repo.assert(predicate::repo::head_matches("main"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare());
+        fixture.assert(predicate::repo::is_worktree().not());
+        fixture.assert(predicate::repo::has_branch("main"));
+        fixture.assert(predicate::repo::head_matches("main"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -108,7 +106,7 @@ mod fixture_builder {
     fn default_branch() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().default_branch("develop").build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -139,23 +137,22 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
-            path.child(".git").assert(predicate::path::is_dir());
-            path.child(".git/config")
-                .assert(predicate::str::contains("bare = false"));
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        dir.child(".git").assert(predicate::path::is_dir());
+        dir.child(".git/config")
+            .assert(predicate::str::contains("bare = false"));
 
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree().not());
-            repo.assert(predicate::repo::has_branch("develop"));
-            repo.assert(predicate::repo::has_branch("main").not());
-            repo.assert(predicate::repo::head_matches("develop"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree().not());
+        fixture.assert(predicate::repo::has_branch("develop"));
+        fixture.assert(predicate::repo::has_branch("main").not());
+        fixture.assert(predicate::repo::head_matches("develop"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -167,7 +164,7 @@ mod fixture_builder {
             .default_branch("develop")
             .build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(git_repo.is_bare(), "Repo should be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -198,26 +195,23 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        // Shoud not have a .git directory in a bare repo
+        dir.child(".git").assert(predicate::path::missing());
+        dir.child("config")
+            .assert(predicate::str::contains("bare = true"));
 
-            // Shoud not have a .git directory in a bare repo
-            path.child(".git").assert(predicate::path::missing());
-
-            path.child("config")
-                .assert(predicate::str::contains("bare = true"));
-
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare());
-            repo.assert(predicate::repo::is_worktree().not());
-            repo.assert(predicate::repo::has_branch("develop"));
-            repo.assert(predicate::repo::has_branch("main").not());
-            repo.assert(predicate::repo::head_matches("develop"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare());
+        fixture.assert(predicate::repo::is_worktree().not());
+        fixture.assert(predicate::repo::has_branch("develop"));
+        fixture.assert(predicate::repo::has_branch("main").not());
+        fixture.assert(predicate::repo::head_matches("develop"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -226,7 +220,7 @@ mod fixture_builder {
     fn worktree() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().worktree("dev").build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -259,27 +253,26 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
-            path.child(".git").assert(predicate::path::is_file());
-            path.child(".git")
-                .assert(predicate::str::contains("gitdir: "));
-            path.child(".git").assert(predicate::str::contains(
-                path.parent().unwrap().to_string_lossy(),
-            ));
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        dir.child(".git").assert(predicate::path::is_file());
+        dir.child(".git")
+            .assert(predicate::str::contains("gitdir: "));
+        dir.child(".git").assert(predicate::str::contains(
+            dir.parent().unwrap().to_string_lossy(),
+        ));
 
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree());
-            repo.assert(predicate::repo::has_branch("main"));
-            repo.assert(predicate::repo::has_branch("dev"));
-            repo.assert(predicate::repo::has_worktree("dev"));
-            repo.assert(predicate::repo::head_matches("dev"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree());
+        fixture.assert(predicate::repo::has_branch("main"));
+        fixture.assert(predicate::repo::has_branch("dev"));
+        fixture.assert(predicate::repo::has_worktree("dev"));
+        fixture.assert(predicate::repo::head_matches("dev"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -296,7 +289,7 @@ mod fixture_builder {
             .default_branch("develop")
             .build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "Repo should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -327,27 +320,26 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
-            path.child(".git").assert(predicate::path::is_file());
-            path.child(".git")
-                .assert(predicate::str::contains("gitdir: "));
-            path.child(".git").assert(predicate::str::contains(
-                path.parent().unwrap().to_string_lossy(),
-            ));
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        dir.child(".git").assert(predicate::path::is_file());
+        dir.child(".git")
+            .assert(predicate::str::contains("gitdir: "));
+        dir.child(".git").assert(predicate::str::contains(
+            dir.parent().unwrap().to_string_lossy(),
+        ));
 
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree());
-            repo.assert(predicate::repo::has_branch("develop"));
-            repo.assert(predicate::repo::has_branch("main"));
-            repo.assert(predicate::repo::has_worktree("main"));
-            repo.assert(predicate::repo::head_matches("main"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree());
+        fixture.assert(predicate::repo::has_branch("develop"));
+        fixture.assert(predicate::repo::has_branch("main"));
+        fixture.assert(predicate::repo::has_worktree("main"));
+        fixture.assert(predicate::repo::head_matches("main"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -356,7 +348,7 @@ mod fixture_builder {
     fn worktree_bare() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).worktree("dev").build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -382,24 +374,22 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        // Shoud have a .git file in a worktree
+        dir.child(".git").assert(predicate::path::is_file());
 
-            // Shoud have a .git file in a worktree
-            path.child(".git").assert(predicate::path::is_file());
-
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree());
-            repo.assert(predicate::repo::has_branch("main"));
-            repo.assert(predicate::repo::has_branch("dev"));
-            repo.assert(predicate::repo::has_worktree("dev"));
-            repo.assert(predicate::repo::head_matches("dev"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree());
+        fixture.assert(predicate::repo::has_branch("main"));
+        fixture.assert(predicate::repo::has_branch("dev"));
+        fixture.assert(predicate::repo::has_worktree("dev"));
+        fixture.assert(predicate::repo::head_matches("dev"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -412,7 +402,7 @@ mod fixture_builder {
             .worktree("dev")
             .build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -445,24 +435,22 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        // Shoud have a .git file in a worktree
+        dir.child(".git").assert(predicate::path::is_file());
 
-            // Shoud have a .git file in a worktree
-            path.child(".git").assert(predicate::path::is_file());
-
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree());
-            repo.assert(predicate::repo::has_branch("develop"));
-            repo.assert(predicate::repo::has_branch("dev"));
-            repo.assert(predicate::repo::has_worktree("dev"));
-            repo.assert(predicate::repo::head_matches("dev"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree());
+        fixture.assert(predicate::repo::has_branch("develop"));
+        fixture.assert(predicate::repo::has_branch("dev"));
+        fixture.assert(predicate::repo::has_worktree("dev"));
+        fixture.assert(predicate::repo::head_matches("dev"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -471,7 +459,7 @@ mod fixture_builder {
     fn worktree_bare_matching_default_branch() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -497,23 +485,21 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        // Shoud have a .git file in a worktree
+        dir.child(".git").assert(predicate::path::is_file());
 
-            // Shoud have a .git file in a worktree
-            path.child(".git").assert(predicate::path::is_file());
-
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree());
-            repo.assert(predicate::repo::has_worktree("main"));
-            repo.assert(predicate::repo::has_branch("main"));
-            repo.assert(predicate::repo::head_matches("main"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree());
+        fixture.assert(predicate::repo::has_worktree("main"));
+        fixture.assert(predicate::repo::has_branch("main"));
+        fixture.assert(predicate::repo::head_matches("main"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -526,7 +512,7 @@ mod fixture_builder {
             .worktree("dev")
             .build()?;
 
-        let git_repo = fixture.repo.as_ref().unwrap();
+        let git_repo = fixture.repo()?;
 
         assert!(!git_repo.is_bare(), "worktree should not be bare");
         assert!(!git_repo.is_empty().unwrap(), "Repo should not be empty");
@@ -552,23 +538,21 @@ mod fixture_builder {
             "Initial commit message should match"
         );
 
-        fixture.with(|repo, path| {
-            path.assert(predicate::path::is_dir());
+        let dir = fixture.cwd()?;
+        dir.assert(predicate::path::is_dir());
+        // Shoud have a .git file in a worktree
+        dir.child(".git").assert(predicate::path::is_file());
 
-            // Shoud have a .git file in a worktree
-            path.child(".git").assert(predicate::path::is_file());
-
-            repo.assert(predicate::repo::is_empty().not());
-            repo.assert(predicate::repo::is_bare().not());
-            repo.assert(predicate::repo::is_worktree());
-            repo.assert(predicate::repo::has_branch("dev"));
-            repo.assert(predicate::repo::has_worktree("dev"));
-            repo.assert(predicate::repo::head_matches("dev"));
-            repo.assert(predicate::repo::head_commit_message_contains(
-                "Initial commit",
-            ));
-            repo.assert(predicate::repo::head_commit_parent_count(0));
-        });
+        fixture.assert(predicate::repo::is_empty().not());
+        fixture.assert(predicate::repo::is_bare().not());
+        fixture.assert(predicate::repo::is_worktree());
+        fixture.assert(predicate::repo::has_branch("dev"));
+        fixture.assert(predicate::repo::has_worktree("dev"));
+        fixture.assert(predicate::repo::head_matches("dev"));
+        fixture.assert(predicate::repo::head_commit_message_contains(
+            "Initial commit",
+        ));
+        fixture.assert(predicate::repo::head_commit_parent_count(0));
 
         Ok(())
     }
@@ -584,13 +568,11 @@ mod fixture_builder {
             .remote("origin", &origin)
             .build()?;
 
-        let repo = local.repo.as_ref().unwrap();
-
         // Verify remote exists
-        repo.assert(predicate::repo::has_remote("origin"));
-        repo.assert(predicate::repo::has_remote_url(
+        local.assert(predicate::repo::has_remote("origin"));
+        local.assert(predicate::repo::has_remote_url(
             "origin",
-            Some(origin.path.as_ref().unwrap().to_str().unwrap()),
+            origin.cwd()?.to_str(),
         ));
 
         Ok(())
@@ -608,16 +590,14 @@ mod fixture_builder {
             .upstream("main", "origin/main")
             .build()?;
 
-        let repo = local.repo.as_ref().unwrap();
-
         // Verify remote exists
-        repo.assert(predicate::repo::has_remote("origin"));
+        local.assert(predicate::repo::has_remote("origin"));
 
         // Verify upstream is configured
-        repo.assert(predicate::repo::has_upstream("main", Some("origin/main")));
+        local.assert(predicate::repo::has_upstream("main", Some("origin/main")));
 
         // Verify remote tracking ref was created
-        repo.assert(predicate::repo::has_remote_branch("origin/main"));
+        local.assert(predicate::repo::has_remote_branch("origin/main"));
 
         Ok(())
     }
@@ -628,10 +608,9 @@ mod fixture_builder {
         let local = FixtureBuilder::new().bare(true).build()?;
 
         // Add remote after fixture creation
-        local.add_remote("origin", origin.path.as_ref().unwrap().to_str().unwrap())?;
+        local.add_remote("origin", origin.cwd()?.to_str().unwrap())?;
 
-        let repo = local.repo.as_ref().unwrap();
-        repo.assert(predicate::repo::has_remote("origin"));
+        local.assert(predicate::repo::has_remote("origin"));
 
         Ok(())
     }
@@ -639,15 +618,13 @@ mod fixture_builder {
     #[test]
     fn fixture_create_remote_ref() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).build()?;
-
-        let repo = fixture.repo.as_ref().unwrap();
-        let commit_oid = repo.head()?.peel_to_commit()?.id();
+        let commit_oid = fixture.head()?.peel_to_commit()?.id();
 
         // Create remote ref
         fixture.create_remote_ref("origin/main", commit_oid)?;
 
         // Verify remote ref exists
-        repo.assert(predicate::repo::has_remote_branch("origin/main"));
+        fixture.assert(predicate::repo::has_remote_branch("origin/main"));
 
         Ok(())
     }
@@ -657,11 +634,10 @@ mod fixture_builder {
         let origin = FixtureBuilder::new().bare(true).build()?;
         let fixture = FixtureBuilder::new().bare(true).build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-        let commit_oid = repo.head()?.peel_to_commit()?.id();
+        let commit_oid = fixture.head()?.peel_to_commit()?.id();
 
         // Add remote first
-        fixture.add_remote("origin", origin.path.as_ref().unwrap().to_str().unwrap())?;
+        fixture.add_remote("origin", origin.cwd()?.to_str().unwrap())?;
 
         // Create remote ref
         fixture.create_remote_ref("origin/main", commit_oid)?;
@@ -670,7 +646,7 @@ mod fixture_builder {
         fixture.set_upstream("main", "origin/main")?;
 
         // Verify upstream is configured
-        repo.assert(predicate::repo::has_upstream("main", Some("origin/main")));
+        fixture.assert(predicate::repo::has_upstream("main", Some("origin/main")));
 
         Ok(())
     }
@@ -686,7 +662,7 @@ mod fixture_builder {
             .file("file2.txt", "content2")
             .create("Add two files")?;
 
-        let repo = fixture.repo.as_ref().unwrap();
+        let repo = fixture.repo()?;
 
         // Verify commit was created
         let commit = repo.find_commit(commit_oid)?;
@@ -712,7 +688,7 @@ mod fixture_builder {
             .create("Test commit")?;
 
         // Create a new branch pointing to initial commit
-        let repo = fixture.repo.as_ref().unwrap();
+        let repo = fixture.repo()?;
         let initial_commit = repo.head()?.peel_to_commit()?.parent(0)?.id();
         repo.branch("feature", &repo.find_commit(initial_commit)?, false)?;
 
@@ -734,16 +710,7 @@ mod fixture_builder {
             .worktree("docs")
             .build()?;
 
-        let repo = fixture.repo.as_ref().unwrap();
-
-        // Get the bare repo by going up from the worktree
-        let bare_path = fixture
-            .path
-            .as_ref()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join(".bare");
+        let bare_path = fixture.root()?.join(".bare");
         let bare_repo = Repository::open(&bare_path)?;
 
         // Verify all worktrees were created
@@ -752,11 +719,10 @@ mod fixture_builder {
         bare_repo.assert(predicate::repo::has_worktree("docs"));
 
         // Verify the Fixture is opened in the last worktree (docs)
-        assert_eq!(fixture.path.as_ref().unwrap().file_name().unwrap(), "docs");
+        assert_eq!(fixture.cwd()?.file_name(), Some(OsStr::new("docs")));
 
         // Verify we can use the fixture to access the docs worktree
-        let head = repo.head()?;
-        assert_eq!(head.name(), Some("refs/heads/docs"));
+        assert_eq!(fixture.head()?.name(), Some("refs/heads/docs"));
 
         Ok(())
     }
@@ -770,7 +736,7 @@ mod fixture_builder {
             .build()?;
 
         // Create commits in each worktree
-        let parent_path = fixture.path.as_ref().unwrap().parent().unwrap();
+        let parent_path = fixture.root()?;
 
         // Commit in main
         fixture
@@ -807,14 +773,8 @@ mod fixture_builder {
             .build()?;
 
         // Fixture should be opened in the last specified worktree
-        assert_eq!(
-            fixture1.path.as_ref().unwrap().file_name().unwrap(),
-            "second"
-        );
-        assert_eq!(
-            fixture2.path.as_ref().unwrap().file_name().unwrap(),
-            "first"
-        );
+        assert_eq!(fixture1.cwd()?.file_name(), Some(OsStr::new("second")));
+        assert_eq!(fixture2.cwd()?.file_name(), Some(OsStr::new("first")));
 
         Ok(())
     }

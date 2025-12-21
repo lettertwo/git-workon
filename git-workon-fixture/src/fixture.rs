@@ -4,37 +4,30 @@ use assert_fs::fixture::ChildPath;
 use assert_fs::TempDir;
 use git2::{Oid, Repository};
 use miette::{bail, IntoDiagnostic, Result};
+use predicates::Predicate;
+
+use crate::assert::{FixtureAssert, IntoFixturePredicate};
 
 pub struct Fixture {
-    pub repo: Option<Repository>,
-    pub path: Option<PathBuf>,
+    repo: Option<Repository>,
+    cwd: Option<PathBuf>,
     tempdir: Option<TempDir>,
 }
 
 impl Fixture {
-    pub fn new(repo: Repository, path: PathBuf, tempdir: TempDir) -> Self {
+    pub fn new(repo: Repository, cwd: PathBuf, tempdir: TempDir) -> Self {
         Self {
             repo: Some(repo),
             tempdir: Some(tempdir),
-            path: Some(path),
+            cwd: Some(cwd),
         }
-    }
-
-    pub fn with<F>(&self, f: F)
-    where
-        F: FnOnce(&Repository, &ChildPath),
-    {
-        let repo = self.repo.as_ref().unwrap();
-        let path = self.path.as_ref().unwrap();
-        let path_child = ChildPath::new(path);
-        f(repo, &path_child);
     }
 
     pub fn destroy(&mut self) -> Result<()> {
         if let Some(tempdir) = self.tempdir.take() {
             tempdir.close().into_diagnostic()?
         }
-        self.path = None;
+        self.cwd = None;
         self.tempdir = None;
         self.repo = None;
         Ok(())
@@ -104,9 +97,56 @@ impl Fixture {
         Ok(())
     }
 
+    pub fn cwd(&self) -> Result<ChildPath> {
+        self.cwd
+            .as_ref()
+            .ok_or_else(|| miette::miette!("No fixture path"))
+            .map(ChildPath::new)
+    }
+
+    pub fn root(&self) -> Result<ChildPath> {
+        self.tempdir
+            .as_ref()
+            .ok_or_else(|| miette::miette!("No fixture root"))
+            .map(|td| ChildPath::new(td.path()))
+    }
+
+    pub fn repo(&self) -> Result<&Repository> {
+        self.repo
+            .as_ref()
+            .ok_or_else(|| miette::miette!("No repository"))
+    }
+
+    pub fn head(&self) -> Result<git2::Reference> {
+        let repo = self.repo()?;
+        repo.head().into_diagnostic()
+    }
+
     /// Start building a commit in a worktree
     pub fn commit<'a>(&'a self, worktree_name: &'a str) -> CommitBuilder<'a> {
         CommitBuilder::new(self, worktree_name)
+    }
+}
+
+impl AsRef<Path> for Fixture {
+    fn as_ref(&self) -> &Path {
+        self.cwd.as_ref().unwrap()
+    }
+}
+
+impl FixtureAssert for Fixture {
+    #[track_caller]
+    fn assert<I, P>(&self, predicate: I) -> &Self
+    where
+        I: IntoFixturePredicate<P, Repository>,
+        P: Predicate<Repository> + 'static,
+    {
+        self.repo
+            .as_ref()
+            .ok_or_else(|| miette::miette!("No repository for fixture assertion"))
+            .unwrap()
+            .assert(predicate);
+        self
     }
 }
 
@@ -136,7 +176,7 @@ impl<'a> CommitBuilder<'a> {
     pub fn create(self, message: &str) -> Result<Oid> {
         let repo_path = self
             .fixture
-            .path
+            .cwd
             .as_ref()
             .ok_or_else(|| miette::miette!("No fixture path"))?;
 

@@ -18,7 +18,7 @@ fn clone_default() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("git-workon")?;
     cmd.current_dir(&clone_dest)
         .arg("clone")
-        .arg(remote.path.as_ref().unwrap().to_str().unwrap())
+        .arg(remote.cwd()?.to_str().unwrap())
         .assert()
         .success();
 
@@ -62,7 +62,7 @@ fn clone_with_name() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = Command::cargo_bin("git-workon")?;
     cmd.current_dir(&temp)
         .arg("clone")
-        .arg(remote.path.as_ref().unwrap().to_str().unwrap())
+        .arg(remote.cwd()?.to_str().unwrap())
         .arg("myrepo")
         .assert()
         .success();

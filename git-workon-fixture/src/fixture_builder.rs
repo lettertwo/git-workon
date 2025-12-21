@@ -15,7 +15,7 @@ pub enum RemoteSource {
 
 impl From<&Fixture> for RemoteSource {
     fn from(fixture: &Fixture) -> Self {
-        RemoteSource::Path(fixture.path.as_ref().unwrap().clone())
+        RemoteSource::Path(fixture.cwd().unwrap().to_path_buf())
     }
 }
 
