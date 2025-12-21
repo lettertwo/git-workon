@@ -43,7 +43,7 @@ impl RemoteSource {
 pub struct FixtureBuilder<'fixture> {
     bare: bool,
     default_branch: &'fixture str,
-    worktree: Option<&'fixture str>,
+    worktrees: Vec<&'fixture str>,
     remotes: Vec<(String, RemoteSource)>,
     upstreams: Vec<(String, String)>, // (local_branch, remote_branch)
 }
@@ -53,7 +53,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
         Self {
             bare: false,
             default_branch: "main",
-            worktree: None,
+            worktrees: Vec::new(),
             remotes: Vec::new(),
             upstreams: Vec::new(),
         }
@@ -69,8 +69,11 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Add a worktree to be created
+    /// Can be called multiple times to create multiple worktrees
+    /// The Fixture will be opened in the last worktree specified
     pub fn worktree(mut self, worktree: &'fixture str) -> Self {
-        self.worktree = Some(worktree);
+        self.worktrees.push(worktree);
         self
     }
 
@@ -165,24 +168,39 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 .into_diagnostic()?;
         }
 
-        match self.worktree {
-            Some(worktree) if worktree != self.default_branch || self.bare => {
-                let worktree_path = tmpdir.path().join(worktree);
+        // Create worktrees if specified
+        if self.worktrees.is_empty() {
+            // No worktrees specified - return the main repo
+            Ok(Fixture::new(repo, path, tmpdir))
+        } else {
+            // Validate worktrees
+            for worktree in &self.worktrees {
+                if *worktree == self.default_branch && !self.bare {
+                    return Err(miette::miette!(
+                        "Cannot create a worktree with the same name as the default branch ({}) in a non-bare repository",
+                        self.default_branch
+                    ));
+                }
+            }
 
+            // Create all worktrees
+            for (i, worktree) in self.worktrees.iter().enumerate() {
+                let worktree_path = tmpdir.path().join(worktree);
                 let mut worktree_opts = WorktreeAddOptions::new();
                 worktree_opts.checkout_existing(self.bare);
 
                 repo.worktree(worktree, &worktree_path, Some(&worktree_opts))
                     .into_diagnostic()?;
 
-                let worktree_repo = Repository::open(&worktree_path).into_diagnostic()?;
+                // If this is the last worktree, return a Fixture for it
+                if i == self.worktrees.len() - 1 {
+                    let worktree_repo = Repository::open(&worktree_path).into_diagnostic()?;
+                    return Ok(Fixture::new(worktree_repo, worktree_path, tmpdir));
+                }
+            }
 
-                Ok(Fixture::new(worktree_repo, worktree_path, tmpdir))
-            }
-            Some(worktree) if worktree == self.default_branch && !self.bare => {
-                Err(miette::miette!("Cannot create a worktree with the same name as the default branch ({}) in a non-bare repository", self.default_branch))
-            }
-            Some(_) | None => Ok(Fixture::new(repo, path, tmpdir)),
+            // Should never reach here, but fallback to bare repo
+            Ok(Fixture::new(repo, path, tmpdir))
         }
     }
 }

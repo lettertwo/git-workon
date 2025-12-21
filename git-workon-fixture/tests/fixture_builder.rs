@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod fixture_builder {
-    use git2::BranchType;
+    use git2::{BranchType, Repository};
     use git_workon_fixture::prelude::*;
 
     #[test]
@@ -721,6 +721,100 @@ mod fixture_builder {
 
         // Verify branch points to the new commit
         repo.assert(predicate::repo::branch_points_to("feature", commit_oid));
+
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .worktree("main")
+            .worktree("feature")
+            .worktree("docs")
+            .build()?;
+
+        let repo = fixture.repo.as_ref().unwrap();
+
+        // Get the bare repo by going up from the worktree
+        let bare_path = fixture
+            .path
+            .as_ref()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".bare");
+        let bare_repo = Repository::open(&bare_path)?;
+
+        // Verify all worktrees were created
+        bare_repo.assert(predicate::repo::has_worktree("main"));
+        bare_repo.assert(predicate::repo::has_worktree("feature"));
+        bare_repo.assert(predicate::repo::has_worktree("docs"));
+
+        // Verify the Fixture is opened in the last worktree (docs)
+        assert_eq!(fixture.path.as_ref().unwrap().file_name().unwrap(), "docs");
+
+        // Verify we can use the fixture to access the docs worktree
+        let head = repo.head()?;
+        assert_eq!(head.name(), Some("refs/heads/docs"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_worktrees_with_commits() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .worktree("main")
+            .worktree("feature")
+            .build()?;
+
+        // Create commits in each worktree
+        let parent_path = fixture.path.as_ref().unwrap().parent().unwrap();
+
+        // Commit in main
+        fixture
+            .commit("main")
+            .file("main.txt", "main content")
+            .create("Add main.txt")?;
+
+        // Commit in feature (this is the current worktree)
+        fixture
+            .commit("feature")
+            .file("feature.txt", "feature content")
+            .create("Add feature.txt")?;
+
+        // Verify both worktrees have their respective files
+        assert!(parent_path.join("main/main.txt").exists());
+        assert!(parent_path.join("feature/feature.txt").exists());
+
+        Ok(())
+    }
+
+    #[test]
+    fn multiple_worktrees_order_matters() -> Result<(), Box<dyn std::error::Error>> {
+        // Create fixture with worktrees in different order
+        let fixture1 = FixtureBuilder::new()
+            .bare(true)
+            .worktree("first")
+            .worktree("second")
+            .build()?;
+
+        let fixture2 = FixtureBuilder::new()
+            .bare(true)
+            .worktree("second")
+            .worktree("first")
+            .build()?;
+
+        // Fixture should be opened in the last specified worktree
+        assert_eq!(
+            fixture1.path.as_ref().unwrap().file_name().unwrap(),
+            "second"
+        );
+        assert_eq!(
+            fixture2.path.as_ref().unwrap().file_name().unwrap(),
+            "first"
+        );
 
         Ok(())
     }
