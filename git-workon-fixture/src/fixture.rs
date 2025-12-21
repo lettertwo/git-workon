@@ -64,10 +64,7 @@ impl Fixture {
 
     /// Set upstream tracking for a branch
     pub fn set_upstream(&self, branch: &str, remote_branch: &str) -> Result<()> {
-        let repo = self
-            .repo
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No repository"))?;
+        let repo = self.repo()?;
 
         let mut local_branch = repo
             .find_branch(branch, git2::BranchType::Local)
@@ -81,10 +78,7 @@ impl Fixture {
 
     /// Update a branch to point to a specific commit
     pub fn update_branch(&self, branch: &str, commit_oid: Oid) -> Result<()> {
-        let repo = self
-            .repo
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No repository"))?;
+        let repo = self.repo()?;
 
         let mut local_branch = repo
             .find_branch(branch, git2::BranchType::Local)
@@ -131,6 +125,24 @@ impl Fixture {
 impl AsRef<Path> for Fixture {
     fn as_ref(&self) -> &Path {
         self.cwd.as_ref().unwrap()
+    }
+}
+
+impl AsRef<Repository> for Fixture {
+    fn as_ref(&self) -> &Repository {
+        self.repo.as_ref().unwrap()
+    }
+}
+
+impl<'a> From<&'a Fixture> for &'a Path {
+    fn from(val: &'a Fixture) -> Self {
+        val.cwd.as_ref().unwrap()
+    }
+}
+
+impl<'a> From<&'a Fixture> for &'a Repository {
+    fn from(val: &'a Fixture) -> Self {
+        val.repo.as_ref().unwrap()
     }
 }
 

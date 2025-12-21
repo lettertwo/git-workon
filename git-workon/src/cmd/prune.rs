@@ -87,6 +87,15 @@ impl Run for Prune {
         let to_prune: Vec<PruneCandidate> = candidates
             .into_iter()
             .filter_map(|(wt, candidate)| {
+                // Never prune the default worktree
+                match get_default_branch(&repo).ok() {
+                    Some(branch) if candidate.branch_name == branch => {
+                        skipped.push((candidate, "is the default worktree".to_string()));
+                        return None;
+                    }
+                    _ => {}
+                }
+
                 // Check for uncommitted changes
                 if !self.allow_dirty {
                     match wt.is_dirty() {
@@ -109,6 +118,8 @@ impl Run for Prune {
                 // Check for unpushed commits
                 if !self.allow_unpushed {
                     match wt.has_unpushed_commits() {
+                        // TODO: figure out what 'unpushed' means when the upstream is gone
+                        // Maybe we want to change unpushed to unmerged?
                         Ok(true) => {
                             skipped.push((
                                 candidate,

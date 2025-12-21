@@ -1,58 +1,47 @@
 use assert_cmd::Command;
-use assert_fs::TempDir;
-use git2::Repository;
 use git_workon_fixture::prelude::*;
 
 #[test]
 fn prune_with_no_stale_worktrees() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
 
     // Run prune - should report nothing to prune
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--yes")
         .assert()
         .success()
         .stdout(predicate::str::contains("No worktrees to prune"));
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_removes_worktree_for_deleted_branch() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
+    // Initialize a repository with a 'feature' worktree
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
 
     // Verify worktree exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    let feature_dir = fixture.cwd()?;
+    feature_dir.assert(predicate::path::is_dir());
 
-    // Delete the branch manually (force delete since it's checked out in a worktree)
-    let repo = Repository::open(temp.path().join(".bare"))?;
+    // Delete the branch manually
+    let repo = fixture.repo()?;
     repo.find_reference("refs/heads/feature")?.delete()?;
 
     // Run prune - should remove the worktree
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--yes")
         .assert()
@@ -60,37 +49,32 @@ fn prune_removes_worktree_for_deleted_branch() -> Result<(), Box<dyn std::error:
         .stdout(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify worktree directory is gone
-    temp.child("feature").assert(predicate::path::missing());
+    feature_dir.assert(predicate::path::missing());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_dry_run_does_not_remove_anything() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    // Initialize a repository with a 'feature' worktree
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
+    // Verify worktree exists
+    let feature_dir = fixture.cwd()?;
+    feature_dir.assert(predicate::path::is_dir());
 
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Delete the branch manually (force delete since it's checked out in a worktree)
-    let repo = Repository::open(temp.path().join(".bare"))?;
+    // Delete the branch manually
+    let repo = fixture.repo()?;
     repo.find_reference("refs/heads/feature")?.delete()?;
 
     // Run prune with --dry-run
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--dry-run")
         .assert()
@@ -98,34 +82,33 @@ fn prune_dry_run_does_not_remove_anything() -> Result<(), Box<dyn std::error::Er
         .stdout(predicate::str::contains("Dry run - no changes made"));
 
     // Verify worktree still exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    feature_dir.assert(predicate::path::is_dir());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_handles_multiple_stale_worktrees() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    // Initialize a repository with a 'feature' worktree
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-1")
+        .worktree("feature-2")
+        .worktree("feature-3")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
+    let repo = fixture.repo()?;
 
-    // Create multiple worktrees
+    // Delete all the feature branches
     for name in &["feature-1", "feature-2", "feature-3"] {
-        let mut new_cmd = Command::cargo_bin("git-workon")?;
-        new_cmd
-            .current_dir(&temp)
-            .arg("new")
-            .arg(name)
-            .assert()
-            .success();
-    }
+        // Verify worktree dir exists
+        fixture
+            .root()?
+            .child(name)
+            .assert(predicate::path::is_dir());
 
-    // Delete all the feature branches (force delete)
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    for name in &["feature-1", "feature-2", "feature-3"] {
+        // Manually delete the branch
         repo.find_reference(&format!("refs/heads/{}", name))?
             .delete()?;
     }
@@ -133,7 +116,7 @@ fn prune_handles_multiple_stale_worktrees() -> Result<(), Box<dyn std::error::Er
     // Run prune
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--yes")
         .assert()
@@ -142,106 +125,76 @@ fn prune_handles_multiple_stale_worktrees() -> Result<(), Box<dyn std::error::Er
 
     // Verify all worktrees are gone
     for name in &["feature-1", "feature-2", "feature-3"] {
-        temp.child(name).assert(predicate::path::missing());
+        fixture
+            .root()?
+            .child(name)
+            .assert(predicate::path::missing());
     }
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_preserves_worktrees_with_existing_branches() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("keep-me")
+        .worktree("delete-me")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create two worktrees
-    let mut new_cmd1 = Command::cargo_bin("git-workon")?;
-    new_cmd1
-        .current_dir(&temp)
-        .arg("new")
-        .arg("keep-me")
-        .assert()
-        .success();
-
-    let mut new_cmd2 = Command::cargo_bin("git-workon")?;
-    new_cmd2
-        .current_dir(&temp)
-        .arg("new")
-        .arg("delete-me")
-        .assert()
-        .success();
-
-    // Delete only one branch (force delete)
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.find_reference("refs/heads/delete-me")?.delete()?;
+    // Delete only one branch
+    fixture
+        .repo()?
+        .find_reference("refs/heads/delete-me")?
+        .delete()?;
 
     // Run prune
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--yes")
         .assert()
         .success()
         .stdout(predicate::str::contains("Pruned 1 worktree"));
 
-    // Verify keep-me still exists but delete-me is gone
-    temp.child("keep-me").assert(predicate::path::is_dir());
-    temp.child("delete-me").assert(predicate::path::missing());
+    // Verify delete-me is gone
+    fixture
+        .root()?
+        .child("delete-me")
+        .assert(predicate::path::missing());
 
-    temp.close()?;
+    // Verify keep-me still exists
+    fixture
+        .root()?
+        .child("keep-me")
+        .assert(predicate::path::is_dir());
+
     Ok(())
 }
 
 #[test]
 fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Set up a fake remote tracking branch for the feature branch
-    let repo = Repository::open(temp.path().join(".bare"))?;
-
-    // Create a fake remote named "origin"
-    repo.remote("origin", temp.path().join(".bare").to_str().unwrap())?;
-
-    // Create a remote ref (simulating a remote branch)
-    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
-    let commit = feature_branch.get().peel_to_commit()?;
-    repo.reference(
-        "refs/remotes/origin/feature",
-        commit.id(),
-        false,
-        "create remote ref",
-    )?;
-
-    // Set the upstream for the feature branch
-    repo.find_branch("feature", git2::BranchType::Local)?
-        .set_upstream(Some("origin/feature"))?;
-
-    // Delete the remote tracking branch (simulating remote deletion + fetch --prune)
-    repo.find_reference("refs/remotes/origin/feature")?
+    // Delete reference to remote branch
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
     // Run prune without --gone - should NOT remove the worktree
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--yes")
         .assert()
@@ -249,12 +202,12 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
         .stdout(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    fixture.cwd()?.assert(predicate::path::is_dir());
 
     // Run prune with --gone - should remove the worktree
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
         .arg("--allow-unpushed")
@@ -265,33 +218,23 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
         .stdout(predicate::str::contains("remote gone"));
 
     // Verify worktree directory is gone
-    temp.child("feature").assert(predicate::path::missing());
+    fixture.cwd()?.assert(predicate::path::missing());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_gone_skips_branches_without_upstream() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree (no upstream configured)
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
 
     // Run prune with --gone - should not remove worktree without upstream
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
         .arg("--yes")
@@ -300,52 +243,31 @@ fn prune_gone_skips_branches_without_upstream() -> Result<(), Box<dyn std::error
         .stdout(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    fixture.cwd()?.assert(predicate::path::is_dir());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_gone_dry_run() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Set up a fake remote tracking branch and then delete it
-    let repo = Repository::open(temp.path().join(".bare"))?;
-
-    // Create a fake remote named "origin"
-    repo.remote("origin", temp.path().join(".bare").to_str().unwrap())?;
-
-    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
-    let commit = feature_branch.get().peel_to_commit()?;
-    repo.reference(
-        "refs/remotes/origin/feature",
-        commit.id(),
-        false,
-        "create remote ref",
-    )?;
-    repo.find_branch("feature", git2::BranchType::Local)?
-        .set_upstream(Some("origin/feature"))?;
-    repo.find_reference("refs/remotes/origin/feature")?
+    // Delete reference to remote branch
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
     // Run prune with --gone and --dry-run
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
         .arg("--allow-unpushed")
@@ -356,40 +278,32 @@ fn prune_gone_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         .stdout(predicate::str::contains("remote gone"));
 
     // Verify worktree still exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    fixture.cwd()?.assert(predicate::path::is_dir());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_skips_dirty_worktrees() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
 
     // Create a file in the worktree (uncommitted change)
-    std::fs::write(temp.path().join("feature/test.txt"), "test content")?;
+    std::fs::write(fixture.cwd()?.join("test.txt"), "test content")?;
 
     // Delete the branch
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.find_reference("refs/heads/feature")?.delete()?;
+    fixture
+        .repo()?
+        .find_reference("refs/heads/feature")?
+        .delete()?;
 
     // Run prune - should skip dirty worktree
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--yes")
         .assert()
@@ -399,40 +313,32 @@ fn prune_skips_dirty_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .stdout(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    fixture.cwd()?.assert(predicate::path::is_dir());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_with_allow_dirty_removes_dirty_worktrees() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
-
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
 
     // Create a file in the worktree (uncommitted change)
-    std::fs::write(temp.path().join("feature/test.txt"), "test content")?;
+    std::fs::write(fixture.cwd()?.join("test.txt"), "test content")?;
 
     // Delete the branch
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.find_reference("refs/heads/feature")?.delete()?;
+    fixture
+        .repo()?
+        .find_reference("refs/heads/feature")?
+        .delete()?;
 
     // Run prune with --allow-dirty
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--allow-dirty")
         .arg("--yes")
@@ -441,64 +347,37 @@ fn prune_with_allow_dirty_removes_dirty_worktrees() -> Result<(), Box<dyn std::e
         .stdout(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify worktree is gone
-    temp.child("feature").assert(predicate::path::missing());
+    fixture.cwd()?.assert(predicate::path::missing());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_gone_skips_worktrees_with_unpushed_commits() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Set up remote tracking
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.remote("origin", temp.path().join(".bare").to_str().unwrap())?;
-
-    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
-    let commit = feature_branch.get().peel_to_commit()?;
-    repo.reference(
-        "refs/remotes/origin/feature",
-        commit.id(),
-        false,
-        "create remote ref",
-    )?;
-    repo.find_branch("feature", git2::BranchType::Local)?
-        .set_upstream(Some("origin/feature"))?;
+    // Delete reference to remote branch
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
 
     // Create a new commit in the worktree (unpushed)
-    let worktree_repo = Repository::open(temp.path().join("feature"))?;
-    std::fs::write(temp.path().join("feature/test.txt"), "test")?;
-    let mut index = worktree_repo.index()?;
-    index.add_path(std::path::Path::new("test.txt"))?;
-    index.write()?;
-    let tree_id = index.write_tree()?;
-    let tree = worktree_repo.find_tree(tree_id)?;
-    let sig = git2::Signature::now("Test", "test@test.com")?;
-    let parent = worktree_repo.head()?.peel_to_commit()?;
-    worktree_repo.commit(Some("HEAD"), &sig, &sig, "New commit", &tree, &[&parent])?;
-
-    // Delete the REMOTE branch (local branch still exists with unpushed commit)
-    repo.find_reference("refs/remotes/origin/feature")?
-        .delete()?;
+    fixture
+        .commit("feature")
+        .file("test.txt", "test")
+        .create("New commit")?;
 
     // Run prune --gone (without --allow-unpushed)
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
         .arg("--yes")
@@ -509,65 +388,38 @@ fn prune_gone_skips_worktrees_with_unpushed_commits() -> Result<(), Box<dyn std:
         .stdout(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    fixture.cwd()?.assert(predicate::path::is_dir());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_gone_with_allow_unpushed_removes_worktrees_with_unpushed_commits(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Set up remote tracking
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    repo.remote("origin", temp.path().join(".bare").to_str().unwrap())?;
-
-    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
-    let commit = feature_branch.get().peel_to_commit()?;
-    repo.reference(
-        "refs/remotes/origin/feature",
-        commit.id(),
-        false,
-        "create remote ref",
-    )?;
-    repo.find_branch("feature", git2::BranchType::Local)?
-        .set_upstream(Some("origin/feature"))?;
+    // Delete reference to remote branch
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
 
     // Create a new commit in the worktree (unpushed)
-    let worktree_repo = Repository::open(temp.path().join("feature"))?;
-    std::fs::write(temp.path().join("feature/test.txt"), "test")?;
-    let mut index = worktree_repo.index()?;
-    index.add_path(std::path::Path::new("test.txt"))?;
-    index.write()?;
-    let tree_id = index.write_tree()?;
-    let tree = worktree_repo.find_tree(tree_id)?;
-    let sig = git2::Signature::now("Test", "test@test.com")?;
-    let parent = worktree_repo.head()?.peel_to_commit()?;
-    worktree_repo.commit(Some("HEAD"), &sig, &sig, "New commit", &tree, &[&parent])?;
-
-    // Delete the REMOTE branch (local branch still exists with unpushed commit)
-    repo.find_reference("refs/remotes/origin/feature")?
-        .delete()?;
+    fixture
+        .commit("feature")
+        .file("test.txt", "test")
+        .create("New commit")?;
 
     // Run prune --gone with --allow-unpushed
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
         .arg("--allow-unpushed")
@@ -577,50 +429,26 @@ fn prune_gone_with_allow_unpushed_removes_worktrees_with_unpushed_commits(
         .stdout(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify worktree is gone
-    temp.child("feature").assert(predicate::path::missing());
+    fixture.cwd()?.assert(predicate::path::missing());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_merged_removes_merged_branch() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a feature worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Add a commit to feature branch
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    let feature_repo = Repository::open(temp.path().join("feature"))?;
-    std::fs::write(temp.path().join("feature/feature.txt"), "feature")?;
-    let mut index = feature_repo.index()?;
-    index.add_path(std::path::Path::new("feature.txt"))?;
-    index.write()?;
-    let tree_id = index.write_tree()?;
-    let tree = feature_repo.find_tree(tree_id)?;
-    let sig = git2::Signature::now("Test", "test@test.com")?;
-    let parent = feature_repo.head()?.peel_to_commit()?;
-    let feature_commit_oid = feature_repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        "Feature commit",
-        &tree,
-        &[&parent],
-    )?;
+    let feature_commit_oid = fixture
+        .commit("feature")
+        .file("feature.txt", "feature")
+        .create("Feature commit")?;
 
     // Fast-forward main to include the feature commit (simulating merge)
+    let repo = fixture.repo()?;
     let feature_commit = repo.find_commit(feature_commit_oid)?;
     repo.find_branch("main", git2::BranchType::Local)?
         .get_mut()
@@ -629,7 +457,7 @@ fn prune_merged_removes_merged_branch() -> Result<(), Box<dyn std::error::Error>
     // Run prune --merged
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--merged")
         .arg("--yes")
@@ -639,52 +467,28 @@ fn prune_merged_removes_merged_branch() -> Result<(), Box<dyn std::error::Error>
         .stdout(predicate::str::contains("merged into main"));
 
     // Verify worktree is gone
-    temp.child("feature").assert(predicate::path::missing());
+    fixture.cwd()?.assert(predicate::path::missing());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_merged_skips_unmerged_branch() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create a feature worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Add a commit to feature branch (not merged)
-    let feature_repo = Repository::open(temp.path().join("feature"))?;
-    std::fs::write(temp.path().join("feature/feature.txt"), "feature")?;
-    let mut index = feature_repo.index()?;
-    index.add_path(std::path::Path::new("feature.txt"))?;
-    index.write()?;
-    let tree_id = index.write_tree()?;
-    let tree = feature_repo.find_tree(tree_id)?;
-    let sig = git2::Signature::now("Test", "test@test.com")?;
-    let parent = feature_repo.head()?.peel_to_commit()?;
-    feature_repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        "Feature commit",
-        &tree,
-        &[&parent],
-    )?;
+    fixture
+        .commit("feature")
+        .file("feature.txt", "feature")
+        .create("Feature commit")?;
 
     // Run prune --merged (should not prune unmerged branch)
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--merged")
         .arg("--yes")
@@ -693,83 +497,63 @@ fn prune_merged_skips_unmerged_branch() -> Result<(), Box<dyn std::error::Error>
         .stdout(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
-    temp.child("feature").assert(predicate::path::is_dir());
+    fixture.cwd()?.assert(predicate::path::is_dir());
 
-    temp.close()?;
     Ok(())
 }
 
 #[test]
 fn prune_merged_with_specific_target() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = TempDir::new()?;
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("develop")
+        .worktree("feature")
+        .build()?;
 
-    // Initialize a repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
-    init_cmd.current_dir(&temp).arg("init").assert().success();
-
-    // Create develop and feature worktrees
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("develop")
-        .assert()
-        .success();
-
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
-    new_cmd
-        .current_dir(&temp)
-        .arg("new")
-        .arg("feature")
-        .assert()
-        .success();
-
-    // Add a commit to feature branch
-    let repo = Repository::open(temp.path().join(".bare"))?;
-    let feature_repo = Repository::open(temp.path().join("feature"))?;
-    std::fs::write(temp.path().join("feature/feature.txt"), "feature")?;
-    let mut index = feature_repo.index()?;
-    index.add_path(std::path::Path::new("feature.txt"))?;
-    index.write()?;
-    let tree_id = index.write_tree()?;
-    let tree = feature_repo.find_tree(tree_id)?;
-    let sig = git2::Signature::now("Test", "test@test.com")?;
-    let parent = feature_repo.head()?.peel_to_commit()?;
-    let feature_commit_oid = feature_repo.commit(
-        Some("HEAD"),
-        &sig,
-        &sig,
-        "Feature commit",
-        &tree,
-        &[&parent],
-    )?;
+    let feature_commit_oid = fixture
+        .commit("feature")
+        .file("feature.txt", "feature")
+        .create("Feature commit")?;
 
     // Fast-forward develop to include the feature commit
+    let repo = fixture.repo()?;
     let feature_commit = repo.find_commit(feature_commit_oid)?;
     repo.find_branch("develop", git2::BranchType::Local)?
         .get_mut()
         .set_target(feature_commit.id(), "Fast-forward to feature")?;
 
     // Run prune --merged=develop
-    // Note: Both main and feature will be pruned since they're both merged into develop
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
-        .current_dir(&temp)
+        .current_dir(&fixture)
         .arg("prune")
         .arg("--merged=develop")
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 2 worktree"))
+        .stdout(predicate::str::contains("default worktree"))
+        .stdout(predicate::str::contains("Pruned 1 worktree"))
         .stdout(predicate::str::contains("merged into develop"));
 
-    // Verify feature and main worktrees are gone
-    temp.child("feature").assert(predicate::path::missing());
-    temp.child("main").assert(predicate::path::missing());
+    // Verify feature worktree is gone
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::missing());
+
+    // Verify main worktree still exists
+    fixture
+        .root()?
+        .child("main")
+        .assert(predicate::path::is_dir());
 
     // Verify develop worktree still exists
-    temp.child("develop").assert(predicate::path::is_dir());
+    fixture
+        .root()?
+        .child("develop")
+        .assert(predicate::path::is_dir());
 
-    temp.close()?;
     Ok(())
 }

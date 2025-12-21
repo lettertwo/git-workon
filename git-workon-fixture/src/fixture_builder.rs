@@ -15,7 +15,10 @@ pub enum RemoteSource {
 
 impl From<&Fixture> for RemoteSource {
     fn from(fixture: &Fixture) -> Self {
-        RemoteSource::Path(fixture.cwd().unwrap().to_path_buf())
+        match fixture.repo().unwrap().is_bare() {
+            true => RemoteSource::Path(fixture.root().unwrap().path().join(".bare")),
+            false => RemoteSource::Path(fixture.root().unwrap().to_path_buf()),
+        }
     }
 }
 
@@ -133,6 +136,23 @@ impl<'fixture> FixtureBuilder<'fixture> {
             }
         }
 
+        // Create worktrees
+        for worktree in &self.worktrees {
+            if *worktree == self.default_branch && !self.bare {
+                return Err(miette::miette!(
+                        "Cannot create a worktree with the same name as the default branch ({}) in a non-bare repository",
+                        self.default_branch
+                    ));
+            }
+
+            let worktree_path = tmpdir.path().join(worktree);
+            let mut worktree_opts = WorktreeAddOptions::new();
+            worktree_opts.checkout_existing(self.bare);
+
+            repo.worktree(worktree, &worktree_path, Some(&worktree_opts))
+                .into_diagnostic()?;
+        }
+
         // Apply remotes
         for (name, source) in &self.remotes {
             repo.remote(name, &source.as_url()).into_diagnostic()?;
@@ -168,39 +188,12 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 .into_diagnostic()?;
         }
 
-        // Create worktrees if specified
         if self.worktrees.is_empty() {
             // No worktrees specified - return the main repo
             Ok(Fixture::new(repo, path, tmpdir))
         } else {
-            // Validate worktrees
-            for worktree in &self.worktrees {
-                if *worktree == self.default_branch && !self.bare {
-                    return Err(miette::miette!(
-                        "Cannot create a worktree with the same name as the default branch ({}) in a non-bare repository",
-                        self.default_branch
-                    ));
-                }
-            }
-
-            // Create all worktrees
-            for (i, worktree) in self.worktrees.iter().enumerate() {
-                let worktree_path = tmpdir.path().join(worktree);
-                let mut worktree_opts = WorktreeAddOptions::new();
-                worktree_opts.checkout_existing(self.bare);
-
-                repo.worktree(worktree, &worktree_path, Some(&worktree_opts))
-                    .into_diagnostic()?;
-
-                // If this is the last worktree, return a Fixture for it
-                if i == self.worktrees.len() - 1 {
-                    let worktree_repo = Repository::open(&worktree_path).into_diagnostic()?;
-                    return Ok(Fixture::new(worktree_repo, worktree_path, tmpdir));
-                }
-            }
-
-            // Should never reach here, but fallback to bare repo
-            Ok(Fixture::new(repo, path, tmpdir))
+            let worktree_path = tmpdir.path().join(self.worktrees.last().unwrap());
+            Ok(Fixture::new(repo, worktree_path, tmpdir))
         }
     }
 }
