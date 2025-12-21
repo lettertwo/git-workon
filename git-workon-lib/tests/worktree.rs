@@ -137,7 +137,7 @@ mod tests {
         assert_eq!(worktree.branch()?, Some("feature".to_string()));
 
         // Verify is_detached() returns false
-        assert_eq!(worktree.is_detached()?, false);
+        assert!(!(worktree.is_detached()?));
 
         Ok(())
     }
@@ -159,7 +159,7 @@ mod tests {
         assert_eq!(worktree.branch()?, Some("user/feature-branch".to_string()));
 
         // Verify is_detached() returns false
-        assert_eq!(worktree.is_detached()?, false);
+        assert!(!(worktree.is_detached()?));
 
         Ok(())
     }
@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(worktree.branch()?, Some("docs".to_string()));
 
         // Verify is_detached() returns false (orphan is still on a branch)
-        assert_eq!(worktree.is_detached()?, false);
+        assert!(!(worktree.is_detached()?));
 
         Ok(())
     }
@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(worktree.branch()?, None);
 
         // Verify is_detached() returns true
-        assert_eq!(worktree.is_detached()?, true);
+        assert!(worktree.is_detached()?);
 
         Ok(())
     }
@@ -222,7 +222,7 @@ mod tests {
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify the worktree is clean
-        assert_eq!(worktree.is_dirty()?, false);
+        assert!(!(worktree.is_dirty()?));
 
         Ok(())
     }
@@ -239,30 +239,22 @@ mod tests {
         let repo = fixture.repo()?;
 
         // Create and commit a file in main worktree
-        let main_path = fixture.root()?.join("main");
-        std::fs::write(main_path.join("test.txt"), "original content")?;
-
-        let worktree_repo = fixture.repo()?;
-        let mut index = worktree_repo.index()?;
-        index.add_path(std::path::Path::new("test.txt"))?;
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = worktree_repo.find_tree(tree_id)?;
-        let sig = git2::Signature::now("Test", "test@test.com")?;
-        let parent = worktree_repo.head()?.peel_to_commit()?;
-        worktree_repo.commit(Some("HEAD"), &sig, &sig, "Add test file", &tree, &[&parent])?;
+        fixture
+            .commit("main")
+            .file("test.txt", "original content")
+            .create("Add test file")?;
 
         // Add a new worktree
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify the worktree is clean
-        assert_eq!(worktree.is_dirty()?, false);
+        assert!(!(worktree.is_dirty()?));
 
         // Modify the file
         std::fs::write(worktree.path().join("test.txt"), "modified content")?;
 
         // Verify the worktree is now dirty
-        assert_eq!(worktree.is_dirty()?, true);
+        assert!(worktree.is_dirty()?);
 
         Ok(())
     }
@@ -281,13 +273,13 @@ mod tests {
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify the worktree is clean
-        assert_eq!(worktree.is_dirty()?, false);
+        assert!(!(worktree.is_dirty()?));
 
         // Add an untracked file
         std::fs::write(worktree.path().join("untracked.txt"), "new file")?;
 
         // Verify the worktree is now dirty
-        assert_eq!(worktree.is_dirty()?, true);
+        assert!(worktree.is_dirty()?);
 
         Ok(())
     }
@@ -306,7 +298,7 @@ mod tests {
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify no unpushed commits (no upstream configured)
-        assert_eq!(worktree.has_unpushed_commits()?, false);
+        assert!(!(worktree.has_unpushed_commits()?));
 
         Ok(())
     }
@@ -314,10 +306,11 @@ mod tests {
     #[test]
     fn test_has_unpushed_commits_with_upstream_up_to_date() -> Result<(), Box<dyn std::error::Error>>
     {
-        // Create a bare fixture with a default branch
+        // Create a bare fixture with a default branch and upstream configured
         let fixture = FixtureBuilder::new()
             .bare(true)
             .default_branch("main")
+            .remote("origin", "https://example.com/repo.git")
             .build()?;
 
         let repo = fixture.repo()?;
@@ -325,37 +318,26 @@ mod tests {
         // Add a new worktree
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
-        // Create a remote (pointing to the bare repo itself)
-        repo.remote("origin", fixture.cwd()?.to_str().unwrap())?;
-
         // Set up upstream tracking
         let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
         let commit = feature_branch.get().peel_to_commit()?;
 
-        // Create a fake remote ref at the same commit
-        repo.reference(
-            "refs/remotes/origin/feature",
-            commit.id(),
-            false,
-            "create remote ref",
-        )?;
-
-        // Set upstream
-        repo.find_branch("feature", git2::BranchType::Local)?
-            .set_upstream(Some("origin/feature"))?;
+        fixture.create_remote_ref("origin/feature", commit.id())?;
+        fixture.set_upstream("feature", "origin/feature")?;
 
         // Verify no unpushed commits (up to date with upstream)
-        assert_eq!(worktree.has_unpushed_commits()?, false);
+        assert!(!(worktree.has_unpushed_commits()?));
 
         Ok(())
     }
 
     #[test]
     fn test_has_unpushed_commits_with_local_commits() -> Result<(), Box<dyn std::error::Error>> {
-        // Create a bare fixture with a default branch
+        // Create a bare fixture with a default branch and upstream configured
         let fixture = FixtureBuilder::new()
             .bare(true)
             .default_branch("main")
+            .remote("origin", "https://example.com/repo.git")
             .build()?;
 
         let repo = fixture.repo()?;
@@ -363,39 +345,21 @@ mod tests {
         // Add a new worktree
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
-        // Create a remote (pointing to the bare repo itself)
-        repo.remote("origin", fixture.cwd()?.to_str().unwrap())?;
-
         // Set up upstream tracking
         let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
         let commit = feature_branch.get().peel_to_commit()?;
 
-        // Create a fake remote ref at the initial commit
-        repo.reference(
-            "refs/remotes/origin/feature",
-            commit.id(),
-            false,
-            "create remote ref",
-        )?;
-
-        // Set upstream
-        repo.find_branch("feature", git2::BranchType::Local)?
-            .set_upstream(Some("origin/feature"))?;
+        fixture.create_remote_ref("origin/feature", commit.id())?;
+        fixture.set_upstream("feature", "origin/feature")?;
 
         // Create a new commit in the worktree (will be ahead of upstream)
-        let worktree_repo = Repository::open(worktree.path())?;
-        std::fs::write(worktree.path().join("test.txt"), "test")?;
-        let mut index = worktree_repo.index()?;
-        index.add_path(std::path::Path::new("test.txt"))?;
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = worktree_repo.find_tree(tree_id)?;
-        let sig = git2::Signature::now("Test", "test@test.com")?;
-        let parent = worktree_repo.head()?.peel_to_commit()?;
-        worktree_repo.commit(Some("HEAD"), &sig, &sig, "New commit", &tree, &[&parent])?;
+        fixture
+            .commit("feature")
+            .file("test.txt", "test")
+            .create("New commit")?;
 
         // Verify has unpushed commits
-        assert_eq!(worktree.has_unpushed_commits()?, true);
+        assert!(worktree.has_unpushed_commits()?);
 
         Ok(())
     }
@@ -419,7 +383,7 @@ mod tests {
         config.set_str("branch.feature.merge", "refs/heads/feature")?;
 
         // Verify has unpushed commits (upstream is gone, conservative)
-        assert_eq!(worktree.has_unpushed_commits()?, true);
+        assert!(worktree.has_unpushed_commits()?);
 
         Ok(())
     }
@@ -438,7 +402,7 @@ mod tests {
         let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify no unpushed commits (detached HEAD has no branch)
-        assert_eq!(worktree.has_unpushed_commits()?, false);
+        assert!(!(worktree.has_unpushed_commits()?));
 
         Ok(())
     }
@@ -457,7 +421,7 @@ mod tests {
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify feature is merged into main (same commit)
-        assert_eq!(worktree.is_merged_into("main")?, true);
+        assert!(worktree.is_merged_into("main")?);
 
         Ok(())
     }
@@ -476,26 +440,13 @@ mod tests {
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Add a commit to feature branch
-        let worktree_repo = Repository::open(worktree.path())?;
-        std::fs::write(worktree.path().join("test.txt"), "test")?;
-        let mut index = worktree_repo.index()?;
-        index.add_path(std::path::Path::new("test.txt"))?;
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = worktree_repo.find_tree(tree_id)?;
-        let sig = git2::Signature::now("Test", "test@test.com")?;
-        let parent = worktree_repo.head()?.peel_to_commit()?;
-        worktree_repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Feature commit",
-            &tree,
-            &[&parent],
-        )?;
+        fixture
+            .commit("feature")
+            .file("test.txt", "test")
+            .create("Feature commit")?;
 
         // Verify feature is NOT merged into main (has additional commits)
-        assert_eq!(worktree.is_merged_into("main")?, false);
+        assert!(!(worktree.is_merged_into("main")?));
 
         Ok(())
     }
@@ -514,32 +465,16 @@ mod tests {
         let feature_wt = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Add a commit to feature branch
-        let feature_repo = Repository::open(feature_wt.path())?;
-        std::fs::write(feature_wt.path().join("feature.txt"), "feature")?;
-        let mut index = feature_repo.index()?;
-        index.add_path(std::path::Path::new("feature.txt"))?;
-        index.write()?;
-        let tree_id = index.write_tree()?;
-        let tree = feature_repo.find_tree(tree_id)?;
-        let sig = git2::Signature::now("Test", "test@test.com")?;
-        let parent = feature_repo.head()?.peel_to_commit()?;
-        let feature_commit_oid = feature_repo.commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            "Feature commit",
-            &tree,
-            &[&parent],
-        )?;
+        let feature_commit_oid = fixture
+            .commit("feature")
+            .file("feature.txt", "feature")
+            .create("Feature commit")?;
 
         // Fast-forward main to include the feature commit
-        let feature_commit = repo.find_commit(feature_commit_oid)?;
-        repo.find_branch("main", git2::BranchType::Local)?
-            .get_mut()
-            .set_target(feature_commit.id(), "Fast-forward to feature")?;
+        fixture.update_branch("main", feature_commit_oid)?;
 
         // Verify feature is now merged into main (same commit)
-        assert_eq!(feature_wt.is_merged_into("main")?, true);
+        assert!(feature_wt.is_merged_into("main")?);
 
         Ok(())
     }
@@ -558,7 +493,7 @@ mod tests {
         let worktree = add_worktree(repo, "feature", BranchType::Normal)?;
 
         // Verify returns false when target branch doesn't exist
-        assert_eq!(worktree.is_merged_into("nonexistent")?, false);
+        assert!(!(worktree.is_merged_into("nonexistent")?));
 
         Ok(())
     }
@@ -577,7 +512,7 @@ mod tests {
         let worktree = add_worktree(repo, "main", BranchType::Normal)?;
 
         // Verify main is not considered merged into itself
-        assert_eq!(worktree.is_merged_into("main")?, false);
+        assert!(!(worktree.is_merged_into("main")?));
 
         Ok(())
     }
@@ -596,7 +531,7 @@ mod tests {
         let worktree = add_worktree(repo, "detached", BranchType::Detached)?;
 
         // Verify detached HEAD returns false
-        assert_eq!(worktree.is_merged_into("main")?, false);
+        assert!(!(worktree.is_merged_into("main")?));
 
         Ok(())
     }
@@ -678,51 +613,19 @@ mod tests {
 
     #[test]
     fn test_remote_with_upstream() -> Result<(), Box<dyn std::error::Error>> {
-        use std::process::Command;
-
         // Create a bare "origin" repository
         let origin_fixture = FixtureBuilder::new()
             .bare(true)
             .default_branch("main")
             .build()?;
 
-        let origin_path = origin_fixture.cwd()?;
-
-        // Create a local bare repo and add origin as remote
+        // Create a local bare repo with origin remote and upsream configured
         let local_fixture = FixtureBuilder::new()
             .bare(true)
             .default_branch("main")
+            .remote("origin", &origin_fixture)
+            .upstream("main", "origin/main")
             .build()?;
-
-        let local_path = local_fixture.cwd()?;
-
-        // Add origin remote
-        Command::new("git")
-            .args([
-                "-C",
-                local_path.to_str().unwrap(),
-                "remote",
-                "add",
-                "origin",
-                origin_path.to_str().unwrap(),
-            ])
-            .output()?;
-
-        // Fetch from origin
-        Command::new("git")
-            .args(["-C", local_path.to_str().unwrap(), "fetch", "origin"])
-            .output()?;
-
-        // Set upstream for main branch
-        Command::new("git")
-            .args([
-                "-C",
-                local_path.to_str().unwrap(),
-                "branch",
-                "--set-upstream-to=origin/main",
-                "main",
-            ])
-            .output()?;
 
         let repo = local_fixture.repo()?;
 
@@ -775,51 +678,19 @@ mod tests {
 
     #[test]
     fn test_remote_branch_with_upstream() -> Result<(), Box<dyn std::error::Error>> {
-        use std::process::Command;
-
         // Create a bare "origin" repository
         let origin_fixture = FixtureBuilder::new()
             .bare(true)
             .default_branch("main")
             .build()?;
 
-        let origin_path = origin_fixture.cwd()?;
-
-        // Create a local bare repo and add origin as remote
+        // Create a local bare repo with origin remote and upstream configured
         let local_fixture = FixtureBuilder::new()
             .bare(true)
             .default_branch("main")
+            .remote("origin", &origin_fixture)
+            .upstream("main", "origin/main")
             .build()?;
-
-        let local_path = local_fixture.cwd()?;
-
-        // Add origin remote
-        Command::new("git")
-            .args([
-                "-C",
-                local_path.to_str().unwrap(),
-                "remote",
-                "add",
-                "origin",
-                origin_path.to_str().unwrap(),
-            ])
-            .output()?;
-
-        // Fetch from origin
-        Command::new("git")
-            .args(["-C", local_path.to_str().unwrap(), "fetch", "origin"])
-            .output()?;
-
-        // Set upstream for main branch
-        Command::new("git")
-            .args([
-                "-C",
-                local_path.to_str().unwrap(),
-                "branch",
-                "--set-upstream-to=origin/main",
-                "main",
-            ])
-            .output()?;
 
         let repo = local_fixture.repo()?;
 
@@ -861,8 +732,6 @@ mod tests {
 
     #[test]
     fn test_remote_url_with_upstream() -> Result<(), Box<dyn std::error::Error>> {
-        use std::process::Command;
-
         // Create a bare "origin" repository
         let origin_fixture = FixtureBuilder::new()
             .bare(true)
@@ -871,41 +740,13 @@ mod tests {
 
         let origin_path = origin_fixture.cwd()?;
 
-        // Create a local bare repo and add origin as remote
+        // Create a local bare repo with origin remote and upstream configured
         let local_fixture = FixtureBuilder::new()
             .bare(true)
             .default_branch("main")
+            .remote("origin", &origin_fixture)
+            .upstream("main", "origin/main")
             .build()?;
-
-        let local_path = local_fixture.cwd()?;
-
-        // Add origin remote
-        Command::new("git")
-            .args([
-                "-C",
-                local_path.to_str().unwrap(),
-                "remote",
-                "add",
-                "origin",
-                origin_path.to_str().unwrap(),
-            ])
-            .output()?;
-
-        // Fetch from origin
-        Command::new("git")
-            .args(["-C", local_path.to_str().unwrap(), "fetch", "origin"])
-            .output()?;
-
-        // Set upstream for main branch
-        Command::new("git")
-            .args([
-                "-C",
-                local_path.to_str().unwrap(),
-                "branch",
-                "--set-upstream-to=origin/main",
-                "main",
-            ])
-            .output()?;
 
         let repo = local_fixture.repo()?;
 
