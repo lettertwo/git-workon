@@ -572,4 +572,156 @@ mod fixture_builder {
 
         Ok(())
     }
+
+    #[test]
+    fn with_remote() -> Result<(), Box<dyn std::error::Error>> {
+        // Create origin repository
+        let origin = FixtureBuilder::new().bare(true).build()?;
+
+        // Create local repository with remote
+        let local = FixtureBuilder::new()
+            .bare(true)
+            .remote("origin", &origin)
+            .build()?;
+
+        let repo = local.repo.as_ref().unwrap();
+
+        // Verify remote exists
+        repo.assert(predicate::repo::has_remote("origin"));
+        repo.assert(predicate::repo::has_remote_url(
+            "origin",
+            Some(origin.path.as_ref().unwrap().to_str().unwrap()),
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn with_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        // Create origin repository
+        let origin = FixtureBuilder::new().bare(true).build()?;
+
+        // Create local repository with remote and upstream tracking
+        let local = FixtureBuilder::new()
+            .bare(true)
+            .remote("origin", &origin)
+            .upstream("main", "origin/main")
+            .build()?;
+
+        let repo = local.repo.as_ref().unwrap();
+
+        // Verify remote exists
+        repo.assert(predicate::repo::has_remote("origin"));
+
+        // Verify upstream is configured
+        repo.assert(predicate::repo::has_upstream("main", Some("origin/main")));
+
+        // Verify remote tracking ref was created
+        repo.assert(predicate::repo::has_remote_branch("origin/main"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_add_remote() -> Result<(), Box<dyn std::error::Error>> {
+        let origin = FixtureBuilder::new().bare(true).build()?;
+        let local = FixtureBuilder::new().bare(true).build()?;
+
+        // Add remote after fixture creation
+        local.add_remote("origin", origin.path.as_ref().unwrap().to_str().unwrap())?;
+
+        let repo = local.repo.as_ref().unwrap();
+        repo.assert(predicate::repo::has_remote("origin"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_create_remote_ref() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new().bare(true).build()?;
+
+        let repo = fixture.repo.as_ref().unwrap();
+        let commit_oid = repo.head()?.peel_to_commit()?.id();
+
+        // Create remote ref
+        fixture.create_remote_ref("origin/main", commit_oid)?;
+
+        // Verify remote ref exists
+        repo.assert(predicate::repo::has_remote_branch("origin/main"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_set_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        let origin = FixtureBuilder::new().bare(true).build()?;
+        let fixture = FixtureBuilder::new().bare(true).build()?;
+
+        let repo = fixture.repo.as_ref().unwrap();
+        let commit_oid = repo.head()?.peel_to_commit()?.id();
+
+        // Add remote first
+        fixture.add_remote("origin", origin.path.as_ref().unwrap().to_str().unwrap())?;
+
+        // Create remote ref
+        fixture.create_remote_ref("origin/main", commit_oid)?;
+
+        // Set upstream
+        fixture.set_upstream("main", "origin/main")?;
+
+        // Verify upstream is configured
+        repo.assert(predicate::repo::has_upstream("main", Some("origin/main")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_commit_builder() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
+
+        // Create a commit with multiple files
+        let commit_oid = fixture
+            .commit("main")
+            .file("file1.txt", "content1")
+            .file("file2.txt", "content2")
+            .create("Add two files")?;
+
+        let repo = fixture.repo.as_ref().unwrap();
+
+        // Verify commit was created
+        let commit = repo.find_commit(commit_oid)?;
+        assert_eq!(commit.message(), Some("Add two files"));
+        assert_eq!(commit.parent_count(), 1);
+
+        // Verify files exist in the commit tree
+        let tree = commit.tree()?;
+        assert!(tree.get_name("file1.txt").is_some());
+        assert!(tree.get_name("file2.txt").is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_update_branch() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
+
+        // Create a commit
+        let commit_oid = fixture
+            .commit("main")
+            .file("test.txt", "content")
+            .create("Test commit")?;
+
+        // Create a new branch pointing to initial commit
+        let repo = fixture.repo.as_ref().unwrap();
+        let initial_commit = repo.head()?.peel_to_commit()?.parent(0)?.id();
+        repo.branch("feature", &repo.find_commit(initial_commit)?, false)?;
+
+        // Update feature branch to point to new commit
+        fixture.update_branch("feature", commit_oid)?;
+
+        // Verify branch points to the new commit
+        repo.assert(predicate::repo::branch_points_to("feature", commit_oid));
+
+        Ok(())
+    }
 }

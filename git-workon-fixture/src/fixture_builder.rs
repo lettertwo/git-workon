@@ -2,12 +2,50 @@ use crate::fixture::Fixture;
 use assert_fs::TempDir;
 use git2::{BranchType, Repository, WorktreeAddOptions};
 use miette::{IntoDiagnostic, Result};
+use std::path::PathBuf;
 use workon::empty_commit;
+
+/// Represents a remote URL source
+pub enum RemoteSource {
+    /// Path to another repository (from a Fixture)
+    Path(PathBuf),
+    /// URL string
+    Url(String),
+}
+
+impl From<&Fixture> for RemoteSource {
+    fn from(fixture: &Fixture) -> Self {
+        RemoteSource::Path(fixture.path.as_ref().unwrap().clone())
+    }
+}
+
+impl From<&str> for RemoteSource {
+    fn from(s: &str) -> Self {
+        RemoteSource::Url(s.to_string())
+    }
+}
+
+impl From<String> for RemoteSource {
+    fn from(s: String) -> Self {
+        RemoteSource::Url(s)
+    }
+}
+
+impl RemoteSource {
+    fn as_url(&self) -> String {
+        match self {
+            RemoteSource::Path(p) => p.to_string_lossy().to_string(),
+            RemoteSource::Url(s) => s.clone(),
+        }
+    }
+}
 
 pub struct FixtureBuilder<'fixture> {
     bare: bool,
     default_branch: &'fixture str,
     worktree: Option<&'fixture str>,
+    remotes: Vec<(String, RemoteSource)>,
+    upstreams: Vec<(String, String)>, // (local_branch, remote_branch)
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -16,6 +54,8 @@ impl<'fixture> FixtureBuilder<'fixture> {
             bare: false,
             default_branch: "main",
             worktree: None,
+            remotes: Vec::new(),
+            upstreams: Vec::new(),
         }
     }
 
@@ -31,6 +71,20 @@ impl<'fixture> FixtureBuilder<'fixture> {
 
     pub fn worktree(mut self, worktree: &'fixture str) -> Self {
         self.worktree = Some(worktree);
+        self
+    }
+
+    /// Add a remote to the repository
+    pub fn remote(mut self, name: &str, source: impl Into<RemoteSource>) -> Self {
+        self.remotes.push((name.to_string(), source.into()));
+        self
+    }
+
+    /// Configure upstream tracking for a branch
+    /// The remote branch will be created automatically at the current branch HEAD
+    pub fn upstream(mut self, branch: &str, remote_branch: &str) -> Self {
+        self.upstreams
+            .push((branch.to_string(), remote_branch.to_string()));
         self
     }
 
@@ -74,6 +128,41 @@ impl<'fixture> FixtureBuilder<'fixture> {
                         .into_diagnostic()?;
                 }
             }
+        }
+
+        // Apply remotes
+        for (name, source) in &self.remotes {
+            repo.remote(name, &source.as_url()).into_diagnostic()?;
+        }
+
+        // Apply upstreams
+        for (branch, remote_branch) in &self.upstreams {
+            // Get the current commit of the local branch
+            let local_branch = repo
+                .find_branch(branch, BranchType::Local)
+                .into_diagnostic()?;
+            let commit_oid = local_branch
+                .get()
+                .target()
+                .ok_or_else(|| miette::miette!("Branch {} has no target", branch))?;
+
+            // Create the remote tracking ref at the same commit
+            let remote_ref = if remote_branch.starts_with("refs/") {
+                remote_branch.clone()
+            } else {
+                format!("refs/remotes/{}", remote_branch)
+            };
+
+            repo.reference(&remote_ref, commit_oid, false, "create remote ref")
+                .into_diagnostic()?;
+
+            // Set upstream tracking
+            let mut local_branch = repo
+                .find_branch(branch, BranchType::Local)
+                .into_diagnostic()?;
+            local_branch
+                .set_upstream(Some(remote_branch))
+                .into_diagnostic()?;
         }
 
         match self.worktree {
