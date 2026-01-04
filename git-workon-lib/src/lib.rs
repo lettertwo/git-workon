@@ -1,4 +1,5 @@
 mod clone;
+mod config;
 mod convert_to_bare;
 mod default_branch;
 mod empty_commit;
@@ -9,6 +10,7 @@ mod workon_root;
 mod worktree;
 
 pub use crate::clone::*;
+pub use crate::config::*;
 pub use crate::convert_to_bare::*;
 pub use crate::default_branch::*;
 pub use crate::empty_commit::*;
