@@ -49,6 +49,7 @@ pub struct FixtureBuilder<'fixture> {
     worktrees: Vec<&'fixture str>,
     remotes: Vec<(String, RemoteSource)>,
     upstreams: Vec<(String, String)>, // (local_branch, remote_branch)
+    configs: Vec<(String, String)>,   // (key, value) for git config
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -59,6 +60,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
             worktrees: Vec::new(),
             remotes: Vec::new(),
             upstreams: Vec::new(),
+            configs: Vec::new(),
         }
     }
 
@@ -94,6 +96,13 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Set a git config value in the repository
+    /// Can be called multiple times with the same key for multi-value configs
+    pub fn config(mut self, key: &str, value: &str) -> Self {
+        self.configs.push((key.to_string(), value.to_string()));
+        self
+    }
+
     pub fn build(self) -> Result<Fixture> {
         let tmpdir = TempDir::new().into_diagnostic()?;
         let path = tmpdir.path().join(if self.bare {
@@ -116,6 +125,13 @@ impl<'fixture> FixtureBuilder<'fixture> {
         config
             .set_str("user.email", "git-workon-fixture@fake.com")
             .into_diagnostic()?;
+
+        // Apply custom configs
+        for (key, value) in &self.configs {
+            // Use set_multivar to support multi-value configs
+            // The regex "^$" matches nothing, so this always adds a new value
+            config.set_multivar(key, "^$", value).into_diagnostic()?;
+        }
 
         empty_commit(&repo)?;
 
