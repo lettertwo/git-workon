@@ -10,6 +10,8 @@ use super::Run;
 impl Run for Prune {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let repo = get_repo(None)?;
+        let config = workon::WorkonConfig::new(&repo)?;
+        let protected_patterns = config.prune_protected_branches()?;
         let worktrees = get_worktrees(&repo)?;
 
         // Find worktrees that should be pruned (with their descriptors for safety checks)
@@ -87,6 +89,15 @@ impl Run for Prune {
         let to_prune: Vec<PruneCandidate> = candidates
             .into_iter()
             .filter_map(|(wt, candidate)| {
+                // Check if branch is protected
+                if is_protected(&candidate.branch_name, &protected_patterns) {
+                    skipped.push((
+                        candidate,
+                        "protected by workon.pruneProtectedBranches".to_string(),
+                    ));
+                    return None;
+                }
+
                 // Never prune the default worktree
                 match get_default_branch(&repo).ok() {
                     Some(branch) if candidate.branch_name == branch => {
@@ -263,4 +274,45 @@ fn prune_worktree(repo: &git2::Repository, candidate: &PruneCandidate) -> Result
 
     println!("  Pruned worktree: {}", candidate.worktree_path.display());
     Ok(())
+}
+
+/// Check if a branch name matches any of the protection patterns
+fn is_protected(branch_name: &str, patterns: &[String]) -> bool {
+    for pattern in patterns {
+        if glob_match(pattern, branch_name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Simple glob pattern matching supporting * and ? wildcards
+fn glob_match(pattern: &str, text: &str) -> bool {
+    // Exact match
+    if pattern == text {
+        return true;
+    }
+
+    // Match all
+    if pattern == "*" {
+        return true;
+    }
+
+    // Prefix match with wildcard (e.g., "release/*")
+    if pattern.ends_with("/*") {
+        let prefix = &pattern[..pattern.len() - 2];
+        return text.starts_with(prefix)
+            && text.len() > prefix.len()
+            && text[prefix.len()..].starts_with('/');
+    }
+
+    // Suffix match with wildcard (e.g., "*/branch")
+    if pattern.starts_with("*/") {
+        let suffix = &pattern[2..];
+        return text.ends_with(suffix)
+            && text.len() > suffix.len()
+            && text[..text.len() - suffix.len()].ends_with('/');
+    }
+
+    false
 }

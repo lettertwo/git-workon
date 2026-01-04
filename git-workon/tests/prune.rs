@@ -557,3 +557,192 @@ fn prune_merged_with_specific_target() -> Result<(), Box<dyn std::error::Error>>
 
     Ok(())
 }
+
+#[test]
+fn prune_skips_protected_branch_exact_match() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("develop")
+        .config("workon.pruneProtectedBranches", "develop")
+        .build()?;
+
+    let develop_dir = fixture.cwd()?;
+    develop_dir.assert(predicate::path::is_dir());
+
+    // Delete the develop branch to make it a prune candidate
+    let repo = fixture.repo()?;
+    repo.find_reference("refs/heads/develop")?.delete()?;
+
+    // Run prune - should skip protected branch
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped"))
+        .stdout(predicate::str::contains(
+            "protected by workon.pruneProtectedBranches",
+        ));
+
+    // Verify worktree still exists
+    develop_dir.assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_skips_protected_branch_with_glob_pattern() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.pruneProtectedBranches", "release/*")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    // Manually create worktrees with slashes using add_worktree
+    use workon::{add_worktree, BranchType};
+    add_worktree(repo, "release/1.0", BranchType::Normal)?;
+    add_worktree(repo, "release/2.0", BranchType::Normal)?;
+    add_worktree(repo, "feature/test", BranchType::Normal)?;
+
+    // Delete all branches to make them prune candidates
+    repo.find_reference("refs/heads/release/1.0")?.delete()?;
+    repo.find_reference("refs/heads/release/2.0")?.delete()?;
+    repo.find_reference("refs/heads/feature/test")?.delete()?;
+
+    // Run prune - should skip release/* but prune feature/test
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped"))
+        .stdout(predicate::str::contains("release/1.0"))
+        .stdout(predicate::str::contains("release/2.0"))
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify release worktrees still exist
+    fixture
+        .root()?
+        .child("release/1.0")
+        .assert(predicate::path::is_dir());
+    fixture
+        .root()?
+        .child("release/2.0")
+        .assert(predicate::path::is_dir());
+
+    // Verify feature worktree is gone
+    fixture
+        .root()?
+        .child("feature/test")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_respects_multiple_protected_patterns() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("develop")
+        .worktree("staging")
+        .config("workon.pruneProtectedBranches", "develop")
+        .config("workon.pruneProtectedBranches", "staging")
+        .config("workon.pruneProtectedBranches", "release/*")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    // Manually create worktrees with slashes using add_worktree
+    use workon::{add_worktree, BranchType};
+    add_worktree(repo, "release/1.0", BranchType::Normal)?;
+    add_worktree(repo, "feature/test", BranchType::Normal)?;
+
+    // Delete all branches to make them prune candidates
+    repo.find_reference("refs/heads/develop")?.delete()?;
+    repo.find_reference("refs/heads/staging")?.delete()?;
+    repo.find_reference("refs/heads/release/1.0")?.delete()?;
+    repo.find_reference("refs/heads/feature/test")?.delete()?;
+
+    // Run prune - should skip all protected branches but prune feature/test
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped"))
+        .stdout(predicate::str::contains("develop"))
+        .stdout(predicate::str::contains("staging"))
+        .stdout(predicate::str::contains("release/1.0"))
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify protected worktrees still exist
+    fixture
+        .root()?
+        .child("develop")
+        .assert(predicate::path::is_dir());
+    fixture
+        .root()?
+        .child("staging")
+        .assert(predicate::path::is_dir());
+    fixture
+        .root()?
+        .child("release/1.0")
+        .assert(predicate::path::is_dir());
+
+    // Verify feature worktree is gone
+    fixture
+        .root()?
+        .child("feature/test")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_without_protected_config_prunes_all_candidates() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-1")
+        .worktree("feature-2")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    // Delete both branches
+    repo.find_reference("refs/heads/feature-1")?.delete()?;
+    repo.find_reference("refs/heads/feature-2")?.delete()?;
+
+    // Run prune without any protection config - should prune both
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 2 worktree"));
+
+    // Verify both worktrees are gone
+    fixture
+        .root()?
+        .child("feature-1")
+        .assert(predicate::path::missing());
+    fixture
+        .root()?
+        .child("feature-2")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
