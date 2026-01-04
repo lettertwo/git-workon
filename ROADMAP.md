@@ -8,46 +8,55 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 ### Implemented ✅
 
-- **Core Commands**: `clone`, `init`, `list`, `new` (with name), `find` (with name), `prune`
-- **Prune Features**: `--gone`, `--merged`, `--dry-run`, safety checks with `--allow-dirty`/`--allow-unpushed`
+- **Core Commands**: `clone`, `init`, `list`, `new` (with name and `--base` flag), `find` (with name), `prune`
+- **Prune Features**: `--gone`, `--merged`, `--dry-run`, safety checks with `--allow-dirty`/`--allow-unpushed`, protected branches
 - **Branch Types**: Normal branches, orphan branches (with initial commit), detached HEAD
 - **Features**: Bare repo + worktrees pattern, namespace support (slashes in branch names)
 - **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged detection
-- **Testing**: Comprehensive test suite for core functionality
+- **Configuration System**: Git config support with 6 config keys, CLI override precedence, validation
+- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates
 
 ### Not Implemented ❌
 
 - **Commands**: `copy-untracked`, `move`, `doctor`
 - **Interactive Modes**: `find` and `new` without arguments, fuzzy matching
-- **Configuration System**: Git config support for defaults and automation
-- **Post-Creation Hooks**: Automatic command execution
+- **Post-Creation Hooks**: Automatic command execution (config defined but not executed)
 - **Shell Integration**: Fast directory switching like zoxide
 
 ---
 
-## Phase 1: Configuration Foundation
+## Phase 1: Configuration Foundation ✅
 
+**Status**: Completed
 **Goal**: Establish git config as foundation for automation and defaults
 
-### 1.1 Configuration System
+### 1.1 Configuration System ✅
 
 - **Priority**: High
 - **Philosophy**: Use git config exclusively (no custom config files)
 - **Description**: Support configuration via standard git config mechanisms
 - **Tasks**:
-  - [ ] Define configuration schema and naming conventions
-  - [ ] Implement config reading from global (~/.gitconfig) and local (.git/config)
-  - [ ] Add `workon.defaultBranch` - default base branch for new worktrees
-  - [ ] Add `workon.postCreateHook` - commands to run after worktree creation (multi-value, convenience alternative to git's post-checkout hook)
-  - [ ] Add `workon.copyPattern` - glob patterns for automatic file copying (multi-value)
-  - [ ] Add `workon.copyExclude` - patterns to exclude from copying (multi-value)
-  - [ ] Add `workon.pruneProtectedBranches` - branches to protect from prune (multi-value)
-  - [ ] Add `workon.prFormat` - format string for PR-based worktree names
-  - [ ] Implement config precedence: CLI args > local config > global config > defaults
-  - [ ] Add validation with helpful error messages for invalid config
-  - [ ] Consider `git workon config` command for interactive config management
-  - [ ] Document all configuration options with examples
-  - [ ] Write tests for config parsing, precedence, and validation
+  - [x] Define configuration schema and naming conventions
+  - [x] Implement config reading from global (~/.gitconfig) and local (.git/config)
+  - [x] Add `workon.defaultBranch` - default base branch for new worktrees
+  - [x] Add `workon.postCreateHook` - commands to run after worktree creation (multi-value, convenience alternative to git's post-checkout hook)
+  - [x] Add `workon.copyPattern` - glob patterns for automatic file copying (multi-value)
+  - [x] Add `workon.copyExclude` - patterns to exclude from copying (multi-value)
+  - [x] Add `workon.pruneProtectedBranches` - branches to protect from prune (multi-value)
+  - [x] Add `workon.prFormat` - format string for PR-based worktree names
+  - [x] Implement config precedence: CLI args > local config > global config > defaults
+  - [x] Add validation with helpful error messages for invalid config
+  - [x] Write tests for config parsing, precedence, and validation
+
+**Implementation Notes**:
+- Core config module with `WorkonConfig` struct and lifetime management
+- 6 config methods with CLI override support
+- Multi-value config support using `config.multivar()`
+- Simple glob pattern matching for protected branches (exact match, `*`, and `prefix/*`)
+- Integrated `workon.defaultBranch` into `new` command with `--base` flag
+- Integrated `workon.pruneProtectedBranches` into `prune` command
+- Extended test infrastructure with FixtureBuilder `.config()` method and `has_config_multivar` predicate
+- 12 unit tests for config module + integration tests for prune and new commands
 
 **Configuration Examples**:
 
@@ -140,20 +149,28 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [ ] Skip files already present in destination
   - [ ] Write tests for pattern matching and copy operations
 
-### 2.3 Protected Branches
+### 2.3 Protected Branches ✅
 
+- **Status**: Completed (implemented in Phase 1)
 - **Priority**: Medium
 - **Description**: Prevent accidental pruning of critical branches
 - **Depends On**: Configuration System (1.1)
 - **Enhancement To**: Prune command (already implemented)
 - **Tasks**:
-  - [ ] Read `workon.pruneProtectedBranches` config (glob patterns)
-  - [ ] Never prune worktrees for branches matching protected patterns
-  - [ ] Show warning when protected branch would be pruned
-  - [ ] Require `--force` to override protection
-  - [ ] Default patterns to suggest: `main`, `master`, `develop`, `release/*`
-  - [ ] Document protection patterns in man page
-  - [ ] Write tests for protected branch detection
+  - [x] Read `workon.pruneProtectedBranches` config (glob patterns)
+  - [x] Never prune worktrees for branches matching protected patterns
+  - [x] Show warning when protected branch would be pruned
+  - [x] Write tests for protected branch detection
+
+**Implementation Notes**:
+- Integrated into prune command during Phase 1
+- Simple glob matching: exact match, `*` wildcard, and `prefix/*` patterns
+- Protected branches are skipped and shown in "Skipped" output
+- 4 integration tests covering exact match, glob patterns, and multiple patterns
+
+**Future Enhancements** (moved to Phase 5):
+- Add `--force` flag to override protection
+- Suggest default protection patterns in documentation
 
 ---
 
@@ -315,14 +332,31 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [ ] Include branch status details (ahead/behind, remote)
   - [ ] Add status indicators (symbols/colors for dirty, ahead, behind)
   - [ ] Support `--porcelain` for stable script-friendly output
+  - [ ] Add `--force` flag to prune command to override protection (deferred from Phase 2.3)
 
-### 5.3 Documentation
+### 5.3 Interactive Configuration Management
+
+- **Priority**: Low
+- **Description**: Interactive command for managing git-workon configuration
+- **Depends On**: Configuration System (Phase 1, completed)
+- **Tasks**:
+  - [ ] Implement `git workon config` command
+  - [ ] Interactive prompts for setting common config keys
+  - [ ] Show current config values
+  - [ ] Validate input before writing to git config
+  - [ ] Support both global and local config scopes
+  - [ ] Provide helpful examples and defaults for each setting
+  - [ ] Write tests for interactive config flows
+
+### 5.4 Documentation
 
 - **Priority**: Medium
 - **Tasks**:
   - [ ] Write comprehensive user guide
   - [ ] Add workflow examples (PR review, feature development, etc.)
-  - [ ] Document all configuration options with examples
+  - [x] Document configuration schema and keys (completed in Phase 1 implementation notes)
+  - [ ] Document all configuration options with detailed examples and use cases
+  - [ ] Document protected branch patterns with recommended defaults (deferred from Phase 2.3)
   - [ ] Create troubleshooting guide
   - [ ] Add architecture documentation for contributors
   - [ ] Document security considerations (hooks, PR fetching)

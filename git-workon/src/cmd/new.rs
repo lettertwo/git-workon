@@ -38,6 +38,11 @@ impl Run for New {
             }
         };
         let repo = get_repo(None)?;
+        let config = workon::WorkonConfig::new(&repo)?;
+
+        // Get base branch with precedence: CLI arg > config > None
+        let base_branch = config.default_branch(self.base.as_deref())?;
+
         let branch_type = if self.orphan {
             BranchType::Orphan
         } else if self.detach {
@@ -45,6 +50,6 @@ impl Run for New {
         } else {
             BranchType::Normal
         };
-        add_worktree(&repo, name, branch_type).map(Some)
+        add_worktree(&repo, name, branch_type, base_branch.as_deref()).map(Some)
     }
 }

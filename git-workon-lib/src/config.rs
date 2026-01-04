@@ -104,16 +104,14 @@ impl<'repo> WorkonConfig<'repo> {
         let config = self.repo.config().into_diagnostic()?;
         let mut values = Vec::new();
 
-        match config.multivar(key, None) {
-            Ok(mut entries) => {
-                while let Some(entry) = entries.next() {
-                    let entry = entry.into_diagnostic()?;
-                    if let Some(value) = entry.value() {
-                        values.push(value.to_string());
-                    }
+        // Key doesn't exist, return empty vec
+        if let Ok(mut entries) = config.multivar(key, None) {
+            while let Some(entry) = entries.next() {
+                let entry = entry.into_diagnostic()?;
+                if let Some(value) = entry.value() {
+                    values.push(value.to_string());
                 }
             }
-            Err(_) => {} // Key doesn't exist, return empty vec
         }
 
         Ok(values)

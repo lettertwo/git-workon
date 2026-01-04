@@ -299,16 +299,14 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     }
 
     // Prefix match with wildcard (e.g., "release/*")
-    if pattern.ends_with("/*") {
-        let prefix = &pattern[..pattern.len() - 2];
+    if let Some(prefix) = pattern.strip_suffix("/*") {
         return text.starts_with(prefix)
             && text.len() > prefix.len()
             && text[prefix.len()..].starts_with('/');
     }
 
     // Suffix match with wildcard (e.g., "*/branch")
-    if pattern.starts_with("*/") {
-        let suffix = &pattern[2..];
+    if let Some(suffix) = pattern.strip_prefix("*/") {
         return text.ends_with(suffix)
             && text.len() > suffix.len()
             && text[..text.len() - suffix.len()].ends_with('/');

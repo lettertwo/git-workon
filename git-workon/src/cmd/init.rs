@@ -12,6 +12,6 @@ impl Run for Init {
         let path = self.path.clone().unwrap_or_else(|| PathBuf::from("."));
         let repo = init(path)?;
         let default_branch = get_default_branch_name(&repo, None)?;
-        add_worktree(&repo, &default_branch, BranchType::default()).map(Some)
+        add_worktree(&repo, &default_branch, BranchType::default(), None).map(Some)
     }
 }

@@ -394,6 +394,7 @@ pub fn add_worktree(
     repo: &Repository,
     branch_name: &str,
     branch_type: BranchType,
+    base_branch: Option<&str>,
 ) -> Result<WorktreeDescriptor> {
     // git worktree add <branch>
     debug!(
@@ -429,8 +430,26 @@ pub fn add_worktree(
                 .ok()
                 .unwrap_or_else(|| {
                     debug!("creating new local branch {:?}", branch_name);
-                    let commit = repo.head().unwrap().peel_to_commit().unwrap();
-                    repo.branch(branch_name, &commit, false)
+
+                    // Determine which commit to branch from
+                    let base_commit = if let Some(base) = base_branch {
+                        // Branch from specified base branch
+                        debug!("branching from base branch {:?}", base);
+                        let base_branch = repo
+                            .find_branch(base, git2::BranchType::Local)
+                            .into_diagnostic()
+                            .unwrap();
+                        base_branch
+                            .into_reference()
+                            .peel_to_commit()
+                            .into_diagnostic()
+                            .unwrap()
+                    } else {
+                        // Default: branch from HEAD
+                        repo.head().unwrap().peel_to_commit().unwrap()
+                    };
+
+                    repo.branch(branch_name, &base_commit, false)
                         .into_diagnostic()
                         .unwrap()
                 });

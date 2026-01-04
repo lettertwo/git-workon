@@ -22,6 +22,6 @@ impl Run for Clone {
 
         let repo = clone(path, &self.url)?;
         let default_branch = get_default_branch_name(&repo, repo.find_remote("origin").ok())?;
-        add_worktree(&repo, &default_branch, BranchType::default()).map(Some)
+        add_worktree(&repo, &default_branch, BranchType::default(), None).map(Some)
     }
 }

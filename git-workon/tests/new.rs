@@ -153,3 +153,154 @@ fn new_detached_worktree() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn new_uses_config_default_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("develop")
+        .config("workon.defaultBranch", "develop")
+        .build()?;
+
+    // Add a commit to develop to differentiate it from main
+    fixture
+        .commit("develop")
+        .file("develop.txt", "from develop")
+        .create("Commit on develop")?;
+
+    // Create a new worktree without specifying base - should use config default
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Verify the new worktree exists
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::is_dir());
+
+    fixture.assert(predicate::repo::has_branch("feature"));
+
+    // Verify feature branch was created from develop by checking commit ancestry
+    let repo = fixture.repo()?;
+    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
+    let feature_commit = feature_branch.get().peel_to_commit()?;
+
+    let develop_branch = repo.find_branch("develop", git2::BranchType::Local)?;
+    let develop_commit = develop_branch.get().peel_to_commit()?;
+
+    // Feature's parent should be develop's HEAD
+    assert_eq!(
+        feature_commit.id(),
+        develop_commit.id(),
+        "Feature branch should be based on develop"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_cli_base_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("develop")
+        .worktree("staging")
+        .config("workon.defaultBranch", "develop")
+        .build()?;
+
+    // Add commits to differentiate branches
+    fixture
+        .commit("develop")
+        .file("develop.txt", "from develop")
+        .create("Commit on develop")?;
+
+    fixture
+        .commit("staging")
+        .file("staging.txt", "from staging")
+        .create("Commit on staging")?;
+
+    // Create new worktree with --base flag (should override config)
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("--base")
+        .arg("staging")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Verify the new worktree exists
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::is_dir());
+
+    fixture.assert(predicate::repo::has_branch("feature"));
+
+    // Verify feature branch was created from staging (not develop)
+    let repo = fixture.repo()?;
+    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
+    let feature_commit = feature_branch.get().peel_to_commit()?;
+
+    let staging_branch = repo.find_branch("staging", git2::BranchType::Local)?;
+    let staging_commit = staging_branch.get().peel_to_commit()?;
+
+    // Feature's parent should be staging's HEAD (not develop)
+    assert_eq!(
+        feature_commit.id(),
+        staging_commit.id(),
+        "Feature branch should be based on staging (CLI override)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_without_config_uses_default_branch() -> Result<(), Box<dyn std::error::Error>> {
+    // Create a bare repo with just the main worktree
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    // Create new worktree without config (should branch from default branch)
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Verify the new worktree exists
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::is_dir());
+
+    fixture.assert(predicate::repo::has_branch("feature"));
+
+    // Verify feature branch was created from main (the default branch)
+    let repo = fixture.repo()?;
+    let feature_branch = repo.find_branch("feature", git2::BranchType::Local)?;
+    let feature_commit = feature_branch.get().peel_to_commit()?;
+
+    let main_branch = repo.find_branch("main", git2::BranchType::Local)?;
+    let main_commit = main_branch.get().peel_to_commit()?;
+
+    // Feature should be based on main (the default branch)
+    assert_eq!(
+        feature_commit.id(),
+        main_commit.id(),
+        "Feature branch should be based on main when no config"
+    );
+
+    Ok(())
+}
