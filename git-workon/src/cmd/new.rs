@@ -1,6 +1,7 @@
 use miette::Result;
 
 use crate::cli::New;
+use crate::hooks::execute_post_create_hooks;
 use workon::{add_worktree, get_repo, BranchType, WorktreeDescriptor};
 
 use super::Run;
@@ -50,6 +51,17 @@ impl Run for New {
         } else {
             BranchType::Normal
         };
-        add_worktree(&repo, name, branch_type, base_branch.as_deref()).map(Some)
+
+        let worktree = add_worktree(&repo, name, branch_type, base_branch.as_deref())?;
+
+        // Execute post-create hooks after successful worktree creation
+        if !self.no_hooks {
+            if let Err(e) = execute_post_create_hooks(&worktree, base_branch.as_deref(), &config) {
+                eprintln!("Warning: Post-create hook failed: {}", e);
+                // Continue - worktree is still valid
+            }
+        }
+
+        Ok(Some(worktree))
     }
 }

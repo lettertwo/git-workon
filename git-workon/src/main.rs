@@ -1,5 +1,6 @@
 mod cli;
 mod cmd;
+mod hooks;
 
 use clap::Parser;
 use cli::Cmd;

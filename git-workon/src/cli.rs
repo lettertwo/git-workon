@@ -37,6 +37,8 @@ pub enum Cmd {
 pub struct Clone {
     pub url: String,
     pub path: Option<PathBuf>,
+    #[arg(long, help = "Skip post-create hooks")]
+    pub no_hooks: bool,
 }
 
 /// Copy any untracked files in <from> to <to>.
@@ -66,6 +68,8 @@ pub struct CopyUntracked {
 #[derive(Debug, Args)]
 pub struct Init {
     pub path: Option<PathBuf>,
+    #[arg(long, help = "Skip post-create hooks")]
+    pub no_hooks: bool,
 }
 
 /// List worktrees.
@@ -82,6 +86,8 @@ pub struct New {
     pub orphan: bool,
     #[arg(short, long, help = "Detach HEAD in the new working tree")]
     pub detach: bool,
+    #[arg(long, help = "Skip post-create hooks")]
+    pub no_hooks: bool,
 }
 
 /// Prune stale worktrees.
