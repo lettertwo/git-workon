@@ -31,6 +31,7 @@ dialoguer.workspace = true
 env_logger.workspace = true
 git-workon-lib.workspace = true
 git2.workspace = true
+glob.workspace = true
 log.workspace = true
 miette.workspace = true
 

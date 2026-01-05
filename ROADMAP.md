@@ -8,19 +8,20 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 ### Implemented ✅
 
-- **Core Commands**: `clone`, `init`, `list`, `new` (with name and `--base` flag), `find` (with name), `prune`
+- **Core Commands**: `clone`, `init`, `list`, `new` (with name and `--base` flag), `find` (with name), `prune`, `copy-untracked`
 - **Prune Features**: `--gone`, `--merged`, `--dry-run`, safety checks with `--allow-dirty`/`--allow-unpushed`, protected branches
 - **Branch Types**: Normal branches, orphan branches (with initial commit), detached HEAD
 - **Features**: Bare repo + worktrees pattern, namespace support (slashes in branch names)
 - **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged detection
 - **Configuration System**: Git config support with 6 config keys, CLI override precedence, validation
-- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates
+- **Post-Creation Hooks**: Automatic execution of `workon.postCreateHook` commands with environment variables, `--no-hooks` flag
+- **File Copying**: Pattern-based copying with `workon.copyPattern` and `workon.copyExclude`, platform-optimized (copy-on-write), `--auto`/`--pattern`/`--force` flags
+- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (53 tests total)
 
 ### Not Implemented ❌
 
-- **Commands**: `copy-untracked`, `move`, `doctor`
+- **Commands**: `move`, `doctor`
 - **Interactive Modes**: `find` and `new` without arguments, fuzzy matching
-- **Post-Creation Hooks**: Automatic command execution (config defined but not executed)
 - **Shell Integration**: Fast directory switching like zoxide
 
 ---
@@ -80,11 +81,12 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 ---
 
-## Phase 2: Automation & Smart Defaults
+## Phase 2: Automation & Smart Defaults ✅
 
+**Status**: Completed
 **Goal**: Eliminate repetitive tasks through automation
 
-### 2.1 Post-Creation Hooks
+### 2.1 Post-Creation Hooks ✅
 
 - **Priority**: High
 - **Description**: Execute commands automatically after worktree creation
@@ -111,43 +113,66 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 - Multi-value config allows multiple commands to run sequentially
 
 - **Tasks**:
-  - [ ] Document git's native `post-checkout` hook approach as primary option
-  - [ ] Provide example post-checkout script that detects worktree creation
-  - [ ] Implement `workon.postCreateHook` config as convenience alternative
-  - [ ] Read `workon.postCreateHook` config (multi-value, executed sequentially)
-  - [ ] Execute config hooks in worktree directory after successful creation
-  - [ ] Provide environment variables to config hooks:
+  - [ ] Document git's native `post-checkout` hook approach as primary option (deferred to Phase 5.4)
+  - [ ] Provide example post-checkout script that detects worktree creation (documented in ROADMAP)
+  - [x] Implement `workon.postCreateHook` config as convenience alternative
+  - [x] Read `workon.postCreateHook` config (multi-value, executed sequentially)
+  - [x] Execute config hooks in worktree directory after successful creation
+  - [x] Provide environment variables to config hooks:
     - `WORKON_WORKTREE_PATH` - absolute path to new worktree
     - `WORKON_BRANCH_NAME` - branch name
     - `WORKON_BASE_BRANCH` - base branch (if applicable)
-  - [ ] Add `--no-hooks` flag to skip both git hooks and config hooks
-  - [ ] Respect git's native hook execution (don't interfere with post-checkout)
-  - [ ] Handle hook failures gracefully (show error, don't delete worktree)
-  - [ ] Show hook output by default, suppress with `--quiet`
-  - [ ] Add timeout protection for long-running config hooks (configurable)
-  - [ ] Document when to use post-checkout vs workon.postCreateHook
-  - [ ] Document hook execution order (git's post-checkout runs first, then config hooks)
-  - [ ] Document security implications of hook execution
-  - [ ] Write tests for config hook execution, failures, and edge cases
+  - [x] Add `--no-hooks` flag to skip both git hooks and config hooks
+  - [x] Respect git's native hook execution (don't interfere with post-checkout)
+  - [x] Handle hook failures gracefully (show error, don't delete worktree)
+  - [x] Show hook output by default, suppress with `--quiet`
+  - [ ] Add timeout protection for long-running config hooks (configurable) (deferred to Phase 5)
+  - [ ] Document when to use post-checkout vs workon.postCreateHook (deferred to Phase 5.4)
+  - [ ] Document hook execution order (git's post-checkout runs first, then config hooks) (deferred to Phase 5.4)
+  - [ ] Document security implications of hook execution (deferred to Phase 5.4)
+  - [x] Write tests for config hook execution, failures, and edge cases
 
-### 2.2 Enhanced File Copying
+**Implementation Notes**:
+- Created `git-workon/src/hooks.rs` module with `execute_post_create_hooks` function
+- Platform-specific shell execution (sh on Unix, cmd on Windows)
+- Hooks execute sequentially with progress output
+- Hook failures show warnings but don't fail worktree creation
+- Integrated into `new`, `clone`, and `init` commands
+- Added `--no-hooks` flag to all three commands
+- 8 comprehensive integration tests covering success, failure, environment variables, multiple hooks, and --no-hooks flag
+
+### 2.2 Enhanced File Copying ✅
 
 - **Priority**: Medium
 - **Description**: Pattern-based automatic file copying between worktrees
 - **Depends On**: Configuration System (1.1)
 - **Upgrade From**: Basic copy-untracked command
 - **Tasks**:
-  - [ ] Implement basic file copying between worktrees
-  - [ ] Add `--auto` flag to copy based on `workon.copyPattern` config
-  - [ ] Support glob patterns (e.g., `.env*`, `node_modules/`, `.vscode/`)
-  - [ ] Respect `workon.copyExclude` patterns
-  - [ ] Add `--pattern` flag for one-off pattern overrides
-  - [ ] Add macOS `clonefile` optimization (copy-on-write)
-  - [ ] Add Linux `cp --reflink` support
-  - [ ] Handle large file scenarios gracefully
-  - [ ] Add progress reporting for large copies
-  - [ ] Skip files already present in destination
-  - [ ] Write tests for pattern matching and copy operations
+  - [x] Implement basic file copying between worktrees
+  - [x] Add `--auto` flag to copy based on `workon.copyPattern` config
+  - [x] Support glob patterns (e.g., `.env*`, `node_modules/`, `.vscode/`)
+  - [x] Respect `workon.copyExclude` patterns
+  - [x] Add `--pattern` flag for one-off pattern overrides
+  - [x] Add macOS `clonefile` optimization (copy-on-write)
+  - [x] Add Linux `cp --reflink` support
+  - [x] Handle large file scenarios gracefully
+  - [ ] Add progress reporting for large copies (deferred to Phase 5)
+  - [x] Skip files already present in destination
+  - [x] Write tests for pattern matching and copy operations
+
+**Implementation Notes**:
+- Created `git-workon/src/copy.rs` module with platform-optimized copying
+- Uses glob crate for pattern matching (default: `**/*` for recursive copying)
+- Platform-specific optimizations:
+  - macOS: `cp -c` (clonefile/copy-on-write)
+  - Linux: `cp --reflink=auto` (copy-on-write when supported)
+  - Other: Standard `fs::copy`
+- Implemented full `copy-untracked` command with worktree path resolution
+- Added `--auto`, `--pattern`, and `--force` flags to CLI
+- Automatic parent directory creation for nested files
+- Skips directories (only copies files)
+- Respects exclusion patterns from `workon.copyExclude`
+- 8 comprehensive integration tests covering basic copying, auto mode, exclusions, pattern overrides, force flag, directory creation, and error cases
 
 ### 2.3 Protected Branches ✅
 

@@ -62,6 +62,12 @@ pub struct Clone {
 pub struct CopyUntracked {
     pub from: String,
     pub to: String,
+    #[arg(long, help = "Use configured patterns from workon.copyPattern")]
+    pub auto: bool,
+    #[arg(short, long, help = "Override patterns for one-off copy")]
+    pub pattern: Option<String>,
+    #[arg(short, long, help = "Overwrite existing files in destination")]
+    pub force: bool,
 }
 
 /// Create a new bare repository and an initial worktree.
