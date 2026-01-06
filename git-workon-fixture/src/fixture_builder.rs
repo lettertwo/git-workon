@@ -196,8 +196,10 @@ impl<'fixture> FixtureBuilder<'fixture> {
             // No worktrees specified - return the main repo
             Ok(Fixture::new(repo, path, tmpdir))
         } else {
+            // Open the repository from the worktree path instead of using the bare/main repo
             let worktree_path = tmpdir.path().join(self.worktrees.last().unwrap());
-            Ok(Fixture::new(repo, worktree_path, tmpdir))
+            let worktree_repo = Repository::open(&worktree_path)?;
+            Ok(Fixture::new(worktree_repo, worktree_path, tmpdir))
         }
     }
 }
