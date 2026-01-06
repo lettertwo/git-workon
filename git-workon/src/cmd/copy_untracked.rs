@@ -1,4 +1,4 @@
-use miette::Result;
+use miette::{Result, WrapErr};
 use workon::{get_repo, workon_root, WorkonConfig, WorktreeDescriptor};
 
 use crate::cli::CopyUntracked;
@@ -39,7 +39,9 @@ impl Run for CopyUntracked {
         let excludes = config.copy_excludes()?;
 
         // Copy files
-        let copied = copy_files(&from_path, &to_path, &patterns, &excludes, self.force)?;
+        let copied = copy_files(&from_path, &to_path, &patterns, &excludes, self.force).wrap_err(
+            format!("Failed to copy files from '{}' to '{}'", self.from, self.to),
+        )?;
 
         // Print results
         for file in &copied {
@@ -47,10 +49,8 @@ impl Run for CopyUntracked {
         }
         println!("\nCopied {} file(s)", copied.len());
 
-        // Try to return the destination worktree descriptor if possible
-        WorktreeDescriptor::new(&repo, &self.to)
-            .map(Some)
-            .or_else(|_| Ok(None))
+        // Return the destination worktree descriptor
+        Ok(Some(WorktreeDescriptor::new(&repo, &self.to)?))
     }
 }
 

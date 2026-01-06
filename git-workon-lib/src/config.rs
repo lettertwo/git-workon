@@ -1,5 +1,6 @@
 use git2::Repository;
-use miette::{IntoDiagnostic, Result};
+
+use crate::error::{ConfigError, Result};
 
 /// Configuration reader for workon settings stored in git config.
 ///
@@ -30,7 +31,7 @@ impl<'repo> WorkonConfig<'repo> {
         }
 
         // Read from git config
-        let config = self.repo.config().into_diagnostic()?;
+        let config = self.repo.config()?;
         match config.get_string("workon.defaultBranch") {
             Ok(val) => Ok(Some(val)),
             Err(_) => Ok(None), // Not configured
@@ -47,7 +48,7 @@ impl<'repo> WorkonConfig<'repo> {
         let format = if let Some(override_val) = cli_override {
             override_val.to_string()
         } else {
-            let config = self.repo.config().into_diagnostic()?;
+            let config = self.repo.config()?;
             config
                 .get_string("workon.prFormat")
                 .unwrap_or_else(|_| "pr-{number}".to_string())
@@ -55,10 +56,10 @@ impl<'repo> WorkonConfig<'repo> {
 
         // Validate format contains {number} placeholder
         if !format.contains("{number}") {
-            return Err(miette::miette!(
-                "workon.prFormat must contain {{number}} placeholder, got: {}",
-                format
-            ));
+            return Err(ConfigError::InvalidPrFormat {
+                format: format.clone(),
+            }
+            .into());
         }
 
         Ok(format)
@@ -101,13 +102,13 @@ impl<'repo> WorkonConfig<'repo> {
     ///
     /// Returns an empty Vec if the key doesn't exist.
     fn read_multivar(&self, key: &str) -> Result<Vec<String>> {
-        let config = self.repo.config().into_diagnostic()?;
+        let config = self.repo.config()?;
         let mut values = Vec::new();
 
         // Key doesn't exist, return empty vec
         if let Ok(mut entries) = config.multivar(key, None) {
             while let Some(entry) = entries.next() {
-                let entry = entry.into_diagnostic()?;
+                let entry = entry?;
                 if let Some(value) = entry.value() {
                     values.push(value.to_string());
                 }

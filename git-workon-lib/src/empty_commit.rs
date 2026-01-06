@@ -1,15 +1,17 @@
 use git2::{Oid, Repository};
-use miette::{ensure, IntoDiagnostic, Result};
+
+use crate::{error::Result, WorktreeError};
 
 pub fn empty_commit(repo: &Repository) -> Result<Oid> {
-    let sig = repo.signature().into_diagnostic()?;
-    let tree = repo
-        .find_tree({
-            let mut index = repo.index().into_diagnostic()?;
-            index.write_tree().into_diagnostic()?
-        })
-        .into_diagnostic()?;
-    ensure!(tree.is_empty(), "Expected an empty index!");
-    repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
-        .into_diagnostic()
+    let sig = repo.signature()?;
+    let tree = repo.find_tree({
+        let mut index = repo.index()?;
+        index.write_tree()?
+    })?;
+
+    if !tree.is_empty() {
+        return Err(WorktreeError::NonEmptyIndex.into());
+    }
+
+    Ok(repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])?)
 }

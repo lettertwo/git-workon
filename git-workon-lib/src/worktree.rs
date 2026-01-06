@@ -1,12 +1,11 @@
 use std::{fmt, fs::create_dir_all, path::Path};
 
-use git2::{Repository, Worktree};
-use miette::{IntoDiagnostic, Result};
-
 use git2::WorktreeAddOptions;
+use git2::{Repository, Worktree};
 use log::debug;
 
-use super::workon_root;
+use crate::error::{Result, WorktreeError};
+use crate::workon_root;
 
 /// Type of branch to create for a new worktree
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,7 +26,7 @@ pub struct WorktreeDescriptor {
 impl WorktreeDescriptor {
     pub fn new(repo: &Repository, name: &str) -> Result<Self> {
         Ok(Self {
-            worktree: repo.find_worktree(name).into_diagnostic()?,
+            worktree: repo.find_worktree(name)?,
         })
     }
 
@@ -54,18 +53,18 @@ impl WorktreeDescriptor {
         let git_dir = self.worktree.path().join(".git");
         let head_path = if git_dir.is_file() {
             // Linked worktree - read .git file to find actual git directory
-            let git_file_content = fs::read_to_string(&git_dir).into_diagnostic()?;
+            let git_file_content = fs::read_to_string(&git_dir)?;
             let git_dir_path = git_file_content
                 .strip_prefix("gitdir: ")
                 .and_then(|s| s.trim().strip_suffix('\n').or(Some(s.trim())))
-                .ok_or_else(|| miette::miette!("Invalid .git file format"))?;
+                .ok_or(WorktreeError::InvalidGitFile)?;
             Path::new(git_dir_path).join("HEAD")
         } else {
             // Main worktree
             git_dir.join("HEAD")
         };
 
-        let head_content = fs::read_to_string(&head_path).into_diagnostic()?;
+        let head_content = fs::read_to_string(&head_path)?;
 
         // HEAD file contains either:
         // - "ref: refs/heads/branch-name" for a branch
@@ -91,8 +90,8 @@ impl WorktreeDescriptor {
     /// - New untracked files
     /// - Deleted files
     pub fn is_dirty(&self) -> Result<bool> {
-        let repo = Repository::open(self.path()).into_diagnostic()?;
-        let statuses = repo.statuses(None).into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
+        let statuses = repo.statuses(None)?;
         Ok(!statuses.is_empty())
     }
 
@@ -114,7 +113,7 @@ impl WorktreeDescriptor {
         };
 
         // Open the repository (use the bare repo, not the worktree)
-        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
 
         // Find the local branch
         let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
@@ -123,7 +122,7 @@ impl WorktreeDescriptor {
         };
 
         // Check if upstream is configured via git config
-        let config = repo.config().into_diagnostic()?;
+        let config = repo.config()?;
         let remote_key = format!("branch.{}.remote", branch_name);
 
         // If no upstream is configured, there can't be unpushed commits
@@ -145,16 +144,14 @@ impl WorktreeDescriptor {
         let local_oid = branch
             .get()
             .target()
-            .ok_or_else(|| miette::miette!("Could not get local branch target"))?;
+            .ok_or(WorktreeError::NoLocalBranchTarget)?;
         let upstream_oid = upstream
             .get()
             .target()
-            .ok_or_else(|| miette::miette!("Could not get upstream branch target"))?;
+            .ok_or(WorktreeError::NoBranchTarget)?;
 
         // Check if local is ahead of upstream
-        let (ahead, _behind) = repo
-            .graph_ahead_behind(local_oid, upstream_oid)
-            .into_diagnostic()?;
+        let (ahead, _behind) = repo.graph_ahead_behind(local_oid, upstream_oid)?;
 
         Ok(ahead > 0)
     }
@@ -185,9 +182,9 @@ impl WorktreeDescriptor {
 
         // Open the bare repository (not the worktree) to check actual branch states
         // The worktree's .git points to the commondir (bare repo)
-        let worktree_repo = Repository::open(self.path()).into_diagnostic()?;
+        let worktree_repo = Repository::open(self.path())?;
         let commondir = worktree_repo.commondir();
-        let repo = Repository::open(commondir).into_diagnostic()?;
+        let repo = Repository::open(commondir)?;
 
         // Find the current branch
         let current_branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
@@ -205,11 +202,8 @@ impl WorktreeDescriptor {
         let current_oid = current_branch
             .get()
             .target()
-            .ok_or_else(|| miette::miette!("Could not get current branch target"))?;
-        let target_oid = target
-            .get()
-            .target()
-            .ok_or_else(|| miette::miette!("Could not get target branch target"))?;
+            .ok_or(WorktreeError::NoCurrentBranchTarget)?;
+        let target_oid = target.get().target().ok_or(WorktreeError::NoBranchTarget)?;
 
         // If they point to the same commit, the branch is merged
         if current_oid == target_oid {
@@ -218,15 +212,14 @@ impl WorktreeDescriptor {
 
         // Check if current branch's commit is reachable from target
         // This means target is a descendant of (or equal to) current
-        repo.graph_descendant_of(target_oid, current_oid)
-            .into_diagnostic()
+        Ok(repo.graph_descendant_of(target_oid, current_oid)?)
     }
 
     /// Returns the commit hash (SHA) of the worktree's current HEAD.
     ///
     /// Returns None if HEAD cannot be resolved (e.g., empty repository).
     pub fn head_commit(&self) -> Result<Option<String>> {
-        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
 
         // Try to resolve HEAD to a commit and extract the OID immediately
         let commit_oid = match repo.head() {
@@ -252,8 +245,8 @@ impl WorktreeDescriptor {
             None => return Ok(None), // Detached HEAD, no branch to check
         };
 
-        let repo = Repository::open(self.path()).into_diagnostic()?;
-        let config = repo.config().into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
+        let config = repo.config()?;
 
         // Check for branch.<name>.remote in git config
         let remote_key = format!("branch.{}.remote", branch_name);
@@ -275,7 +268,7 @@ impl WorktreeDescriptor {
             None => return Ok(None), // Detached HEAD, no branch to check
         };
 
-        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
 
         // Find the local branch and get its upstream, extracting the name immediately
         let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
@@ -307,7 +300,7 @@ impl WorktreeDescriptor {
             None => return Ok(None),
         };
 
-        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
 
         // Find the remote and extract the URL immediately
         let url = match repo.find_remote(&remote_name) {
@@ -331,7 +324,7 @@ impl WorktreeDescriptor {
             None => return Ok(None),
         };
 
-        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
 
         // Find the remote and extract the fetch URL immediately
         let url = match repo.find_remote(&remote_name) {
@@ -355,7 +348,7 @@ impl WorktreeDescriptor {
             None => return Ok(None),
         };
 
-        let repo = Repository::open(self.path()).into_diagnostic()?;
+        let repo = Repository::open(self.path())?;
 
         // Find the remote and extract the push URL (or fallback to fetch URL) immediately
         let url = match repo.find_remote(&remote_name) {
@@ -383,10 +376,12 @@ impl fmt::Display for WorktreeDescriptor {
 }
 
 pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
-    repo.worktrees()
-        .into_diagnostic()?
+    repo.worktrees()?
         .into_iter()
-        .map(|name| WorktreeDescriptor::new(repo, name.unwrap_or_default()))
+        .map(|name| {
+            let name = name.ok_or(WorktreeError::InvalidName)?;
+            WorktreeDescriptor::new(repo, name)
+        })
         .collect()
 }
 
@@ -414,45 +409,34 @@ pub fn add_worktree(
             None
         }
         BranchType::Normal => {
-            let branch = repo
-                .find_branch(branch_name, git2::BranchType::Local)
-                .into_diagnostic()
-                .or_else(|e| {
+            let branch = match repo.find_branch(branch_name, git2::BranchType::Local) {
+                Ok(b) => b,
+                Err(e) => {
                     debug!("local branch not found: {:?}", e);
                     debug!("looking for remote branch {:?}", branch_name);
-                    repo.find_branch(branch_name, git2::BranchType::Remote)
-                        .into_diagnostic()
-                        .map_err(|e| {
+                    match repo.find_branch(branch_name, git2::BranchType::Remote) {
+                        Ok(b) => b,
+                        Err(e) => {
                             debug!("remote branch not found: {:?}", e);
-                            e
-                        })
-                })
-                .ok()
-                .unwrap_or_else(|| {
-                    debug!("creating new local branch {:?}", branch_name);
+                            debug!("creating new local branch {:?}", branch_name);
 
-                    // Determine which commit to branch from
-                    let base_commit = if let Some(base) = base_branch {
-                        // Branch from specified base branch
-                        debug!("branching from base branch {:?}", base);
-                        let base_branch = repo
-                            .find_branch(base, git2::BranchType::Local)
-                            .into_diagnostic()
-                            .unwrap();
-                        base_branch
-                            .into_reference()
-                            .peel_to_commit()
-                            .into_diagnostic()
-                            .unwrap()
-                    } else {
-                        // Default: branch from HEAD
-                        repo.head().unwrap().peel_to_commit().unwrap()
-                    };
+                            // Determine which commit to branch from
+                            let base_commit = if let Some(base) = base_branch {
+                                // Branch from specified base branch
+                                debug!("branching from base branch {:?}", base);
+                                let base_branch =
+                                    repo.find_branch(base, git2::BranchType::Local)?;
+                                base_branch.into_reference().peel_to_commit()?
+                            } else {
+                                // Default: branch from HEAD
+                                repo.head()?.peel_to_commit()?
+                            };
 
-                    repo.branch(branch_name, &base_commit, false)
-                        .into_diagnostic()
-                        .unwrap()
-                });
+                            repo.branch(branch_name, &base_commit, false)?
+                        }
+                    }
+                }
+            };
 
             Some(branch.into_reference())
         }
@@ -463,7 +447,7 @@ pub fn add_worktree(
     // Git does not support worktree names with slashes in them,
     // so take the base of the branch name as the worktree name.
     let worktree_name = match Path::new(&branch_name).file_name() {
-        Some(basename) => basename.to_str().unwrap(),
+        Some(basename) => basename.to_str().ok_or(WorktreeError::InvalidName)?,
         None => branch_name,
     };
 
@@ -471,7 +455,7 @@ pub fn add_worktree(
 
     // Create parent directories if the branch name contains slashes
     if let Some(parent) = worktree_path.parent() {
-        create_dir_all(parent).into_diagnostic()?;
+        create_dir_all(parent)?;
     }
 
     let mut opts = WorktreeAddOptions::new();
@@ -485,9 +469,7 @@ pub fn add_worktree(
         worktree_path.display()
     );
 
-    let worktree = repo
-        .worktree(worktree_name, worktree_path.as_path(), Some(&opts))
-        .into_diagnostic()?;
+    let worktree = repo.worktree(worktree_name, worktree_path.as_path(), Some(&opts))?;
 
     // For detached worktrees, set HEAD to point directly to a commit SHA
     if branch_type == BranchType::Detached {
@@ -496,17 +478,13 @@ pub fn add_worktree(
         use std::fs;
 
         // Get the current HEAD commit SHA
-        let head_commit = repo
-            .head()
-            .into_diagnostic()?
-            .peel_to_commit()
-            .into_diagnostic()?;
+        let head_commit = repo.head()?.peel_to_commit()?;
         let commit_sha = head_commit.id().to_string();
 
         // Write the commit SHA directly to the worktree's HEAD file
         let git_dir = repo.path().join("worktrees").join(worktree_name);
         let head_path = git_dir.join("HEAD");
-        fs::write(&head_path, format!("{}\n", commit_sha).as_bytes()).into_diagnostic()?;
+        fs::write(&head_path, format!("{}\n", commit_sha).as_bytes())?;
 
         debug!(
             "detached HEAD setup complete for worktree {:?} at {}",
@@ -528,67 +506,62 @@ pub fn add_worktree(
         let git_dir = repo.path().join("worktrees").join(worktree_name);
         let head_path = git_dir.join("HEAD");
         let branch_ref = format!("ref: refs/heads/{}\n", branch_name);
-        fs::write(&head_path, branch_ref.as_bytes()).into_diagnostic()?;
+        fs::write(&head_path, branch_ref.as_bytes())?;
 
         // Remove any existing branch ref that libgit2 may have created
         let branch_ref_path = repo.path().join("refs/heads").join(branch_name);
         let _ = fs::remove_file(&branch_ref_path);
 
         // Open the worktree repository
-        let worktree_repo = Repository::open(&worktree_path).into_diagnostic()?;
+        let worktree_repo = Repository::open(&worktree_path)?;
 
         // Remove all files from the working directory (but keep .git)
-        for entry in fs::read_dir(&worktree_path).into_diagnostic()? {
-            let entry = entry.into_diagnostic()?;
+        for entry in fs::read_dir(&worktree_path)? {
+            let entry = entry?;
             let path = entry.path();
             if path.file_name() != Some(std::ffi::OsStr::new(".git")) {
                 if path.is_dir() {
-                    fs::remove_dir_all(&path).into_diagnostic()?;
+                    fs::remove_dir_all(&path)?;
                 } else {
-                    fs::remove_file(&path).into_diagnostic()?;
+                    fs::remove_file(&path)?;
                 }
             }
         }
 
         // Clear the index to start fresh
-        let mut index = worktree_repo.index().into_diagnostic()?;
-        index.clear().into_diagnostic()?;
-        index.write().into_diagnostic()?;
+        let mut index = worktree_repo.index()?;
+        index.clear()?;
+        index.write()?;
 
         // Create an empty tree for the initial commit
-        let tree_id = index.write_tree().into_diagnostic()?;
-        let tree = worktree_repo.find_tree(tree_id).into_diagnostic()?;
+        let tree_id = index.write_tree()?;
+        let tree = worktree_repo.find_tree(tree_id)?;
 
         // Create signature for the commit
-        let config = worktree_repo.config().into_diagnostic()?;
-        let sig = worktree_repo
-            .signature()
-            .or_else(|_| {
-                // Fallback if no git config is set
-                git2::Signature::now(
-                    config
-                        .get_string("user.name")
-                        .unwrap_or_else(|_| "git-workon".to_string())
-                        .as_str(),
-                    config
-                        .get_string("user.email")
-                        .unwrap_or_else(|_| "git-workon@localhost".to_string())
-                        .as_str(),
-                )
-            })
-            .into_diagnostic()?;
+        let config = worktree_repo.config()?;
+        let sig = worktree_repo.signature().or_else(|_| {
+            // Fallback if no git config is set
+            git2::Signature::now(
+                config
+                    .get_string("user.name")
+                    .unwrap_or_else(|_| "git-workon".to_string())
+                    .as_str(),
+                config
+                    .get_string("user.email")
+                    .unwrap_or_else(|_| "git-workon@localhost".to_string())
+                    .as_str(),
+            )
+        })?;
 
         // Create initial commit with no parents (orphan)
-        worktree_repo
-            .commit(
-                Some("HEAD"),
-                &sig,
-                &sig,
-                "Initial commit",
-                &tree,
-                &[], // No parents - this makes it an orphan
-            )
-            .into_diagnostic()?;
+        worktree_repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "Initial commit",
+            &tree,
+            &[], // No parents - this makes it an orphan
+        )?;
 
         debug!("orphan branch setup complete for {:?}", branch_name);
     }

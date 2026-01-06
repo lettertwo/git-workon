@@ -1,7 +1,7 @@
 use git2::{Direction, Remote, RemoteCallbacks, Repository};
-use miette::{bail, ensure, IntoDiagnostic, Result};
 
-use super::get_remote_callbacks;
+use crate::error::{DefaultBranchError, Result};
+use crate::get_remote_callbacks;
 
 pub struct DefaultBranch<'repo, 'cb> {
     repo: &'repo Repository,
@@ -31,24 +31,25 @@ impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
     pub fn get_name(self) -> Result<String> {
         match self.remote {
             Some(mut remote) => {
-                let mut cxn = remote
-                    .connect_auth(Direction::Fetch, self.callbacks, None)
-                    .into_diagnostic()?;
-                ensure!(cxn.connected(), "Remote is not connected");
+                let mut cxn = remote.connect_auth(Direction::Fetch, self.callbacks, None)?;
 
-                match cxn.default_branch().into_diagnostic()?.as_str() {
+                if !cxn.connected() {
+                    return Err(DefaultBranchError::NotConnected.into());
+                }
+
+                match cxn.default_branch()?.as_str() {
                     Some(default_branch) => Ok(default_branch
                         .strip_prefix("refs/heads/")
                         .unwrap_or(default_branch)
                         .to_string()),
-                    None => bail!(
-                        "Could not determine default branch for remote {:?}",
-                        cxn.remote().name()
-                    ),
+                    None => Err(DefaultBranchError::NoRemoteDefault {
+                        remote: cxn.remote().name().map(|s| s.to_string()),
+                    }
+                    .into()),
                 }
             }
             None => {
-                let config = self.repo.config().into_diagnostic()?;
+                let config = self.repo.config()?;
                 let defaultbranch = config.get_str("init.defaultbranch").unwrap_or("main");
                 Ok(defaultbranch.to_string())
             }
@@ -96,5 +97,5 @@ pub fn get_default_branch(repo: &Repository) -> Result<String> {
         return Ok("master".to_string());
     }
 
-    bail!("Could not determine default branch: neither 'main' nor 'master' exist, and init.defaultBranch is not configured")
+    Err(DefaultBranchError::NoDefaultBranch.into())
 }

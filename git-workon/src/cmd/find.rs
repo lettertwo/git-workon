@@ -1,4 +1,4 @@
-use miette::{bail, Result};
+use miette::{bail, Result, WrapErr};
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::Find;
@@ -21,8 +21,8 @@ impl Run for Find {
                 unimplemented!("Interactive find not implemented!");
             }
         };
-        let repo = get_repo(None)?;
-        let worktrees = get_worktrees(&repo)?;
+        let repo = get_repo(None).wrap_err("Failed to find git repository")?;
+        let worktrees = get_worktrees(&repo).wrap_err("Failed to list worktrees in repository")?;
         for worktree in worktrees {
             match worktree.name() {
                 // TODO: Fuzzy match on name,

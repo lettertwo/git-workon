@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use miette::Result;
+use miette::{Result, WrapErr};
 use workon::{add_worktree, clone, get_default_branch_name, BranchType, WorktreeDescriptor};
 
 use crate::cli::Clone;
@@ -21,10 +21,16 @@ impl Run for Clone {
             )
         });
 
-        let repo = clone(path, &self.url)?;
+        let repo = clone(path, &self.url)
+            .wrap_err(format!("Failed to clone repository from {}", self.url))?;
         let config = workon::WorkonConfig::new(&repo)?;
-        let default_branch = get_default_branch_name(&repo, repo.find_remote("origin").ok())?;
-        let worktree = add_worktree(&repo, &default_branch, BranchType::default(), None)?;
+        let default_branch = get_default_branch_name(&repo, repo.find_remote("origin").ok())
+            .wrap_err("Failed to determine default branch")?;
+        let worktree =
+            add_worktree(&repo, &default_branch, BranchType::default(), None).wrap_err(format!(
+                "Failed to create worktree for default branch '{}'",
+                default_branch
+            ))?;
 
         // Execute post-create hooks after successful worktree creation
         if !self.no_hooks {

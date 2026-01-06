@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use git2::Repository;
-use miette::Result;
+
+use crate::error::{Result, WorktreeError};
 
 pub fn workon_root(repo: &Repository) -> Result<&Path> {
     let path = repo.path();
@@ -19,5 +20,5 @@ pub fn workon_root(repo: &Repository) -> Result<&Path> {
         _ => {}
     }
 
-    Ok(path.parent().unwrap())
+    path.parent().ok_or(WorktreeError::NoParent.into())
 }

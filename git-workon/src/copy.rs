@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
 
 /// Copy files from source to destination using glob patterns
 ///
@@ -24,7 +24,10 @@ pub fn copy_files(
             .ok_or_else(|| miette::miette!("Invalid pattern path: {:?}", pattern_path))?;
 
         // Find all files matching the pattern
-        for entry in glob::glob(pattern_str).into_diagnostic()? {
+        for entry in glob::glob(pattern_str)
+            .into_diagnostic()
+            .wrap_err(format!("Invalid glob pattern: {}", pattern))?
+        {
             let src_file = entry.into_diagnostic()?;
 
             // Skip directories - only copy files
@@ -54,11 +57,14 @@ pub fn copy_files(
 
             // Create parent directories if needed
             if let Some(parent) = dest_file.parent() {
-                fs::create_dir_all(parent).into_diagnostic()?;
+                fs::create_dir_all(parent)
+                    .into_diagnostic()
+                    .wrap_err(format!("Failed to create directory {}", parent.display()))?;
             }
 
             // Copy the file using platform-specific optimization
-            copy_file_platform(&src_file, &dest_file)?;
+            copy_file_platform(&src_file, &dest_file)
+                .wrap_err(format!("Failed to copy {}", rel_path.display()))?;
             copied_files.push(rel_path);
         }
     }
@@ -103,13 +109,16 @@ fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
         .arg(src)
         .arg(dest)
         .status()
-        .into_diagnostic()?;
+        .into_diagnostic()
+        .wrap_err("Failed to execute cp command")?;
 
     if result.success() {
         Ok(())
     } else {
         // Fallback to standard copy
-        fs::copy(src, dest).into_diagnostic()?;
+        fs::copy(src, dest)
+            .into_diagnostic()
+            .wrap_err("Failed to copy file")?;
         Ok(())
     }
 }
@@ -122,13 +131,16 @@ fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
         .arg(src)
         .arg(dest)
         .status()
-        .into_diagnostic()?;
+        .into_diagnostic()
+        .wrap_err("Failed to execute cp command")?;
 
     if result.success() {
         Ok(())
     } else {
         // Fallback to standard copy
-        fs::copy(src, dest).into_diagnostic()?;
+        fs::copy(src, dest)
+            .into_diagnostic()
+            .wrap_err("Failed to copy file")?;
         Ok(())
     }
 }
@@ -136,6 +148,8 @@ fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
     // Use standard copy for other platforms
-    fs::copy(src, dest).into_diagnostic()?;
+    fs::copy(src, dest)
+        .into_diagnostic()
+        .wrap_err("Failed to copy file")?;
     Ok(())
 }

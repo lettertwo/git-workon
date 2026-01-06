@@ -1,4 +1,4 @@
-use miette::Result;
+use miette::{Result, WrapErr};
 
 use crate::cli::New;
 use crate::hooks::execute_post_create_hooks;
@@ -38,7 +38,7 @@ impl Run for New {
                 unimplemented!("Interactive new not implemented!");
             }
         };
-        let repo = get_repo(None)?;
+        let repo = get_repo(None).wrap_err("Failed to find git repository")?;
         let config = workon::WorkonConfig::new(&repo)?;
 
         // Get base branch with precedence: CLI arg > config > None
@@ -52,7 +52,8 @@ impl Run for New {
             BranchType::Normal
         };
 
-        let worktree = add_worktree(&repo, name, branch_type, base_branch.as_deref())?;
+        let worktree = add_worktree(&repo, name, branch_type, base_branch.as_deref())
+            .wrap_err(format!("Failed to create worktree '{}'", name))?;
 
         // Execute post-create hooks after successful worktree creation
         if !self.no_hooks {

@@ -21,6 +21,7 @@ git2.workspace = true
 git2_credentials.workspace = true
 log.workspace = true
 miette.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 assert_fs.workspace = true
