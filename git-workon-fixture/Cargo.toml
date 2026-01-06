@@ -15,5 +15,4 @@ git-workon-lib.workspace = true
 git2.workspace = true
 git2_credentials.workspace = true
 log.workspace = true
-miette.workspace = true
 predicates.workspace = true

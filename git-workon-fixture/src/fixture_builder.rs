@@ -1,9 +1,10 @@
 use crate::fixture::Fixture;
 use assert_fs::TempDir;
 use git2::{BranchType, Repository, WorktreeAddOptions};
-use miette::{IntoDiagnostic, Result};
 use std::path::PathBuf;
 use workon::empty_commit;
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Represents a remote URL source
 pub enum RemoteSource {
@@ -104,33 +105,29 @@ impl<'fixture> FixtureBuilder<'fixture> {
     }
 
     pub fn build(self) -> Result<Fixture> {
-        let tmpdir = TempDir::new().into_diagnostic()?;
+        let tmpdir = TempDir::new()?;
         let path = tmpdir.path().join(if self.bare {
             ".bare"
         } else {
             self.default_branch
         });
         let repo = if self.bare {
-            Repository::init_bare(&path).into_diagnostic()?
+            Repository::init_bare(&path)?
         } else {
-            Repository::init(&path).into_diagnostic()?
+            Repository::init(&path)?
         };
 
-        let mut config = repo.config().into_diagnostic()?;
+        let mut config = repo.config()?;
 
-        config
-            .set_str("user.name", "git-workon-fixture")
-            .into_diagnostic()?;
+        config.set_str("user.name", "git-workon-fixture")?;
 
-        config
-            .set_str("user.email", "git-workon-fixture@fake.com")
-            .into_diagnostic()?;
+        config.set_str("user.email", "git-workon-fixture@fake.com")?;
 
         // Apply custom configs
         for (key, value) in &self.configs {
             // Use set_multivar to support multi-value configs
             // The regex "^$" matches nothing, so this always adds a new value
-            config.set_multivar(key, "^$", value).into_diagnostic()?;
+            config.set_multivar(key, "^$", value)?;
         }
 
         empty_commit(&repo)?;
@@ -139,15 +136,14 @@ impl<'fixture> FixtureBuilder<'fixture> {
             .find_branch(self.default_branch, BranchType::Local)
             .is_err()
         {
-            let head = repo.head().into_diagnostic()?;
+            let head = repo.head()?;
             let head_ref = head.shorthand().unwrap_or("");
             if head_ref != self.default_branch {
                 if let Ok(mut branch) = repo.find_branch(head_ref, BranchType::Local) {
-                    branch.rename(self.default_branch, true).into_diagnostic()?;
+                    branch.rename(self.default_branch, true)?;
                 }
                 if !self.bare {
-                    repo.set_head(&format!("refs/heads/{}", self.default_branch))
-                        .into_diagnostic()?;
+                    repo.set_head(&format!("refs/heads/{}", self.default_branch))?;
                 }
             }
         }
@@ -155,35 +151,32 @@ impl<'fixture> FixtureBuilder<'fixture> {
         // Create worktrees
         for worktree in &self.worktrees {
             if *worktree == self.default_branch && !self.bare {
-                return Err(miette::miette!(
+                return Err(format!(
                         "Cannot create a worktree with the same name as the default branch ({}) in a non-bare repository",
                         self.default_branch
-                    ));
+                    ).into());
             }
 
             let worktree_path = tmpdir.path().join(worktree);
             let mut worktree_opts = WorktreeAddOptions::new();
             worktree_opts.checkout_existing(self.bare);
 
-            repo.worktree(worktree, &worktree_path, Some(&worktree_opts))
-                .into_diagnostic()?;
+            repo.worktree(worktree, &worktree_path, Some(&worktree_opts))?;
         }
 
         // Apply remotes
         for (name, source) in &self.remotes {
-            repo.remote(name, &source.as_url()).into_diagnostic()?;
+            repo.remote(name, &source.as_url())?;
         }
 
         // Apply upstreams
         for (branch, remote_branch) in &self.upstreams {
             // Get the current commit of the local branch
-            let local_branch = repo
-                .find_branch(branch, BranchType::Local)
-                .into_diagnostic()?;
+            let local_branch = repo.find_branch(branch, BranchType::Local)?;
             let commit_oid = local_branch
                 .get()
                 .target()
-                .ok_or_else(|| miette::miette!("Branch {} has no target", branch))?;
+                .ok_or_else(|| format!("Branch {} has no target", branch))?;
 
             // Create the remote tracking ref at the same commit
             let remote_ref = if remote_branch.starts_with("refs/") {
@@ -192,16 +185,11 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 format!("refs/remotes/{}", remote_branch)
             };
 
-            repo.reference(&remote_ref, commit_oid, false, "create remote ref")
-                .into_diagnostic()?;
+            repo.reference(&remote_ref, commit_oid, false, "create remote ref")?;
 
             // Set upstream tracking
-            let mut local_branch = repo
-                .find_branch(branch, BranchType::Local)
-                .into_diagnostic()?;
-            local_branch
-                .set_upstream(Some(remote_branch))
-                .into_diagnostic()?;
+            let mut local_branch = repo.find_branch(branch, BranchType::Local)?;
+            local_branch.set_upstream(Some(remote_branch))?;
         }
 
         if self.worktrees.is_empty() {

@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use assert_fs::fixture::ChildPath;
 use assert_fs::TempDir;
 use git2::{Oid, Repository};
-use miette::{bail, IntoDiagnostic, Result};
 use predicates::Predicate;
 
 use crate::assert::{FixtureAssert, IntoFixturePredicate};
+
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 pub struct Fixture {
     repo: Option<Repository>,
@@ -25,7 +26,7 @@ impl Fixture {
 
     pub fn destroy(&mut self) -> Result<()> {
         if let Some(tempdir) = self.tempdir.take() {
-            tempdir.close().into_diagnostic()?
+            tempdir.close()?
         }
         self.cwd = None;
         self.tempdir = None;
@@ -35,20 +36,14 @@ impl Fixture {
 
     /// Add a remote to the repository
     pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
-        let repo = self
-            .repo
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No repository"))?;
-        repo.remote(name, url).into_diagnostic()?;
+        let repo = self.repo.as_ref().ok_or("No repository")?;
+        repo.remote(name, url)?;
         Ok(())
     }
 
     /// Create a remote tracking reference
     pub fn create_remote_ref(&self, ref_name: &str, commit_oid: Oid) -> Result<()> {
-        let repo = self
-            .repo
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No repository"))?;
+        let repo = self.repo.as_ref().ok_or("No repository")?;
 
         // Normalize ref name - add refs/remotes/ prefix if not present
         let full_ref = if ref_name.starts_with("refs/") {
@@ -57,8 +52,7 @@ impl Fixture {
             format!("refs/remotes/{}", ref_name)
         };
 
-        repo.reference(&full_ref, commit_oid, false, "create remote ref")
-            .into_diagnostic()?;
+        repo.reference(&full_ref, commit_oid, false, "create remote ref")?;
         Ok(())
     }
 
@@ -66,13 +60,9 @@ impl Fixture {
     pub fn set_upstream(&self, branch: &str, remote_branch: &str) -> Result<()> {
         let repo = self.repo()?;
 
-        let mut local_branch = repo
-            .find_branch(branch, git2::BranchType::Local)
-            .into_diagnostic()?;
+        let mut local_branch = repo.find_branch(branch, git2::BranchType::Local)?;
 
-        local_branch
-            .set_upstream(Some(remote_branch))
-            .into_diagnostic()?;
+        local_branch.set_upstream(Some(remote_branch))?;
         Ok(())
     }
 
@@ -80,40 +70,31 @@ impl Fixture {
     pub fn update_branch(&self, branch: &str, commit_oid: Oid) -> Result<()> {
         let repo = self.repo()?;
 
-        let mut local_branch = repo
-            .find_branch(branch, git2::BranchType::Local)
-            .into_diagnostic()?;
+        let mut local_branch = repo.find_branch(branch, git2::BranchType::Local)?;
 
         local_branch
             .get_mut()
-            .set_target(commit_oid, &format!("Update {} to {}", branch, commit_oid))
-            .into_diagnostic()?;
+            .set_target(commit_oid, &format!("Update {} to {}", branch, commit_oid))?;
         Ok(())
     }
 
     pub fn cwd(&self) -> Result<ChildPath> {
-        self.cwd
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No fixture path"))
-            .map(ChildPath::new)
+        let path = self.cwd.as_ref().ok_or("No fixture path")?;
+        Ok(ChildPath::new(path))
     }
 
     pub fn root(&self) -> Result<ChildPath> {
-        self.tempdir
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No fixture root"))
-            .map(|td| ChildPath::new(td.path()))
+        let tempdir = self.tempdir.as_ref().ok_or("No fixture root")?;
+        Ok(ChildPath::new(tempdir.path()))
     }
 
     pub fn repo(&self) -> Result<&Repository> {
-        self.repo
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No repository"))
+        self.repo.as_ref().ok_or_else(|| "No repository".into())
     }
 
     pub fn head(&self) -> Result<git2::Reference> {
         let repo = self.repo()?;
-        repo.head().into_diagnostic()
+        Ok(repo.head()?)
     }
 
     /// Start building a commit in a worktree
@@ -155,8 +136,7 @@ impl FixtureAssert for Fixture {
     {
         self.repo
             .as_ref()
-            .ok_or_else(|| miette::miette!("No repository for fixture assertion"))
-            .unwrap()
+            .expect("No repository for fixture assertion")
             .assert(predicate);
         self
     }
@@ -186,11 +166,7 @@ impl<'a> CommitBuilder<'a> {
 
     /// Create the commit with the specified message
     pub fn create(self, message: &str) -> Result<Oid> {
-        let repo_path = self
-            .fixture
-            .cwd
-            .as_ref()
-            .ok_or_else(|| miette::miette!("No fixture path"))?;
+        let repo_path = self.fixture.cwd.as_ref().ok_or("No fixture path")?;
 
         // Find the worktree path
         let worktree_path =
@@ -203,10 +179,10 @@ impl<'a> CommitBuilder<'a> {
             };
 
         if !worktree_path.exists() {
-            bail!("Worktree {} does not exist", self.worktree_name);
+            return Err(format!("Worktree {} does not exist", self.worktree_name).into());
         }
 
-        let worktree_repo = Repository::open(&worktree_path).into_diagnostic()?;
+        let worktree_repo = Repository::open(&worktree_path)?;
 
         // Write all files
         for (path, content) in &self.files {
@@ -214,33 +190,28 @@ impl<'a> CommitBuilder<'a> {
 
             // Create parent directories if needed
             if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent).into_diagnostic()?;
+                std::fs::create_dir_all(parent)?;
             }
 
-            std::fs::write(&file_path, content).into_diagnostic()?;
+            std::fs::write(&file_path, content)?;
         }
 
         // Stage all files
-        let mut index = worktree_repo.index().into_diagnostic()?;
+        let mut index = worktree_repo.index()?;
         for (path, _) in &self.files {
-            index.add_path(Path::new(path)).into_diagnostic()?;
+            index.add_path(Path::new(path))?;
         }
-        index.write().into_diagnostic()?;
+        index.write()?;
 
         // Create commit
-        let tree_id = index.write_tree().into_diagnostic()?;
-        let tree = worktree_repo.find_tree(tree_id).into_diagnostic()?;
-        let sig = git2::Signature::now("Test User", "test@example.com").into_diagnostic()?;
+        let tree_id = index.write_tree()?;
+        let tree = worktree_repo.find_tree(tree_id)?;
+        let sig = git2::Signature::now("Test User", "test@example.com")?;
 
-        let parent_commit = worktree_repo
-            .head()
-            .into_diagnostic()?
-            .peel_to_commit()
-            .into_diagnostic()?;
+        let parent_commit = worktree_repo.head()?.peel_to_commit()?;
 
-        let commit_oid = worktree_repo
-            .commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent_commit])
-            .into_diagnostic()?;
+        let commit_oid =
+            worktree_repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &[&parent_commit])?;
 
         Ok(commit_oid)
     }
