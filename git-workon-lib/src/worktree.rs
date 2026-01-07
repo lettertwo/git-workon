@@ -508,15 +508,18 @@ pub fn add_worktree(
 
         use std::fs;
 
+        // Get the common directory (bare repo path) - important when running from a worktree
+        let common_dir = repo.commondir();
+
         // First, manually set HEAD to point to the new branch as a symbolic reference
         // This ensures we're not trying to update an existing branch
-        let git_dir = repo.path().join("worktrees").join(worktree_name);
+        let git_dir = common_dir.join("worktrees").join(worktree_name);
         let head_path = git_dir.join("HEAD");
         let branch_ref = format!("ref: refs/heads/{}\n", branch_name);
         fs::write(&head_path, branch_ref.as_bytes())?;
 
         // Remove any existing branch ref that libgit2 may have created
-        let branch_ref_path = repo.path().join("refs/heads").join(branch_name);
+        let branch_ref_path = common_dir.join("refs/heads").join(branch_name);
         let _ = fs::remove_file(&branch_ref_path);
 
         // Open the worktree repository
