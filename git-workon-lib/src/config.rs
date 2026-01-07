@@ -89,6 +89,26 @@ impl<'repo> WorkonConfig<'repo> {
         self.read_multivar("workon.copyExclude")
     }
 
+    /// Get whether to automatically copy untracked files when creating new worktrees.
+    ///
+    /// Precedence: CLI override > workon.autoCopyUntracked config > false
+    ///
+    /// When enabled, files matching workon.copyPattern (excluding workon.copyExclude)
+    /// will be automatically copied from the base worktree to the new worktree.
+    pub fn auto_copy_untracked(&self, cli_override: Option<bool>) -> Result<bool> {
+        // CLI takes precedence
+        if let Some(override_val) = cli_override {
+            return Ok(override_val);
+        }
+
+        // Read from git config
+        let config = self.repo.config()?;
+        match config.get_bool("workon.autoCopyUntracked") {
+            Ok(val) => Ok(val),
+            Err(_) => Ok(false), // Default to false
+        }
+    }
+
     /// Get the list of branch patterns to protect from pruning.
     ///
     /// Reads from multi-value workon.pruneProtectedBranches config.

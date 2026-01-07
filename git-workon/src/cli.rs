@@ -62,8 +62,6 @@ pub struct Clone {
 pub struct CopyUntracked {
     pub from: String,
     pub to: String,
-    #[arg(long, help = "Use configured patterns from workon.copyPattern")]
-    pub auto: bool,
     #[arg(short, long, help = "Override patterns for one-off copy")]
     pub pattern: Option<String>,
     #[arg(short, long, help = "Overwrite existing files in destination")]
@@ -94,6 +92,18 @@ pub struct New {
     pub detach: bool,
     #[arg(long, help = "Skip post-create hooks")]
     pub no_hooks: bool,
+    #[arg(
+        long = "copy-untracked",
+        overrides_with = "no_copy_untracked",
+        help = "Copy untracked files from base worktree using configured patterns"
+    )]
+    pub copy_untracked: bool,
+    #[arg(
+        long = "no-copy-untracked",
+        overrides_with = "copy_untracked",
+        help = "Do not copy untracked files (overrides config)"
+    )]
+    pub no_copy_untracked: bool,
 }
 
 /// Prune stale worktrees.

@@ -1,6 +1,5 @@
 mod cli;
 mod cmd;
-mod copy;
 mod hooks;
 
 use clap::Parser;
@@ -55,6 +54,8 @@ fn route_pr_ref_to_command(pr_ref: &str) -> Option<Cmd> {
             orphan: false,
             detach: false,
             no_hooks: false,
+            copy_untracked: false,
+            no_copy_untracked: false,
         })),
     }
 }

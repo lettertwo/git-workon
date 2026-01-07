@@ -8,6 +8,7 @@ fn copy_basic() -> Result<(), Box<dyn std::error::Error>> {
         .bare(true)
         .default_branch("main")
         .worktree("feature")
+        .config("workon.copyPattern", "**/*")
         .build()?;
 
     let main_worktree = fixture.root()?.join("main");
@@ -22,7 +23,7 @@ fn copy_basic() -> Result<(), Box<dyn std::error::Error>> {
         "console.log('test');",
     )?;
 
-    // Copy files from main to feature
+    // Copy files from main to feature (uses config patterns)
     let mut cmd = Command::cargo_bin("git-workon")?;
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
@@ -49,7 +50,7 @@ fn copy_basic() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn copy_with_auto_flag() -> Result<(), Box<dyn std::error::Error>> {
+fn copy_with_config_patterns() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -68,11 +69,10 @@ fn copy_with_auto_flag() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(main_worktree.join("build"))?;
     fs::write(main_worktree.join("build/output.js"), "build output")?;
 
-    // Copy with --auto flag (should use config patterns)
+    // Copy using config patterns (default behavior)
     let mut cmd = Command::cargo_bin("git-workon")?;
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
-        .arg("--auto")
         .arg("main")
         .arg("feature")
         .assert()
@@ -102,6 +102,7 @@ fn copy_with_excludes() -> Result<(), Box<dyn std::error::Error>> {
         .default_branch("main")
         .worktree("main")
         .worktree("feature")
+        .config("workon.copyPattern", "**/*")
         .config("workon.copyExclude", "*.log")
         .config("workon.copyExclude", "temp/*")
         .build()?;
@@ -115,7 +116,7 @@ fn copy_with_excludes() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(main_worktree.join("temp"))?;
     fs::write(main_worktree.join("temp/cache.dat"), "cached data")?;
 
-    // Copy all files (default pattern *)
+    // Copy all files using config pattern
     let mut cmd = Command::cargo_bin("git-workon")?;
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
@@ -189,6 +190,7 @@ fn copy_respects_force_flag() -> Result<(), Box<dyn std::error::Error>> {
         .default_branch("main")
         .worktree("main")
         .worktree("feature")
+        .config("workon.copyPattern", "**/*")
         .build()?;
 
     let main_worktree = fixture.root()?.join("main");
@@ -239,6 +241,7 @@ fn copy_creates_directories() -> Result<(), Box<dyn std::error::Error>> {
         .bare(true)
         .default_branch("main")
         .worktree("feature")
+        .config("workon.copyPattern", "**/*")
         .build()?;
 
     let main_worktree = fixture.root()?.join("main");
@@ -317,22 +320,45 @@ fn copy_with_no_matching_files() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn copy_auto_without_config_fails() -> Result<(), Box<dyn std::error::Error>> {
+fn copy_without_config_defaults_to_all() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
+        .worktree("main")
         .worktree("feature")
         .build()?;
 
-    // Try to use --auto without any copyPattern configured
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    // Create various files
+    fs::write(main_worktree.join("test.txt"), "test")?;
+    fs::write(main_worktree.join("readme.md"), "readme")?;
+    fs::create_dir_all(main_worktree.join("src"))?;
+    fs::write(main_worktree.join("src/main.rs"), "fn main() {}")?;
+
+    // Copy without config or pattern (should copy everything)
     let mut cmd = Command::cargo_bin("git-workon")?;
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
-        .arg("--auto")
         .arg("main")
         .arg("feature")
         .assert()
-        .failure();
+        .success();
+
+    // Verify all files were copied
+    assert!(
+        feature_worktree.join("test.txt").exists(),
+        "Should copy test.txt"
+    );
+    assert!(
+        feature_worktree.join("readme.md").exists(),
+        "Should copy readme.md"
+    );
+    assert!(
+        feature_worktree.join("src/main.rs").exists(),
+        "Should copy src/main.rs"
+    );
 
     Ok(())
 }

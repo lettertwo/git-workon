@@ -1,8 +1,7 @@
 use miette::{Result, WrapErr};
-use workon::{get_repo, workon_root, WorkonConfig, WorktreeDescriptor};
+use workon::{copy_files, get_repo, workon_root, WorkonConfig, WorktreeDescriptor};
 
 use crate::cli::CopyUntracked;
-use crate::copy::copy_files;
 
 use super::Run;
 
@@ -34,7 +33,7 @@ impl Run for CopyUntracked {
             ));
         }
 
-        // Determine patterns: --pattern > --auto > default "*"
+        // Determine patterns: --pattern flag > config > error
         let patterns = determine_patterns(self, &config)?;
         let excludes = config.copy_excludes()?;
 
@@ -56,25 +55,19 @@ impl Run for CopyUntracked {
 
 /// Determine which patterns to use for copying
 ///
-/// Priority: --pattern flag > --auto (config) > default "*"
+/// Priority: --pattern flag > config > default **/*
 fn determine_patterns(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<String>> {
     // If --pattern is specified, use it (overrides everything)
     if let Some(pattern) = &cmd.pattern {
         return Ok(vec![pattern.clone()]);
     }
 
-    // If --auto is specified, use config patterns
-    if cmd.auto {
-        let patterns = config.copy_patterns()?;
-        if !patterns.is_empty() {
-            return Ok(patterns);
-        }
-        // If auto is set but no patterns configured, return error
-        return Err(miette::miette!(
-            "No copy patterns configured. Set workon.copyPattern or use --pattern"
-        ));
+    // Use config patterns if configured
+    let patterns = config.copy_patterns()?;
+    if !patterns.is_empty() {
+        return Ok(patterns);
     }
 
-    // Default: copy everything recursively
+    // Default: copy everything
     Ok(vec!["**/*".to_string()])
 }

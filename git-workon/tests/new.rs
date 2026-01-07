@@ -304,3 +304,243 @@ fn new_without_config_uses_default_branch() -> Result<(), Box<dyn std::error::Er
 
     Ok(())
 }
+
+#[test]
+fn new_with_auto_copy_enabled() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.autoCopyUntracked", "true")
+        .config("workon.copyPattern", ".env*")
+        .config("workon.copyPattern", "node_modules/**/*")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+
+    // Create some untracked files in main worktree
+    fs::write(main_worktree.join(".env.local"), "SECRET=value")?;
+    fs::write(main_worktree.join("other.txt"), "not copied")?;
+    fs::create_dir_all(main_worktree.join("node_modules/lib"))?;
+    fs::write(main_worktree.join("node_modules/lib/index.js"), "module")?;
+
+    // Create new worktree from main (should auto-copy matching files)
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    let feature_worktree = fixture.root()?.join("feature");
+
+    // Verify pattern-matched files were copied
+    assert!(
+        feature_worktree.join(".env.local").exists(),
+        "Should auto-copy .env.local (matches .env*)"
+    );
+    assert!(
+        feature_worktree.join("node_modules/lib/index.js").exists(),
+        "Should auto-copy node_modules (matches pattern)"
+    );
+    assert!(
+        !feature_worktree.join("other.txt").exists(),
+        "Should not copy other.txt (no matching pattern)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_with_auto_copy_respects_excludes() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.autoCopyUntracked", "true")
+        .config("workon.copyPattern", "**/*")
+        .config("workon.copyExclude", "*.log")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+
+    // Create files
+    fs::write(main_worktree.join("data.txt"), "data")?;
+    fs::write(main_worktree.join("debug.log"), "debug")?;
+
+    // Create new worktree
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    let feature_worktree = fixture.root()?.join("feature");
+
+    // Verify exclusions were respected
+    assert!(
+        feature_worktree.join("data.txt").exists(),
+        "Should copy data.txt"
+    );
+    assert!(
+        !feature_worktree.join("debug.log").exists(),
+        "Should not copy debug.log (excluded)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        // Config disabled, but flag should enable it
+        .config("workon.autoCopyUntracked", "false")
+        .config("workon.copyPattern", "*.txt")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    fs::write(main_worktree.join("test.txt"), "content")?;
+
+    // Create new worktree with --copy-untracked flag
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("--copy-untracked")
+        .arg("feature")
+        .assert()
+        .success();
+
+    let feature_worktree = fixture.root()?.join("feature");
+
+    // Verify file was copied despite config being false
+    assert!(
+        feature_worktree.join("test.txt").exists(),
+        "Should copy file when --copy-untracked flag is used"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_no_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        // Config enabled, but flag should disable it
+        .config("workon.autoCopyUntracked", "true")
+        .config("workon.copyPattern", "*.txt")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    fs::write(main_worktree.join("test.txt"), "content")?;
+
+    // Create new worktree with --no-copy-untracked flag
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("--no-copy-untracked")
+        .arg("feature")
+        .assert()
+        .success();
+
+    let feature_worktree = fixture.root()?.join("feature");
+
+    // Verify file was NOT copied despite config being true
+    assert!(
+        !feature_worktree.join("test.txt").exists(),
+        "Should not copy file when --no-copy-untracked flag is used"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_auto_copy_skips_when_base_worktree_missing() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        // Note: no main worktree created
+        .config("workon.autoCopyUntracked", "true")
+        .config("workon.copyPattern", "*.txt")
+        .build()?;
+
+    // Create new worktree (should succeed even though base worktree doesn't exist)
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // Verify worktree was created successfully
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn new_auto_copy_without_patterns_copies_everything() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.autoCopyUntracked", "true")
+        // Note: no copyPattern configured - should default to copying everything
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    fs::write(main_worktree.join("test.txt"), "content")?;
+    fs::write(main_worktree.join("readme.md"), "readme")?;
+    fs::create_dir_all(main_worktree.join("src"))?;
+    fs::write(main_worktree.join("src/main.rs"), "code")?;
+
+    // Create new worktree (should copy all files using default pattern)
+    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    let feature_worktree = fixture.root()?.join("feature");
+
+    // Verify all files were copied (default pattern **/* used)
+    assert!(
+        feature_worktree.join("test.txt").exists(),
+        "Should copy test.txt with default pattern"
+    );
+    assert!(
+        feature_worktree.join("readme.md").exists(),
+        "Should copy readme.md with default pattern"
+    );
+    assert!(
+        feature_worktree.join("src/main.rs").exists(),
+        "Should copy src/main.rs with default pattern"
+    );
+
+    Ok(())
+}

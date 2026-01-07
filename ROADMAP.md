@@ -15,9 +15,9 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 - **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged detection
 - **Configuration System**: Git config support with 7 config keys, CLI override precedence, validation
 - **Post-Creation Hooks**: Automatic execution of `workon.postCreateHook` commands with environment variables, `--no-hooks` flag
-- **File Copying**: Pattern-based copying with `workon.copyPattern` and `workon.copyExclude`, platform-optimized (copy-on-write), `--auto`/`--pattern`/`--force` flags
+- **File Copying**: Standalone `copy-untracked` command (defaults to copying all untracked files), automatic copying in `new` command with `workon.autoCopyUntracked` config, pattern-based with `workon.copyPattern` and `workon.copyExclude`, platform-optimized (copy-on-write), `--(no-)copy-untracked`/`--pattern`/`--force` flags
 - **Pull Request Support**: Create worktrees from PR references (`#123`, `pr#123`, GitHub URLs), smart routing, auto-fetch, configurable naming (`workon.prFormat`)
-- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (69 tests total)
+- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (75 tests total)
 
 ### Not Implemented ❌
 
@@ -44,6 +44,7 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [x] Add `workon.postCreateHook` - commands to run after worktree creation (multi-value, convenience alternative to git's post-checkout hook)
   - [x] Add `workon.copyPattern` - glob patterns for automatic file copying (multi-value)
   - [x] Add `workon.copyExclude` - patterns to exclude from copying (multi-value)
+  - [x] Add `workon.autoCopyUntracked` - enable automatic file copying when creating new worktrees (boolean)
   - [x] Add `workon.pruneProtectedBranches` - branches to protect from prune (multi-value)
   - [x] Add `workon.prFormat` - format string for PR-based worktree names
   - [x] Implement config precedence: CLI args > local config > global config > defaults
@@ -52,7 +53,7 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 **Implementation Notes**:
 - Core config module with `WorkonConfig` struct and lifetime management
-- 6 config methods with CLI override support
+- 7 config methods with CLI override support
 - Multi-value config support using `config.multivar()`
 - Simple glob pattern matching for protected branches (exact match, `*`, and `prefix/*`)
 - Integrated `workon.defaultBranch` into `new` command with `--base` flag
@@ -74,6 +75,7 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   copyPattern = .env.local
   copyPattern = .vscode/
   copyExclude = .env.production
+  autoCopyUntracked = true
   pruneProtectedBranches = main
   pruneProtectedBranches = develop
   pruneProtectedBranches = release/*
@@ -150,7 +152,6 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 - **Upgrade From**: Basic copy-untracked command
 - **Tasks**:
   - [x] Implement basic file copying between worktrees
-  - [x] Add `--auto` flag to copy based on `workon.copyPattern` config
   - [x] Support glob patterns (e.g., `.env*`, `node_modules/`, `.vscode/`)
   - [x] Respect `workon.copyExclude` patterns
   - [x] Add `--pattern` flag for one-off pattern overrides
@@ -159,21 +160,42 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
   - [x] Handle large file scenarios gracefully
   - [ ] Add progress reporting for large copies (deferred to Phase 5)
   - [x] Skip files already present in destination
-  - [x] Write tests for pattern matching and copy operations
+  - [x] Add `workon.autoCopyUntracked` config for automatic copying in `new` command
+  - [x] Add `--(no-)copy-untracked` flags to `new` command
+  - [x] Integrate automatic copying into `new` command workflow
+  - [x] Write tests for pattern matching, copy operations, and automatic copying
 
 **Implementation Notes**:
 - Created `git-workon/src/copy.rs` module with platform-optimized copying
-- Uses glob crate for pattern matching (default: `**/*` for recursive copying)
+- Uses glob crate for pattern matching
 - Platform-specific optimizations:
   - macOS: `cp -c` (clonefile/copy-on-write)
   - Linux: `cp --reflink=auto` (copy-on-write when supported)
   - Other: Standard `fs::copy`
 - Implemented full `copy-untracked` command with worktree path resolution
-- Added `--auto`, `--pattern`, and `--force` flags to CLI
+- **Standalone command** (`copy-untracked`):
+  - Default behavior: copies all untracked files (`**/*` pattern)
+  - `--pattern` flag: override with specific pattern
+  - Config: uses `workon.copyPattern` if set (convenience)
+  - Priority: `--pattern` > config > default `**/*`
+  - Added `--force` flag to overwrite existing files
+- **Automatic copying** (`new` command):
+  - Enable with `workon.autoCopyUntracked=true`
+  - Uses `workon.copyPattern` if configured, otherwise defaults to `**/*`
+  - Respects `workon.copyExclude` always
+  - Added `--(no-)copy-untracked` flags to override config
+  - Copies from base branch's worktree (or HEAD's worktree if no base specified)
+  - Gracefully skips if source worktree doesn't exist
+  - Runs after worktree creation, before post-create hooks
 - Automatic parent directory creation for nested files
 - Skips directories (only copies files)
-- Respects exclusion patterns from `workon.copyExclude`
-- 8 comprehensive integration tests covering basic copying, auto mode, exclusions, pattern overrides, force flag, directory creation, and error cases
+- 8 integration tests for standalone command + 6 integration tests for automatic copying in `new`
+- Total: 14 comprehensive tests covering all copying scenarios
+
+**Configuration**:
+- `workon.autoCopyUntracked` - Boolean (default: false), enables automatic copying in `new` command
+- `workon.copyPattern` - Multi-value, glob patterns to copy (default: `**/*` if not set)
+- `workon.copyExclude` - Multi-value, glob patterns to exclude from copying
 
 ### 2.3 Protected Branches ✅
 

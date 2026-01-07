@@ -525,6 +525,7 @@ dependencies = [
  "git-workon-fixture",
  "git2",
  "git2_credentials",
+ "glob",
  "log",
  "miette",
  "predicates",

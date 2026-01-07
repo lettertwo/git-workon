@@ -2,7 +2,7 @@ use miette::{Result, WrapErr};
 
 use crate::cli::New;
 use crate::hooks::execute_post_create_hooks;
-use workon::{add_worktree, get_repo, BranchType, WorktreeDescriptor};
+use workon::{add_worktree, copy_files, get_repo, workon_root, BranchType, WorktreeDescriptor};
 
 use super::Run;
 
@@ -75,6 +75,23 @@ impl Run for New {
         let worktree = add_worktree(&repo, &worktree_name, branch_type, base_branch.as_deref())
             .wrap_err(format!("Failed to create worktree '{}'", worktree_name))?;
 
+        // Copy untracked files if enabled
+        let copy_override = if self.copy_untracked {
+            Some(true)
+        } else if self.no_copy_untracked {
+            Some(false)
+        } else {
+            None
+        };
+
+        if config.auto_copy_untracked(copy_override)? {
+            if let Err(e) = copy_untracked_files(&repo, &worktree, base_branch.as_deref(), &config)
+            {
+                eprintln!("Warning: Failed to copy untracked files: {}", e);
+                // Continue - worktree is still valid
+            }
+        }
+
         // Execute post-create hooks after successful worktree creation
         if !self.no_hooks {
             if let Err(e) = execute_post_create_hooks(&worktree, base_branch.as_deref(), &config) {
@@ -85,4 +102,64 @@ impl Run for New {
 
         Ok(Some(worktree))
     }
+}
+
+/// Copy untracked files from the base worktree to the new worktree
+fn copy_untracked_files(
+    repo: &git2::Repository,
+    worktree: &WorktreeDescriptor,
+    base_branch: Option<&str>,
+    config: &workon::WorkonConfig,
+) -> Result<()> {
+    // Get copy patterns from config, or default to copying everything
+    let patterns = config.copy_patterns()?;
+    let patterns = if patterns.is_empty() {
+        vec!["**/*".to_string()]
+    } else {
+        patterns
+    };
+
+    let excludes = config.copy_excludes()?;
+
+    // Determine which branch to copy from
+    let source_branch_name = if let Some(base) = base_branch {
+        base.to_string()
+    } else {
+        // No base branch specified, use HEAD's branch
+        match repo.head() {
+            Ok(head) => {
+                if let Some(shorthand) = head.shorthand() {
+                    shorthand.to_string()
+                } else {
+                    // HEAD is detached or not a branch, skip copying
+                    return Ok(());
+                }
+            }
+            Err(_) => {
+                // Can't determine HEAD, skip copying
+                return Ok(());
+            }
+        }
+    };
+
+    // Find the source worktree path
+    let root = workon_root(repo)?;
+    let source_path = root.join(&source_branch_name);
+    if !source_path.exists() {
+        // Source worktree doesn't exist, skip copying
+        return Ok(());
+    }
+
+    // Get destination path
+    let dest_path = worktree.path().to_path_buf();
+
+    // Copy files
+    let copied = copy_files(&source_path, &dest_path, &patterns, &excludes, false)?;
+
+    // Report what was copied
+    if !copied.is_empty() {
+        println!("Copied {} file(s) from base worktree", copied.len());
+    }
+
+    Ok(())
 }
