@@ -424,8 +424,15 @@ pub fn add_worktree(
                             let base_commit = if let Some(base) = base_branch {
                                 // Branch from specified base branch
                                 debug!("branching from base branch {:?}", base);
+                                // Try local branch first, then remote branch
                                 let base_branch =
-                                    repo.find_branch(base, git2::BranchType::Local)?;
+                                    match repo.find_branch(base, git2::BranchType::Local) {
+                                        Ok(b) => b,
+                                        Err(_) => {
+                                            debug!("base branch not found as local, trying remote");
+                                            repo.find_branch(base, git2::BranchType::Remote)?
+                                        }
+                                    };
                                 base_branch.into_reference().peel_to_commit()?
                             } else {
                                 // Default: branch from HEAD

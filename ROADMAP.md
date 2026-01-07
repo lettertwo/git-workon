@@ -13,10 +13,11 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 - **Branch Types**: Normal branches, orphan branches (with initial commit), detached HEAD
 - **Features**: Bare repo + worktrees pattern, namespace support (slashes in branch names)
 - **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged detection
-- **Configuration System**: Git config support with 6 config keys, CLI override precedence, validation
+- **Configuration System**: Git config support with 7 config keys, CLI override precedence, validation
 - **Post-Creation Hooks**: Automatic execution of `workon.postCreateHook` commands with environment variables, `--no-hooks` flag
 - **File Copying**: Pattern-based copying with `workon.copyPattern` and `workon.copyExclude`, platform-optimized (copy-on-write), `--auto`/`--pattern`/`--force` flags
-- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (53 tests total)
+- **Pull Request Support**: Create worktrees from PR references (`#123`, `pr#123`, GitHub URLs), smart routing, auto-fetch, configurable naming (`workon.prFormat`)
+- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (69 tests total)
 
 ### Not Implemented ❌
 
@@ -246,27 +247,40 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 **Goal**: Support modern development workflows
 
-### 4.1 Pull Request Support
+### 4.1 Pull Request Support ✅
 
+- **Status**: Completed
 - **Priority**: Medium-High
 - **Description**: Create worktrees directly from pull request URLs
 - **Depends On**: Configuration System (for PR naming format)
 - **Examples**:
-  - `git workon new https://github.com/user/repo/pull/123`
-  - `git workon new pr#123` (if in same repo)
+  - `git workon #123` - Smart routing creates worktree for PR #123
+  - `git workon new pr#123` - Explicit PR creation
+  - `git workon new https://github.com/user/repo/pull/123` - From URL
 - **Tasks**:
-  - [ ] Parse GitHub PR URLs (github.com/user/repo/pull/123)
-  - [ ] Parse short PR references (pr#123, #123)
-  - [ ] Fetch PR branch from appropriate remote
-  - [ ] Determine worktree name using `workon.prFormat` config
-  - [ ] Support format variables: `{number}`, `{title}`, `{author}`
-  - [ ] Default format: `pr-{number}`
-  - [ ] Set up tracking to PR head branch
-  - [ ] Handle fork-based PRs (fetch from fork remote)
-  - [ ] Integration with `gh` CLI for metadata (optional enhancement)
-  - [ ] Support GitLab merge requests as stretch goal
-  - [ ] Write tests for PR URL parsing and worktree creation
-  - [ ] Document PR workflow patterns and examples
+  - [x] Parse GitHub PR URLs (github.com/user/repo/pull/123)
+  - [x] Parse short PR references (pr#123, pr-123, #123)
+  - [x] Fetch PR branch from appropriate remote
+  - [x] Determine worktree name using `workon.prFormat` config
+  - [x] Default format: `pr-{number}`
+  - [x] Set up tracking to PR head branch
+  - [x] Auto-detect remote (upstream > origin > first remote)
+  - [x] Smart routing: `git workon #123` automatically creates PR worktree
+  - [x] Write tests for PR URL parsing and worktree creation (16 tests total)
+  - [x] Document PR workflow patterns and examples
+  - [ ] Support format variables: `{title}`, `{author}` (deferred - requires gh CLI)
+  - [ ] Handle fork-based PRs (fetch from fork remote) (deferred - future enhancement)
+  - [ ] Integration with `gh` CLI for metadata (deferred - optional enhancement)
+  - [ ] Support GitLab merge requests (deferred - stretch goal)
+
+**Implementation Notes**:
+- Created `git-workon-lib/src/pr.rs` module with parsing, remote detection, and fetching logic
+- Added `PrError` enum to error.rs with diagnostic help messages
+- Enhanced `new` command to detect PR references and handle PR workflow
+- Smart routing in main.rs automatically routes `#123` patterns to `new` command
+- Auto-fetches PR refs if not present locally using `git fetch <remote> +refs/pull/{number}/head:...`
+- 10 unit tests for PR parsing + 6 integration tests for remote detection and config
+- Configuration already existed: `workon.prFormat` with `{number}` placeholder validation
 
 ### 4.2 Move Command
 

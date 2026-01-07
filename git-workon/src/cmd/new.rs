@@ -41,19 +41,39 @@ impl Run for New {
         let repo = get_repo(None).wrap_err("Failed to find git repository")?;
         let config = workon::WorkonConfig::new(&repo)?;
 
-        // Get base branch with precedence: CLI arg > config > None
-        let base_branch = config.default_branch(self.base.as_deref())?;
-
-        let branch_type = if self.orphan {
-            BranchType::Orphan
-        } else if self.detach {
-            BranchType::Detached
+        // Check if this is a PR reference
+        // Only treat as PR if no conflicting flags are provided
+        let pr_info = if !self.orphan && !self.detach && self.base.is_none() {
+            workon::parse_pr_reference(name)?
         } else {
-            BranchType::Normal
+            None
         };
 
-        let worktree = add_worktree(&repo, name, branch_type, base_branch.as_deref())
-            .wrap_err(format!("Failed to create worktree '{}'", name))?;
+        let (worktree_name, base_branch, branch_type) = if let Some(pr) = pr_info {
+            // This is a PR reference - handle PR workflow
+            let pr_format = config.pr_format(None)?;
+            let (worktree_name, remote_ref) =
+                workon::prepare_pr_worktree(&repo, pr.number, &pr_format)
+                    .wrap_err(format!("Failed to prepare PR #{} worktree", pr.number))?;
+
+            (worktree_name, Some(remote_ref), BranchType::Normal)
+        } else {
+            // Regular worktree creation
+            let base_branch = config.default_branch(self.base.as_deref())?;
+
+            let branch_type = if self.orphan {
+                BranchType::Orphan
+            } else if self.detach {
+                BranchType::Detached
+            } else {
+                BranchType::Normal
+            };
+
+            (name.clone(), base_branch, branch_type)
+        };
+
+        let worktree = add_worktree(&repo, &worktree_name, branch_type, base_branch.as_deref())
+            .wrap_err(format!("Failed to create worktree '{}'", worktree_name))?;
 
         // Execute post-create hooks after successful worktree creation
         if !self.no_hooks {

@@ -7,6 +7,7 @@ mod error;
 mod get_remote_callbacks;
 mod get_repo;
 mod init;
+mod pr;
 mod workon_root;
 mod worktree;
 
@@ -19,5 +20,6 @@ pub use crate::error::*;
 pub use crate::get_remote_callbacks::*;
 pub use crate::get_repo::*;
 pub use crate::init::*;
+pub use crate::pr::*;
 pub use crate::workon_root::*;
 pub use crate::worktree::*;

@@ -31,6 +31,11 @@ pub enum WorkonError {
     #[error(transparent)]
     #[diagnostic(forward(0))]
     DefaultBranch(#[from] DefaultBranchError),
+
+    /// Pull request-related errors
+    #[error(transparent)]
+    #[diagnostic(forward(0))]
+    Pr(#[from] PrError),
 }
 
 /// Worktree-specific errors
@@ -122,4 +127,36 @@ pub enum DefaultBranchError {
         help("Set init.defaultBranch in your git config, or create a 'main' or 'master' branch")
     )]
     NoDefaultBranch,
+}
+
+/// Pull request-related errors
+#[derive(Error, Diagnostic, Debug)]
+pub enum PrError {
+    #[error("Invalid PR reference: {input}")]
+    #[diagnostic(
+        code(workon::pr::invalid_reference),
+        help("Use formats like #123, pr-123, or https://github.com/owner/repo/pull/123")
+    )]
+    InvalidReference { input: String },
+
+    #[error("PR #{number} not found on remote {remote}")]
+    #[diagnostic(
+        code(workon::pr::not_found),
+        help("Verify the PR number exists and you have access to the repository")
+    )]
+    PrNotFound { number: u32, remote: String },
+
+    #[error("No git remote configured")]
+    #[diagnostic(
+        code(workon::pr::no_remote),
+        help("Add a remote with: git remote add origin <url>")
+    )]
+    NoRemoteConfigured,
+
+    #[error("Failed to fetch PR refs from {remote}: {message}")]
+    #[diagnostic(
+        code(workon::pr::fetch_failed),
+        help("Check your network connection and repository access")
+    )]
+    FetchFailed { remote: String, message: String },
 }
