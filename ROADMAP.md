@@ -8,8 +8,8 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 ### Implemented ✅
 
-- **Core Commands**: `clone`, `init`, `list`, `new` (with name and `--base` flag), `find` (with name), `prune`, `copy-untracked`
-- **Prune Features**: `--gone`, `--merged`, `--dry-run`, safety checks with `--allow-dirty`/`--allow-unpushed`, protected branches
+- **Core Commands**: `clone`, `init`, `list`, `new` (with name and `--base` flag), `find` (with name), `prune` (bulk and targeted), `copy-untracked`
+- **Prune Features**: Named worktree pruning (`prune <name>...`), bulk pruning with `--gone`/`--merged`, `--dry-run`, safety checks with `--allow-dirty`/`--allow-unpushed`, protected branches
 - **Branch Types**: Normal branches, orphan branches (with initial commit), detached HEAD
 - **Features**: Bare repo + worktrees pattern, namespace support (slashes in branch names)
 - **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged detection
@@ -17,7 +17,7 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 - **Post-Creation Hooks**: Automatic execution of `workon.postCreateHook` commands with environment variables, `--no-hooks` flag
 - **File Copying**: Standalone `copy-untracked` command (defaults to copying all untracked files), automatic copying in `new` command with `workon.autoCopyUntracked` config, pattern-based with `workon.copyPattern` and `workon.copyExclude`, platform-optimized (copy-on-write), `--(no-)copy-untracked`/`--pattern`/`--force` flags
 - **Pull Request Support**: Create worktrees from PR references (`#123`, `pr#123`, GitHub URLs), smart routing, auto-fetch, configurable naming (`workon.prFormat`)
-- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (75 tests total)
+- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (83 tests total)
 
 ### Not Implemented ❌
 

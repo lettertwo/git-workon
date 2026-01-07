@@ -746,3 +746,276 @@ fn prune_without_protected_config_prunes_all_candidates() -> Result<(), Box<dyn 
 
     Ok(())
 }
+
+#[test]
+fn prune_single_named_worktree() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-1")
+        .worktree("feature-2")
+        .build()?;
+
+    // Prune feature-1 by name
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature-1")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"))
+        .stdout(predicate::str::contains("explicitly requested"));
+
+    // Verify feature-1 is gone, feature-2 still exists
+    fixture
+        .root()?
+        .child("feature-1")
+        .assert(predicate::path::missing());
+    fixture
+        .root()?
+        .child("feature-2")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_multiple_named_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-1")
+        .worktree("feature-2")
+        .worktree("feature-3")
+        .build()?;
+
+    // Prune feature-1 and feature-2 by name
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature-1")
+        .arg("feature-2")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 2 worktree"));
+
+    // Verify feature-1 and feature-2 are gone, feature-3 still exists
+    fixture
+        .root()?
+        .child("feature-1")
+        .assert(predicate::path::missing());
+    fixture
+        .root()?
+        .child("feature-2")
+        .assert(predicate::path::missing());
+    fixture
+        .root()?
+        .child("feature-3")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-1")
+        .worktree("feature-2")
+        .worktree("feature-3")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    // Delete feature-2 branch to make it a filter candidate
+    repo.find_reference("refs/heads/feature-2")?.delete()?;
+
+    // Prune feature-1 by name AND all worktrees with deleted branches
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature-1")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 2 worktree"));
+
+    // Verify feature-1 and feature-2 are gone, feature-3 still exists
+    fixture
+        .root()?
+        .child("feature-1")
+        .assert(predicate::path::missing());
+    fixture
+        .root()?
+        .child("feature-2")
+        .assert(predicate::path::missing());
+    fixture
+        .root()?
+        .child("feature-3")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_not_found() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-1")
+        .build()?;
+
+    // Try to prune non-existent worktree
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("does-not-exist")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Warning: worktree 'does-not-exist' not found",
+        ))
+        .stdout(predicate::str::contains("No worktrees to prune"));
+
+    // Verify feature-1 still exists
+    fixture
+        .root()?
+        .child("feature-1")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_respects_protected_branches() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("develop")
+        .worktree("feature")
+        .config("workon.pruneProtectedBranches", "develop")
+        .build()?;
+
+    // Try to prune protected branch by name
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("develop")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped"))
+        .stdout(predicate::str::contains(
+            "protected by workon.pruneProtectedBranches",
+        ))
+        .stdout(predicate::str::contains("No worktrees to prune"));
+
+    // Verify develop still exists
+    fixture
+        .root()?
+        .child("develop")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_respects_dirty_check() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Make feature worktree dirty
+    let feature_dir = fixture.cwd()?;
+    std::fs::write(feature_dir.join("dirty.txt"), "uncommitted")?;
+
+    // Try to prune dirty worktree by name
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Skipped"))
+        .stdout(predicate::str::contains(
+            "has uncommitted changes, use --allow-dirty",
+        ))
+        .stdout(predicate::str::contains("No worktrees to prune"));
+
+    // Verify feature still exists
+    feature_dir.assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_with_allow_dirty() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Make feature worktree dirty
+    let feature_dir = fixture.cwd()?;
+    std::fs::write(feature_dir.join("dirty.txt"), "uncommitted")?;
+
+    // Prune dirty worktree with --allow-dirty
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--allow-dirty")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify feature is gone
+    feature_dir.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_dry_run() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let feature_dir = fixture.cwd()?;
+
+    // Dry run prune of named worktree
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Worktrees to prune"))
+        .stdout(predicate::str::contains("feature"))
+        .stdout(predicate::str::contains("Dry run - no changes made"));
+
+    // Verify feature still exists
+    feature_dir.assert(predicate::path::is_dir());
+
+    Ok(())
+}

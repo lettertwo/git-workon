@@ -109,6 +109,8 @@ pub struct New {
 /// Prune stale worktrees.
 #[derive(Debug, Args)]
 pub struct Prune {
+    /// Specific worktree names to prune
+    pub names: Vec<String>,
     #[arg(
         short = 'n',
         long,

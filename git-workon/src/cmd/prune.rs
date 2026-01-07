@@ -14,10 +14,59 @@ impl Run for Prune {
         let protected_patterns = config.prune_protected_branches()?;
         let worktrees = get_worktrees(&repo)?;
 
-        // Find worktrees that should be pruned (with their descriptors for safety checks)
-        let candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = worktrees
+        let mut candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = Vec::new();
+
+        // First, add explicitly named worktrees
+        for name in &self.names {
+            // Find worktree by name (exact match or branch name)
+            let matching_wt = worktrees.iter().find(|wt| {
+                // Match by worktree name or branch name
+                if let Some(wt_name) = wt.name() {
+                    if wt_name == name {
+                        return true;
+                    }
+                }
+                if let Ok(Some(branch)) = wt.branch() {
+                    if branch == *name {
+                        return true;
+                    }
+                }
+                false
+            });
+
+            if let Some(wt) = matching_wt {
+                // Get the branch name (if any)
+                let branch_name = match wt.branch() {
+                    Ok(Some(name)) => name,
+                    Ok(None) => "(detached HEAD)".to_string(),
+                    Err(_) => "(error reading branch)".to_string(),
+                };
+
+                candidates.push((
+                    wt,
+                    PruneCandidate {
+                        worktree_name: wt.name().unwrap_or("").to_string(),
+                        worktree_path: wt.path().to_path_buf(),
+                        branch_name,
+                        reason: PruneReason::Explicit,
+                    },
+                ));
+            } else {
+                // Worktree not found - continue, don't error
+                // We'll report this in the output
+                println!("Warning: worktree '{}' not found, skipping", name);
+            }
+        }
+
+        // Then, add filter-based worktrees (if any filters are specified)
+        let filter_candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = worktrees
             .iter()
             .filter_map(|wt| {
+                // Skip if already in candidates (from explicit names)
+                if candidates.iter().any(|(c, _)| c.name() == wt.name()) {
+                    return None;
+                }
+
                 // Get the branch name - skip detached worktrees and worktrees with errors
                 let branch_name = match wt.branch() {
                     Ok(Some(name)) => name,
@@ -83,6 +132,9 @@ impl Run for Prune {
                 }
             })
             .collect();
+
+        // Combine explicit and filter-based candidates
+        candidates.extend(filter_candidates);
 
         // Apply safety checks to filter out unsafe worktrees
         let mut skipped: Vec<(PruneCandidate, String)> = Vec::new();
@@ -207,6 +259,7 @@ enum PruneReason {
     BranchDeleted,
     RemoteGone,
     Merged(String),
+    Explicit,
 }
 
 impl std::fmt::Display for PruneReason {
@@ -215,6 +268,7 @@ impl std::fmt::Display for PruneReason {
             PruneReason::BranchDeleted => write!(f, "branch deleted"),
             PruneReason::RemoteGone => write!(f, "remote gone"),
             PruneReason::Merged(target) => write!(f, "merged into {}", target),
+            PruneReason::Explicit => write!(f, "explicitly requested"),
         }
     }
 }
