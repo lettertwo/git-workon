@@ -1,4 +1,5 @@
-use miette::{Result, WrapErr};
+use dialoguer::{FuzzySelect, Input};
+use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
 use crate::cli::New;
 use crate::hooks::execute_post_create_hooks;
@@ -33,18 +34,34 @@ use super::Run;
 impl Run for New {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let name = match &self.name {
-            Some(name) => name,
+            Some(name) => name.clone(),
             None => {
-                unimplemented!("Interactive new not implemented!");
+                if self.no_interactive {
+                    bail!("No worktree name provided. Specify a name or remove --no-interactive.");
+                }
+
+                // Prompt for branch name
+                let name: String = Input::new()
+                    .with_prompt("Branch name")
+                    .interact_text()
+                    .into_diagnostic()
+                    .wrap_err("Failed to read branch name")?;
+
+                if name.trim().is_empty() {
+                    bail!("Branch name cannot be empty");
+                }
+
+                name.trim().to_string()
             }
         };
+
         let repo = get_repo(None).wrap_err("Failed to find git repository")?;
         let config = workon::WorkonConfig::new(&repo)?;
 
         // Check if this is a PR reference
         // Only treat as PR if no conflicting flags are provided
         let pr_info = if !self.orphan && !self.detach && self.base.is_none() {
-            workon::parse_pr_reference(name)?
+            workon::parse_pr_reference(&name)?
         } else {
             None
         };
@@ -59,7 +76,16 @@ impl Run for New {
             (worktree_name, Some(remote_ref), BranchType::Normal)
         } else {
             // Regular worktree creation
-            let base_branch = config.default_branch(self.base.as_deref())?;
+
+            // Determine base branch
+            let base_branch = if let Some(base) = &self.base {
+                config.default_branch(Some(base))?
+            } else if !self.no_interactive && self.name.is_none() {
+                // Interactive mode: prompt for base branch
+                prompt_for_base_branch(&repo, &config)?
+            } else {
+                config.default_branch(None)?
+            };
 
             let branch_type = if self.orphan {
                 BranchType::Orphan
@@ -69,7 +95,7 @@ impl Run for New {
                 BranchType::Normal
             };
 
-            (name.clone(), base_branch, branch_type)
+            (name, base_branch, branch_type)
         };
 
         let worktree = add_worktree(&repo, &worktree_name, branch_type, base_branch.as_deref())
@@ -101,6 +127,47 @@ impl Run for New {
         }
 
         Ok(Some(worktree))
+    }
+}
+
+/// Prompt user to select a base branch from available branches
+fn prompt_for_base_branch(
+    repo: &git2::Repository,
+    config: &workon::WorkonConfig,
+) -> Result<Option<String>> {
+    let branches = repo
+        .branches(Some(git2::BranchType::Local))
+        .into_diagnostic()?;
+
+    let branch_names: Vec<String> = branches
+        .filter_map(|b| {
+            b.ok()
+                .and_then(|(branch, _)| branch.name().ok().flatten().map(|s| s.to_string()))
+        })
+        .collect();
+
+    if branch_names.is_empty() {
+        return config.default_branch(None).map_err(Into::into);
+    }
+
+    let default_branch = config
+        .default_branch(None)?
+        .unwrap_or_else(|| "main".to_string());
+    let mut items = vec![format!("<default: {}>", default_branch)];
+    items.extend(branch_names.iter().cloned());
+
+    let selection = FuzzySelect::new()
+        .with_prompt("Base branch")
+        .items(&items)
+        .default(0)
+        .interact()
+        .into_diagnostic()
+        .wrap_err("Failed to select base branch")?;
+
+    if selection == 0 {
+        Ok(Some(default_branch))
+    } else {
+        Ok(Some(branch_names[selection - 1].clone()))
     }
 }
 

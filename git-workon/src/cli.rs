@@ -119,6 +119,8 @@ pub struct New {
         help = "Do not copy untracked files (overrides config)"
     )]
     pub no_copy_untracked: bool,
+    #[arg(long, help = "Disable interactive mode (for testing/scripting)")]
+    pub no_interactive: bool,
 }
 
 /// Prune stale worktrees.
@@ -163,6 +165,24 @@ pub struct Prune {
 pub struct Find {
     /// A partial name of a worktree.
     pub name: Option<String>,
+
+    #[arg(long, help = "Show only worktrees with uncommitted changes")]
+    pub dirty: bool,
+
+    #[arg(long, help = "Show only worktrees without uncommitted changes")]
+    pub clean: bool,
+
+    #[arg(long, help = "Show only worktrees with unpushed commits")]
+    pub ahead: bool,
+
+    #[arg(long, help = "Show only worktrees behind their upstream")]
+    pub behind: bool,
+
+    #[arg(long, help = "Show only worktrees whose upstream branch is deleted")]
+    pub gone: bool,
+
+    #[arg(long, help = "Disable interactive mode (for testing/scripting)")]
+    pub no_interactive: bool,
 }
 
 #[cfg(test)]

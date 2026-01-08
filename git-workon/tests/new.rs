@@ -544,3 +544,42 @@ fn new_auto_copy_without_patterns_copies_everything() -> Result<(), Box<dyn std:
 
     Ok(())
 }
+
+#[test]
+fn new_no_name_errors_with_no_interactive() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    Command::cargo_bin("git-workon")?
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("--no-interactive")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No worktree name provided"));
+
+    Ok(())
+}
+
+#[test]
+fn new_with_explicit_name_works_non_interactively() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    Command::cargo_bin("git-workon")?
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .arg("--no-interactive")
+        .assert()
+        .success();
+
+    let repo = fixture.repo()?;
+    repo.assert(predicate::repo::has_worktree("feature"));
+
+    Ok(())
+}
