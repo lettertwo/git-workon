@@ -156,6 +156,110 @@ impl WorktreeDescriptor {
         Ok(ahead > 0)
     }
 
+    /// Returns true if the worktree's branch is behind its upstream.
+    ///
+    /// Returns false if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    /// - The branch is up to date with upstream
+    /// - The upstream is configured but the remote reference is gone
+    ///
+    /// Returns true if:
+    /// - The branch has commits behind its upstream
+    pub fn is_behind_upstream(&self) -> Result<bool> {
+        // Get the branch name - return false if detached
+        let branch_name = match self.branch()? {
+            Some(name) => name,
+            None => return Ok(false), // Detached HEAD, no branch to check
+        };
+
+        // Open the repository
+        let repo = Repository::open(self.path())?;
+
+        // Find the local branch
+        let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => return Ok(false), // Branch doesn't exist
+        };
+
+        // Check if upstream is configured via git config
+        let config = repo.config()?;
+        let remote_key = format!("branch.{}.remote", branch_name);
+
+        // If no upstream is configured, can't be behind
+        let _remote = match config.get_string(&remote_key) {
+            Ok(r) => r,
+            Err(_) => return Ok(false), // No remote configured
+        };
+
+        // Get the upstream branch
+        let upstream = match branch.upstream() {
+            Ok(u) => u,
+            Err(_) => {
+                // Upstream is configured but ref is gone - can't be behind non-existent branch
+                return Ok(false);
+            }
+        };
+
+        // Get the local and upstream commit OIDs
+        let local_oid = branch
+            .get()
+            .target()
+            .ok_or(WorktreeError::NoLocalBranchTarget)?;
+        let upstream_oid = upstream
+            .get()
+            .target()
+            .ok_or(WorktreeError::NoBranchTarget)?;
+
+        // Check if local is behind upstream
+        let (_ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid)?;
+
+        Ok(behind > 0)
+    }
+
+    /// Returns true if the worktree's upstream branch reference is gone (deleted on remote).
+    ///
+    /// Returns false if:
+    /// - The worktree is detached (no branch)
+    /// - The branch has no upstream configured
+    /// - The upstream branch reference exists
+    ///
+    /// Returns true if:
+    /// - Upstream is configured (branch.{name}.remote exists in config)
+    /// - But the upstream branch reference cannot be found
+    pub fn has_gone_upstream(&self) -> Result<bool> {
+        // Get the branch name - return false if detached
+        let branch_name = match self.branch()? {
+            Some(name) => name,
+            None => return Ok(false), // Detached HEAD, no branch to check
+        };
+
+        // Open the repository
+        let repo = Repository::open(self.path())?;
+
+        // Find the local branch
+        let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
+            Ok(b) => b,
+            Err(_) => return Ok(false), // Branch doesn't exist
+        };
+
+        // Check if upstream is configured via git config
+        let config = repo.config()?;
+        let remote_key = format!("branch.{}.remote", branch_name);
+
+        // If no upstream is configured, it's not "gone"
+        match config.get_string(&remote_key) {
+            Ok(_) => {
+                // Upstream is configured - check if the reference exists
+                match branch.upstream() {
+                    Ok(_) => Ok(false), // Upstream exists
+                    Err(_) => Ok(true), // Upstream configured but ref is gone
+                }
+            }
+            Err(_) => Ok(false), // No upstream configured
+        }
+    }
+
     /// Returns true if the worktree's branch has been merged into the target branch.
     ///
     /// A branch is considered merged if its HEAD commit is reachable from the target branch,

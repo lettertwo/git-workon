@@ -78,7 +78,22 @@ pub struct Init {
 
 /// List worktrees.
 #[derive(Debug, Args)]
-pub struct List {}
+pub struct List {
+    #[arg(long, help = "Show only worktrees with uncommitted changes")]
+    pub dirty: bool,
+
+    #[arg(long, help = "Show only worktrees without uncommitted changes")]
+    pub clean: bool,
+
+    #[arg(long, help = "Show only worktrees with unpushed commits")]
+    pub ahead: bool,
+
+    #[arg(long, help = "Show only worktrees behind their upstream")]
+    pub behind: bool,
+
+    #[arg(long, help = "Show only worktrees whose upstream branch is deleted")]
+    pub gone: bool,
+}
 
 /// Create a new worktree.
 #[derive(Debug, Args)]

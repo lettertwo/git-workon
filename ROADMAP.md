@@ -8,16 +8,17 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 ### Implemented ✅
 
-- **Core Commands**: `clone`, `init`, `list`, `new` (with name and `--base` flag), `find` (with name), `prune` (bulk and targeted), `copy-untracked`
+- **Core Commands**: `clone`, `init`, `list` (with status filtering), `new` (with name and `--base` flag), `find` (with name), `prune` (bulk and targeted), `copy-untracked`
+- **List Features**: Status-based filtering with `--dirty`, `--clean`, `--ahead`, `--behind`, `--gone` flags, AND logic for combining filters
 - **Prune Features**: Named worktree pruning (`prune <name>...`), bulk pruning with `--gone`/`--merged`, `--dry-run`, safety checks with `--allow-dirty`/`--allow-unpushed`, protected branches
 - **Branch Types**: Normal branches, orphan branches (with initial commit), detached HEAD
 - **Features**: Bare repo + worktrees pattern, namespace support (slashes in branch names)
-- **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged detection
+- **Metadata**: WorktreeDescriptor methods for branch info, dirty/unpushed/merged/behind/gone detection
 - **Configuration System**: Git config support with 7 config keys, CLI override precedence, validation
 - **Post-Creation Hooks**: Automatic execution of `workon.postCreateHook` commands with environment variables, `--no-hooks` flag
 - **File Copying**: Standalone `copy-untracked` command (defaults to copying all untracked files), automatic copying in `new` command with `workon.autoCopyUntracked` config, pattern-based with `workon.copyPattern` and `workon.copyExclude`, platform-optimized (copy-on-write), `--(no-)copy-untracked`/`--pattern`/`--force` flags
 - **Pull Request Support**: Create worktrees from PR references (`#123`, `pr#123`, GitHub URLs), smart routing, auto-fetch, configurable naming (`workon.prFormat`)
-- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (83 tests total)
+- **Testing**: Comprehensive test suite with FixtureBuilder pattern and custom predicates (97 tests total)
 
 ### Not Implemented ❌
 
@@ -226,23 +227,32 @@ Create a git extension for daily workflows with heavy worktree use, with a stret
 
 **Goal**: Make finding and navigating worktrees fast and intuitive
 
-### 3.1 Status Filtering
+### 3.1 Status Filtering ✅
 
+- **Status**: Completed (partial - list command only)
 - **Priority**: High
 - **Description**: Filter worktrees by status for better discovery
 - **Enhancement To**: List and find commands
 - **Tasks**:
-  - [ ] Add `--dirty` flag - show only worktrees with uncommitted changes
-  - [ ] Add `--clean` flag - show only worktrees without uncommitted changes
-  - [ ] Add `--ahead` flag - show worktrees with unpushed commits
-  - [ ] Add `--behind` flag - show worktrees behind their upstream
-  - [ ] Add `--gone` flag - show worktrees whose upstream branch is deleted
-  - [ ] Support combining multiple filters (AND logic)
-  - [ ] Add filters to `list` command output
-  - [ ] Add filters to interactive `find` mode (when implemented)
-  - [ ] Add `--json` output option for programmatic filtering
-  - [ ] Optimize status checks for performance with many worktrees
-  - [ ] Write tests for all filter combinations
+  - [x] Add `--dirty` flag - show only worktrees with uncommitted changes
+  - [x] Add `--clean` flag - show only worktrees without uncommitted changes
+  - [x] Add `--ahead` flag - show worktrees with unpushed commits
+  - [x] Add `--behind` flag - show worktrees behind their upstream
+  - [x] Add `--gone` flag - show worktrees whose upstream branch is deleted
+  - [x] Support combining multiple filters (AND logic)
+  - [x] Add filters to `list` command output
+  - [ ] Add filters to interactive `find` mode (when implemented - depends on Phase 3.2)
+  - [ ] Add `--json` output option for programmatic filtering (deferred to Phase 5.2)
+  - [ ] Optimize status checks for performance with many worktrees (deferred to Phase 5.2)
+  - [x] Write tests for all filter combinations
+
+**Implementation Notes**:
+- Added two new WorktreeDescriptor methods: `is_behind_upstream()` and `has_gone_upstream()`
+- Implemented filtering in list command with fail-safe error handling (`.unwrap_or(false)`)
+- Hard error when both `--dirty` and `--clean` are specified together
+- Conservative behavior: `has_unpushed_commits()` returns true for gone upstreams
+- 14 comprehensive integration tests covering individual filters, combinations, and edge cases
+- All quality checks pass (cargo fmt, clippy, tests)
 
 ### 3.2 Interactive Modes & Fuzzy Matching
 
