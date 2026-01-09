@@ -1,3 +1,71 @@
+//! Atomic worktree and branch renaming.
+//!
+//! This module provides atomic renaming of worktrees and their associated branches,
+//! keeping the branch name and directory structure synchronized.
+//!
+//! ## Atomic Operation Strategy
+//!
+//! The move operation consists of three steps:
+//! 1. Rename the branch using `git branch -m`
+//! 2. Move the worktree directory to match the new branch name
+//! 3. Update git worktree metadata bidirectionally:
+//!    - Update `.git/worktrees/<name>/gitdir` to point to new location
+//!    - Update worktree's `.git` file to point to correct admin directory
+//!
+//! If the directory move fails after branch rename, the operation rolls back the branch
+//! rename to maintain consistency.
+//!
+//! ## Safety Checks
+//!
+//! By default, the operation performs several safety checks:
+//! - Source worktree exists
+//! - Target doesn't exist (no conflicts with existing worktrees or branches)
+//! - Source is not detached HEAD (can't rename detached HEAD)
+//! - Source is not protected (matches `workon.pruneProtectedBranches`)
+//! - Source is not dirty (no uncommitted changes)
+//! - Source has no unpushed commits (all commits are pushed to remote)
+//!
+//! The `--force` flag overrides all safety checks (single flag for simplicity).
+//!
+//! ## Namespace Support
+//!
+//! Supports moving worktrees between namespaces:
+//! ```bash
+//! git workon move feature user/feature        # Move into namespace
+//! git workon move user/feature feature        # Move out of namespace
+//! git workon move old/path new/deeper/path    # Reorganize
+//! ```
+//!
+//! Parent directories are created automatically as needed.
+//!
+//! ## CLI Modes
+//!
+//! Two invocation modes:
+//! 1. **Single-arg mode**: `git workon move <new-name>` - Renames current worktree (when run from within a worktree)
+//! 2. **Two-arg mode**: `git workon move <from> <to>` - Explicit source and target
+//!
+//! ## Example Usage
+//!
+//! ```bash
+//! # Rename current worktree
+//! cd ~/repos/project/feature
+//! git workon move new-feature-name
+//!
+//! # Rename specific worktree
+//! git workon move old-name new-name
+//!
+//! # Move into namespace
+//! git workon move feature user/feature
+//!
+//! # Preview changes
+//! git workon move --dry-run old new
+//!
+//! # Override safety checks
+//! git workon move --force dirty-branch new-name
+//! ```
+//!
+//! TODO: Update shell integration cache when move command is used
+
 use git2::BranchType;
 use std::{fs, path::Path};
 

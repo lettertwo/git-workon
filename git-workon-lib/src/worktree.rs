@@ -1,3 +1,45 @@
+//! Worktree descriptor and metadata access.
+//!
+//! This module provides the core `WorktreeDescriptor` type that wraps git2's `Worktree`
+//! and exposes rich metadata about worktree state.
+//!
+//! ## Completed Metadata Methods
+//!
+//! The following metadata is fully implemented and working:
+//! - **Basic info**: `name()`, `path()`, `branch()`
+//! - **State detection**: `is_detached()`, `is_dirty()`, `is_valid()`, `is_locked()`
+//! - **Remote tracking**: `remote()`, `remote_branch()`, `remote_url()`, `remote_fetch_url()`, `remote_push_url()`
+//! - **Commit info**: `head_commit()`
+//! - **Status checks**: `has_unpushed_commits()`, `is_behind_upstream()`, `has_gone_upstream()`, `is_merged_into()`
+//!
+//! These methods enable status filtering (`--dirty`, `--ahead`, `--behind`, `--gone`) and
+//! interactive display with status indicators.
+//!
+//! ## Branch Types
+//!
+//! Supports three branch types for worktree creation:
+//! - **Normal**: Standard branch, tracks existing or creates from HEAD
+//! - **Orphan**: Independent history with initial empty commit (for documentation, gh-pages, etc.)
+//! - **Detached**: Detached HEAD state (for exploring specific commits)
+//!
+//! ## Future Extensions
+//!
+//! Planned metadata methods for smart worktree management:
+//!
+//! TODO: Add `is_stale(days: u32)` method
+//! - Track last access/modification time
+//! - Enable `--stale` filter to find forgotten worktrees
+//! - Support auto-prune suggestions based on inactivity
+//!
+//! TODO: Add `last_activity()` method
+//! - Return last modification/access timestamp
+//! - Enable activity-based sorting and filtering
+//!
+//! TODO: Add worktree notes/descriptions support
+//! - Store user-provided notes/context for worktrees
+//! - Help remember why a worktree was created
+//! - Storage strategy TBD (git notes, config, or metadata file)
+
 use std::{fmt, fs::create_dir_all, path::Path};
 
 use git2::WorktreeAddOptions;

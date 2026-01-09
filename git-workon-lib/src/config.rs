@@ -1,3 +1,59 @@
+//! Configuration system for git-workon.
+//!
+//! This module provides the foundation for all git-workon configuration through git's
+//! native config system. No custom config files are used - everything is stored in
+//! standard git config locations (.git/config, ~/.gitconfig, /etc/gitconfig).
+//!
+//! ## Design Philosophy
+//!
+//! **Git config as single source of truth**: We exclusively use git config rather than
+//! introducing custom configuration files. This aligns with git-workon's goal of feeling
+//! like a native git command.
+//!
+//! **Multi-value support**: Git config naturally supports multi-value entries, perfect for
+//! patterns, hooks, and other list-based configuration:
+//!
+//! ```bash
+//! git config --add workon.copyPattern '.env*'
+//! git config --add workon.copyPattern '.vscode/'
+//! git config --get-all workon.copyPattern
+//! ```
+//!
+//! **Precedence**: CLI arguments > local config (.git/config) > global config (~/.gitconfig) > defaults
+//!
+//! ## Configuration Keys
+//!
+//! This module supports 7 configuration keys:
+//!
+//! 1. **workon.defaultBranch** - Default base branch for new worktrees (string, default: None)
+//! 2. **workon.postCreateHook** - Commands to run after worktree creation (multi-value, default: [])
+//! 3. **workon.copyPattern** - Glob patterns for automatic file copying (multi-value, default: [])
+//! 4. **workon.copyExclude** - Patterns to exclude from copying (multi-value, default: [])
+//! 5. **workon.autoCopyUntracked** - Enable automatic file copying in new command (bool, default: false)
+//! 6. **workon.pruneProtectedBranches** - Branches protected from pruning (multi-value, default: [])
+//! 7. **workon.prFormat** - Format string for PR-based worktree names (string, default: "pr-{number}")
+//!
+//! ## Example Configuration
+//!
+//! ```gitconfig
+//! # Global config (~/.gitconfig) - personal preferences
+//! [workon]
+//!   defaultBranch = main
+//!
+//! # Per-repo config (.git/config) - project-specific
+//! [workon]
+//!   postCreateHook = npm install
+//!   postCreateHook = cp ../.env .env
+//!   copyPattern = .env.local
+//!   copyPattern = .vscode/
+//!   copyExclude = .env.production
+//!   autoCopyUntracked = true
+//!   pruneProtectedBranches = main
+//!   pruneProtectedBranches = develop
+//!   pruneProtectedBranches = release/*
+//!   prFormat = pr-{number}
+//! ```
+
 use git2::Repository;
 
 use crate::error::{ConfigError, Result};

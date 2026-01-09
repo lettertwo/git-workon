@@ -1,3 +1,40 @@
+//! Worktree display formatting with status indicators.
+//!
+//! This module provides consistent formatting for displaying worktrees with visual
+//! status indicators, used in interactive modes and list output.
+//!
+//! ## Status Indicators
+//!
+//! Each indicator shows a specific worktree state:
+//! - `*` (asterisk) - Worktree has uncommitted changes (dirty)
+//! - `↑` (up arrow) - Worktree has unpushed commits (ahead of upstream)
+//! - `↓` (down arrow) - Worktree is behind upstream
+//! - `✗` (cross mark) - Upstream branch has been deleted (gone)
+//!
+//! Multiple indicators can appear together, e.g., `feature * ↑` indicates a dirty worktree
+//! with unpushed commits.
+//!
+//! ## Display Format
+//!
+//! The basic format is: `branch-name [indicators...]`
+//!
+//! Examples:
+//! - `main` - Clean worktree, up to date
+//! - `feature *` - Dirty worktree
+//! - `bugfix ↑` - Has unpushed commits
+//! - `experiment * ↑ ↓` - Dirty, has unpushed commits, and is behind upstream
+//! - `old-feature ✗` - Upstream branch deleted
+//! - `(detached HEAD)` - Detached HEAD state
+//!
+//! ## Usage in Interactive Modes
+//!
+//! This formatting is used by:
+//! - `git workon find` (interactive selection)
+//! - `git workon new` (base branch selection)
+//! - Future interactive features
+//!
+//! The indicators help users quickly identify worktree state when selecting from lists.
+
 use miette::Result;
 use workon::WorktreeDescriptor;
 

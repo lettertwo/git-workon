@@ -1,3 +1,38 @@
+//! List command with status filtering.
+//!
+//! Lists worktrees with optional status-based filtering to help discover
+//! worktrees in specific states.
+//!
+//! ## Status Filters
+//!
+//! - `--dirty` - Show worktrees with uncommitted changes
+//! - `--clean` - Show worktrees without uncommitted changes
+//! - `--ahead` - Show worktrees with unpushed commits
+//! - `--behind` - Show worktrees behind their upstream
+//! - `--gone` - Show worktrees whose upstream branch has been deleted
+//!
+//! ## Filter Combination Logic
+//!
+//! Multiple filters use AND logic - all must match:
+//! ```bash
+//! git workon list --dirty --ahead  # Show dirty AND ahead worktrees
+//! git workon list --clean --gone   # Show clean AND gone worktrees
+//! ```
+//!
+//! Conflicting filters (--dirty and --clean together) produce an error.
+//!
+//! ## Fail-Safe Error Handling
+//!
+//! When checking status (dirty, unpushed, etc.), errors default to false
+//! using `.unwrap_or(false)`. This ensures that problems reading one worktree
+//! don't break the entire list operation.
+//!
+//! Conservative behavior: `has_unpushed_commits()` returns true for gone upstreams
+//! (we can't know if commits are pushed when the upstream is deleted).
+//!
+//! TODO: Add --json output option for programmatic use
+//! TODO: Optimize status checks for performance with many worktrees
+
 use miette::Result;
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 

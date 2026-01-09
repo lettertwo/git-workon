@@ -1,3 +1,29 @@
+//! Move command CLI wrapper.
+//!
+//! CLI wrapper for the move_worktree library function (see git-workon-lib/src/move.rs
+//! for the atomic operation implementation).
+//!
+//! ## Two Invocation Modes
+//!
+//! 1. **Single-arg**: `git workon move <new-name>` - Renames current worktree
+//!    - Detects current worktree from working directory
+//!    - Extracts branch name as source
+//!    - Fails if not in a worktree or in detached HEAD
+//!
+//! 2. **Two-arg**: `git workon move <from> <to>` - Explicit source and target
+//!    - Can run from anywhere (doesn't need to be in a worktree)
+//!    - Explicitly specifies which worktree to rename
+//!
+//! ## Dry Run Mode
+//!
+//! `--dry-run` validates the operation and shows what would happen:
+//! - Checks all safety constraints
+//! - Shows branch and directory paths that would change
+//! - No modifications made
+//!
+//! See git-workon-lib/src/move.rs for implementation details, safety checks,
+//! and atomic operation strategy.
+
 use miette::{bail, Context, Result};
 use workon::{
     current_worktree, find_worktree, get_repo, move_worktree, validate_move, MoveOptions,

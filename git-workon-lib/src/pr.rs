@@ -1,3 +1,78 @@
+//! Pull request support for creating worktrees from PR references.
+//!
+//! This module enables creating worktrees directly from pull request references,
+//! making it easy to review PRs in isolated worktrees.
+//!
+//! ## PR Reference Parsing
+//!
+//! Supports multiple PR reference formats:
+//! - `#123` - GitHub shorthand (most common)
+//! - `pr#123` or `pr-123` - Explicit PR references
+//! - `https://github.com/owner/repo/pull/123` - Full GitHub PR URL
+//! - `origin/pull/123/head` - Direct remote ref (less common)
+//!
+//! Parsing is lenient - if it looks like a PR reference, we'll try to extract the number.
+//!
+//! ## Smart Routing
+//!
+//! The CLI's smart routing (in main.rs) automatically detects PR references:
+//! ```bash
+//! git workon #123        # Routes to `new` command with PR reference
+//! git workon pr#123      # Same - creates PR worktree
+//! git workon feature     # Routes to `find` command (not a PR)
+//! ```
+//!
+//! ## Remote Detection Algorithm
+//!
+//! To fetch PRs, we need to determine which remote to use. The detection strategy:
+//! 1. Check for `upstream` remote (common in fork workflows)
+//! 2. Fall back to `origin` remote (most common)
+//! 3. Use first available remote (rare, but handles edge cases)
+//!
+//! This handles both direct repository workflows and fork-based workflows.
+//!
+//! ## Auto-Fetch Strategy
+//!
+//! PR branches are fetched automatically if not present locally:
+//! ```text
+//! git fetch <remote> +refs/pull/{number}/head:refs/remotes/<remote>/pr/{number}
+//! ```
+//!
+//! The `+` forces the fetch even if not fast-forward, ensuring we always get the latest PR state.
+//!
+//! ## Worktree Naming
+//!
+//! Worktree names are generated from `workon.prFormat` config (default: `pr-{number}`):
+//! - `pr-123` (default format)
+//! - `#123` (if configured with `#{number}`)
+//! - `pull-123` (if configured with `pull-{number}`)
+//!
+//! The format must contain `{number}` placeholder.
+//!
+//! ## Example Usage
+//!
+//! ```bash
+//! # Create worktree for PR #123 (auto-detects remote, auto-fetches)
+//! git workon #123
+//!
+//! # Explicit PR reference
+//! git workon new pr#456
+//!
+//! # From GitHub URL
+//! git workon new https://github.com/user/repo/pull/789
+//!
+//! # Configure custom naming
+//! git config workon.prFormat "review-{number}"
+//! git workon #123  # Creates worktree named "review-123"
+//! ```
+//!
+//! ## Future Enhancements
+//!
+//! TODO: Support PR format variables {title}, {author} (requires gh CLI integration)
+//! TODO: Handle fork-based PRs (fetch from fork remote)
+//! TODO: Integration with gh CLI for PR metadata
+//! TODO: Support GitLab merge requests
+
 use git2::{FetchOptions, Repository};
 use log::debug;
 

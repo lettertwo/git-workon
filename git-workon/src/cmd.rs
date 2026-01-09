@@ -1,5 +1,7 @@
 mod clone;
+mod config;
 mod copy_untracked;
+mod doctor;
 mod find;
 mod init;
 mod list;
@@ -20,7 +22,9 @@ impl Run for Cmd {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         match self {
             Cmd::Clone(cmd) => cmd.run(),
+            Cmd::Config(cmd) => cmd.run(),
             Cmd::CopyUntracked(cmd) => cmd.run(),
+            Cmd::Doctor(cmd) => cmd.run(),
             Cmd::Find(cmd) => cmd.run(),
             Cmd::Init(cmd) => cmd.run(),
             Cmd::List(cmd) => cmd.run(),

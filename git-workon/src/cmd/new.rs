@@ -1,3 +1,55 @@
+//! New command with interactive mode, PR support, and auto-copy.
+//!
+//! Creates new worktrees with interactive prompts, pull request support, and
+//! automatic file copying integration.
+//!
+//! ## Interactive Prompts
+//!
+//! When no name is provided:
+//! 1. Prompts for branch name using Input widget
+//! 2. Prompts for base branch using FuzzySelect (shows local branches + configured default)
+//! 3. PR detection still works - user can type `pr#123` at the name prompt
+//!
+//! Use `--no-interactive` to bypass prompts (required for testing/scripting).
+//!
+//! ## PR Support Integration
+//!
+//! Detects PR references in the name and handles them specially:
+//! - Parses PR reference (see pr.rs for supported formats)
+//! - Auto-detects remote (upstream → origin → first)
+//! - Auto-fetches if PR branch not present
+//! - Names worktree using `workon.prFormat` config
+//! - Sets up tracking to PR head branch
+//!
+//! Combined with smart routing in main.rs, enables: `git workon #123`
+//!
+//! ## Automatic File Copying
+//!
+//! If `workon.autoCopyUntracked=true`:
+//! - Copies files from base branch's worktree (or HEAD's worktree if no base)
+//! - Uses `workon.copyPattern` patterns (or defaults to `**/*`)
+//! - Respects `workon.copyExclude` patterns
+//! - Runs after worktree creation, before post-create hooks
+//! - Can be overridden with `--(no-)copy-untracked` flags
+//!
+//! ## Execution Order
+//!
+//! 1. Create worktree
+//! 2. Copy files (if auto-copy enabled)
+//! 3. Execute post-create hooks (from hooks.rs)
+//!
+//! FIXME: our crude attempt at supporting PRs is not sophisticated enough for real-world usage.
+//!       Even beyond advanced scenarios (e.g., handling forks, multiple remotes, gh CLI integration, etc),
+//!       straightforward cases are broken by default, e.g., the upstream branch is not properly set
+//!       (instead, a new branch is created that matches the PR worktree name as formatted by config).
+//!       This needs a more thorough design and implementation pass. We may consider not supporting PRs
+//!       at all until/unless we are integrated with the gh CLI or similar tools.
+//!
+//! TODO: Support PR format variables {title}, {author} (requires gh CLI integration)
+//! TODO: Handle fork-based PRs (fetch from fork remote)
+//! TODO: Integration with gh CLI for PR metadata
+//! TODO: Support GitLab merge requests
+
 use dialoguer::{FuzzySelect, Input};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 

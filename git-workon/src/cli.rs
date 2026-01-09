@@ -24,7 +24,13 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
     Clone(Clone),
+    /// Manage git-workon configuration interactively
+    #[command(visible_alias = "cfg")]
+    Config(Config),
     CopyUntracked(CopyUntracked),
+    /// Detect and repair workspace issues
+    #[command(visible_alias = "check")]
+    Doctor(Doctor),
     Find(Find),
     Init(Init),
     List(List),
@@ -206,6 +212,32 @@ pub struct Find {
 
     #[arg(long, help = "Disable interactive mode (for testing/scripting)")]
     pub no_interactive: bool,
+}
+
+/// Detect and repair workspace issues.
+#[derive(Debug, Args)]
+pub struct Doctor {
+    /// Automatically fix detected issues
+    #[arg(long)]
+    pub fix: bool,
+
+    /// Preview fixes without applying them
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// Manage git-workon configuration interactively.
+#[derive(Debug, Args)]
+pub struct Config {
+    /// Scope for configuration (global or local)
+    #[arg(long, value_enum, default_value = "local")]
+    pub scope: ConfigScope,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum ConfigScope {
+    Global,
+    Local,
 }
 
 #[cfg(test)]

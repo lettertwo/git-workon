@@ -1,3 +1,39 @@
+//! Find command with fuzzy matching and interactive selection.
+//!
+//! Finds worktrees using exact match, fuzzy matching, or interactive selection,
+//! with integrated status filtering.
+//!
+//! ## Three-Mode Strategy
+//!
+//! 1. **Exact match**: If name matches exactly, return immediately
+//! 2. **Single fuzzy match**: If name fuzzy-matches one worktree, return it
+//! 3. **Interactive selection**: If multiple matches or no name provided, show interactive picker
+//!
+//! ## Fuzzy Matching Algorithm
+//!
+//! Simple case-insensitive substring matching:
+//! - `feat` matches `feature`, `feat-branch`, `new-feature`
+//! - `user/` matches `user/feature`, `user/bugfix`
+//! - Exact matches take priority over fuzzy matches
+//!
+//! ## Status Filter Integration
+//!
+//! All status filters work in find:
+//! ```bash
+//! git workon find --dirty           # Find dirty worktrees
+//! git workon find feat --ahead      # Find 'feat*' with unpushed commits
+//! git workon find --clean --behind  # Interactive select from clean, behind worktrees
+//! ```
+//!
+//! ## Interactive Mode
+//!
+//! Uses dialoguer's FuzzySelect widget with:
+//! - Status indicators from display.rs (`*`, `↑`, `↓`, `✗`)
+//! - Fuzzy searchable selection
+//! - `--no-interactive` bypass for testing and scripting
+//!
+//! TODO: Add tests for interactive UI behavior (requires stdin mocking)
+
 use dialoguer::FuzzySelect;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};

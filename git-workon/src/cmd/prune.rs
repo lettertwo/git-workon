@@ -1,3 +1,31 @@
+//! Prune command - remove merged/gone worktrees.
+//!
+//! Removes worktrees whose branches have been merged or deleted, with safety checks
+//! to prevent accidental deletion of active work.
+//!
+//! ## Features
+//!
+//! - **Targeted pruning**: `git workon prune <name>...` - prune specific worktrees
+//! - **Bulk pruning**: `--gone` and `--merged` flags for automatic discovery
+//! - **Protected branches**: Respects `workon.pruneProtectedBranches` glob patterns
+//! - **Safety checks**: `--allow-dirty` and `--allow-unpushed` to override warnings
+//! - **Dry run**: `--dry-run` to preview without deleting
+//!
+//! ## Protected Branch Matching
+//!
+//! Simple glob patterns:
+//! - Exact match: `main` protects only "main"
+//! - Wildcard: `*` protects all branches
+//! - Prefix: `release/*` protects "release/v1", "release/v2", etc.
+//!
+//! ## Status Filtering
+//!
+//! When using `--gone` or `--merged`, the command uses WorktreeDescriptor's status
+//! methods to detect which worktrees can be safely pruned.
+//!
+//! TODO: Add --force flag to override protection
+//! TODO: Figure out what 'unpushed' means when the upstream is gone (maybe change to 'unmerged'?)
+
 use dialoguer::Confirm;
 use git2::BranchType;
 use miette::{IntoDiagnostic, Result};

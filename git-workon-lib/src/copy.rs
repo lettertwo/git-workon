@@ -1,3 +1,68 @@
+//! Enhanced file copying with pattern matching and platform optimizations.
+//!
+//! This module provides pattern-based file copying between worktrees with platform-specific
+//! optimizations for efficient copying of large files and directories.
+//!
+//! ## Design: Two Modes
+//!
+//! ### 1. Standalone Command (`copy-untracked`)
+//! - Default behavior: copies ALL untracked files (`**/*` pattern)
+//! - `--pattern` flag: override with specific patterns
+//! - Config: uses `workon.copyPattern` if set (convenience)
+//! - Priority: `--pattern` > config > default `**/*`
+//! - `--force` flag: overwrite existing files at destination
+//!
+//! ### 2. Automatic Copying (`new` command integration)
+//! - Enable with `workon.autoCopyUntracked=true` config
+//! - Uses `workon.copyPattern` if configured, otherwise defaults to `**/*`
+//! - Always respects `workon.copyExclude` patterns
+//! - Flags: `--(no-)copy-untracked` to override config
+//! - Copies from base branch's worktree (or HEAD's worktree if no base specified)
+//! - Gracefully skips if source worktree doesn't exist
+//! - Runs after worktree creation, before post-create hooks
+//!
+//! ## Pattern Matching
+//!
+//! Uses standard glob patterns via the `glob` crate:
+//! - `*.env` - All .env files in current directory
+//! - `.env*` - All files starting with .env
+//! - `**/*.json` - All JSON files recursively
+//! - `.vscode/` - Entire directory and contents
+//!
+//! Exclude patterns work the same way, checked after include patterns match.
+//!
+//! ## Platform Optimizations
+//!
+//! Platform-specific copy-on-write optimizations for large files:
+//! - **macOS**: `cp -c` (clonefile) - instant CoW copies on APFS
+//! - **Linux**: `cp --reflink=auto` - CoW copies on btrfs/XFS when supported
+//! - **Other**: Standard `fs::copy` fallback
+//!
+//! These optimizations make copying large node_modules or build directories nearly instant
+//! on supported filesystems.
+//!
+//! ## Behavior
+//!
+//! - Only copies files (directories are skipped, but created as needed for nested files)
+//! - Automatic parent directory creation for nested files
+//! - Skips files that already exist at destination (unless --force)
+//! - Returns list of successfully copied files
+//!
+//! ## Example Usage
+//!
+//! ```bash
+//! # Copy specific patterns
+//! git workon copy-untracked --pattern '.env*' --pattern '.vscode/'
+//!
+//! # Configure automatic copying
+//! git config workon.autoCopyUntracked true
+//! git config --add workon.copyPattern '.env.local'
+//! git config --add workon.copyPattern 'node_modules/'
+//! git config --add workon.copyExclude '.env.production'
+//! ```
+//!
+//! TODO: Add progress reporting for large copies
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
