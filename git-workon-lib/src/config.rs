@@ -118,6 +118,31 @@ impl<'repo> WorkonConfig<'repo> {
         self.read_multivar("workon.pruneProtectedBranches")
     }
 
+    /// Check if a given branch name is protected from pruning.
+    ///
+    /// Returns true if the branch name matches any of the protected patterns.
+    pub fn is_protected(&self, branch_name: &str) -> bool {
+        let patterns = match self.prune_protected_branches() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        // Same logic as prune command
+        for pattern in patterns {
+            if pattern == branch_name {
+                return true;
+            }
+            if pattern == "*" {
+                return true;
+            }
+            if let Some(prefix) = pattern.strip_suffix("/*") {
+                if branch_name.starts_with(&format!("{}/", prefix)) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Helper to read multi-value config entries.
     ///
     /// Returns an empty Vec if the key doesn't exist.

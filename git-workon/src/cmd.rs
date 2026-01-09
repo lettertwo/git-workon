@@ -3,6 +3,7 @@ mod copy_untracked;
 mod find;
 mod init;
 mod list;
+mod r#move; // r#move because "move" is a reserved keyword
 mod new;
 mod prune;
 
@@ -23,6 +24,7 @@ impl Run for Cmd {
             Cmd::Find(cmd) => cmd.run(),
             Cmd::Init(cmd) => cmd.run(),
             Cmd::List(cmd) => cmd.run(),
+            Cmd::Move(cmd) => cmd.run(),
             Cmd::New(cmd) => cmd.run(),
             Cmd::Prune(cmd) => cmd.run(),
         }

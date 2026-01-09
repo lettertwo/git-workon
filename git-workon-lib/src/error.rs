@@ -17,6 +17,11 @@ pub enum WorkonError {
     #[diagnostic(code(workon::io_error))]
     Io(#[from] std::io::Error),
 
+    /// Repository-related errors
+    #[error(transparent)]
+    #[diagnostic(forward(0))]
+    Repo(#[from] RepoError),
+
     /// Worktree-related errors
     #[error(transparent)]
     #[diagnostic(forward(0))]
@@ -38,6 +43,17 @@ pub enum WorkonError {
     Pr(#[from] PrError),
 }
 
+/// Repository-specific errors
+#[derive(Error, Diagnostic, Debug)]
+pub enum RepoError {
+    #[error("Not a bare repository at {0}")]
+    #[diagnostic(
+        code(workon::repo::not_bare),
+        help("Workon commands must be run in bare repositories")
+    )]
+    NotBare(String),
+}
+
 /// Worktree-specific errors
 #[derive(Error, Diagnostic, Debug)]
 pub enum WorktreeError {
@@ -54,6 +70,13 @@ pub enum WorktreeError {
         help("Use 'git workon list' to see available worktrees")
     )]
     NotFound(String),
+
+    #[error("Not in a worktree directory")]
+    #[diagnostic(
+        code(workon::worktree::not_in_worktree),
+        help("Run this command from within a worktree directory")
+    )]
+    NotInWorktree,
 
     #[error("Could not determine branch target")]
     #[diagnostic(
@@ -87,6 +110,41 @@ pub enum WorktreeError {
     #[error("Expected an empty index!")]
     #[diagnostic(code(workon::worktree::non_empty_index))]
     NonEmptyIndex,
+
+    #[error("Worktree '{to}' already exists")]
+    #[diagnostic(
+        code(workon::worktree::target_exists),
+        help("Choose a different name or remove the existing worktree first")
+    )]
+    TargetExists { to: String },
+
+    #[error("Cannot move detached HEAD worktree")]
+    #[diagnostic(
+        code(workon::worktree::move_detached),
+        help("Detached HEAD worktrees have no branch to rename")
+    )]
+    CannotMoveDetached,
+
+    #[error("Branch '{0}' is protected and cannot be renamed")]
+    #[diagnostic(
+        code(workon::worktree::protected_branch_move),
+        help("Protected branches are configured in workon.pruneProtectedBranches. Use --force to override.")
+    )]
+    ProtectedBranchMove(String),
+
+    #[error("Worktree is dirty (uncommitted changes)")]
+    #[diagnostic(
+        code(workon::worktree::dirty_worktree),
+        help("Commit or stash changes, or use --force to override")
+    )]
+    DirtyWorktree,
+
+    #[error("Worktree has unpushed commits")]
+    #[diagnostic(
+        code(workon::worktree::unpushed_commits),
+        help("Push commits first, or use --force to override")
+    )]
+    UnpushedCommits,
 }
 
 /// Configuration-related errors

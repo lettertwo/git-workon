@@ -28,6 +28,7 @@ pub enum Cmd {
     Find(Find),
     Init(Init),
     List(List),
+    Move(Move),
     New(New),
     Prune(Prune),
 }
@@ -93,6 +94,28 @@ pub struct List {
 
     #[arg(long, help = "Show only worktrees whose upstream branch is deleted")]
     pub gone: bool,
+}
+
+/// Rename a worktree and its branch atomically.
+///
+/// Usage:
+///   git workon move <to>           # Rename current worktree
+///   git workon move <from> <to>    # Rename specific worktree
+#[derive(Debug, Args)]
+pub struct Move {
+    /// Worktree name(s): either [to] or [from] [to]
+    #[arg(num_args = 1..=2, required = true)]
+    pub names: Vec<String>,
+
+    #[arg(short = 'n', long, help = "Preview changes without executing")]
+    pub dry_run: bool,
+
+    #[arg(
+        short,
+        long,
+        help = "Override all safety checks (dirty, unpushed, protected)"
+    )]
+    pub force: bool,
 }
 
 /// Create a new worktree.

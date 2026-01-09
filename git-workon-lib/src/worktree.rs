@@ -489,6 +489,27 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
         .collect()
 }
 
+pub fn current_worktree(repo: &Repository) -> Result<WorktreeDescriptor> {
+    let current_dir = std::env::current_dir().map_err(std::io::Error::other)?;
+
+    let worktrees = get_worktrees(repo)?;
+    worktrees
+        .into_iter()
+        .find(|wt| current_dir.starts_with(wt.path()))
+        .ok_or_else(|| WorktreeError::NotInWorktree.into())
+}
+
+pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor> {
+    let worktrees = get_worktrees(repo)?;
+    worktrees
+        .into_iter()
+        .find(|wt| {
+            // Match by worktree name or branch name
+            wt.name() == Some(name) || wt.branch().ok().flatten().as_deref() == Some(name)
+        })
+        .ok_or_else(|| WorktreeError::NotFound(name.to_string()).into())
+}
+
 pub fn add_worktree(
     repo: &Repository,
     branch_name: &str,
