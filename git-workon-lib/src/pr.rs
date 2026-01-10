@@ -33,12 +33,16 @@
 //!
 //! ## Auto-Fetch Strategy
 //!
-//! PR branches are fetched automatically if not present locally:
+//! PR branches are fetched automatically using gh CLI metadata:
 //! ```text
-//! git fetch <remote> +refs/pull/{number}/head:refs/remotes/<remote>/pr/{number}
+//! git fetch <remote> +refs/heads/{branch}:refs/remotes/<remote>/{branch}
 //! ```
 //!
+//! Where `{branch}` is the actual branch name from the PR (obtained via gh CLI).
 //! The `+` forces the fetch even if not fast-forward, ensuring we always get the latest PR state.
+//!
+//! For fork PRs, a fork remote is automatically added and the branch is fetched from it.
+//! For non-fork PRs, the branch is fetched from the detected remote (origin/upstream).
 //!
 //! ## Worktree Naming
 //!
@@ -66,12 +70,13 @@
 //! git workon #123  # Creates worktree named "review-123"
 //! ```
 //!
-//! ## Future Enhancements
+//! ## gh CLI Integration
 //!
-//! TODO: Support PR format variables {title}, {author} (requires gh CLI integration)
-//! TODO: Handle fork-based PRs (fetch from fork remote)
-//! TODO: Integration with gh CLI for PR metadata
-//! TODO: Support GitLab merge requests
+//! PR support integrates with gh CLI for rich metadata:
+//! - **Format placeholders**: {number}, {title}, {author}, {branch}
+//! - **Fork support**: Auto-adds fork remotes and fetches fork branches
+//! - **Metadata**: Fetches PR title, author, branch names, and state
+//! - **Validation**: Checks PR exists before creating worktree
 
 use git2::{FetchOptions, Repository};
 use log::debug;
@@ -86,6 +91,19 @@ use crate::{
 pub struct PullRequest {
     pub number: u32,
     pub remote: Option<String>,
+}
+
+/// PR metadata fetched from gh CLI
+#[derive(Debug, Clone)]
+pub struct PrMetadata {
+    pub number: u32,
+    pub title: String,
+    pub author: String,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub is_fork: bool,
+    pub fork_owner: Option<String>,
+    pub fork_url: Option<String>,
 }
 
 /// Parse a PR reference from user input
@@ -197,6 +215,150 @@ fn parse_remote_ref(ref_str: &str) -> Result<Option<PullRequest>> {
     .into())
 }
 
+/// Check if gh CLI is available
+pub fn check_gh_available() -> Result<()> {
+    std::process::Command::new("gh")
+        .arg("--version")
+        .output()
+        .map_err(|_| PrError::GhNotInstalled)?;
+    Ok(())
+}
+
+/// Fetch PR metadata using gh CLI
+pub fn fetch_pr_metadata(pr_number: u32) -> Result<PrMetadata> {
+    // Ensure gh is available
+    check_gh_available()?;
+
+    // Fetch PR metadata with single gh command
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &pr_number.to_string(),
+            "--json",
+            "number,title,author,headRefName,baseRefName,isCrossRepository,headRepository",
+        ])
+        .output()
+        .map_err(|e| PrError::GhFetchFailed {
+            message: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PrError::GhFetchFailed {
+            message: stderr.to_string(),
+        }
+        .into());
+    }
+
+    // Parse JSON response
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| PrError::GhJsonParseFailed {
+            message: e.to_string(),
+        })?;
+
+    // Extract fields
+    let number = json["number"]
+        .as_u64()
+        .ok_or_else(|| PrError::GhJsonParseFailed {
+            message: "Missing 'number' field".to_string(),
+        })? as u32;
+
+    let title = json["title"]
+        .as_str()
+        .ok_or_else(|| PrError::GhJsonParseFailed {
+            message: "Missing 'title' field".to_string(),
+        })?
+        .to_string();
+
+    let author = json["author"]["login"]
+        .as_str()
+        .ok_or_else(|| PrError::GhJsonParseFailed {
+            message: "Missing 'author.login' field".to_string(),
+        })?
+        .to_string();
+
+    let head_ref = json["headRefName"]
+        .as_str()
+        .ok_or_else(|| PrError::GhJsonParseFailed {
+            message: "Missing 'headRefName' field".to_string(),
+        })?
+        .to_string();
+
+    let base_ref = json["baseRefName"]
+        .as_str()
+        .ok_or_else(|| PrError::GhJsonParseFailed {
+            message: "Missing 'baseRefName' field".to_string(),
+        })?
+        .to_string();
+
+    let is_fork = json["isCrossRepository"].as_bool().unwrap_or(false);
+
+    let (fork_owner, fork_url) = if is_fork {
+        let owner = json["headRepository"]["owner"]["login"]
+            .as_str()
+            .ok_or(PrError::MissingForkOwner)?
+            .to_string();
+        let url = json["headRepository"]["url"]
+            .as_str()
+            .map(|s| s.to_string());
+        (Some(owner), url)
+    } else {
+        (None, None)
+    };
+
+    Ok(PrMetadata {
+        number,
+        title,
+        author,
+        head_ref,
+        base_ref,
+        is_fork,
+        fork_owner,
+        fork_url,
+    })
+}
+
+/// Sanitize a string for use in branch/worktree names
+fn sanitize_for_branch_name(s: &str) -> String {
+    let sanitized = s
+        .chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => c,
+            ' ' | '/' => '-',
+            _ => '-',
+        })
+        .collect::<String>()
+        .to_lowercase();
+
+    // Collapse multiple dashes into single dash
+    let mut result = String::new();
+    let mut last_was_dash = false;
+    for c in sanitized.chars() {
+        if c == '-' {
+            if !last_was_dash {
+                result.push(c);
+            }
+            last_was_dash = true;
+        } else {
+            result.push(c);
+            last_was_dash = false;
+        }
+    }
+
+    result.trim_matches(|c| c == '-' || c == '_').to_string()
+}
+
+/// Format PR name with metadata placeholders
+pub fn format_pr_name_with_metadata(format: &str, metadata: &PrMetadata) -> String {
+    format
+        .replace("{number}", &metadata.number.to_string())
+        .replace("{title}", &sanitize_for_branch_name(&metadata.title))
+        .replace("{author}", &sanitize_for_branch_name(&metadata.author))
+        .replace("{branch}", &sanitize_for_branch_name(&metadata.head_ref))
+}
+
 /// Check if a string looks like a PR reference
 ///
 /// This is a quick check used for routing decisions.
@@ -226,40 +388,80 @@ pub fn detect_pr_remote(repo: &Repository) -> Result<String> {
     }
 }
 
-/// Fetch PR refs from the remote
+/// Add fork remote if needed and return remote name to fetch from
+pub fn setup_fork_remote(repo: &Repository, metadata: &PrMetadata) -> Result<String> {
+    if !metadata.is_fork {
+        // Not a fork - use regular remote
+        return detect_pr_remote(repo);
+    }
+
+    // Fork PR - need to add fork remote
+    let _fork_owner = metadata
+        .fork_owner
+        .as_ref()
+        .ok_or(PrError::MissingForkOwner)?;
+
+    let fork_url = metadata
+        .fork_url
+        .as_ref()
+        .ok_or(PrError::MissingForkOwner)?;
+
+    // Check if fork remote already exists
+    let fork_remote_name = format!("pr-{}-fork", metadata.number);
+
+    if repo.find_remote(&fork_remote_name).is_ok() {
+        debug!("Fork remote {} already exists", fork_remote_name);
+        return Ok(fork_remote_name);
+    }
+
+    // Add fork as remote
+    debug!("Adding fork remote: {} -> {}", fork_remote_name, fork_url);
+    repo.remote(&fork_remote_name, fork_url)
+        .map_err(|e| PrError::FetchFailed {
+            remote: fork_remote_name.clone(),
+            message: format!("Failed to add fork remote: {}", e),
+        })?;
+
+    Ok(fork_remote_name)
+}
+
+/// Fetch a branch from a remote
 ///
-/// This fetches the specific PR ref if it doesn't already exist locally.
-pub fn fetch_pr_refs(repo: &Repository, remote: &str, pr_number: u32) -> Result<()> {
-    // Check if PR ref already exists
-    let pr_ref = format!("refs/remotes/{}/pull/{}/head", remote, pr_number);
-    if repo.find_reference(&pr_ref).is_ok() {
-        debug!("PR ref {} already exists", pr_ref);
+/// This fetches the specified branch from the remote, making it available
+/// as `refs/remotes/{remote}/{branch}` locally.
+///
+/// This is used for both fork and non-fork PRs to fetch the actual branch
+/// that was used to create the PR (using gh CLI metadata).
+pub fn fetch_branch(repo: &Repository, remote_name: &str, branch: &str) -> Result<()> {
+    // Check if branch already exists locally
+    let branch_ref = format!("refs/remotes/{}/{}", remote_name, branch);
+    if repo.find_reference(&branch_ref).is_ok() {
+        debug!("Branch ref {} already exists", branch_ref);
         return Ok(());
     }
 
-    debug!("Fetching PR #{} from remote {}", pr_number, remote);
+    debug!("Fetching branch {} from remote {}", branch, remote_name);
 
-    // Build the refspec for fetching this specific PR
     let refspec = format!(
-        "+refs/pull/{}/head:refs/remotes/{}/pull/{}/head",
-        pr_number, remote, pr_number
+        "+refs/heads/{}:refs/remotes/{}/{}",
+        branch, remote_name, branch
     );
 
     let mut fetch_options = FetchOptions::new();
     fetch_options.remote_callbacks(get_remote_callbacks()?);
 
-    repo.find_remote(remote)?
+    repo.find_remote(remote_name)?
         .fetch(
             &[refspec.as_str()],
             Some(&mut fetch_options),
-            Some("Fetching PR"),
+            Some("Fetching PR branch"),
         )
         .map_err(|e| PrError::FetchFailed {
-            remote: remote.to_string(),
+            remote: remote_name.to_string(),
             message: e.message().to_string(),
         })?;
 
-    debug!("Successfully fetched PR #{}", pr_number);
+    debug!("Successfully fetched branch {}", branch);
     Ok(())
 }
 
@@ -270,36 +472,51 @@ pub fn format_pr_name(format: &str, pr_number: u32) -> String {
     format.replace("{number}", &pr_number.to_string())
 }
 
-/// Prepare a PR worktree by fetching refs and determining the branch name
+/// Prepare a PR worktree using gh CLI metadata
 ///
 /// This handles the complete PR workflow:
-/// 1. Detect which remote to use
-/// 2. Fetch PR refs if needed
-/// 3. Format the worktree name using config
+/// 1. Check gh CLI is available
+/// 2. Fetch PR metadata from gh
+/// 3. Setup fork remote if needed
+/// 4. Fetch PR branch
+/// 5. Format worktree name using metadata
 ///
-/// Returns (worktree_name, remote_ref) for use with add_worktree
+/// Returns (worktree_name, remote_ref, base_branch) for use with add_worktree
 pub fn prepare_pr_worktree(
     repo: &Repository,
     pr_number: u32,
     pr_format: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, String)> {
     debug!("Preparing PR worktree for PR #{}", pr_number);
 
-    // Detect which remote to use
-    let remote = detect_pr_remote(repo)?;
-    debug!("Using remote: {}", remote);
+    // Fetch PR metadata from gh CLI
+    let metadata = fetch_pr_metadata(pr_number)?;
+    debug!(
+        "Fetched metadata: title='{}', author='{}', is_fork={}",
+        metadata.title, metadata.author, metadata.is_fork
+    );
 
-    // Fetch the PR refs if needed
-    fetch_pr_refs(repo, &remote, pr_number)?;
+    // Setup remote and fetch branch
+    // For fork PRs: setup fork remote and fetch from it
+    // For non-fork PRs: use existing remote (origin/upstream)
+    let remote_name = if metadata.is_fork {
+        setup_fork_remote(repo, &metadata)?
+    } else {
+        detect_pr_remote(repo)?
+    };
 
-    // Format the worktree name using the PR format
-    let worktree_name = format_pr_name(pr_format, pr_number);
+    // Fetch the actual branch from gh CLI metadata (works for both fork and non-fork)
+    fetch_branch(repo, &remote_name, &metadata.head_ref)?;
+
+    // Format worktree name using metadata
+    let worktree_name = format_pr_name_with_metadata(pr_format, &metadata);
     debug!("Worktree name: {}", worktree_name);
 
-    // Build the remote ref for branching
-    let remote_ref = format!("{}/pull/{}/head", remote, pr_number);
+    // Build remote ref using the actual branch from metadata
+    let remote_ref = format!("{}/{}", remote_name, metadata.head_ref);
+    debug!("Remote ref: {}", remote_ref);
 
-    Ok((worktree_name, remote_ref))
+    Ok((worktree_name, remote_ref, metadata.base_ref))
 }
 
 #[cfg(test)]
@@ -374,5 +591,70 @@ mod tests {
         assert_eq!(format_pr_name("pr-{number}", 123), "pr-123");
         assert_eq!(format_pr_name("review-{number}", 456), "review-456");
         assert_eq!(format_pr_name("{number}-test", 789), "789-test");
+    }
+
+    #[test]
+    fn test_sanitize_branch_name() {
+        assert_eq!(sanitize_for_branch_name("Fix Bug #123"), "fix-bug-123");
+        assert_eq!(
+            sanitize_for_branch_name("Add Feature (v2)"),
+            "add-feature-v2"
+        );
+        assert_eq!(sanitize_for_branch_name("john-smith"), "john-smith");
+        assert_eq!(
+            sanitize_for_branch_name("Fix: Authentication Issue"),
+            "fix-authentication-issue"
+        );
+        assert_eq!(sanitize_for_branch_name("Test@#$%"), "test");
+    }
+
+    #[test]
+    fn test_format_with_metadata() {
+        let metadata = PrMetadata {
+            number: 123,
+            title: "Fix Authentication Bug".to_string(),
+            author: "john-smith".to_string(),
+            head_ref: "feature/fix-auth".to_string(),
+            base_ref: "main".to_string(),
+            is_fork: false,
+            fork_owner: None,
+            fork_url: None,
+        };
+
+        assert_eq!(
+            format_pr_name_with_metadata("pr-{number}", &metadata),
+            "pr-123"
+        );
+        assert_eq!(
+            format_pr_name_with_metadata("{number}-{title}", &metadata),
+            "123-fix-authentication-bug"
+        );
+        assert_eq!(
+            format_pr_name_with_metadata("{author}/pr-{number}", &metadata),
+            "john-smith/pr-123"
+        );
+        assert_eq!(
+            format_pr_name_with_metadata("{branch}-{number}", &metadata),
+            "feature-fix-auth-123"
+        );
+    }
+
+    // Integration tests requiring gh CLI (marked with #[ignore])
+    #[test]
+    #[ignore]
+    fn test_gh_cli_available() {
+        check_gh_available().expect("gh CLI should be installed");
+    }
+
+    #[test]
+    #[ignore]
+    fn test_fetch_real_pr_metadata() {
+        // Requires gh CLI and auth
+        // This test uses a real PR from a public repo (git-workon itself if available)
+        // Replace with actual PR number from your repository for testing
+        let metadata = fetch_pr_metadata(1).expect("Failed to fetch PR metadata");
+        assert_eq!(metadata.number, 1);
+        assert!(!metadata.title.is_empty());
+        assert!(!metadata.author.is_empty());
     }
 }

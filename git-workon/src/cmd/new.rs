@@ -38,17 +38,13 @@
 //! 2. Copy files (if auto-copy enabled)
 //! 3. Execute post-create hooks (from hooks.rs)
 //!
-//! FIXME: our crude attempt at supporting PRs is not sophisticated enough for real-world usage.
-//!       Even beyond advanced scenarios (e.g., handling forks, multiple remotes, gh CLI integration, etc),
-//!       straightforward cases are broken by default, e.g., the upstream branch is not properly set
-//!       (instead, a new branch is created that matches the PR worktree name as formatted by config).
-//!       This needs a more thorough design and implementation pass. We may consider not supporting PRs
-//!       at all until/unless we are integrated with the gh CLI or similar tools.
+//! ## gh CLI Integration
 //!
-//! TODO: Support PR format variables {title}, {author} (requires gh CLI integration)
-//! TODO: Handle fork-based PRs (fetch from fork remote)
-//! TODO: Integration with gh CLI for PR metadata
-//! TODO: Support GitLab merge requests
+//! PR support uses gh CLI for robust metadata handling:
+//! - Fetches PR title, author, branch name, and base branch
+//! - Supports fork-based PRs by auto-adding fork remotes
+//! - Properly sets upstream tracking for PR branches
+//! - Enables format placeholders: {number}, {title}, {author}, {branch}
 
 use dialoguer::{FuzzySelect, Input};
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
@@ -119,13 +115,48 @@ impl Run for New {
         };
 
         let (worktree_name, base_branch, branch_type) = if let Some(pr) = pr_info {
-            // This is a PR reference - handle PR workflow
+            // This is a PR reference - use gh CLI workflow
             let pr_format = config.pr_format(None)?;
-            let (worktree_name, remote_ref) =
+            let (worktree_name, remote_ref, base_ref) =
                 workon::prepare_pr_worktree(&repo, pr.number, &pr_format)
                     .wrap_err(format!("Failed to prepare PR #{} worktree", pr.number))?;
 
-            (worktree_name, Some(remote_ref), BranchType::Normal)
+            // Create worktree
+            let worktree =
+                add_worktree(&repo, &worktree_name, BranchType::Normal, Some(&remote_ref))?;
+
+            // Fix upstream tracking
+            // remote_ref is in format "remote/branch" - extract both parts
+            let parts: Vec<&str> = remote_ref.split('/').collect();
+            let remote_name = parts.first().copied().unwrap_or("origin");
+            let branch_name = parts[1..].join("/"); // Handle branches with slashes
+            let branch_ref = format!("refs/heads/{}", branch_name);
+            workon::set_upstream_tracking(&worktree, remote_name, &branch_ref)
+                .wrap_err("Failed to set upstream tracking for PR branch")?;
+
+            // Copy files if configured
+            let copy_override = if self.copy_untracked {
+                Some(true)
+            } else if self.no_copy_untracked {
+                Some(false)
+            } else {
+                None
+            };
+
+            if config.auto_copy_untracked(copy_override)? {
+                if let Err(e) = copy_untracked_files(&repo, &worktree, Some(&base_ref), &config) {
+                    eprintln!("Warning: Failed to copy untracked files: {}", e);
+                }
+            }
+
+            // Execute post-create hooks
+            if !self.no_hooks {
+                if let Err(e) = execute_post_create_hooks(&worktree, Some(&base_ref), &config) {
+                    eprintln!("Warning: Post-create hook failed: {}", e);
+                }
+            }
+
+            return Ok(Some(worktree));
         } else {
             // Regular worktree creation
 

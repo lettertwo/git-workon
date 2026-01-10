@@ -61,6 +61,7 @@
 //! git config --add workon.copyExclude '.env.production'
 //! ```
 //!
+//! TODO: Replace error wrappers with custom error types for better diagnostics
 //! TODO: Add progress reporting for large copies
 
 use std::fs;

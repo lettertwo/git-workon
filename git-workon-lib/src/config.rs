@@ -114,6 +114,26 @@ impl<'repo> WorkonConfig<'repo> {
         if !format.contains("{number}") {
             return Err(ConfigError::InvalidPrFormat {
                 format: format.clone(),
+                reason: "Format must contain {number} placeholder".to_string(),
+            }
+            .into());
+        }
+
+        // Valid placeholders: {number}, {title}, {author}, {branch}
+        let valid_placeholders = ["{number}", "{title}", "{author}", "{branch}"];
+        let mut remaining = format.clone();
+        for placeholder in &valid_placeholders {
+            remaining = remaining.replace(placeholder, "");
+        }
+
+        // Check for invalid placeholders (anything still matching {.*})
+        if remaining.contains('{') {
+            return Err(ConfigError::InvalidPrFormat {
+                format: format.clone(),
+                reason: format!(
+                    "Invalid placeholder found. Valid placeholders: {}",
+                    valid_placeholders.join(", ")
+                ),
             }
             .into());
         }

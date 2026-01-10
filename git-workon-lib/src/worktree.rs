@@ -745,3 +745,38 @@ pub fn add_worktree(
 
     Ok(WorktreeDescriptor::of(worktree))
 }
+
+/// Set upstream tracking for a worktree branch
+///
+/// Configures the branch in the worktree to track a remote branch by setting
+/// `branch.*.remote` and `branch.*.merge` configuration entries.
+///
+/// This is particularly important for PR worktrees to ensure they properly track
+/// the PR's remote branch.
+pub fn set_upstream_tracking(
+    worktree: &WorktreeDescriptor,
+    remote: &str,
+    remote_ref: &str,
+) -> Result<()> {
+    let repo = Repository::open(worktree.path())?;
+    let mut config = repo.config()?;
+
+    let head = repo.head()?;
+    let branch_name = head
+        .shorthand()
+        .ok_or(WorktreeError::NoCurrentBranchTarget)?;
+
+    // Set branch.*.remote
+    let remote_key = format!("branch.{}.remote", branch_name);
+    config.set_str(&remote_key, remote)?;
+
+    // Set branch.*.merge
+    let merge_key = format!("branch.{}.merge", branch_name);
+    config.set_str(&merge_key, remote_ref)?;
+
+    debug!(
+        "Set upstream tracking: {} -> {}/{}",
+        branch_name, remote, remote_ref
+    );
+    Ok(())
+}

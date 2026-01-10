@@ -150,12 +150,12 @@ pub enum WorktreeError {
 /// Configuration-related errors
 #[derive(Error, Diagnostic, Debug)]
 pub enum ConfigError {
-    #[error("Invalid PR format: '{format}' - must contain {{number}} placeholder")]
+    #[error("Invalid PR format: '{format}' - {reason}")]
     #[diagnostic(
         code(workon::config::invalid_pr_format),
-        help("Use a format like 'pr-{{number}}' that includes the {{number}} placeholder")
+        help("Valid placeholders: {{number}}, {{title}}, {{author}}, {{branch}}")
     )]
-    InvalidPrFormat { format: String },
+    InvalidPrFormat { format: String, reason: String },
 
     #[error("Config entry has no value")]
     #[diagnostic(code(workon::config::no_value))]
@@ -217,4 +217,32 @@ pub enum PrError {
         help("Check your network connection and repository access")
     )]
     FetchFailed { remote: String, message: String },
+
+    #[error("gh CLI is not installed or not in PATH")]
+    #[diagnostic(
+        code(workon::pr::gh_not_installed),
+        help("Install gh CLI: https://cli.github.com/")
+    )]
+    GhNotInstalled,
+
+    #[error("Failed to fetch PR metadata from gh: {message}")]
+    #[diagnostic(
+        code(workon::pr::gh_fetch_failed),
+        help("Check your network connection and GitHub authentication (gh auth status)")
+    )]
+    GhFetchFailed { message: String },
+
+    #[error("Invalid JSON output from gh CLI: {message}")]
+    #[diagnostic(
+        code(workon::pr::gh_json_parse_failed),
+        help("This may indicate a gh CLI version incompatibility")
+    )]
+    GhJsonParseFailed { message: String },
+
+    #[error("Fork repository missing owner information")]
+    #[diagnostic(
+        code(workon::pr::missing_fork_owner),
+        help("This PR may be from a deleted fork")
+    )]
+    MissingForkOwner,
 }
