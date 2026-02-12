@@ -1019,3 +1019,130 @@ fn prune_named_worktree_dry_run() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn prune_force_overrides_protected_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("develop")
+        .config("workon.pruneProtectedBranches", "develop")
+        .build()?;
+
+    let develop_dir = fixture.cwd()?;
+    develop_dir.assert(predicate::path::is_dir());
+
+    // Prune protected branch with --force
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("develop")
+        .arg("--force")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify develop is gone
+    develop_dir.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_force_overrides_dirty_check() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Make feature worktree dirty
+    let feature_dir = fixture.cwd()?;
+    std::fs::write(feature_dir.join("dirty.txt"), "uncommitted")?;
+
+    // Prune dirty worktree with --force
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--force")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify feature is gone
+    feature_dir.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_force_overrides_unpushed_check() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    // Delete reference to remote branch
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    // Create a new commit in the worktree (unpushed)
+    fixture
+        .commit("feature")
+        .file("test.txt", "test")
+        .create("New commit")?;
+
+    // Prune worktree with unpushed commits using --force
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--gone")
+        .arg("--force")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify feature is gone
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_force_overrides_default_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .build()?;
+
+    // Prune default branch worktree with --force
+    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("main")
+        .arg("--force")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify main worktree is gone
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}

@@ -23,7 +23,6 @@
 //! When using `--gone` or `--merged`, the command uses WorktreeDescriptor's status
 //! methods to detect which worktrees can be safely pruned.
 //!
-//! TODO: Add --force flag to override protection
 //! TODO: Figure out what 'unpushed' means when the upstream is gone (maybe change to 'unmerged'?)
 
 use dialoguer::Confirm;
@@ -170,7 +169,7 @@ impl Run for Prune {
             .into_iter()
             .filter_map(|(wt, candidate)| {
                 // Check if branch is protected
-                if is_protected(&candidate.branch_name, &protected_patterns) {
+                if !self.force && is_protected(&candidate.branch_name, &protected_patterns) {
                     skipped.push((
                         candidate,
                         "protected by workon.pruneProtectedBranches".to_string(),
@@ -179,16 +178,18 @@ impl Run for Prune {
                 }
 
                 // Never prune the default worktree
-                match get_default_branch(&repo).ok() {
-                    Some(branch) if candidate.branch_name == branch => {
-                        skipped.push((candidate, "is the default worktree".to_string()));
-                        return None;
+                if !self.force {
+                    match get_default_branch(&repo).ok() {
+                        Some(branch) if candidate.branch_name == branch => {
+                            skipped.push((candidate, "is the default worktree".to_string()));
+                            return None;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
 
                 // Check for uncommitted changes
-                if !self.allow_dirty {
+                if !self.force && !self.allow_dirty {
                     match wt.is_dirty() {
                         Ok(true) => {
                             skipped.push((
@@ -207,7 +208,7 @@ impl Run for Prune {
                 }
 
                 // Check for unpushed commits
-                if !self.allow_unpushed {
+                if !self.force && !self.allow_unpushed {
                     match wt.has_unpushed_commits() {
                         // TODO: figure out what 'unpushed' means when the upstream is gone
                         // Maybe we want to change unpushed to unmerged?
