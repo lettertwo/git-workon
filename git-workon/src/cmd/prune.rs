@@ -8,7 +8,7 @@
 //! - **Targeted pruning**: `git workon prune <name>...` - prune specific worktrees
 //! - **Bulk pruning**: `--gone` and `--merged` flags for automatic discovery
 //! - **Protected branches**: Respects `workon.pruneProtectedBranches` glob patterns
-//! - **Safety checks**: `--allow-dirty` and `--allow-unpushed` to override warnings
+//! - **Safety checks**: `--allow-dirty` and `--allow-unmerged` to override warnings
 //! - **Dry run**: `--dry-run` to preview without deleting
 //!
 //! ## Protected Branch Matching
@@ -22,8 +22,6 @@
 //!
 //! When using `--gone` or `--merged`, the command uses WorktreeDescriptor's status
 //! methods to detect which worktrees can be safely pruned.
-//!
-//! TODO: Figure out what 'unpushed' means when the upstream is gone (maybe change to 'unmerged'?)
 
 use dialoguer::Confirm;
 use git2::BranchType;
@@ -163,6 +161,9 @@ impl Run for Prune {
         // Combine explicit and filter-based candidates
         candidates.extend(filter_candidates);
 
+        // Pre-compute default branch for safety checks
+        let default_branch = get_default_branch(&repo).ok();
+
         // Apply safety checks to filter out unsafe worktrees
         let mut skipped: Vec<(PruneCandidate, String)> = Vec::new();
         let to_prune: Vec<PruneCandidate> = candidates
@@ -179,12 +180,11 @@ impl Run for Prune {
 
                 // Never prune the default worktree
                 if !self.force {
-                    match get_default_branch(&repo).ok() {
-                        Some(branch) if candidate.branch_name == branch => {
+                    if let Some(ref branch) = default_branch {
+                        if candidate.branch_name == *branch {
                             skipped.push((candidate, "is the default worktree".to_string()));
                             return None;
                         }
-                        _ => {}
                     }
                 }
 
@@ -207,21 +207,25 @@ impl Run for Prune {
                     }
                 }
 
-                // Check for unpushed commits
-                if !self.force && !self.allow_unpushed {
-                    match wt.has_unpushed_commits() {
-                        // TODO: figure out what 'unpushed' means when the upstream is gone
-                        // Maybe we want to change unpushed to unmerged?
-                        Ok(true) => {
+                // Check for unmerged commits into the default branch.
+                // Skip if branch is already deleted (deletion implies work was handled)
+                // or if --merged already verified it's merged into the specified target.
+                if !self.force
+                    && !self.allow_unmerged
+                    && !matches!(
+                        candidate.reason,
+                        PruneReason::BranchDeleted | PruneReason::Merged(_)
+                    )
+                {
+                    if let Some(ref branch) = default_branch {
+                        if let Ok(false) = wt.is_merged_into(branch) {
                             skipped.push((
                                 candidate,
-                                "has unpushed commits, use --allow-unpushed to override"
+                                "has unmerged commits, use --allow-unmerged to override"
                                     .to_string(),
                             ));
                             return None;
                         }
-                        Err(_) => {}
-                        _ => {}
                     }
                 }
 

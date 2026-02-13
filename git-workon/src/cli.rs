@@ -184,12 +184,16 @@ pub struct Prune {
         help = "Allow pruning worktrees with uncommitted changes (dirty working tree)"
     )]
     pub allow_dirty: bool,
-    #[arg(long, help = "Allow pruning worktrees with unpushed commits")]
-    pub allow_unpushed: bool,
+    #[arg(
+        long,
+        alias = "allow-unpushed",
+        help = "Allow pruning worktrees with unmerged commits"
+    )]
+    pub allow_unmerged: bool,
     #[arg(
         short,
         long,
-        help = "Override all safety checks (protection, default branch, dirty, unpushed)"
+        help = "Override all safety checks (protection, default branch, dirty, unmerged)"
     )]
     pub force: bool,
 }

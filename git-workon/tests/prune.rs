@@ -204,13 +204,12 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
     // Verify worktree still exists
     fixture.cwd()?.assert(predicate::path::is_dir());
 
-    // Run prune with --gone - should remove the worktree
+    // Run prune with --gone - should remove the worktree (feature is merged into main)
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
-        .arg("--allow-unpushed")
         .arg("--yes")
         .assert()
         .success()
@@ -264,13 +263,12 @@ fn prune_gone_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
-    // Run prune with --gone and --dry-run
+    // Run prune with --gone and --dry-run (feature is merged into main, no --allow-unmerged needed)
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
-        .arg("--allow-unpushed")
         .arg("--dry-run")
         .assert()
         .success()
@@ -353,7 +351,7 @@ fn prune_with_allow_dirty_removes_dirty_worktrees() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn prune_gone_skips_worktrees_with_unpushed_commits() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_gone_skips_worktrees_with_unmerged_commits() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -368,13 +366,13 @@ fn prune_gone_skips_worktrees_with_unpushed_commits() -> Result<(), Box<dyn std:
         .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
-    // Create a new commit in the worktree (unpushed)
+    // Create a new commit in the worktree (unmerged into main)
     fixture
         .commit("feature")
         .file("test.txt", "test")
         .create("New commit")?;
 
-    // Run prune --gone (without --allow-unpushed)
+    // Run prune --gone (without --allow-unmerged)
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
         .current_dir(&fixture)
@@ -384,7 +382,7 @@ fn prune_gone_skips_worktrees_with_unpushed_commits() -> Result<(), Box<dyn std:
         .assert()
         .success()
         .stdout(predicate::str::contains("Skipped worktrees"))
-        .stdout(predicate::str::contains("unpushed commits"))
+        .stdout(predicate::str::contains("unmerged commits"))
         .stdout(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
@@ -394,7 +392,7 @@ fn prune_gone_skips_worktrees_with_unpushed_commits() -> Result<(), Box<dyn std:
 }
 
 #[test]
-fn prune_gone_with_allow_unpushed_removes_worktrees_with_unpushed_commits(
+fn prune_gone_with_allow_unmerged_removes_worktrees_with_unmerged_commits(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
@@ -410,19 +408,19 @@ fn prune_gone_with_allow_unpushed_removes_worktrees_with_unpushed_commits(
         .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
-    // Create a new commit in the worktree (unpushed)
+    // Create a new commit in the worktree (unmerged into main)
     fixture
         .commit("feature")
         .file("test.txt", "test")
         .create("New commit")?;
 
-    // Run prune --gone with --allow-unpushed
+    // Run prune --gone with --allow-unmerged
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
         .arg("--gone")
-        .arg("--allow-unpushed")
+        .arg("--allow-unmerged")
         .arg("--yes")
         .assert()
         .success()
@@ -1081,7 +1079,7 @@ fn prune_force_overrides_dirty_check() -> Result<(), Box<dyn std::error::Error>>
 }
 
 #[test]
-fn prune_force_overrides_unpushed_check() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_force_overrides_unmerged_check() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -1096,13 +1094,13 @@ fn prune_force_overrides_unpushed_check() -> Result<(), Box<dyn std::error::Erro
         .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
-    // Create a new commit in the worktree (unpushed)
+    // Create a new commit in the worktree (unmerged into main)
     fixture
         .commit("feature")
         .file("test.txt", "test")
         .create("New commit")?;
 
-    // Prune worktree with unpushed commits using --force
+    // Prune worktree with unmerged commits using --force
     let mut prune_cmd = Command::cargo_bin("git-workon")?;
     prune_cmd
         .current_dir(&fixture)
