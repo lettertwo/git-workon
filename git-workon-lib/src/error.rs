@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use miette::Diagnostic;
 use thiserror::Error;
 
@@ -41,6 +43,11 @@ pub enum WorkonError {
     #[error(transparent)]
     #[diagnostic(forward(0))]
     Pr(#[from] PrError),
+
+    /// File copy errors
+    #[error(transparent)]
+    #[diagnostic(forward(0))]
+    Copy(#[from] CopyError),
 }
 
 /// Repository-specific errors
@@ -245,4 +252,43 @@ pub enum PrError {
         help("This PR may be from a deleted fork")
     )]
     MissingForkOwner,
+}
+
+/// File copy errors
+#[derive(Error, Diagnostic, Debug)]
+pub enum CopyError {
+    #[error("Pattern path is not valid UTF-8: {}", path.display())]
+    #[diagnostic(
+        code(workon::copy::invalid_pattern_path),
+        help("Ensure file paths contain only valid UTF-8 characters")
+    )]
+    InvalidPatternPath { path: PathBuf },
+
+    #[error("Invalid glob pattern '{pattern}'")]
+    #[diagnostic(
+        code(workon::copy::invalid_glob_pattern),
+        help("Check glob pattern syntax: *, **, ?, [...]")
+    )]
+    InvalidGlobPattern {
+        pattern: String,
+        #[source]
+        source: glob::PatternError,
+    },
+
+    #[error("Path is not valid UTF-8: {}", path.display())]
+    #[diagnostic(code(workon::copy::invalid_path))]
+    InvalidPath { path: PathBuf },
+
+    #[error("Failed to read glob entry")]
+    #[diagnostic(code(workon::copy::glob_error))]
+    GlobEntry(#[from] glob::GlobError),
+
+    #[error("Failed to copy '{}' to '{}'", src.display(), dest.display())]
+    #[diagnostic(code(workon::copy::copy_failed))]
+    CopyFailed {
+        src: PathBuf,
+        dest: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }

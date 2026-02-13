@@ -61,14 +61,13 @@
 //! git config --add workon.copyExclude '.env.production'
 //! ```
 //!
-//! TODO: Replace error wrappers with custom error types for better diagnostics
 //! TODO: Add progress reporting for large copies
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use miette::{IntoDiagnostic, Result, WrapErr};
+use crate::error::{CopyError, Result};
 
 /// Copy files from source to destination using glob patterns
 ///
@@ -87,14 +86,16 @@ pub fn copy_files(
         let pattern_path = from_path.join(pattern);
         let pattern_str = pattern_path
             .to_str()
-            .ok_or_else(|| miette::miette!("Invalid pattern path: {:?}", pattern_path))?;
+            .ok_or_else(|| CopyError::InvalidPatternPath {
+                path: pattern_path.clone(),
+            })?;
 
         // Find all files matching the pattern
-        for entry in glob::glob(pattern_str)
-            .into_diagnostic()
-            .wrap_err(format!("Invalid glob pattern: {}", pattern))?
-        {
-            let src_file = entry.into_diagnostic()?;
+        for entry in glob::glob(pattern_str).map_err(|e| CopyError::InvalidGlobPattern {
+            pattern: pattern.clone(),
+            source: e,
+        })? {
+            let src_file = entry.map_err(CopyError::from)?;
 
             // Skip directories - only copy files
             if src_file.is_dir() {
@@ -109,7 +110,7 @@ pub fn copy_files(
             // Calculate relative path from source
             let rel_path = src_file
                 .strip_prefix(from_path)
-                .into_diagnostic()?
+                .expect("src_file is under from_path")
                 .to_path_buf();
 
             // Build destination path
@@ -123,14 +124,11 @@ pub fn copy_files(
 
             // Create parent directories if needed
             if let Some(parent) = dest_file.parent() {
-                fs::create_dir_all(parent)
-                    .into_diagnostic()
-                    .wrap_err(format!("Failed to create directory {}", parent.display()))?;
+                fs::create_dir_all(parent)?;
             }
 
             // Copy the file using platform-specific optimization
-            copy_file_platform(&src_file, &dest_file)
-                .wrap_err(format!("Failed to copy {}", rel_path.display()))?;
+            copy_file_platform(&src_file, &dest_file)?;
             copied_files.push(rel_path);
         }
     }
@@ -146,15 +144,18 @@ fn should_exclude(path: &Path, base: &Path, excludes: &[String]) -> Result<bool>
         Err(_) => return Ok(false), // If not under base, don't exclude
     };
 
-    let rel_path_str = rel_path
-        .to_str()
-        .ok_or_else(|| miette::miette!("Invalid path: {:?}", rel_path))?;
+    let rel_path_str = rel_path.to_str().ok_or_else(|| CopyError::InvalidPath {
+        path: rel_path.to_path_buf(),
+    })?;
 
     // Check against each exclusion pattern
     for exclude_pattern in excludes {
         // Simple glob pattern matching
         if glob::Pattern::new(exclude_pattern)
-            .into_diagnostic()?
+            .map_err(|e| CopyError::InvalidGlobPattern {
+                pattern: exclude_pattern.clone(),
+                source: e,
+            })?
             .matches(rel_path_str)
         {
             return Ok(true);
@@ -175,16 +176,21 @@ fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
         .arg(src)
         .arg(dest)
         .status()
-        .into_diagnostic()
-        .wrap_err("Failed to execute cp command")?;
+        .map_err(|e| CopyError::CopyFailed {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+            source: e,
+        })?;
 
     if result.success() {
         Ok(())
     } else {
         // Fallback to standard copy
-        fs::copy(src, dest)
-            .into_diagnostic()
-            .wrap_err("Failed to copy file")?;
+        fs::copy(src, dest).map_err(|e| CopyError::CopyFailed {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+            source: e,
+        })?;
         Ok(())
     }
 }
@@ -197,16 +203,21 @@ fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
         .arg(src)
         .arg(dest)
         .status()
-        .into_diagnostic()
-        .wrap_err("Failed to execute cp command")?;
+        .map_err(|e| CopyError::CopyFailed {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+            source: e,
+        })?;
 
     if result.success() {
         Ok(())
     } else {
         // Fallback to standard copy
-        fs::copy(src, dest)
-            .into_diagnostic()
-            .wrap_err("Failed to copy file")?;
+        fs::copy(src, dest).map_err(|e| CopyError::CopyFailed {
+            src: src.to_path_buf(),
+            dest: dest.to_path_buf(),
+            source: e,
+        })?;
         Ok(())
     }
 }
@@ -214,8 +225,10 @@ fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn copy_file_platform(src: &Path, dest: &Path) -> Result<()> {
     // Use standard copy for other platforms
-    fs::copy(src, dest)
-        .into_diagnostic()
-        .wrap_err("Failed to copy file")?;
+    fs::copy(src, dest).map_err(|e| CopyError::CopyFailed {
+        src: src.to_path_buf(),
+        dest: dest.to_path_buf(),
+        source: e,
+    })?;
     Ok(())
 }
