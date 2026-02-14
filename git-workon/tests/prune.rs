@@ -16,7 +16,7 @@ fn prune_with_no_stale_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     Ok(())
 }
@@ -46,7 +46,7 @@ fn prune_removes_worktree_for_deleted_branch() -> Result<(), Box<dyn std::error:
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify worktree directory is gone
     feature_dir.assert(predicate::path::missing());
@@ -79,7 +79,7 @@ fn prune_dry_run_does_not_remove_anything() -> Result<(), Box<dyn std::error::Er
         .arg("--dry-run")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Dry run - no changes made"));
+        .stderr(predicate::str::contains("Dry run - no changes made"));
 
     // Verify worktree still exists
     feature_dir.assert(predicate::path::is_dir());
@@ -121,7 +121,7 @@ fn prune_handles_multiple_stale_worktrees() -> Result<(), Box<dyn std::error::Er
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 3 worktree"));
+        .stderr(predicate::str::contains("Pruned 3 worktree"));
 
     // Verify all worktrees are gone
     for name in &["feature-1", "feature-2", "feature-3"] {
@@ -157,7 +157,7 @@ fn prune_preserves_worktrees_with_existing_branches() -> Result<(), Box<dyn std:
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify delete-me is gone
     fixture
@@ -199,7 +199,7 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
     fixture.cwd()?.assert(predicate::path::is_dir());
@@ -213,8 +213,8 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"))
-        .stdout(predicate::str::contains("remote gone"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"))
+        .stderr(predicate::str::contains("remote gone"));
 
     // Verify worktree directory is gone
     fixture.cwd()?.assert(predicate::path::missing());
@@ -239,7 +239,7 @@ fn prune_gone_skips_branches_without_upstream() -> Result<(), Box<dyn std::error
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
     fixture.cwd()?.assert(predicate::path::is_dir());
@@ -272,8 +272,8 @@ fn prune_gone_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--dry-run")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Dry run - no changes made"))
-        .stdout(predicate::str::contains("remote gone"));
+        .stderr(predicate::str::contains("Dry run - no changes made"))
+        .stderr(predicate::str::contains("remote gone"));
 
     // Verify worktree still exists
     fixture.cwd()?.assert(predicate::path::is_dir());
@@ -306,9 +306,9 @@ fn prune_skips_dirty_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped worktrees"))
-        .stdout(predicate::str::contains("uncommitted changes"))
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("Skipped worktrees"))
+        .stderr(predicate::str::contains("uncommitted changes"))
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
     fixture.cwd()?.assert(predicate::path::is_dir());
@@ -342,7 +342,7 @@ fn prune_with_allow_dirty_removes_dirty_worktrees() -> Result<(), Box<dyn std::e
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify worktree is gone
     fixture.cwd()?.assert(predicate::path::missing());
@@ -381,9 +381,9 @@ fn prune_gone_skips_worktrees_with_unmerged_commits() -> Result<(), Box<dyn std:
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped worktrees"))
-        .stdout(predicate::str::contains("unmerged commits"))
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("Skipped worktrees"))
+        .stderr(predicate::str::contains("unmerged commits"))
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
     fixture.cwd()?.assert(predicate::path::is_dir());
@@ -424,7 +424,7 @@ fn prune_gone_with_allow_unmerged_removes_worktrees_with_unmerged_commits(
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify worktree is gone
     fixture.cwd()?.assert(predicate::path::missing());
@@ -461,8 +461,8 @@ fn prune_merged_removes_merged_branch() -> Result<(), Box<dyn std::error::Error>
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"))
-        .stdout(predicate::str::contains("merged into main"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"))
+        .stderr(predicate::str::contains("merged into main"));
 
     // Verify worktree is gone
     fixture.cwd()?.assert(predicate::path::missing());
@@ -492,7 +492,7 @@ fn prune_merged_skips_unmerged_branch() -> Result<(), Box<dyn std::error::Error>
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify worktree still exists
     fixture.cwd()?.assert(predicate::path::is_dir());
@@ -531,9 +531,9 @@ fn prune_merged_with_specific_target() -> Result<(), Box<dyn std::error::Error>>
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("default worktree"))
-        .stdout(predicate::str::contains("Pruned 1 worktree"))
-        .stdout(predicate::str::contains("merged into develop"));
+        .stderr(predicate::str::contains("default worktree"))
+        .stderr(predicate::str::contains("Pruned 1 worktree"))
+        .stderr(predicate::str::contains("merged into develop"));
 
     // Verify feature worktree is gone
     fixture
@@ -580,8 +580,8 @@ fn prune_skips_protected_branch_exact_match() -> Result<(), Box<dyn std::error::
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped"))
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains("Skipped"))
+        .stderr(predicate::str::contains(
             "protected by workon.pruneProtectedBranches",
         ));
 
@@ -620,10 +620,10 @@ fn prune_skips_protected_branch_with_glob_pattern() -> Result<(), Box<dyn std::e
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped"))
-        .stdout(predicate::str::contains("release/1.0"))
-        .stdout(predicate::str::contains("release/2.0"))
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Skipped"))
+        .stderr(predicate::str::contains("release/1.0"))
+        .stderr(predicate::str::contains("release/2.0"))
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify release worktrees still exist
     fixture
@@ -677,11 +677,11 @@ fn prune_respects_multiple_protected_patterns() -> Result<(), Box<dyn std::error
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped"))
-        .stdout(predicate::str::contains("develop"))
-        .stdout(predicate::str::contains("staging"))
-        .stdout(predicate::str::contains("release/1.0"))
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Skipped"))
+        .stderr(predicate::str::contains("develop"))
+        .stderr(predicate::str::contains("staging"))
+        .stderr(predicate::str::contains("release/1.0"))
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify protected worktrees still exist
     fixture
@@ -730,7 +730,7 @@ fn prune_without_protected_config_prunes_all_candidates() -> Result<(), Box<dyn 
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 2 worktree"));
+        .stderr(predicate::str::contains("Pruned 2 worktree"));
 
     // Verify both worktrees are gone
     fixture
@@ -763,8 +763,8 @@ fn prune_single_named_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"))
-        .stdout(predicate::str::contains("explicitly requested"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"))
+        .stderr(predicate::str::contains("explicitly requested"));
 
     // Verify feature-1 is gone, feature-2 still exists
     fixture
@@ -799,7 +799,7 @@ fn prune_multiple_named_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 2 worktree"));
+        .stderr(predicate::str::contains("Pruned 2 worktree"));
 
     // Verify feature-1 and feature-2 are gone, feature-3 still exists
     fixture
@@ -842,7 +842,7 @@ fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error:
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 2 worktree"));
+        .stderr(predicate::str::contains("Pruned 2 worktree"));
 
     // Verify feature-1 and feature-2 are gone, feature-3 still exists
     fixture
@@ -878,10 +878,10 @@ fn prune_named_worktree_not_found() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains(
             "Warning: worktree 'does-not-exist' not found",
         ))
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify feature-1 still exists
     fixture
@@ -911,11 +911,11 @@ fn prune_named_worktree_respects_protected_branches() -> Result<(), Box<dyn std:
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped"))
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains("Skipped"))
+        .stderr(predicate::str::contains(
             "protected by workon.pruneProtectedBranches",
         ))
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify develop still exists
     fixture
@@ -947,11 +947,11 @@ fn prune_named_worktree_respects_dirty_check() -> Result<(), Box<dyn std::error:
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Skipped"))
-        .stdout(predicate::str::contains(
+        .stderr(predicate::str::contains("Skipped"))
+        .stderr(predicate::str::contains(
             "has uncommitted changes, use --allow-dirty",
         ))
-        .stdout(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     // Verify feature still exists
     feature_dir.assert(predicate::path::is_dir());
@@ -981,7 +981,7 @@ fn prune_named_worktree_with_allow_dirty() -> Result<(), Box<dyn std::error::Err
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify feature is gone
     feature_dir.assert(predicate::path::missing());
@@ -1008,9 +1008,9 @@ fn prune_named_worktree_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--dry-run")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Worktrees to prune"))
-        .stdout(predicate::str::contains("feature"))
-        .stdout(predicate::str::contains("Dry run - no changes made"));
+        .stderr(predicate::str::contains("Worktrees to prune"))
+        .stderr(predicate::str::contains("feature"))
+        .stderr(predicate::str::contains("Dry run - no changes made"));
 
     // Verify feature still exists
     feature_dir.assert(predicate::path::is_dir());
@@ -1040,7 +1040,7 @@ fn prune_force_overrides_protected_branch() -> Result<(), Box<dyn std::error::Er
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify develop is gone
     develop_dir.assert(predicate::path::missing());
@@ -1070,7 +1070,7 @@ fn prune_force_overrides_dirty_check() -> Result<(), Box<dyn std::error::Error>>
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify feature is gone
     feature_dir.assert(predicate::path::missing());
@@ -1111,7 +1111,7 @@ fn prune_force_overrides_unmerged_check() -> Result<(), Box<dyn std::error::Erro
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify feature is gone
     fixture.cwd()?.assert(predicate::path::missing());
@@ -1137,7 +1137,7 @@ fn prune_force_overrides_default_branch() -> Result<(), Box<dyn std::error::Erro
         .arg("--yes")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Pruned 1 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     // Verify main worktree is gone
     fixture.cwd()?.assert(predicate::path::missing());

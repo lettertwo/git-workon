@@ -509,7 +509,9 @@ dependencies = [
  "glob",
  "log",
  "miette",
+ "owo-colors",
  "predicates",
+ "supports-color",
 ]
 
 [[package]]

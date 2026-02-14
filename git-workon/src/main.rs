@@ -2,6 +2,7 @@ mod cli;
 mod cmd;
 mod display;
 mod hooks;
+mod output;
 
 use clap::Parser;
 use cli::Cmd;

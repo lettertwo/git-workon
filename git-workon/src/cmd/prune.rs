@@ -29,6 +29,7 @@ use miette::{IntoDiagnostic, Result};
 use workon::{get_default_branch, get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::Prune;
+use crate::output;
 
 use super::Run;
 
@@ -77,9 +78,7 @@ impl Run for Prune {
                     },
                 ));
             } else {
-                // Worktree not found - continue, don't error
-                // We'll report this in the output
-                println!("Warning: worktree '{}' not found, skipping", name);
+                output::warn(&format!("worktree '{}' not found, skipping", name));
             }
         }
 
@@ -235,31 +234,35 @@ impl Run for Prune {
 
         // Display skipped worktrees
         if !skipped.is_empty() {
-            println!("Skipped worktrees (unsafe to prune):");
+            output::notice("Skipped worktrees (unsafe to prune):");
             for (candidate, reason) in &skipped {
-                println!("  {} ({})", candidate.worktree_path.display(), reason);
+                output::detail(&format!(
+                    "  {} ({})",
+                    candidate.worktree_path.display(),
+                    reason
+                ));
             }
-            println!();
+            eprintln!();
         }
 
         if to_prune.is_empty() {
-            println!("No worktrees to prune");
+            output::status("No worktrees to prune");
             return Ok(None);
         }
 
         // Display what will be pruned
-        println!("Worktrees to prune:");
+        output::info("Worktrees to prune:");
         for candidate in &to_prune {
-            println!(
+            output::detail(&format!(
                 "  {} (branch: {}, reason: {})",
                 candidate.worktree_path.display(),
                 candidate.branch_name,
                 candidate.reason
-            );
+            ));
         }
 
         if self.dry_run {
-            println!("\nDry run - no changes made");
+            output::notice("\nDry run - no changes made");
             return Ok(None);
         }
 
@@ -272,7 +275,7 @@ impl Run for Prune {
                 .into_diagnostic()?;
 
             if !confirmed {
-                println!("Cancelled");
+                output::notice("Cancelled");
                 return Ok(None);
             }
         }
@@ -282,7 +285,7 @@ impl Run for Prune {
             prune_worktree(&repo, candidate)?;
         }
 
-        println!("Pruned {} worktree(s)", to_prune.len());
+        output::success(&format!("Pruned {} worktree(s)", to_prune.len()));
         Ok(None)
     }
 }
@@ -359,7 +362,7 @@ fn prune_worktree(repo: &git2::Repository, candidate: &PruneCandidate) -> Result
     opts.valid(true); // Allow pruning even if worktree is valid
     worktree.prune(Some(&mut opts)).into_diagnostic()?;
 
-    println!("  Pruned worktree: {}", candidate.worktree_path.display());
+    output::success(&format!("  Pruned {}", candidate.worktree_path.display()));
     Ok(())
 }
 

@@ -38,6 +38,8 @@
 use miette::Result;
 use workon::WorktreeDescriptor;
 
+use crate::output::style;
+
 /// Format a worktree for display with status indicators
 /// Format: "branch-name * ↑ ↓" (shows indicators only when applicable)
 pub fn format_worktree_item(wt: &WorktreeDescriptor) -> Result<String> {
@@ -46,32 +48,36 @@ pub fn format_worktree_item(wt: &WorktreeDescriptor) -> Result<String> {
         None => "(detached HEAD)".to_string(),
     };
 
-    let mut indicators = Vec::new();
+    let mut indicators: Vec<String> = Vec::new();
 
     // * = dirty
     if wt.is_dirty().unwrap_or(false) {
-        indicators.push("*");
+        indicators.push(style::yellow("*"));
     }
 
     // ↑ = ahead (unpushed commits)
     if wt.has_unpushed_commits().unwrap_or(false) {
-        indicators.push("↑");
+        indicators.push(style::green("↑"));
     }
 
     // ↓ = behind upstream
     if wt.is_behind_upstream().unwrap_or(false) {
-        indicators.push("↓");
+        indicators.push(style::red("↓"));
     }
 
     // ✗ = upstream gone
     if wt.has_gone_upstream().unwrap_or(false) {
-        indicators.push("✗");
+        indicators.push(style::red_bold("✗"));
     }
 
     if indicators.is_empty() {
-        Ok(branch_name)
+        Ok(style::bold(&branch_name))
     } else {
-        Ok(format!("{} {}", branch_name, indicators.join(" ")))
+        Ok(format!(
+            "{} {}",
+            style::bold(&branch_name),
+            indicators.join(" ")
+        ))
     }
 }
 

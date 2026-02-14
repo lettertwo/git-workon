@@ -37,6 +37,7 @@ use miette::Result;
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::List;
+use crate::display::format_worktree_item;
 
 use super::Run;
 
@@ -59,7 +60,13 @@ impl Run for List {
             .collect();
 
         for worktree in &filtered {
-            println!("{}", worktree);
+            let display = format_worktree_item(worktree).unwrap_or_else(|_| {
+                worktree
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "(unknown)".to_string())
+            });
+            println!("{}", display);
         }
 
         Ok(None)

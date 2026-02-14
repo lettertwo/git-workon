@@ -51,6 +51,7 @@ use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
 use crate::cli::New;
 use crate::hooks::execute_post_create_hooks;
+use crate::output;
 use workon::{add_worktree, copy_files, get_repo, workon_root, BranchType, WorktreeDescriptor};
 
 use super::Run;
@@ -145,14 +146,14 @@ impl Run for New {
 
             if config.auto_copy_untracked(copy_override)? {
                 if let Err(e) = copy_untracked_files(&repo, &worktree, Some(&base_ref), &config) {
-                    eprintln!("Warning: Failed to copy untracked files: {}", e);
+                    output::warn(&format!("Failed to copy untracked files: {}", e));
                 }
             }
 
             // Execute post-create hooks
             if !self.no_hooks {
                 if let Err(e) = execute_post_create_hooks(&worktree, Some(&base_ref), &config) {
-                    eprintln!("Warning: Post-create hook failed: {}", e);
+                    output::warn(&format!("Post-create hook failed: {}", e));
                 }
             }
 
@@ -196,7 +197,7 @@ impl Run for New {
         if config.auto_copy_untracked(copy_override)? {
             if let Err(e) = copy_untracked_files(&repo, &worktree, base_branch.as_deref(), &config)
             {
-                eprintln!("Warning: Failed to copy untracked files: {}", e);
+                output::warn(&format!("Failed to copy untracked files: {}", e));
                 // Continue - worktree is still valid
             }
         }
@@ -204,7 +205,7 @@ impl Run for New {
         // Execute post-create hooks after successful worktree creation
         if !self.no_hooks {
             if let Err(e) = execute_post_create_hooks(&worktree, base_branch.as_deref(), &config) {
-                eprintln!("Warning: Post-create hook failed: {}", e);
+                output::warn(&format!("Post-create hook failed: {}", e));
                 // Continue - worktree is still valid
             }
         }
@@ -308,7 +309,10 @@ fn copy_untracked_files(
 
     // Report what was copied
     if !copied.is_empty() {
-        println!("Copied {} file(s) from base worktree", copied.len());
+        output::success(&format!(
+            "Copied {} file(s) from base worktree",
+            copied.len()
+        ));
     }
 
     Ok(())
