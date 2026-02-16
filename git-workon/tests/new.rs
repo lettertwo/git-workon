@@ -122,7 +122,6 @@ fn new_orphan_worktree() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-#[ignore]
 fn new_detached_worktree() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
@@ -149,7 +148,10 @@ fn new_detached_worktree() -> Result<(), Box<dyn std::error::Error>> {
     fixture.assert(predicate::repo::is_bare());
     fixture.assert(predicate::repo::has_branch("main"));
 
-    // TODO: Verify the detached worktree HEAD is in detached state
+    // Verify the detached worktree HEAD is in detached state
+    let worktree_path = fixture.root()?.child("detached");
+    let worktree_repo = git2::Repository::open(worktree_path.path())?;
+    worktree_repo.assert(predicate::repo::is_head_detached());
 
     Ok(())
 }
