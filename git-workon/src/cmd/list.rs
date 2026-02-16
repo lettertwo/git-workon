@@ -33,11 +33,11 @@
 //! TODO: Add --json output option for programmatic use
 //! TODO: Optimize status checks for performance with many worktrees
 
-use miette::Result;
+use miette::{IntoDiagnostic, Result};
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::List;
-use crate::display::format_worktree_item;
+use crate::display::{format_aligned_rows, worktree_display_row};
 
 use super::Run;
 
@@ -59,14 +59,16 @@ impl Run for List {
             .filter(|wt| self.matches_filters(wt))
             .collect();
 
-        for worktree in &filtered {
-            let display = format_worktree_item(worktree).unwrap_or_else(|_| {
-                worktree
-                    .name()
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "(unknown)".to_string())
-            });
-            println!("{}", display);
+        let root = workon::workon_root(&repo)?;
+        let current_dir = std::env::current_dir().into_diagnostic()?;
+
+        let rows: Vec<_> = filtered
+            .iter()
+            .filter_map(|wt| worktree_display_row(wt, root, &current_dir).ok())
+            .collect();
+
+        for line in format_aligned_rows(&rows, true) {
+            println!("{}", line);
         }
 
         Ok(None)

@@ -25,12 +25,10 @@
 //! ### Planned Features
 //! - `--json` output for programmatic use
 //! - `--verbose` flag for debugging
-//! - Pretty-printed worktree lists with aligned columns
 //! - `--porcelain` for stable script-friendly output
 
 // TODO: Implement --json output format
 // TODO: Add --verbose debugging output
-// TODO: Pretty-print worktree lists with column alignment
 // TODO: Add --porcelain stable output format
 
 use std::sync::OnceLock;
@@ -135,6 +133,14 @@ pub mod style {
     pub fn red_bold(s: &str) -> String {
         if use_color() {
             s.red().bold().to_string()
+        } else {
+            s.to_string()
+        }
+    }
+
+    pub fn dim(s: &str) -> String {
+        if use_color() {
+            s.dimmed().to_string()
         } else {
             s.to_string()
         }

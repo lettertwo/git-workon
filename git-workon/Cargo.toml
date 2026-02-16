@@ -35,7 +35,9 @@ glob.workspace = true
 log.workspace = true
 miette.workspace = true
 owo-colors.workspace = true
+pathdiff = "0.2.3"
 supports-color.workspace = true
+unicode-width = "0.2.2"
 
 [dev-dependencies]
 assert_cmd.workspace = true

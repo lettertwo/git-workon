@@ -34,12 +34,14 @@
 //!
 //! TODO: Add tests for interactive UI behavior (requires stdin mocking)
 
+use dialoguer::console::{style, Style};
+use dialoguer::theme::ColorfulTheme;
 use dialoguer::FuzzySelect;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::Find;
-use crate::display::format_worktree_items;
+use crate::display::{format_aligned_rows, worktree_display_row};
 
 use super::Run;
 
@@ -137,12 +139,29 @@ fn matches_filters(find: &Find, wt: &WorktreeDescriptor) -> bool {
 
 /// Show interactive fuzzy selection list
 fn select_from_list(worktrees: Vec<WorktreeDescriptor>) -> Result<Option<WorktreeDescriptor>> {
-    let items = format_worktree_items(&worktrees);
+    let repo = get_repo(None)?;
+    let root = workon::workon_root(&repo)?;
+    let current_dir = std::env::current_dir().into_diagnostic()?;
 
-    let selection = FuzzySelect::new()
+    let rows: Vec<_> = worktrees
+        .iter()
+        .filter_map(|wt| worktree_display_row(wt, root, &current_dir).ok())
+        .collect();
+    let active_index = rows.iter().position(|r| r.is_active).unwrap_or(0);
+    let items = format_aligned_rows(&rows, false);
+
+    let theme = ColorfulTheme {
+        active_item_prefix: style("→".to_string()).for_stderr().green(),
+        active_item_style: Style::new().for_stderr(),
+        inactive_item_style: Style::new().for_stderr(),
+        fuzzy_match_highlight_style: Style::new().for_stderr().underlined(),
+        ..ColorfulTheme::default()
+    };
+
+    let selection = FuzzySelect::with_theme(&theme)
         .with_prompt("Select a worktree")
         .items(&items)
-        .default(0)
+        .default(active_index)
         .interact()
         .into_diagnostic()
         .wrap_err("Failed to show interactive selection")?;
