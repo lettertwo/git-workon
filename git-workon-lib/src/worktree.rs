@@ -22,18 +22,11 @@
 //! - **Orphan**: Independent history with initial empty commit (for documentation, gh-pages, etc.)
 //! - **Detached**: Detached HEAD state (for exploring specific commits)
 //!
+//! - **Activity tracking**: `last_activity()`, `is_stale()`
+//!
 //! ## Future Extensions
 //!
 //! Planned metadata methods for smart worktree management:
-//!
-//! TODO: Add `is_stale(days: u32)` method
-//! - Track last access/modification time
-//! - Enable `--stale` filter to find forgotten worktrees
-//! - Support auto-prune suggestions based on inactivity
-//!
-//! TODO: Add `last_activity()` method
-//! - Return last modification/access timestamp
-//! - Enable activity-based sorting and filtering
 //!
 //! TODO: Add worktree notes/descriptions support
 //! - Store user-provided notes/context for worktrees
@@ -377,6 +370,41 @@ impl WorktreeDescriptor {
         };
 
         Ok(commit_oid.map(|oid| oid.to_string()))
+    }
+
+    /// Returns the timestamp of the HEAD commit as the last activity time.
+    ///
+    /// Returns None if:
+    /// - HEAD cannot be resolved (empty/unborn repository)
+    /// - HEAD cannot be peeled to a commit
+    pub fn last_activity(&self) -> Result<Option<i64>> {
+        let repo = Repository::open(self.path())?;
+        let seconds = match repo.head() {
+            Ok(head) => match head.peel_to_commit() {
+                Ok(commit) => Some(commit.time().seconds()),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        };
+        Ok(seconds)
+    }
+
+    /// Returns true if the worktree's last activity is older than `days` days.
+    ///
+    /// Returns false if:
+    /// - Last activity cannot be determined
+    /// - The worktree has recent activity within the threshold
+    pub fn is_stale(&self, days: u32) -> Result<bool> {
+        let last = match self.last_activity()? {
+            Some(ts) => ts,
+            None => return Ok(false),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_secs() as i64;
+        let threshold = i64::from(days) * 86400;
+        Ok((now - last) > threshold)
     }
 
     /// Returns the name of the remote that the worktree's branch tracks (e.g., "origin").

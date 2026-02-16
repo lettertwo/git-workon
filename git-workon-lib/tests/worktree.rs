@@ -762,6 +762,109 @@ mod tests {
     }
 
     #[test]
+    fn test_last_activity_returns_timestamp() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        let ts = worktree.last_activity()?;
+        assert!(
+            ts.is_some(),
+            "Expected a timestamp for a worktree with commits"
+        );
+
+        // Timestamp should be recent (within the last minute)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+        let activity = ts.unwrap();
+        assert!(
+            (now - activity).abs() < 60,
+            "Expected timestamp within last 60s, got delta {}",
+            now - activity
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_last_activity_none_for_empty_repo() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        // Create an orphan worktree, then strip its commit to simulate an unborn branch
+        let worktree = add_worktree(repo, "empty", BranchType::Detached, None)?;
+
+        // Write an unborn branch ref to HEAD to simulate no commits
+        let git_file = std::fs::read_to_string(worktree.path().join(".git"))?;
+        let git_dir = git_file.strip_prefix("gitdir: ").unwrap().trim();
+        let head_path = std::path::Path::new(git_dir).join("HEAD");
+        std::fs::write(&head_path, "ref: refs/heads/unborn\n")?;
+
+        let ts = worktree.last_activity()?;
+        assert_eq!(ts, None, "Expected None for unborn branch");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_stale_recent_worktree() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        // A freshly created worktree should not be stale for any reasonable threshold
+        assert!(!worktree.is_stale(1)?);
+        assert!(!worktree.is_stale(30)?);
+        assert!(!worktree.is_stale(365)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_stale_with_zero_days() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        // Create worktree, then add a commit with an old timestamp
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+        let worktree_repo = Repository::open(worktree.path())?;
+        let head = worktree_repo.head()?.peel_to_commit()?;
+        let old_time = git2::Time::new(1_000_000, 0); // Jan 12, 1970
+        let old_sig = git2::Signature::new("test", "test@test.com", &old_time)?;
+        let tree = head.tree()?;
+        worktree_repo.commit(
+            Some("HEAD"),
+            &old_sig,
+            &old_sig,
+            "old commit",
+            &tree,
+            &[&head],
+        )?;
+
+        // With 0 days threshold, an old commit should be stale
+        assert!(worktree.is_stale(0)?);
+
+        Ok(())
+    }
+
+    #[test]
     fn test_remote_url_without_upstream() -> Result<(), Box<dyn std::error::Error>> {
         // Create a bare fixture with a default branch
         let fixture = FixtureBuilder::new()
