@@ -2,14 +2,16 @@ mod cli;
 mod cmd;
 mod display;
 mod hooks;
+mod json;
 mod output;
 
 use clap::Parser;
 use cli::Cmd;
-use miette::Result;
+use miette::{IntoDiagnostic, Result};
 
 use crate::cli::Cli;
 use crate::cmd::Run;
+use crate::json::worktree_to_json;
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
@@ -17,6 +19,12 @@ fn main() -> Result<()> {
     env_logger::Builder::new()
         .filter_level(cli.verbose.log_level_filter())
         .init();
+
+    let json_mode = cli.json;
+
+    if json_mode {
+        output::set_json_mode(true);
+    }
 
     if cli.command.is_none() {
         match cli.find.name {
@@ -29,9 +37,28 @@ fn main() -> Result<()> {
         }
     }
 
-    let worktree = cli.command.unwrap().run()?;
+    let mut cmd = cli.command.unwrap();
 
-    if let Some(worktree) = worktree {
+    // Propagate --json to commands that handle it internally
+    if json_mode {
+        match &mut cmd {
+            Cmd::List(list) => list.json = true,
+            Cmd::Prune(prune) => prune.json = true,
+            Cmd::Find(find) => find.no_interactive = true,
+            _ => {}
+        }
+    }
+
+    let worktree = cmd.run()?;
+
+    if json_mode {
+        if let Some(wt) = worktree {
+            let json = serde_json::to_string_pretty(&worktree_to_json(&wt)).into_diagnostic()?;
+            println!("{}", json);
+        }
+        // list/prune already printed their JSON in run()
+        // other None cases: output nothing (valid for commands that don't return a worktree)
+    } else if let Some(worktree) = worktree {
         if let Some(path_str) = worktree.path().to_str() {
             println!("{}", path_str);
         }

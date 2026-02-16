@@ -30,7 +30,6 @@
 //! Conservative behavior: `has_unpushed_commits()` returns true for gone upstreams
 //! (we can't know if commits are pushed when the upstream is deleted).
 //!
-//! TODO: Add --json output option for programmatic use
 //! TODO: Optimize status checks for performance with many worktrees
 
 use miette::{IntoDiagnostic, Result};
@@ -38,6 +37,7 @@ use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::List;
 use crate::display::{format_aligned_rows, worktree_display_row};
+use crate::json::worktree_to_json;
 
 use super::Run;
 
@@ -58,6 +58,13 @@ impl Run for List {
             .into_iter()
             .filter(|wt| self.matches_filters(wt))
             .collect();
+
+        if self.json {
+            let json_array: Vec<_> = filtered.iter().map(worktree_to_json).collect();
+            let output = serde_json::to_string_pretty(&json_array).into_diagnostic()?;
+            println!("{}", output);
+            return Ok(None);
+        }
 
         let root = workon::workon_root(&repo)?;
         let current_dir = std::env::current_dir().into_diagnostic()?;

@@ -15,6 +15,8 @@ use clap_verbosity_flag::{InfoLevel, Verbosity};
 pub struct Cli {
     #[clap(flatten)]
     pub verbose: Verbosity<InfoLevel>,
+    #[arg(long, global = true, help = "Output results as JSON")]
+    pub json: bool,
     #[command(subcommand)]
     pub command: Option<Cmd>,
     #[clap(flatten)]
@@ -86,6 +88,10 @@ pub struct Init {
 /// List worktrees.
 #[derive(Debug, Args)]
 pub struct List {
+    #[clap(skip)]
+    #[allow(dead_code)]
+    pub json: bool,
+
     #[arg(long, help = "Show only worktrees with uncommitted changes")]
     pub dirty: bool,
 
@@ -155,6 +161,10 @@ pub struct New {
 /// Prune stale worktrees.
 #[derive(Debug, Args)]
 pub struct Prune {
+    #[clap(skip)]
+    #[allow(dead_code)]
+    pub json: bool,
+
     /// Specific worktree names to prune
     pub names: Vec<String>,
     #[arg(

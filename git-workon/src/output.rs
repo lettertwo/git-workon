@@ -23,17 +23,27 @@
 //! is not set. See <https://no-color.org/>.
 //!
 //! ### Planned Features
-//! - `--json` output for programmatic use
 //! - `--verbose` flag for debugging
 //! - `--porcelain` for stable script-friendly output
 
-// TODO: Implement --json output format
 // TODO: Add --verbose debugging output
 // TODO: Add --porcelain stable output format
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use owo_colors::OwoColorize;
+
+static JSON_MODE: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable JSON mode. When enabled, all stderr output is suppressed.
+pub fn set_json_mode(enabled: bool) {
+    JSON_MODE.store(enabled, Ordering::Relaxed);
+}
+
+fn is_json_mode() -> bool {
+    JSON_MODE.load(Ordering::Relaxed)
+}
 
 /// Checks if we should use color (terminal + NO_COLOR not set)
 fn use_color() -> bool {
@@ -46,6 +56,9 @@ fn use_color() -> bool {
 
 /// Print a warning to stderr. Formats as "Warning: {msg}".
 pub fn warn(msg: &str) {
+    if is_json_mode() {
+        return;
+    }
     if use_color() {
         eprintln!("{} {}", "Warning:".yellow(), msg);
     } else {
@@ -55,6 +68,9 @@ pub fn warn(msg: &str) {
 
 /// Print a success message to stderr in green.
 pub fn success(msg: &str) {
+    if is_json_mode() {
+        return;
+    }
     if use_color() {
         eprintln!("{}", msg.green());
     } else {
@@ -64,6 +80,9 @@ pub fn success(msg: &str) {
 
 /// Print a header/info line to stderr in bold.
 pub fn info(msg: &str) {
+    if is_json_mode() {
+        return;
+    }
     if use_color() {
         eprintln!("{}", msg.bold());
     } else {
@@ -73,6 +92,9 @@ pub fn info(msg: &str) {
 
 /// Print a detail line to stderr in dim.
 pub fn detail(msg: &str) {
+    if is_json_mode() {
+        return;
+    }
     if use_color() {
         eprintln!("{}", msg.dimmed());
     } else {
@@ -82,6 +104,9 @@ pub fn detail(msg: &str) {
 
 /// Print a notice to stderr in yellow (dry run, cancelled, skipped headers).
 pub fn notice(msg: &str) {
+    if is_json_mode() {
+        return;
+    }
     if use_color() {
         eprintln!("{}", msg.yellow());
     } else {
@@ -91,6 +116,9 @@ pub fn notice(msg: &str) {
 
 /// Print a plain status message to stderr.
 pub fn status(msg: &str) {
+    if is_json_mode() {
+        return;
+    }
     eprintln!("{}", msg);
 }
 

@@ -512,6 +512,7 @@ dependencies = [
  "owo-colors",
  "pathdiff",
  "predicates",
+ "serde_json",
  "supports-color",
  "unicode-width 0.2.2",
 ]

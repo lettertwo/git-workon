@@ -26,6 +26,7 @@
 use dialoguer::Confirm;
 use git2::BranchType;
 use miette::{IntoDiagnostic, Result};
+use serde_json::json;
 use workon::{get_default_branch, get_repo, get_worktrees, WorktreeDescriptor};
 
 use crate::cli::Prune;
@@ -231,6 +232,35 @@ impl Run for Prune {
                 Some(candidate)
             })
             .collect();
+
+        if self.json {
+            // JSON mode: skip confirmation, output structured result
+            if !self.dry_run {
+                for candidate in &to_prune {
+                    prune_worktree(&repo, candidate)?;
+                }
+            }
+
+            let result = json!({
+                "pruned": to_prune.iter().map(|c| json!({
+                    "name": c.worktree_name,
+                    "path": c.worktree_path.to_str(),
+                    "branch": c.branch_name,
+                    "reason": c.reason.to_string(),
+                })).collect::<Vec<_>>(),
+                "skipped": skipped.iter().map(|(c, reason)| json!({
+                    "name": c.worktree_name,
+                    "path": c.worktree_path.to_str(),
+                    "branch": c.branch_name,
+                    "reason": reason,
+                })).collect::<Vec<_>>(),
+                "dry_run": self.dry_run,
+            });
+
+            let output = serde_json::to_string_pretty(&result).into_diagnostic()?;
+            println!("{}", output);
+            return Ok(None);
+        }
 
         // Display skipped worktrees
         if !skipped.is_empty() {
