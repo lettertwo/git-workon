@@ -45,6 +45,7 @@ assert_cmd.workspace = true
 assert_fs.workspace = true
 git2.workspace = true
 git-workon-fixture.workspace = true
+expectrl = "0.7"
 predicates.workspace = true
 
 [build-dependencies]

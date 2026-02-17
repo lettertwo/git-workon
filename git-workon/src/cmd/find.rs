@@ -32,7 +32,6 @@
 //! - Fuzzy searchable selection
 //! - `--no-interactive` bypass for testing and scripting
 //!
-//! TODO: Add tests for interactive UI behavior (requires stdin mocking)
 
 use dialoguer::console::{style, Style};
 use dialoguer::theme::ColorfulTheme;
