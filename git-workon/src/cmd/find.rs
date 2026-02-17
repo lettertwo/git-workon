@@ -37,6 +37,7 @@
 use dialoguer::console::{style, Style};
 use dialoguer::theme::ColorfulTheme;
 use dialoguer::FuzzySelect;
+use log::debug;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 
@@ -59,10 +60,13 @@ impl Run for Find {
 
         match &self.name {
             Some(name) => {
+                debug!("Searching for worktree '{}'", name);
+
                 // Try exact match first
                 for (idx, worktree) in worktrees.iter().enumerate() {
                     if let Some(wt_name) = worktree.name() {
                         if wt_name == name {
+                            debug!("Found exact match: {}", wt_name);
                             // Return the worktree by consuming the vec
                             return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
                         }
@@ -70,6 +74,7 @@ impl Run for Find {
                 }
 
                 // No exact match - try fuzzy matching (case-insensitive substring)
+                debug!("No exact match, trying fuzzy match");
                 let fuzzy_matches: Vec<_> = worktrees
                     .into_iter()
                     .enumerate()
@@ -81,6 +86,8 @@ impl Run for Find {
                         }
                     })
                     .collect();
+
+                debug!("Found {} fuzzy match(es)", fuzzy_matches.len());
 
                 match fuzzy_matches.len() {
                     0 => bail!("No matching worktree found for '{}'", name),

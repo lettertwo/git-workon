@@ -32,6 +32,7 @@
 //!
 //! TODO: Optimize status checks for performance with many worktrees
 
+use log::debug;
 use miette::{IntoDiagnostic, Result};
 use workon::{get_repo, get_worktrees, WorktreeDescriptor};
 
@@ -52,12 +53,14 @@ impl Run for List {
 
         let repo = get_repo(None)?;
         let worktrees = get_worktrees(&repo)?;
+        debug!("Found {} worktree(s)", worktrees.len());
 
         // Apply filters (AND logic)
         let filtered: Vec<_> = worktrees
             .into_iter()
             .filter(|wt| self.matches_filters(wt))
             .collect();
+        debug!("{} worktree(s) after filtering", filtered.len());
 
         if self.json {
             let json_array: Vec<_> = filtered.iter().map(worktree_to_json).collect();

@@ -18,6 +18,10 @@ fn main() -> Result<()> {
 
     env_logger::Builder::new()
         .filter_level(cli.verbose.log_level_filter())
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(buf, "{}", record.args())
+        })
         .init();
 
     let json_mode = cli.json;

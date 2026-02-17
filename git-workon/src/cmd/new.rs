@@ -47,6 +47,7 @@
 //! - Enables format placeholders: {number}, {title}, {author}, {branch}
 
 use dialoguer::{FuzzySelect, Input};
+use log::debug;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
 use crate::cli::New;
@@ -110,8 +111,13 @@ impl Run for New {
         // Check if this is a PR reference
         // Only treat as PR if no conflicting flags are provided
         let pr_info = if !self.orphan && !self.detach && self.base.is_none() {
-            workon::parse_pr_reference(&name)?
+            let info = workon::parse_pr_reference(&name)?;
+            if info.is_some() {
+                debug!("Detected PR reference in '{}'", name);
+            }
+            info
         } else {
+            debug!("Skipping PR detection (conflicting flags)");
             None
         };
 
@@ -163,11 +169,14 @@ impl Run for New {
 
             // Determine base branch
             let base_branch = if let Some(base) = &self.base {
+                debug!("Using explicit base branch: {}", base);
                 config.default_branch(Some(base))?
             } else if !self.no_interactive && self.name.is_none() {
                 // Interactive mode: prompt for base branch
+                debug!("Prompting for base branch (interactive mode)");
                 prompt_for_base_branch(&repo, &config)?
             } else {
+                debug!("Using default base branch from config");
                 config.default_branch(None)?
             };
 
@@ -195,19 +204,25 @@ impl Run for New {
         };
 
         if config.auto_copy_untracked(copy_override)? {
+            debug!("Auto-copy enabled, copying from base worktree");
             if let Err(e) = copy_untracked_files(&repo, &worktree, base_branch.as_deref(), &config)
             {
                 output::warn(&format!("Failed to copy untracked files: {}", e));
                 // Continue - worktree is still valid
             }
+        } else {
+            debug!("Auto-copy disabled");
         }
 
         // Execute post-create hooks after successful worktree creation
         if !self.no_hooks {
+            debug!("Executing post-create hooks");
             if let Err(e) = execute_post_create_hooks(&worktree, base_branch.as_deref(), &config) {
                 output::warn(&format!("Post-create hook failed: {}", e));
                 // Continue - worktree is still valid
             }
+        } else {
+            debug!("Hooks skipped (--no-hooks)");
         }
 
         Ok(Some(worktree))

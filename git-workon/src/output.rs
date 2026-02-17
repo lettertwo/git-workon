@@ -23,10 +23,8 @@
 //! is not set. See <https://no-color.org/>.
 //!
 //! ### Planned Features
-//! - `--verbose` flag for debugging
 //! - `--porcelain` for stable script-friendly output
 
-// TODO: Add --verbose debugging output
 // TODO: Add --porcelain stable output format
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -25,6 +25,7 @@
 
 use dialoguer::Confirm;
 use git2::BranchType;
+use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
 use workon::{get_default_branch, get_repo, get_worktrees, WorktreeDescriptor};
@@ -105,6 +106,7 @@ impl Run for Prune {
 
                 if !branch_exists {
                     // Branch is deleted - always prune
+                    debug!("'{}': branch deleted, candidate for pruning", branch_name);
                     Some((
                         wt,
                         PruneCandidate {
@@ -117,15 +119,18 @@ impl Run for Prune {
                 } else if self.gone {
                     // Branch exists - check if upstream is gone (only if --gone flag is set)
                     match is_upstream_gone(&repo, &branch_name) {
-                        Ok(true) => Some((
-                            wt,
-                            PruneCandidate {
-                                worktree_name: wt.name()?.to_string(),
-                                worktree_path: wt.path().to_path_buf(),
-                                branch_name,
-                                reason: PruneReason::RemoteGone,
-                            },
-                        )),
+                        Ok(true) => {
+                            debug!("'{}': upstream gone, candidate for pruning", branch_name);
+                            Some((
+                                wt,
+                                PruneCandidate {
+                                    worktree_name: wt.name()?.to_string(),
+                                    worktree_path: wt.path().to_path_buf(),
+                                    branch_name,
+                                    reason: PruneReason::RemoteGone,
+                                },
+                            ))
+                        }
                         _ => None,
                     }
                 } else if let Some(ref merged_target) = self.merged {
@@ -153,6 +158,7 @@ impl Run for Prune {
                         _ => None,
                     }
                 } else {
+                    debug!("'{}': no prune criteria matched, skipping", branch_name);
                     None
                 }
             })
@@ -171,6 +177,7 @@ impl Run for Prune {
             .filter_map(|(wt, candidate)| {
                 // Check if branch is protected
                 if !self.force && is_protected(&candidate.branch_name, &protected_patterns) {
+                    debug!("'{}': skipped (protected branch)", candidate.branch_name);
                     skipped.push((
                         candidate,
                         "protected by workon.pruneProtectedBranches".to_string(),

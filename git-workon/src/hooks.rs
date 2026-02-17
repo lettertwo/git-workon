@@ -65,6 +65,7 @@
 use std::env;
 use std::process::Command;
 
+use log::debug;
 use miette::{IntoDiagnostic, Result};
 use workon::{WorkonConfig, WorktreeDescriptor};
 
@@ -80,22 +81,33 @@ pub fn execute_post_create_hooks(
     let hooks = config.post_create_hooks()?;
 
     if hooks.is_empty() {
+        debug!("No post-create hooks configured");
         return Ok(());
     }
+
+    debug!("Found {} post-create hook(s)", hooks.len());
 
     for (i, hook_cmd) in hooks.iter().enumerate() {
         eprintln!("Running hook {}/{}: {}", i + 1, hooks.len(), hook_cmd);
 
         // Set up environment variables for the hook
+        debug!("Setting WORKON_WORKTREE_PATH={}", worktree.path().display());
         env::set_var("WORKON_WORKTREE_PATH", worktree.path());
 
         if let Ok(Some(branch)) = worktree.branch() {
+            debug!("Setting WORKON_BRANCH_NAME={}", branch);
             env::set_var("WORKON_BRANCH_NAME", branch);
         }
 
         if let Some(base) = base_branch {
+            debug!("Setting WORKON_BASE_BRANCH={}", base);
             env::set_var("WORKON_BASE_BRANCH", base);
         }
+
+        debug!(
+            "Executing in working directory: {}",
+            worktree.path().display()
+        );
 
         // Execute using shell (platform-dependent)
         let result = if cfg!(target_os = "windows") {
