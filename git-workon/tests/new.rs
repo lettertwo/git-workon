@@ -1,3 +1,6 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use assert_cmd::Command;
 use git_workon_fixture::prelude::*;
 
@@ -582,6 +585,137 @@ fn new_with_explicit_name_works_non_interactively() -> Result<(), Box<dyn std::e
 
     let repo = fixture.repo()?;
     repo.assert(predicate::repo::has_worktree("feature"));
+
+    Ok(())
+}
+
+// --- Interactive PTY tests ---
+
+const ENTER: &[u8] = b"\r";
+const ARROW_DOWN: &[u8] = b"\x1b[B";
+
+fn cargo_bin_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_git-workon"))
+}
+
+fn spawn_interactive(cwd: &Path, args: &[&str]) -> expectrl::Session {
+    let mut cmd = std::process::Command::new(cargo_bin_path());
+    cmd.current_dir(cwd);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let mut session = expectrl::Session::spawn(cmd).expect("Failed to spawn in PTY");
+    session.set_expect_timeout(Some(Duration::from_secs(10)));
+    session
+}
+
+/// Extract the last non-empty line from PTY output, stripping ANSI escape sequences.
+fn last_line(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let line = text
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
+    let mut result = String::new();
+    let mut chars = line.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            if chars.next() == Some('[') {
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() || ch == 'h' || ch == 'l' {
+                        break;
+                    }
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+#[test]
+fn new_interactive_prompts_for_name() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .build()?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["new"]);
+
+    session.expect("Branch name")?;
+    session.send("my-feature\r")?;
+
+    session.expect("Base branch")?;
+    session.send(ENTER)?;
+
+    let output = session.expect(expectrl::Eof)?;
+    let selected = last_line(output.get(0).unwrap());
+
+    assert!(
+        selected.contains("my-feature"),
+        "Expected output to contain 'my-feature', got: {selected}"
+    );
+
+    fixture
+        .root()?
+        .child("my-feature")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn new_interactive_prompts_for_base_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("develop")
+        .build()?;
+
+    // Add a distinct commit on develop so we can verify the base
+    fixture
+        .commit("develop")
+        .file("develop.txt", "from develop")
+        .create("Commit on develop")?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["new"]);
+
+    session.expect("Branch name")?;
+    session.send("my-feature\r")?;
+
+    // Base branch prompt: default is item 0 "<default: main>",
+    // then branches listed. Arrow down to skip default, then find "develop".
+    session.expect("Base branch")?;
+    // Arrow down past default to select a non-default branch.
+    // The list is: 0: <default: main>, 1: develop, 2: main
+    session.send(ARROW_DOWN)?;
+    session.send(ENTER)?;
+
+    let output = session.expect(expectrl::Eof)?;
+    let selected = last_line(output.get(0).unwrap());
+
+    assert!(
+        selected.contains("my-feature"),
+        "Expected output to contain 'my-feature', got: {selected}"
+    );
+
+    // Verify the feature branch was based on develop (same commit)
+    let repo = fixture.repo()?;
+    let feature_branch = repo.find_branch("my-feature", git2::BranchType::Local)?;
+    let feature_commit = feature_branch.get().peel_to_commit()?;
+
+    let develop_branch = repo.find_branch("develop", git2::BranchType::Local)?;
+    let develop_commit = develop_branch.get().peel_to_commit()?;
+
+    assert_eq!(
+        feature_commit.id(),
+        develop_commit.id(),
+        "Feature branch should be based on develop"
+    );
 
     Ok(())
 }
