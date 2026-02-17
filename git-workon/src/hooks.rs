@@ -60,10 +60,16 @@
 //! fi
 //! ```
 //!
-//! TODO: Add timeout protection for long-running hooks
+//! ## Timeout Protection
+//!
+//! Hooks are subject to a configurable timeout (`workon.hookTimeout`, default 300s).
+//! If a hook exceeds the timeout, it is killed and an error is returned.
+//! Set `workon.hookTimeout` to `0` to disable the timeout.
 
 use std::env;
 use std::process::Command;
+use std::thread;
+use std::time::Instant;
 
 use log::debug;
 use miette::{IntoDiagnostic, Result};
@@ -110,29 +116,56 @@ pub fn execute_post_create_hooks(
         );
 
         // Execute using shell (platform-dependent)
-        let result = if cfg!(target_os = "windows") {
+        let mut child = if cfg!(target_os = "windows") {
             Command::new("cmd")
                 .args(["/C", hook_cmd])
                 .current_dir(worktree.path())
-                .status()
+                .spawn()
         } else {
             Command::new("sh")
                 .args(["-c", hook_cmd])
                 .current_dir(worktree.path())
-                .status()
-        };
+                .spawn()
+        }
+        .into_diagnostic()?;
 
-        match result.into_diagnostic()? {
-            status if status.success() => {
-                eprintln!("✓ Hook completed successfully");
-            }
-            status => {
+        let timeout = config.hook_timeout()?;
+
+        if timeout.is_zero() {
+            // No timeout - blocking wait
+            let status = child.wait().into_diagnostic()?;
+            if !status.success() {
                 return Err(miette::miette!(
                     "Hook failed with exit code: {:?}",
                     status.code()
                 ));
             }
+        } else {
+            let start = Instant::now();
+            loop {
+                match child.try_wait().into_diagnostic()? {
+                    Some(status) if status.success() => break,
+                    Some(status) => {
+                        return Err(miette::miette!(
+                            "Hook failed with exit code: {:?}",
+                            status.code()
+                        ));
+                    }
+                    None if start.elapsed() >= timeout => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(miette::miette!(
+                            "Hook timed out after {}s: {}",
+                            timeout.as_secs(),
+                            hook_cmd
+                        ));
+                    }
+                    None => thread::sleep(std::time::Duration::from_millis(100)),
+                }
+            }
         }
+
+        eprintln!("✓ Hook completed successfully");
     }
 
     Ok(())

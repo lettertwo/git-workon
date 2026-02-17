@@ -23,15 +23,16 @@
 //!
 //! ## Configuration Keys
 //!
-//! This module supports 7 configuration keys:
+//! This module supports the following configuration keys:
 //!
-//! 1. **workon.defaultBranch** - Default base branch for new worktrees (string, default: None)
-//! 2. **workon.postCreateHook** - Commands to run after worktree creation (multi-value, default: [])
-//! 3. **workon.copyPattern** - Glob patterns for automatic file copying (multi-value, default: [])
-//! 4. **workon.copyExclude** - Patterns to exclude from copying (multi-value, default: [])
-//! 5. **workon.autoCopyUntracked** - Enable automatic file copying in new command (bool, default: false)
-//! 6. **workon.pruneProtectedBranches** - Branches protected from pruning (multi-value, default: [])
-//! 7. **workon.prFormat** - Format string for PR-based worktree names (string, default: "pr-{number}")
+//! - **workon.defaultBranch** - Default base branch for new worktrees (string, default: None)
+//! - **workon.postCreateHook** - Commands to run after worktree creation (multi-value, default: [])
+//! - **workon.copyPattern** - Glob patterns for automatic file copying (multi-value, default: [])
+//! - **workon.copyExclude** - Patterns to exclude from copying (multi-value, default: [])
+//! - **workon.autoCopyUntracked** - Enable automatic file copying in new command (bool, default: false)
+//! - **workon.pruneProtectedBranches** - Branches protected from pruning (multi-value, default: [])
+//! - **workon.prFormat** - Format string for PR-based worktree names (string, default: "pr-{number}")
+//! - **workon.hookTimeout** - Timeout in seconds for hook execution (integer, default: 300, 0 = no timeout)
 //!
 //! ## Example Configuration
 //!
@@ -53,6 +54,8 @@
 //!   pruneProtectedBranches = release/*
 //!   prFormat = pr-{number}
 //! ```
+
+use std::time::Duration;
 
 use git2::Repository;
 
@@ -217,6 +220,19 @@ impl<'repo> WorkonConfig<'repo> {
             }
         }
         false
+    }
+
+    /// Get the timeout duration for hook execution.
+    ///
+    /// Reads from workon.hookTimeout config (integer seconds).
+    /// Default: 300 seconds (5 minutes). A value of 0 disables the timeout.
+    pub fn hook_timeout(&self) -> Result<Duration> {
+        let config = self.repo.config()?;
+        let seconds = match config.get_i64("workon.hookTimeout") {
+            Ok(val) => val.max(0) as u64,
+            Err(_) => 300,
+        };
+        Ok(Duration::from_secs(seconds))
     }
 
     /// Helper to read multi-value config entries.
