@@ -1,3 +1,6 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
 use assert_cmd::Command;
 use git_workon_fixture::prelude::*;
 
@@ -1141,6 +1144,79 @@ fn prune_force_overrides_default_branch() -> Result<(), Box<dyn std::error::Erro
 
     // Verify main worktree is gone
     fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+// --- Interactive PTY tests ---
+
+fn cargo_bin_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_git-workon"))
+}
+
+fn spawn_interactive(cwd: &Path, args: &[&str]) -> expectrl::Session {
+    let mut cmd = std::process::Command::new(cargo_bin_path());
+    cmd.current_dir(cwd);
+    for arg in args {
+        cmd.arg(arg);
+    }
+    let mut session = expectrl::Session::spawn(cmd).expect("Failed to spawn in PTY");
+    session.set_expect_timeout(Some(Duration::from_secs(10)));
+    session
+}
+
+#[test]
+fn prune_interactive_confirm_yes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let feature_dir = fixture.cwd()?;
+    feature_dir.assert(predicate::path::is_dir());
+
+    // Delete the branch to make it a prune candidate
+    let repo = fixture.repo()?;
+    repo.find_reference("refs/heads/feature")?.delete()?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["prune"]);
+
+    session.expect("Prune 1 worktree")?;
+    session.send("y\r")?;
+
+    session.expect(expectrl::Eof)?;
+
+    // Verify worktree directory is gone
+    feature_dir.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_interactive_confirm_no() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let feature_dir = fixture.cwd()?;
+    feature_dir.assert(predicate::path::is_dir());
+
+    // Delete the branch to make it a prune candidate
+    let repo = fixture.repo()?;
+    repo.find_reference("refs/heads/feature")?.delete()?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["prune"]);
+
+    session.expect("Prune 1 worktree")?;
+    session.send("n\r")?;
+
+    session.expect(expectrl::Eof)?;
+
+    // Verify worktree directory still exists
+    feature_dir.assert(predicate::path::is_dir());
 
     Ok(())
 }
