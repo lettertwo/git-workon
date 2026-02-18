@@ -36,7 +36,9 @@ pub enum Cmd {
     Doctor(Doctor),
     Find(Find),
     Init(Init),
+    #[command(visible_alias = "ls")]
     List(List),
+    #[command(visible_alias = "mv")]
     Move(Move),
     New(New),
     Prune(Prune),
