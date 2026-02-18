@@ -1,4 +1,5 @@
 mod clone;
+mod complete;
 mod config;
 mod copy_untracked;
 mod doctor;
@@ -8,6 +9,7 @@ mod list;
 mod r#move; // r#move because "move" is a reserved keyword
 mod new;
 mod prune;
+mod shell_init;
 
 use miette::Result;
 use workon::WorktreeDescriptor;
@@ -22,6 +24,7 @@ impl Run for Cmd {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         match self {
             Cmd::Clone(cmd) => cmd.run(),
+            Cmd::Complete(cmd) => cmd.run(),
             Cmd::Config(cmd) => cmd.run(),
             Cmd::CopyUntracked(cmd) => cmd.run(),
             Cmd::Doctor(cmd) => cmd.run(),
@@ -31,6 +34,7 @@ impl Run for Cmd {
             Cmd::Move(cmd) => cmd.run(),
             Cmd::New(cmd) => cmd.run(),
             Cmd::Prune(cmd) => cmd.run(),
+            Cmd::ShellInit(cmd) => cmd.run(),
         }
     }
 }

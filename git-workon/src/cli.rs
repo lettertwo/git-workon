@@ -39,6 +39,9 @@ pub enum Cmd {
     Move(Move),
     New(New),
     Prune(Prune),
+    ShellInit(ShellInit),
+    #[command(name = "_complete", hide = true)]
+    Complete(Complete),
 }
 
 /// Perform a bare clone of a repository and create an initial worktree.
@@ -259,6 +262,27 @@ pub enum ConfigScope {
     Global,
     Local,
 }
+
+/// Generate shell integration script (wrapper function + completions).
+#[derive(Debug, Args)]
+pub struct ShellInit {
+    /// Shell to generate init script for
+    pub shell: Shell,
+    /// Name for the wrapper function
+    #[arg(long, default_value = "workon")]
+    pub cmd: String,
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+/// List worktree names for shell completion (hidden).
+#[derive(Debug, Args)]
+pub struct Complete;
 
 #[cfg(test)]
 mod tests {
