@@ -6,6 +6,7 @@
 //! ## Usage
 //!
 //! ```bash
+//! eval "$(git workon shell-init)"        # auto-detect from $SHELL
 //! eval "$(git workon shell-init bash)"   # bash
 //! eval "$(git workon shell-init zsh)"    # zsh
 //! git workon shell-init fish | source    # fish
@@ -13,19 +14,42 @@
 //!
 //! ## Future Work
 //!
-//! TODO: Auto-detect shell and print appropriate script when `git workon shell-init` is run without arguments
 //! TODO: Frequency/recency tracking for smart defaults (zoxide-style)
 //! TODO: Determine feasability of acheiving cd from git extension, e.g.:
 //!  - `git workon jump <pattern>` — fast jump by fuzzy match using frequency data
 //!  - `git workon switch <pattern>` — alternative name for jump
 //!  - `git workon find <pattern> --jump` — alternative to augment `find` witha jump/switch behavior
 
-use miette::Result;
+use std::path::Path;
+
+use miette::{miette, Result};
 use workon::WorktreeDescriptor;
 
 use crate::cli::{Shell, ShellInit};
 
 use super::Run;
+
+fn shell_from_path(path: &str) -> Result<Shell> {
+    let basename = Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    match basename {
+        "bash" => Ok(Shell::Bash),
+        "zsh" => Ok(Shell::Zsh),
+        "fish" => Ok(Shell::Fish),
+        other => Err(miette!(
+            "Unrecognized shell '{other}'; specify a shell explicitly (bash, zsh, or fish)"
+        )),
+    }
+}
+
+fn detect_shell() -> Result<Shell> {
+    let shell_var = std::env::var("SHELL").map_err(|_| {
+        miette!("$SHELL is not set; specify a shell explicitly (bash, zsh, or fish)")
+    })?;
+    shell_from_path(&shell_var)
+}
 
 const BASH_TEMPLATE: &str = r#"{cmd}() {
     local result
@@ -76,7 +100,11 @@ complete -c {cmd} -f -a '(command git workon _complete 2>/dev/null)'
 impl Run for ShellInit {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let cmd = &self.cmd;
-        let script = match self.shell {
+        let shell = match &self.shell {
+            Some(s) => s.clone(),
+            None => detect_shell()?,
+        };
+        let script = match shell {
             Shell::Bash => BASH_TEMPLATE.replace("{cmd}", cmd),
             Shell::Zsh => ZSH_TEMPLATE.replace("{cmd}", cmd),
             Shell::Fish => FISH_TEMPLATE.replace("{cmd}", cmd),
@@ -152,5 +180,31 @@ mod tests {
     fn fish_contains_complete_c() {
         let script = init(Shell::Fish, "workon");
         assert!(script.contains("complete -c"));
+    }
+
+    #[test]
+    fn detect_shell_bash() {
+        assert!(matches!(shell_from_path("/bin/bash").unwrap(), Shell::Bash));
+    }
+
+    #[test]
+    fn detect_shell_zsh() {
+        assert!(matches!(
+            shell_from_path("/usr/bin/zsh").unwrap(),
+            Shell::Zsh
+        ));
+    }
+
+    #[test]
+    fn detect_shell_fish() {
+        assert!(matches!(
+            shell_from_path("/usr/local/bin/fish").unwrap(),
+            Shell::Fish
+        ));
+    }
+
+    #[test]
+    fn detect_shell_unrecognized() {
+        assert!(shell_from_path("/bin/sh").is_err());
     }
 }

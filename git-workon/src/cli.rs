@@ -266,8 +266,8 @@ pub enum ConfigScope {
 /// Generate shell integration script (wrapper function + completions).
 #[derive(Debug, Args)]
 pub struct ShellInit {
-    /// Shell to generate init script for
-    pub shell: Shell,
+    /// Shell to generate init script for (auto-detected from $SHELL if not specified)
+    pub shell: Option<Shell>,
     /// Name for the wrapper function
     #[arg(long, default_value = "workon")]
     pub cmd: String,
