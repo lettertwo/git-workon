@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
@@ -263,6 +264,13 @@ pub enum ConfigScope {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
 /// Generate shell integration script (wrapper function + completions).
 #[derive(Debug, Args)]
 pub struct ShellInit {
@@ -273,16 +281,16 @@ pub struct ShellInit {
     pub cmd: String,
 }
 
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum Shell {
-    Bash,
-    Zsh,
-    Fish,
-}
-
 /// List worktree names for shell completion (hidden).
 #[derive(Debug, Args)]
-pub struct Complete;
+pub struct Complete {
+    /// 0-based index of the word being completed
+    #[arg(long, default_value_t = 0)]
+    pub index: usize,
+    /// Command line words (after the wrapper command name)
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<OsString>,
+}
 
 #[cfg(test)]
 mod tests {

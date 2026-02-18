@@ -70,7 +70,7 @@ fn shell_init_custom_cmd() -> Result<(), Box<dyn std::error::Error>> {
         .assert()
         .success()
         .stdout(predicate::str::contains("gw()"))
-        .stdout(predicate::str::contains("complete -F _gw_complete gw"));
+        .stdout(predicate::str::contains("complete -F"));
 
     Ok(())
 }

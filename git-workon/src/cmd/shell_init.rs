@@ -20,14 +20,29 @@
 //!  - `git workon switch <pattern>` — alternative name for jump
 //!  - `git workon find <pattern> --jump` — alternative to augment `find` witha jump/switch behavior
 
-use std::path::Path;
+use std::{
+    io::{self, Write},
+    path::Path,
+};
 
-use miette::{miette, Result};
+use clap::CommandFactory;
+use clap_complete::{generate, Shell as ClapShell};
+use miette::{miette, IntoDiagnostic, Result};
 use workon::WorktreeDescriptor;
 
-use crate::cli::{Shell, ShellInit};
+use crate::cli::{Cli, Shell, ShellInit};
 
 use super::Run;
+
+impl From<Shell> for ClapShell {
+    fn from(value: Shell) -> Self {
+        match value {
+            Shell::Bash => ClapShell::Bash,
+            Shell::Zsh => ClapShell::Zsh,
+            Shell::Fish => ClapShell::Fish,
+        }
+    }
+}
 
 fn shell_from_path(path: &str) -> Result<Shell> {
     let basename = Path::new(path)
@@ -51,6 +66,24 @@ fn detect_shell() -> Result<Shell> {
     shell_from_path(&shell_var)
 }
 
+fn generate_shell_integration(shell: Shell, bin_name: &str, buf: &mut dyn Write) -> Result<()> {
+    let cargo_pkg_name = env!("CARGO_PKG_NAME");
+    let cmd = &mut Cli::command();
+    generate(ClapShell::from(shell), cmd, cargo_pkg_name, buf);
+    generate(ClapShell::from(shell), cmd, bin_name, buf);
+
+    write!(
+        buf,
+        "{}",
+        match shell {
+            Shell::Bash => BASH_TEMPLATE.replace("{cmd}", bin_name),
+            Shell::Zsh => ZSH_TEMPLATE.replace("{cmd}", bin_name),
+            Shell::Fish => FISH_TEMPLATE.replace("{cmd}", bin_name),
+        }
+    )
+    .into_diagnostic()
+}
+
 const BASH_TEMPLATE: &str = r#"{cmd}() {
     local result
     result="$(command git workon "$@")" || { local code=$?; printf '%s\n' "$result"; return $code; }
@@ -60,12 +93,6 @@ const BASH_TEMPLATE: &str = r#"{cmd}() {
         printf '%s\n' "$result"
     fi
 }
-
-_{cmd}_complete() {
-    local IFS=$'\n'
-    COMPREPLY=($(compgen -W "$(command git workon _complete 2>/dev/null)" -- "${COMP_WORDS[COMP_CWORD]}"))
-}
-complete -F _{cmd}_complete {cmd}
 "#;
 
 const ZSH_TEMPLATE: &str = r#"{cmd}() {
@@ -77,13 +104,6 @@ const ZSH_TEMPLATE: &str = r#"{cmd}() {
         printf '%s\n' "$result"
     fi
 }
-
-_{cmd}_complete() {
-    local -a worktrees
-    worktrees=(${(f)"$(command git workon _complete 2>/dev/null)"})
-    _describe 'worktree' worktrees
-}
-compdef _{cmd}_complete {cmd}
 "#;
 
 const FISH_TEMPLATE: &str = r#"function {cmd}
@@ -93,24 +113,17 @@ const FISH_TEMPLATE: &str = r#"function {cmd}
     if test -d "$result"; cd $result
     else if test -n "$result"; printf '%s\n' $result; end
 end
-
-complete -c {cmd} -f -a '(command git workon _complete 2>/dev/null)'
 "#;
 
 impl Run for ShellInit {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let cmd = &self.cmd;
-        let shell = match &self.shell {
-            Some(s) => s.clone(),
+        let shell = match self.shell {
+            Some(s) => s,
             None => detect_shell()?,
         };
-        let script = match shell {
-            Shell::Bash => BASH_TEMPLATE.replace("{cmd}", cmd),
-            Shell::Zsh => ZSH_TEMPLATE.replace("{cmd}", cmd),
-            Shell::Fish => FISH_TEMPLATE.replace("{cmd}", cmd),
-        };
-        print!("{}", script);
-        Ok(None)
+
+        generate_shell_integration(shell, cmd, &mut io::stdout()).map(|_| None)
     }
 }
 
@@ -138,27 +151,13 @@ mod tests {
     fn bash_custom_cmd() {
         let script = init(Shell::Bash, "gw");
         assert!(script.contains("gw()"));
-        assert!(script.contains("complete -F _gw_complete gw"));
         assert!(!script.contains("workon()"));
-    }
-
-    #[test]
-    fn bash_contains_complete_keyword() {
-        let script = init(Shell::Bash, "workon");
-        assert!(script.contains("complete -F"));
-    }
-
-    #[test]
-    fn zsh_contains_compdef() {
-        let script = init(Shell::Zsh, "workon");
-        assert!(script.contains("compdef"));
     }
 
     #[test]
     fn zsh_custom_cmd() {
         let script = init(Shell::Zsh, "gw");
         assert!(script.contains("gw()"));
-        assert!(script.contains("compdef _gw_complete gw"));
         assert!(!script.contains("workon()"));
     }
 
@@ -172,14 +171,7 @@ mod tests {
     fn fish_custom_cmd() {
         let script = init(Shell::Fish, "gw");
         assert!(script.contains("function gw"));
-        assert!(script.contains("complete -c gw"));
         assert!(!script.contains("function workon"));
-    }
-
-    #[test]
-    fn fish_contains_complete_c() {
-        let script = init(Shell::Fish, "workon");
-        assert!(script.contains("complete -c"));
     }
 
     #[test]
