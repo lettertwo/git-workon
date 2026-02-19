@@ -33,6 +33,7 @@ use std::sync::OnceLock;
 use owo_colors::OwoColorize;
 
 static JSON_MODE: AtomicBool = AtomicBool::new(false);
+static NO_COLOR: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable JSON mode. When enabled, all stderr output is suppressed.
 pub fn set_json_mode(enabled: bool) {
@@ -43,11 +44,17 @@ fn is_json_mode() -> bool {
     JSON_MODE.load(Ordering::Relaxed)
 }
 
+/// Disable color output, overriding terminal detection.
+pub fn set_no_color(enabled: bool) {
+    NO_COLOR.store(enabled, Ordering::Relaxed);
+}
+
 /// Checks if we should use color (terminal + NO_COLOR not set)
 fn use_color() -> bool {
     static C: OnceLock<bool> = OnceLock::new();
     *C.get_or_init(|| {
-        std::env::var_os("NO_COLOR").is_none()
+        !NO_COLOR.load(Ordering::Relaxed)
+            && std::env::var_os("NO_COLOR").is_none()
             && supports_color::on(supports_color::Stream::Stdout).is_some()
     })
 }

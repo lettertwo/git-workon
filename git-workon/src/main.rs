@@ -34,6 +34,10 @@ fn main() -> Result<()> {
         output::set_json_mode(true);
     }
 
+    if cli.no_color {
+        output::set_no_color(true);
+    }
+
     if cli.command.is_none() {
         match cli.find.name {
             Some(ref name) if workon::is_pr_reference(name) => {

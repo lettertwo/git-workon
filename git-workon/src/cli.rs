@@ -18,6 +18,8 @@ pub struct Cli {
     pub verbose: Verbosity<InfoLevel>,
     #[arg(long, global = true, help = "Output results as JSON")]
     pub json: bool,
+    #[arg(long, global = true, help = "Disable color output")]
+    pub no_color: bool,
     #[command(subcommand)]
     pub command: Option<Cmd>,
     #[clap(flatten)]
