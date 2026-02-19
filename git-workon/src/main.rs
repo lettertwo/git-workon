@@ -56,6 +56,7 @@ fn main() -> Result<()> {
         match &mut cmd {
             Cmd::List(list) => list.json = true,
             Cmd::Prune(prune) => prune.json = true,
+            Cmd::Doctor(doctor) => doctor.json = true,
             Cmd::Find(find) => find.no_interactive = true,
             _ => {}
         }

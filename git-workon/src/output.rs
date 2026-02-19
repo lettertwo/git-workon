@@ -122,6 +122,42 @@ pub fn status(msg: &str) {
     eprintln!("{}", msg);
 }
 
+/// Print a passing check item: `  ✓ label` (green checkmark, dim label).
+pub fn check_pass(label: &str) {
+    if is_json_mode() {
+        return;
+    }
+    if use_color() {
+        eprintln!("  {} {}", "✓".green(), label.dimmed());
+    } else {
+        eprintln!("  ✓ {}", label);
+    }
+}
+
+/// Print a failing check item: `  ✗ label — detail` (red bold cross).
+pub fn check_fail(label: &str, detail: &str) {
+    if is_json_mode() {
+        return;
+    }
+    if use_color() {
+        eprintln!("  {} {} — {}", "✗".red().bold(), label, detail);
+    } else {
+        eprintln!("  ✗ {} — {}", label, detail);
+    }
+}
+
+/// Print a warning check item: `  ⚠ label — detail` (yellow warning sign).
+pub fn check_warn(label: &str, detail: &str) {
+    if is_json_mode() {
+        return;
+    }
+    if use_color() {
+        eprintln!("  {} {} — {}", "⚠".yellow(), label, detail);
+    } else {
+        eprintln!("  ⚠ {} — {}", label, detail);
+    }
+}
+
 /// Style module for inline string formatting (checks stdout color support).
 pub mod style {
     use super::*;

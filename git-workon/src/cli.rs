@@ -252,6 +252,10 @@ pub struct Doctor {
     /// Preview fixes without applying them
     #[arg(long)]
     pub dry_run: bool,
+
+    #[clap(skip)]
+    #[allow(dead_code)]
+    pub json: bool,
 }
 
 /// Manage git-workon configuration interactively.
