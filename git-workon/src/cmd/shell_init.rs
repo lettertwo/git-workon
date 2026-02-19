@@ -25,24 +25,13 @@ use std::{
     path::Path,
 };
 
-use clap::CommandFactory;
-use clap_complete::{generate, Shell as ClapShell};
+use clap_complete::env::{Bash, EnvCompleter, Fish, Zsh};
 use miette::{miette, IntoDiagnostic, Result};
 use workon::WorktreeDescriptor;
 
-use crate::cli::{Cli, Shell, ShellInit};
+use crate::cli::{Shell, ShellInit};
 
 use super::Run;
-
-impl From<Shell> for ClapShell {
-    fn from(value: Shell) -> Self {
-        match value {
-            Shell::Bash => ClapShell::Bash,
-            Shell::Zsh => ClapShell::Zsh,
-            Shell::Fish => ClapShell::Fish,
-        }
-    }
-}
 
 fn shell_from_path(path: &str) -> Result<Shell> {
     let basename = Path::new(path)
@@ -67,10 +56,22 @@ fn detect_shell() -> Result<Shell> {
 }
 
 fn generate_shell_integration(shell: Shell, bin_name: &str, buf: &mut dyn Write) -> Result<()> {
-    let cargo_pkg_name = env!("CARGO_PKG_NAME");
-    let cmd = &mut Cli::command();
-    generate(ClapShell::from(shell), cmd, cargo_pkg_name, buf);
-    generate(ClapShell::from(shell), cmd, bin_name, buf);
+    let pkg_name = env!("CARGO_PKG_NAME");
+    let env_shell: &dyn EnvCompleter = match shell {
+        Shell::Bash => &Bash,
+        Shell::Zsh => &Zsh,
+        Shell::Fish => &Fish,
+    };
+
+    env_shell
+        .write_registration("COMPLETE", pkg_name, pkg_name, pkg_name, buf)
+        .into_diagnostic()?;
+
+    if bin_name != pkg_name {
+        env_shell
+            .write_registration("COMPLETE", bin_name, bin_name, pkg_name, buf)
+            .into_diagnostic()?;
+    }
 
     write!(
         buf,

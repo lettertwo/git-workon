@@ -10,9 +10,15 @@ fn complete_lists_worktree_names() -> Result<(), Box<dyn std::error::Error>> {
         .worktree("feature")
         .build()?;
 
+    // Complete the name arg in the "find" subcommand (index 1 = after "find")
     Command::cargo_bin("git-workon")?
         .current_dir(&fixture)
         .arg("_complete")
+        .arg("--index")
+        .arg("1")
+        .arg("--")
+        .arg("find")
+        .arg("")
         .assert()
         .success()
         .stdout(predicate::str::contains("main"))
@@ -29,7 +35,7 @@ fn shell_init_bash_outputs_function() -> Result<(), Box<dyn std::error::Error>> 
         .assert()
         .success()
         .stdout(predicate::str::contains("workon()"))
-        .stdout(predicate::str::contains("complete -F"));
+        .stdout(predicate::str::contains("complete -o nospace"));
 
     Ok(())
 }
@@ -55,7 +61,7 @@ fn shell_init_fish_outputs_function() -> Result<(), Box<dyn std::error::Error>> 
         .assert()
         .success()
         .stdout(predicate::str::contains("function workon"))
-        .stdout(predicate::str::contains("complete -c"));
+        .stdout(predicate::str::contains("complete --keep-order"));
 
     Ok(())
 }
@@ -70,7 +76,7 @@ fn shell_init_custom_cmd() -> Result<(), Box<dyn std::error::Error>> {
         .assert()
         .success()
         .stdout(predicate::str::contains("gw()"))
-        .stdout(predicate::str::contains("complete -F"));
+        .stdout(predicate::str::contains("complete -o nospace"));
 
     Ok(())
 }

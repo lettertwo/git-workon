@@ -1,11 +1,13 @@
 mod cli;
 mod cmd;
+mod completers;
 mod display;
 mod hooks;
 mod json;
 mod output;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::env::CompleteEnv;
 use cli::Cmd;
 use miette::{IntoDiagnostic, Result};
 
@@ -14,6 +16,8 @@ use crate::cmd::Run;
 use crate::json::worktree_to_json;
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(|| completers::augment(Cli::command())).complete();
+
     let mut cli = Cli::parse();
 
     env_logger::Builder::new()
