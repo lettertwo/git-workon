@@ -25,7 +25,12 @@ impl Run for Complete {
 
         if let Ok(candidates) = complete(&mut cmd, args, index, current_dir.as_deref()) {
             for candidate in &candidates {
-                println!("{}", candidate.get_value().to_string_lossy());
+                let value = candidate.get_value().to_string_lossy();
+                if let Some(help) = candidate.get_help() {
+                    println!("{}\t{}", value, help);
+                } else {
+                    println!("{}", value);
+                }
             }
         }
 
