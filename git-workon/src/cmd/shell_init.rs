@@ -87,7 +87,7 @@ fn generate_shell_integration(shell: Shell, bin_name: &str, buf: &mut dyn Write)
 
 const BASH_TEMPLATE: &str = r#"{cmd}() {
     local result
-    result="$(command git workon "$@")" || { local code=$?; printf '%s\n' "$result"; return $code; }
+    result="$(FORCE_COLOR=1 command git workon "$@")" || { local code=$?; printf '%s\n' "$result"; return $code; }
     if [ -d "$result" ]; then
         cd "$result" || return $?
     elif [ -n "$result" ]; then
@@ -98,7 +98,7 @@ const BASH_TEMPLATE: &str = r#"{cmd}() {
 
 const ZSH_TEMPLATE: &str = r#"{cmd}() {
     local result
-    result="$(command git workon "$@")" || { local code=$?; printf '%s\n' "$result"; return $code; }
+    result="$(FORCE_COLOR=1 command git workon "$@")" || { local code=$?; printf '%s\n' "$result"; return $code; }
     if [ -d "$result" ]; then
         cd "$result" || return $?
     elif [ -n "$result" ]; then
@@ -108,7 +108,7 @@ const ZSH_TEMPLATE: &str = r#"{cmd}() {
 "#;
 
 const FISH_TEMPLATE: &str = r#"function {cmd}
-    set -l result (command git workon $argv)
+    set -l result (FORCE_COLOR=1 command git workon $argv)
     set -l code $status
     if test $code -ne 0; printf '%s\n' $result; return $code; end
     if test -d "$result"; cd $result
