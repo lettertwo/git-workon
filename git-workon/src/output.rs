@@ -21,11 +21,6 @@
 //!
 //! Color is enabled per-stream when the stream is a terminal and `NO_COLOR` env var
 //! is not set. See <https://no-color.org/>.
-//!
-//! ### Planned Features
-//! - `--porcelain` for stable script-friendly output
-
-// TODO: Add --porcelain stable output format
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;

@@ -63,8 +63,6 @@
 //! # Override safety checks
 //! git workon move --force dirty-branch new-name
 //! ```
-//!
-//! TODO: Update shell integration cache when move command is used
 
 use git2::BranchType;
 use std::{fs, path::Path};

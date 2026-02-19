@@ -1,5 +1,0 @@
-- [ ] explore https://github.com/hakoerber/git-repo-manager/
-- [ ] support pruning worktrees for 'gone' branches
-- [ ] interactive modes via fzf (like zoxide)
-  - [ ] alternatively, explore skim as a library: https://github.com/skim-rs/skim?tab=readme-ov-file#use-as-a-library
-- [ ] shell integration like zoxide
