@@ -1,6 +1,5 @@
 mod clone;
 mod complete;
-mod config;
 mod copy_untracked;
 mod doctor;
 mod find;
@@ -25,7 +24,6 @@ impl Run for Cmd {
         match self {
             Cmd::Clone(cmd) => cmd.run(),
             Cmd::Complete(cmd) => cmd.run(),
-            Cmd::Config(cmd) => cmd.run(),
             Cmd::CopyUntracked(cmd) => cmd.run(),
             Cmd::Doctor(cmd) => cmd.run(),
             Cmd::Find(cmd) => cmd.run(),

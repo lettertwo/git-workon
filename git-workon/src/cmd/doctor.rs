@@ -171,6 +171,16 @@ impl Run for Doctor {
             }
         }
 
+        // Configuration section — informational only, not included in fixable issues
+        output::status("\nChecking configuration...");
+        let config_entries = read_config_entries(&repo, &config)?;
+        for (key, value, source) in &config_entries {
+            match source {
+                Some(src) => output::check_pass(&format!("{key} = {value} ({src})")),
+                None => output::check_pass(&format!("{key} = {value}")),
+            }
+        }
+
         debug!("found {} issue(s) total", issues.len());
 
         // JSON output: serialize all collected issues
@@ -203,10 +213,16 @@ impl Run for Doctor {
                 })
                 .collect();
 
+            let config_json: serde_json::Map<String, serde_json::Value> = config_entries
+                .into_iter()
+                .map(|(k, v, s)| (k, json!({ "value": v, "source": s })))
+                .collect();
+
             let result = json!({
                 "issues": issues_json,
                 "fixed": fixed_names,
                 "dry_run": self.dry_run,
+                "configuration": config_json,
             });
             let output = serde_json::to_string_pretty(&result).into_diagnostic()?;
             println!("{}", output);
@@ -254,6 +270,151 @@ impl Run for Doctor {
 
         Ok(None)
     }
+}
+
+/// Abbreviate the home directory as `~` in a path string.
+fn abbreviate_home(path: &std::path::Path) -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            return format!("~/{}", rel.display());
+        }
+    }
+    path.display().to_string()
+}
+
+/// Returns the abbreviated file path for a given config level.
+fn config_level_path(repo: &git2::Repository, level: git2::ConfigLevel) -> Option<String> {
+    let path = match level {
+        git2::ConfigLevel::Local => Some(repo.path().join("config")),
+        git2::ConfigLevel::Worktree => Some(repo.path().join("config.worktree")),
+        git2::ConfigLevel::Global => git2::Config::find_global().ok(),
+        git2::ConfigLevel::XDG => git2::Config::find_xdg().ok(),
+        git2::ConfigLevel::System => git2::Config::find_system().ok(),
+        _ => None,
+    }?;
+    Some(abbreviate_home(&path))
+}
+
+/// Return the config file path for a scalar key, or None if not set anywhere.
+fn scalar_source(repo: &git2::Repository, config: &git2::Config, key: &str) -> Option<String> {
+    for level in [
+        git2::ConfigLevel::Local,
+        git2::ConfigLevel::Worktree,
+        git2::ConfigLevel::Global,
+        git2::ConfigLevel::XDG,
+        git2::ConfigLevel::System,
+    ] {
+        if config
+            .open_level(level)
+            .ok()
+            .and_then(|c| c.get_string(key).ok())
+            .is_some()
+        {
+            return config_level_path(repo, level);
+        }
+    }
+    None
+}
+
+/// Return distinct config file paths for a multi-value key, or None if not set.
+fn multivar_source(repo: &git2::Repository, config: &git2::Config, key: &str) -> Option<String> {
+    let mut seen: Vec<String> = Vec::new();
+    if let Ok(mut entries) = config.multivar(key, None) {
+        while let Some(Ok(entry)) = entries.next() {
+            if let Some(path) = config_level_path(repo, entry.level()) {
+                if !seen.contains(&path) {
+                    seen.push(path);
+                }
+            }
+        }
+    }
+    if seen.is_empty() {
+        None
+    } else {
+        Some(seen.join(", "))
+    }
+}
+
+/// Read all workon config values for display, returning (key, value, source) triples.
+/// `source` is None for values that are just defaults (not set in any config file).
+fn read_config_entries(
+    repo: &git2::Repository,
+    config: &WorkonConfig,
+) -> Result<Vec<(String, String, Option<String>)>> {
+    let git_config = repo.config().into_diagnostic()?;
+    let mut entries = Vec::new();
+
+    let (val, src) = match config.default_branch(None)? {
+        Some(val) => (
+            val,
+            scalar_source(repo, &git_config, "workon.defaultBranch"),
+        ),
+        None => ("(not set)".to_string(), None),
+    };
+    entries.push(("workon.defaultBranch".to_string(), val, src));
+
+    let auto_copy = config.auto_copy_untracked(None)?;
+    let src = scalar_source(repo, &git_config, "workon.autoCopyUntracked");
+    entries.push((
+        "workon.autoCopyUntracked".to_string(),
+        auto_copy.to_string(),
+        src,
+    ));
+
+    let (val, src) = match config.pr_format(None) {
+        Ok(val) => (val, scalar_source(repo, &git_config, "workon.prFormat")),
+        Err(_) => (
+            "(invalid)".to_string(),
+            scalar_source(repo, &git_config, "workon.prFormat"),
+        ),
+    };
+    entries.push(("workon.prFormat".to_string(), val, src));
+
+    let timeout = config.hook_timeout()?;
+    let src = scalar_source(repo, &git_config, "workon.hookTimeout");
+    entries.push((
+        "workon.hookTimeout".to_string(),
+        format!("{}s", timeout.as_secs()),
+        src,
+    ));
+
+    let patterns = config.copy_patterns()?;
+    let src = multivar_source(repo, &git_config, "workon.copyPattern");
+    let val = if patterns.is_empty() {
+        "(not set)".to_string()
+    } else {
+        patterns.join(", ")
+    };
+    entries.push(("workon.copyPattern".to_string(), val, src));
+
+    let excludes = config.copy_excludes()?;
+    let src = multivar_source(repo, &git_config, "workon.copyExclude");
+    let val = if excludes.is_empty() {
+        "(not set)".to_string()
+    } else {
+        excludes.join(", ")
+    };
+    entries.push(("workon.copyExclude".to_string(), val, src));
+
+    let protected = config.prune_protected_branches()?;
+    let src = multivar_source(repo, &git_config, "workon.pruneProtectedBranches");
+    let val = if protected.is_empty() {
+        "(not set)".to_string()
+    } else {
+        protected.join(", ")
+    };
+    entries.push(("workon.pruneProtectedBranches".to_string(), val, src));
+
+    let hooks = config.post_create_hooks()?;
+    let src = multivar_source(repo, &git_config, "workon.postCreateHook");
+    let val = if hooks.is_empty() {
+        "(not set)".to_string()
+    } else {
+        hooks.join(", ")
+    };
+    entries.push(("workon.postCreateHook".to_string(), val, src));
+
+    Ok(entries)
 }
 
 /// Prune worktrees with missing directories. Returns the names of pruned worktrees.

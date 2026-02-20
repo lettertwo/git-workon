@@ -29,9 +29,6 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
     Clone(Clone),
-    /// Manage git-workon configuration interactively
-    #[command(visible_alias = "cfg")]
-    Config(Config),
     CopyUntracked(CopyUntracked),
     /// Detect and repair workspace issues
     #[command(visible_alias = "check")]
@@ -256,20 +253,6 @@ pub struct Doctor {
     #[clap(skip)]
     #[allow(dead_code)]
     pub json: bool,
-}
-
-/// Manage git-workon configuration interactively.
-#[derive(Debug, Args)]
-pub struct Config {
-    /// Scope for configuration (global or local)
-    #[arg(long, value_enum, default_value = "local")]
-    pub scope: ConfigScope,
-}
-
-#[derive(Debug, Clone, clap::ValueEnum)]
-pub enum ConfigScope {
-    Global,
-    Local,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]

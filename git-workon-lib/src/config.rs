@@ -1,14 +1,7 @@
 //! Configuration system for git-workon.
 //!
 //! This module provides the foundation for all git-workon configuration through git's
-//! native config system. No custom config files are used - everything is stored in
-//! standard git config locations (.git/config, ~/.gitconfig, /etc/gitconfig).
-//!
-//! ## Design Philosophy
-//!
-//! **Git config as single source of truth**: We exclusively use git config rather than
-//! introducing custom configuration files. This aligns with git-workon's goal of feeling
-//! like a native git command.
+//! native config system (.git/config, ~/.gitconfig, /etc/gitconfig).
 //!
 //! **Multi-value support**: Git config naturally supports multi-value entries, perfect for
 //! patterns, hooks, and other list-based configuration:
