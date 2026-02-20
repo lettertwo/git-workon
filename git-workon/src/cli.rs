@@ -4,10 +4,11 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 
-/// Testing
+/// A git plugin for managing worktrees
 #[derive(Debug, Parser)]
 #[clap(
     about,
+    long_about = "An opinionated git worktree workflow for managing multiple branches simultaneously.\n\ngit-workon clones repositories as bare repos with a worktrees-first layout, then provides commands for creating, finding, and cleaning up worktrees — so switching between branches is just `cd`, not `git stash && git checkout`.",
     author,
     bin_name = env!("CARGO_PKG_NAME"),
     propagate_version = true,
