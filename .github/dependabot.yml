@@ -9,6 +9,11 @@ updates:
         patterns:
           - "*"
 
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
