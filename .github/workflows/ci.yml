@@ -1,4 +1,7 @@
 name: CI
+permissions:
+  contents: read
+  pull-requests: write
 
 on:
   push:
@@ -14,7 +17,7 @@ jobs:
   conventional-commits:
     name: Conventional Commits
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && !startsWith(github.head_ref, 'release-please--')
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'dependabot/') && !startsWith(github.head_ref, 'release-please--')
     steps:
       - uses: actions/checkout@v6
         with:
