@@ -1,0 +1,49 @@
+# <type>(<scope>): <subject>
+#
+# <body>
+#
+# <footer>
+
+# --- COMMIT TYPES ---
+# feat:     A new feature
+# fix:      A bug fix
+# docs:     Documentation only changes
+# style:    Code style changes (formatting, whitespace, etc.)
+# refactor: Code change that neither fixes a bug nor adds a feature
+# perf:     Performance improvements
+# test:     Adding or updating tests
+# build:    Changes to build system or external dependencies
+# ci:       Changes to CI configuration files and scripts
+# chore:    Other changes that don't modify src or test files
+# revert:   Reverts a previous commit
+
+# --- git-workon SCOPES ---
+# cli         git-workon binary / CLI argument handling
+# lib         git-workon-lib core library
+# fixture     git-workon-fixture test utilities
+# config      Configuration parsing and defaults
+# worktree    Worktree creation, discovery, deletion
+# hooks       Hook execution (copy, post-checkout, etc.)
+# copy        File copying logic
+# pr          PR parsing and fetching
+# completions Shell completion generation
+# build       Build scripts and generated files
+# release     Release tooling, versioning, changelogs
+
+# --- EXAMPLES ---
+# feat(cli): add --dry-run flag to prune command
+# fix(worktree): resolve path correctly for bare repos
+# docs: update README with clone workflow
+# refactor(config): simplify branch protection logic
+# chore: update dependencies
+# feat!: change worktree path format (breaking change)
+
+# --- GUIDELINES ---
+# * Use imperative, present tense: "add" not "added" nor "adds"
+# * Don't capitalize first letter of subject
+# * No period (.) at the end of subject
+# * Limit subject line to 72 characters
+# * Separate subject from body with a blank line
+# * Use body to explain what and why vs. how
+# * Use footer to reference issues: Fixes #123, Closes #456
+# * Use ! after type/scope for breaking changes

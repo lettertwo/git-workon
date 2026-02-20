@@ -1,0 +1,90 @@
+#!/bin/sh
+#
+# Git commit-msg hook to validate Conventional Commits format
+#
+# This hook validates that commit messages follow the Conventional Commits
+# specification: https://www.conventionalcommits.org/
+#
+# This hook also chains to global hooks if they exist, allowing both
+# repo-specific and global validations to run.
+#
+# To install this hook, run: make install-hooks
+#
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Get the commit message (first argument is the file containing the message)
+COMMIT_MSG_FILE=$1
+COMMIT_MSG=$(cat "$COMMIT_MSG_FILE")
+
+# Get just the first line (subject)
+COMMIT_SUBJECT=$(echo "$COMMIT_MSG" | head -n 1)
+
+# Skip merge commits
+if echo "$COMMIT_SUBJECT" | grep -qE '^Merge (branch|remote-tracking branch|pull request)'; then
+  exit 0
+fi
+
+# Skip revert commits (they have a special format)
+if echo "$COMMIT_SUBJECT" | grep -qE '^Revert '; then
+  exit 0
+fi
+
+# Skip fixup/squash/amend commits (temporary commits for interactive rebase)
+if echo "$COMMIT_SUBJECT" | grep -qE '^(fixup|squash|amend)! '; then
+  exit 0
+fi
+
+# Conventional Commits pattern
+# Matches: type(scope): subject or type: subject
+# Optional ! for breaking changes
+PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .{1,72}$'
+
+# Validate the commit message
+if ! echo "$COMMIT_SUBJECT" | grep -qE "$PATTERN"; then
+  echo ""
+  echo "${RED}✗ Invalid commit message format${NC}"
+  echo ""
+  echo "  Commit messages must follow the Conventional Commits format:"
+  echo ""
+  echo "  ${YELLOW}<type>(<scope>): <subject>${NC}"
+  echo ""
+  echo "  Valid types:"
+  echo "    feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+  echo ""
+  echo "  git-workon scopes (optional):"
+  echo "    cli, lib, fixture, config, worktree, hooks, copy, pr, completions, build, release"
+  echo ""
+  echo "  Examples:"
+  echo "    feat(cli): add --dry-run flag to prune command"
+  echo "    fix(worktree): resolve path for bare repos"
+  echo "    docs: update README with new workflow"
+  echo "    chore: update dependencies"
+  echo "    feat!: change worktree path format (breaking change)"
+  echo ""
+  echo "  Your commit message:"
+  echo "    ${RED}$COMMIT_SUBJECT${NC}"
+  echo ""
+  echo "  See: https://www.conventionalcommits.org/"
+  echo ""
+  exit 1
+fi
+
+echo "${GREEN}✓${NC} Commit message follows Conventional Commits format"
+
+# Chain to global hook if it exists
+GLOBAL_HOOKS_PATH=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
+if [ -n "$GLOBAL_HOOKS_PATH" ]; then
+  GLOBAL_HOOKS_PATH="${GLOBAL_HOOKS_PATH/#\~/$HOME}"
+  GLOBAL_HOOK="$GLOBAL_HOOKS_PATH/commit-msg"
+  if [ -x "$GLOBAL_HOOK" ]; then
+    "$GLOBAL_HOOK" "$@"
+    exit $?
+  fi
+fi
+
+exit 0

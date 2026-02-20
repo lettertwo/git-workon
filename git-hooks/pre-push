@@ -1,0 +1,50 @@
+#!/bin/sh
+#
+# Git pre-push hook to prevent pushing fixup/squash/amend commits
+#
+# These temporary commits should be autosquashed via interactive rebase
+# before pushing. Pushing them to shared branches causes confusion.
+#
+# To install this hook, run: make install-hooks
+#
+
+# Colors for output
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+
+while read -r local_ref local_sha remote_ref remote_sha
+do
+  # Skip deletions
+  if [ "$local_sha" = "0000000000000000000000000000000000000000" ]; then
+    continue
+  fi
+
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+    # New branch — check all commits up to local_sha
+    range="$local_sha"
+  else
+    range="$remote_sha..$local_sha"
+  fi
+
+  fixup_commits=$(git log --format=%s "$range" 2>/dev/null | grep -E '^(fixup|squash|amend)! ')
+
+  if [ -n "$fixup_commits" ]; then
+    echo ""
+    echo "${RED}✗ Push rejected: fixup/squash/amend commits found${NC}"
+    echo ""
+    echo "  The following temporary commits must be cleaned up before pushing:"
+    echo ""
+    echo "$fixup_commits" | while read -r commit; do
+      echo "    ${YELLOW}$commit${NC}"
+    done
+    echo ""
+    echo "  Run interactive rebase to autosquash them:"
+    echo "    ${YELLOW}git rebase -i --autosquash origin/main${NC}"
+    echo ""
+    exit 1
+  fi
+done
+
+exit 0

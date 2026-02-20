@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  conventional-commits:
+    name: Conventional Commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && !startsWith(github.head_ref, 'release-please--')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR title
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .{1,72}$'
+          TITLE="${{ github.event.pull_request.title }}"
+          if ! echo "$TITLE" | grep -qE "$PATTERN"; then
+            echo "::error::PR title does not follow Conventional Commits format"
+            echo ""
+            echo "PR title: $TITLE"
+            echo ""
+            echo "Expected format: <type>(<scope>): <subject>"
+            echo "Valid types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
+            exit 1
+          fi
+          echo "✓ PR title follows Conventional Commits format"
+
+      - name: Validate commit messages
+        run: |
+          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?: .{1,72}$'
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          FAILED=0
+
+          while read -r sha; do
+            SUBJECT=$(git log --format=%s -n 1 "$sha")
+
+            # Skip merge commits
+            if echo "$SUBJECT" | grep -qE '^Merge (branch|remote-tracking branch|pull request)'; then
+              continue
+            fi
+
+            # Skip revert commits
+            if echo "$SUBJECT" | grep -qE '^Revert '; then
+              continue
+            fi
+
+            # Skip fixup/squash/amend commits (they'll be squashed before merge)
+            if echo "$SUBJECT" | grep -qE '^(fixup|squash|amend)! '; then
+              continue
+            fi
+
+            if ! echo "$SUBJECT" | grep -qE "$PATTERN"; then
+              echo "::error::Commit $sha does not follow Conventional Commits format"
+              echo "  Subject: $SUBJECT"
+              FAILED=1
+            fi
+          done < <(git log --format=%H "$BASE..$HEAD")
+
+          if [ "$FAILED" = "1" ]; then
+            echo ""
+            echo "One or more commits do not follow Conventional Commits format."
+            echo "See: https://www.conventionalcommits.org/"
+            exit 1
+          fi
+
+          echo "✓ All commits follow Conventional Commits format"
