@@ -3,6 +3,7 @@ use git2::{Direction, Remote, RemoteCallbacks, Repository};
 use crate::error::{DefaultBranchError, Result};
 use crate::get_remote_callbacks;
 
+/// Builder for resolving the default branch name of a repository or remote.
 pub struct DefaultBranch<'repo, 'cb> {
     repo: &'repo Repository,
     remote: Option<Remote<'repo>>,
@@ -10,6 +11,7 @@ pub struct DefaultBranch<'repo, 'cb> {
 }
 
 impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
+    /// Create a new builder for the given repository.
     pub fn new(repo: &'repo Repository) -> Self {
         Self {
             repo,
@@ -18,16 +20,22 @@ impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
         }
     }
 
+    /// Set the remote to query for its default branch.
     pub fn remote(&mut self, remote: Remote<'repo>) -> &mut Self {
         self.remote = Some(remote);
         self
     }
 
+    /// Set credential callbacks for the remote connection.
     pub fn remote_callbacks(&mut self, cbs: RemoteCallbacks<'cb>) -> &mut Self {
         self.callbacks = Some(cbs);
         self
     }
 
+    /// Resolve the default branch name.
+    ///
+    /// If a remote was set, queries the remote for its HEAD ref.
+    /// Otherwise reads `init.defaultbranch` from git config (defaulting to `"main"`).
     pub fn get_name(self) -> Result<String> {
         match self.remote {
             Some(mut remote) => {
@@ -57,6 +65,10 @@ impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
     }
 }
 
+/// Convenience wrapper around [`DefaultBranch`].
+///
+/// Queries the remote for its default branch if one is provided, otherwise
+/// falls back to `init.defaultbranch` config (defaulting to `"main"`).
 pub fn get_default_branch_name(repo: &Repository, remote: Option<Remote>) -> Result<String> {
     let mut default_branch = DefaultBranch::new(repo);
     if let Some(remote) = remote {

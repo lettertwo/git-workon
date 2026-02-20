@@ -4,6 +4,13 @@ use git2::Repository;
 
 use crate::error::{Result, WorktreeError};
 
+/// Resolve the directory that contains all worktrees for the repository.
+///
+/// For the standard bare-repo layout (`project/.bare`, `project/main`, …) this
+/// returns the `project/` directory — the common ancestor of the `.bare` git
+/// directory and any working directory.
+///
+/// Returns [`WorktreeError::NoParent`] if the path has no parent.
 pub fn workon_root(repo: &Repository) -> Result<&Path> {
     let path = repo.path();
 

@@ -3,6 +3,11 @@ use git2_credentials::CredentialHandler;
 
 use crate::error::Result;
 
+/// Build [`git2::RemoteCallbacks`] that handle credential prompts via the system
+/// credential store (SSH keys, keychain, etc.).
+///
+/// Uses [`git2_credentials::CredentialHandler`] which respects `~/.gitconfig`
+/// credential settings and SSH agent.
 pub fn get_remote_callbacks<'a>() -> Result<RemoteCallbacks<'a>> {
     let mut callbacks = RemoteCallbacks::new();
     let git_config = Config::open_default()?;

@@ -6,6 +6,14 @@ use log::debug;
 use crate::error::Result;
 use crate::{convert_to_bare, get_default_branch_name, get_remote_callbacks};
 
+/// Clone a remote repository into the worktrees layout.
+///
+/// The repository is cloned as a bare repo at `<path>/.bare` and a `.git` link
+/// file is written at `<path>/.git` so that standard git tooling continues to
+/// work. The fetch refspec for `origin` is configured to fetch all branches.
+///
+/// If `path` already ends with `.bare` it is used as-is; otherwise `.bare` is
+/// appended.
 pub fn clone(path: PathBuf, url: &str) -> Result<Repository> {
     debug!("path {}", path.display());
     let path = if path.ends_with(".bare") {

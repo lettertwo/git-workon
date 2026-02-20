@@ -6,6 +6,10 @@ use log::debug;
 use crate::error::Result;
 use crate::{convert_to_bare, empty_commit};
 
+/// Initialise a new bare repository at `path` in the worktrees layout.
+///
+/// Creates a bare repository, adds an initial empty commit so that HEAD is
+/// valid, then converts to the worktrees layout (see [`convert_to_bare`]).
 pub fn init(path: PathBuf) -> Result<Repository> {
     debug!("initializing bare repository at {}", path.display());
 

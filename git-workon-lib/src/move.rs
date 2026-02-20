@@ -164,6 +164,14 @@ pub fn move_worktree(
     WorktreeDescriptor::new(repo, &new_name)
 }
 
+/// Validate that a move from `source` to `target_name` is safe to perform.
+///
+/// Checks (unless `options.force` is set):
+/// - Source is not detached HEAD
+/// - Target does not already exist as a worktree or branch
+/// - Source is not a protected branch
+/// - Source has no uncommitted changes
+/// - Source has no unpushed commits
 pub fn validate_move(
     repo: &git2::Repository,
     source: &WorktreeDescriptor,

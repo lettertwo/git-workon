@@ -2,6 +2,11 @@ use git2::{Oid, Repository};
 
 use crate::{error::Result, WorktreeError};
 
+/// Create an empty initial commit on HEAD with no parents.
+///
+/// Used when initialising a new bare repository to ensure HEAD points to a
+/// valid commit. Returns [`WorktreeError::NonEmptyIndex`] if the index is not
+/// empty when called.
 pub fn empty_commit(repo: &Repository) -> Result<Oid> {
     let sig = repo.signature()?;
     let tree = repo.find_tree({

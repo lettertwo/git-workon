@@ -86,23 +86,33 @@ use crate::{
     get_remote_callbacks,
 };
 
-/// Represents a pull request reference
+/// A parsed pull request reference from user input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
+    /// The PR number extracted from the reference string.
     pub number: u32,
+    /// Optional remote name if the reference included one (e.g. `origin/pull/123/head`).
     pub remote: Option<String>,
 }
 
-/// PR metadata fetched from gh CLI
+/// PR metadata fetched from the `gh` CLI.
 #[derive(Debug, Clone)]
 pub struct PrMetadata {
+    /// PR number.
     pub number: u32,
+    /// PR title.
     pub title: String,
+    /// GitHub login of the PR author.
     pub author: String,
+    /// Name of the branch that the PR was created from.
     pub head_ref: String,
+    /// Name of the branch the PR targets.
     pub base_ref: String,
+    /// True if the PR comes from a forked repository.
     pub is_fork: bool,
+    /// GitHub login of the fork owner, if this is a fork PR.
     pub fork_owner: Option<String>,
+    /// Clone URL of the fork repository, if this is a fork PR.
     pub fork_url: Option<String>,
 }
 
@@ -215,7 +225,9 @@ fn parse_remote_ref(ref_str: &str) -> Result<Option<PullRequest>> {
     .into())
 }
 
-/// Check if gh CLI is available
+/// Return `Ok(())` if the `gh` CLI is installed and reachable in `PATH`.
+///
+/// Returns [`PrError::GhNotInstalled`] if `gh` cannot be executed.
 pub fn check_gh_available() -> Result<()> {
     std::process::Command::new("gh")
         .arg("--version")
@@ -224,7 +236,10 @@ pub fn check_gh_available() -> Result<()> {
     Ok(())
 }
 
-/// Fetch PR metadata using gh CLI
+/// Fetch PR metadata for `pr_number` using the `gh` CLI.
+///
+/// Runs `gh pr view <pr_number> --json ...` and parses the JSON output.
+/// Requires `gh` to be authenticated (`gh auth login`).
 pub fn fetch_pr_metadata(pr_number: u32) -> Result<PrMetadata> {
     // Ensure gh is available
     check_gh_available()?;
@@ -350,7 +365,10 @@ fn sanitize_for_branch_name(s: &str) -> String {
     result.trim_matches(|c| c == '-' || c == '_').to_string()
 }
 
-/// Format PR name with metadata placeholders
+/// Expand all placeholders in `format` using `metadata`.
+///
+/// Supported placeholders: `{number}`, `{title}`, `{author}`, `{branch}`.
+/// Title, author, and branch values are sanitized for use in branch/directory names.
 pub fn format_pr_name_with_metadata(format: &str, metadata: &PrMetadata) -> String {
     format
         .replace("{number}", &metadata.number.to_string())
@@ -366,9 +384,10 @@ pub fn is_pr_reference(input: &str) -> bool {
     parse_pr_reference(input).ok().flatten().is_some()
 }
 
-/// Detect which remote to use for fetching PR refs
+/// Select which remote to use for fetching PR refs.
 ///
-/// Priority: upstream > origin > first remote
+/// Priority: `upstream` → `origin` → first available remote.
+/// Returns [`PrError::NoRemoteConfigured`] if the repository has no remotes.
 pub fn detect_pr_remote(repo: &Repository) -> Result<String> {
     let remotes = repo.remotes()?;
 
@@ -388,7 +407,11 @@ pub fn detect_pr_remote(repo: &Repository) -> Result<String> {
     }
 }
 
-/// Add fork remote if needed and return remote name to fetch from
+/// Ensure a remote for a fork PR exists, then return its name.
+///
+/// For non-fork PRs this is equivalent to [`detect_pr_remote`].
+/// For fork PRs, a remote named `pr-{number}-fork` is added if it doesn't
+/// already exist, pointing at the fork's clone URL.
 pub fn setup_fork_remote(repo: &Repository, metadata: &PrMetadata) -> Result<String> {
     if !metadata.is_fork {
         // Not a fork - use regular remote
@@ -425,13 +448,12 @@ pub fn setup_fork_remote(repo: &Repository, metadata: &PrMetadata) -> Result<Str
     Ok(fork_remote_name)
 }
 
-/// Fetch a branch from a remote
+/// Fetch `branch` from `remote_name`, making it available as
+/// `refs/remotes/{remote_name}/{branch}`.
 ///
-/// This fetches the specified branch from the remote, making it available
-/// as `refs/remotes/{remote}/{branch}` locally.
-///
-/// This is used for both fork and non-fork PRs to fetch the actual branch
-/// that was used to create the PR (using gh CLI metadata).
+/// This is used for both fork and non-fork PRs to fetch the PR's head branch
+/// identified via `gh` CLI metadata. If the ref already exists locally the
+/// fetch is skipped.
 pub fn fetch_branch(repo: &Repository, remote_name: &str, branch: &str) -> Result<()> {
     // Check if branch already exists locally
     let branch_ref = format!("refs/remotes/{}/{}", remote_name, branch);
@@ -472,16 +494,16 @@ pub fn format_pr_name(format: &str, pr_number: u32) -> String {
     format.replace("{number}", &pr_number.to_string())
 }
 
-/// Prepare a PR worktree using gh CLI metadata
+/// Prepare everything needed to create a worktree for PR `pr_number`.
 ///
-/// This handles the complete PR workflow:
-/// 1. Check gh CLI is available
-/// 2. Fetch PR metadata from gh
-/// 3. Setup fork remote if needed
-/// 4. Fetch PR branch
-/// 5. Format worktree name using metadata
+/// Orchestrates the complete PR workflow:
+/// 1. Checks that `gh` CLI is available
+/// 2. Fetches PR metadata via `gh`
+/// 3. Sets up a fork remote if the PR is cross-repository
+/// 4. Fetches the PR's head branch
+/// 5. Formats the worktree name using `pr_format`
 ///
-/// Returns (worktree_name, remote_ref, base_branch) for use with add_worktree
+/// Returns `(worktree_name, remote_ref, base_branch)` ready for `add_worktree`.
 pub fn prepare_pr_worktree(
     repo: &Repository,
     pr_number: u32,

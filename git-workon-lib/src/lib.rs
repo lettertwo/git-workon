@@ -1,3 +1,50 @@
+//! Core library for `git-workon`, an opinionated git worktree workflow tool.
+//!
+//! This crate (published as `workon`) provides the building blocks for cloning,
+//! initialising, and managing git repositories in a bare-repo-plus-worktrees layout.
+//!
+//! ## Key types
+//!
+//! - [`WorktreeDescriptor`] — wraps a git2 `Worktree` with rich metadata methods
+//! - [`BranchType`] — controls how a branch is created for a new worktree
+//! - [`WorkonConfig`] — reads `workon.*` settings from git config
+//! - [`PullRequest`] / [`PrMetadata`] — PR reference parsing and gh CLI integration
+//! - [`MoveOptions`] — options for [`move_worktree`]
+//! - [`WorkonError`] and its sub-types — all error variants with miette diagnostics
+//!
+//! ## Key functions
+//!
+//! | Function | Description |
+//! |---|---|
+//! | [`clone`] | Clone a remote repository into the worktrees layout |
+//! | [`init`] | Initialise a new bare repository with an initial commit |
+//! | [`get_repo`] | Discover and open a bare repository from a path |
+//! | [`get_worktrees`] | List all worktrees in a repository |
+//! | [`add_worktree`] | Create a new worktree (normal, orphan, or detached) |
+//! | [`find_worktree`] | Locate a worktree by name or branch |
+//! | [`current_worktree`] | Return the worktree containing the current directory |
+//! | [`move_worktree`] | Atomically rename a worktree and its branch |
+//! | [`copy_files`] | Copy files between worktrees using glob patterns |
+//! | [`workon_root`] | Resolve the directory that holds all worktrees |
+//!
+//! ## Example
+//!
+//! ```no_run
+//! use workon::{get_repo, get_worktrees, add_worktree, BranchType};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let repo = get_repo(None)?;
+//!
+//! for wt in get_worktrees(&repo)? {
+//!     println!("{}: {}", wt.name().unwrap_or("?"), wt.path().display());
+//! }
+//!
+//! let wt = add_worktree(&repo, "my-feature", BranchType::Normal, None)?;
+//! println!("Created: {}", wt.path().display());
+//! # Ok(())
+//! # }
+//! ```
+
 mod clone;
 mod config;
 mod convert_to_bare;

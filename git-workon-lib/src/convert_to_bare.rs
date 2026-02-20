@@ -6,6 +6,15 @@ use log::debug;
 use crate::error::Result;
 use crate::workon_root;
 
+/// Convert a standard git repository into the worktrees layout.
+///
+/// Performs the following steps:
+/// 1. Sets `core.bare = true` in git config
+/// 2. Renames `.git` to `.bare`
+/// 3. Writes a `.git` link file containing `gitdir: ./.bare`
+/// 4. Configures `origin`'s fetch refspec to mirror all branches
+///
+/// Returns the re-opened bare repository.
 pub fn convert_to_bare(mut repo: Repository) -> Result<Repository> {
     debug!("Converting to bare repository");
     // git config core.bare true

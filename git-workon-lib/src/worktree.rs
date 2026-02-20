@@ -54,25 +54,33 @@ pub enum BranchType {
     Detached,
 }
 
+/// A handle to a git worktree with rich metadata access.
+///
+/// Wraps a [`git2::Worktree`] and exposes branch state, remote tracking info,
+/// commit history, and status checks used by the CLI commands.
 pub struct WorktreeDescriptor {
     worktree: Worktree,
 }
 
 impl WorktreeDescriptor {
+    /// Open a worktree by name within the given repository.
     pub fn new(repo: &Repository, name: &str) -> Result<Self> {
         Ok(Self {
             worktree: repo.find_worktree(name)?,
         })
     }
 
+    /// Wrap an existing [`git2::Worktree`] without a repository lookup.
     pub fn of(worktree: Worktree) -> Self {
         Self { worktree }
     }
 
+    /// Returns the name of the worktree, or `None` if the name is invalid UTF-8.
     pub fn name(&self) -> Option<&str> {
         self.worktree.name()
     }
 
+    /// Returns the filesystem path to the worktree's working directory.
     pub fn path(&self) -> &Path {
         self.worktree.path()
     }
@@ -549,6 +557,7 @@ impl fmt::Display for WorktreeDescriptor {
     }
 }
 
+/// Return all worktrees registered with the repository.
 pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
     repo.worktrees()?
         .into_iter()
@@ -559,6 +568,10 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
         .collect()
 }
 
+/// Return the worktree that contains the current working directory.
+///
+/// Returns [`WorktreeError::NotInWorktree`] if the current directory is not
+/// inside any registered worktree.
 pub fn current_worktree(repo: &Repository) -> Result<WorktreeDescriptor> {
     let current_dir = std::env::current_dir().map_err(std::io::Error::other)?;
 
@@ -569,6 +582,9 @@ pub fn current_worktree(repo: &Repository) -> Result<WorktreeDescriptor> {
         .ok_or_else(|| WorktreeError::NotInWorktree.into())
 }
 
+/// Find a worktree by its name or by its branch name.
+///
+/// Returns [`WorktreeError::NotFound`] if no matching worktree exists.
 pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor> {
     let worktrees = get_worktrees(repo)?;
     worktrees
@@ -580,6 +596,20 @@ pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor
         .ok_or_else(|| WorktreeError::NotFound(name.to_string()).into())
 }
 
+/// Create a new worktree for the given branch.
+///
+/// The worktree directory is placed under the workon root (see [`workon_root`]).
+/// Branch names containing `/` are supported; parent directories are created
+/// automatically and the worktree is named after the final path component.
+///
+/// # Branch types
+///
+/// - [`BranchType::Normal`] — uses an existing local/remote branch, or creates one from
+///   `base_branch` (or HEAD if `base_branch` is `None`).
+/// - [`BranchType::Orphan`] — creates an independent branch with no shared history,
+///   seeded with an empty initial commit.
+/// - [`BranchType::Detached`] — creates a worktree with a detached HEAD pointing to
+///   the current HEAD commit.
 pub fn add_worktree(
     repo: &Repository,
     branch_name: &str,
