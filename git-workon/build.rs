@@ -16,6 +16,9 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed=templates/");
     println!("cargo:rerun-if-changed=tests/");
 
+    let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../README.md");
+    println!("cargo:rerun-if-changed={}", readme_path.display());
+
     generate_manpages()?;
     Ok(())
 }
@@ -40,6 +43,120 @@ fn git_version() -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
+/// Parse a markdown document into a map of section heading -> section body.
+/// Sections are delimited by `## Heading` lines.
+fn parse_readme_sections(readme: &str) -> std::collections::HashMap<String, String> {
+    let mut sections = std::collections::HashMap::new();
+    for part in readme.split("\n## ").skip(1) {
+        if let Some((heading, content)) = part.split_once('\n') {
+            sections.insert(heading.trim().to_string(), content.to_string());
+        }
+    }
+    sections
+}
+
+/// Apply inline formatting to a line of markdown text:
+/// - `code` -> \fBcode\fR
+/// - [text](url) -> text
+fn format_inline(s: &str) -> String {
+    let mut result = String::new();
+    let mut chars = s.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '`' => {
+                let mut code = String::new();
+                for nc in chars.by_ref() {
+                    if nc == '`' {
+                        break;
+                    }
+                    code.push(nc);
+                }
+                let escaped = code.replace('\\', "\\\\");
+                result.push_str(&format!("\\fB{escaped}\\fR"));
+            }
+            '[' => {
+                let mut text = String::new();
+                let mut closed = false;
+                for nc in chars.by_ref() {
+                    if nc == ']' {
+                        closed = true;
+                        break;
+                    }
+                    text.push(nc);
+                }
+                if closed && chars.peek() == Some(&'(') {
+                    chars.next(); // consume '('
+                    for nc in chars.by_ref() {
+                        if nc == ')' {
+                            break;
+                        }
+                    }
+                    result.push_str(&text);
+                } else {
+                    result.push('[');
+                    result.push_str(&text);
+                    if closed {
+                        result.push(']');
+                    }
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+
+    result
+}
+
+/// Convert a README section body (markdown) to roff text.
+/// Handles: ### subheadings, fenced code blocks, inline `code`, [text](url), empty lines.
+fn markdown_to_roff_string(content: &str) -> String {
+    let mut roff = String::new();
+    let mut in_code_block = false;
+    let mut need_pp = false;
+
+    for line in content.lines() {
+        if in_code_block {
+            if line.starts_with("```") {
+                roff.push_str(".EE\n.RE\n");
+                in_code_block = false;
+                need_pp = true;
+            } else {
+                let escaped = line.replace('\\', "\\\\");
+                if escaped.starts_with('.') {
+                    roff.push_str("\\&");
+                }
+                roff.push_str(&escaped);
+                roff.push('\n');
+            }
+        } else if line.starts_with("```") {
+            roff.push_str(".RS 4\n.EX\n");
+            in_code_block = true;
+            need_pp = false;
+        } else if let Some(heading) = line.strip_prefix("### ") {
+            roff.push_str(&format!(".SS \"{heading}\"\n"));
+            need_pp = false;
+        } else if line.is_empty() {
+            if !need_pp && !roff.is_empty() {
+                need_pp = true;
+            }
+        } else {
+            if need_pp {
+                roff.push_str(".PP\n");
+                need_pp = false;
+            }
+            let formatted = format_inline(line);
+            if formatted.starts_with('.') {
+                roff.push_str("\\&");
+            }
+            roff.push_str(&formatted);
+            roff.push('\n');
+        }
+    }
+
+    roff
+}
+
 fn generate_manpages() -> io::Result<()> {
     use clap::CommandFactory;
     use clap_mangen::Man;
@@ -50,11 +167,42 @@ fn generate_manpages() -> io::Result<()> {
     let path = format!("{}/{}.1", dir, env!("CARGO_PKG_NAME"));
     let cmd = Cli::command();
     let man = Man::new(cmd);
+
+    // Render the base man page
     let mut buffer: Vec<u8> = Default::default();
     man.render(&mut buffer)?;
+    let mut man_content = String::from_utf8(buffer).expect("man page is valid UTF-8");
+
+    // Try to inject README sections (gracefully skip if README is missing, e.g. on crates.io)
+    let readme_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../README.md");
+    if readme_path.exists() {
+        let readme = std::fs::read_to_string(&readme_path)?;
+        let raw_sections = parse_readme_sections(&readme);
+
+        let mut custom = String::new();
+        for (readme_heading, man_heading) in &[
+            ("Quick start", "EXAMPLES"),
+            ("Shell integration", "SHELL INTEGRATION"),
+            ("Configuration", "CONFIGURATION"),
+        ] {
+            if let Some(content) = raw_sections.get(*readme_heading) {
+                let roff_content = markdown_to_roff_string(content);
+                custom.push_str(&format!(".SH \"{man_heading}\"\n{roff_content}"));
+            }
+        }
+
+        if !custom.is_empty() {
+            const VERSION_SECTION: &str = ".SH VERSION\n";
+            if let Some(pos) = man_content.find(VERSION_SECTION) {
+                man_content.insert_str(pos, &custom);
+            } else {
+                man_content.push_str(&custom);
+            }
+        }
+    }
 
     create_dir_all(dir)?;
-    write(&path, buffer)?;
+    write(&path, man_content.as_bytes())?;
 
     println!("cargo:warning=generated manpage: {:?}", &path);
 

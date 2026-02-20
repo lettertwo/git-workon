@@ -39,19 +39,31 @@ git workon clone https://github.com/owner/repo
 cd repo/main        # jumps into the default branch worktree
 ```
 
+### Initialize a new repository
+
+```sh
+git workon init                  # bare init in current directory with initial worktree
+git workon init my-project       # bare init in my-project/ with initial worktree
+```
+
 ### Create a new worktree
 
 ```sh
+git workon new                   # interactive: prompts for name, then base branch
 git workon new my-feature        # creates branch + worktree
-git workon new my-feature --from main   # branch from main
+git workon new my-feature --base main   # branch from main
+git workon new my-feature --orphan      # create branch with no parent commits
+git workon new my-feature --detach      # detach HEAD in the new worktree
 git workon #123                  # create worktree from PR #123 (auto-fetches)
 ```
 
 ### Find an existing worktree
 
 ```sh
+git workon find                  # interactive: fuzzy picker across all worktrees
 git workon find main             # prints path to the 'main' worktree
-git workon my-feature            # shorthand: find, then cd to it
+git workon my-feature            # shorthand for find (prints path)
+                                 # note: multiple fuzzy matches also trigger the picker
 ```
 
 ### List worktrees
@@ -66,19 +78,49 @@ git workon list --gone           # worktrees whose upstream branch was deleted
 ### Prune stale worktrees
 
 ```sh
-git workon prune                 # dry-run by default, shows what would be removed
-git workon prune --execute       # actually delete merged/stale worktrees
+git workon prune                 # interactive: shows candidates, prompts for confirmation
+git workon prune --yes           # skip confirmation prompt (for scripting)
+git workon prune --dry-run       # preview without deleting
+git workon prune my-feature      # prune a specific worktree
+git workon prune --gone          # also prune worktrees whose upstream branch is gone
+git workon prune --merged        # also prune worktrees merged into the default branch
+```
+
+### Rename a worktree
+
+```sh
+git workon move new-name                # rename the current worktree
+git workon move old-name new-name       # rename a specific worktree
+git workon move new-name --dry-run      # preview without renaming
+```
+
+### Diagnose workspace issues
+
+```sh
+git workon doctor                # check for broken worktrees and missing dependencies
+git workon doctor --fix          # automatically repair fixable issues
+git workon doctor --dry-run      # preview fixes without applying
 ```
 
 ### Copy untracked files between worktrees
 
 ```sh
-git workon copy-untracked --pattern '.env*' --pattern '.vscode/'
+git workon copy-untracked main my-feature --pattern '.env*'
 ```
 
 ## Shell integration
 
-Add worktree-aware `cd` to your shell:
+`git workon find` and `git workon new` print the worktree path to stdout — they don't `cd` on their own, since a subprocess can't change the parent shell's directory. Without the shell wrapper, you'd need to do this yourself:
+
+```sh
+# bash / zsh
+cd "$(git workon find main)"
+
+# fish
+cd (git workon find main)
+```
+
+The shell integration sets up a `workon` wrapper function that captures the output and `cd`s automatically when the result is a directory:
 
 ```sh
 # bash / zsh
@@ -88,7 +130,9 @@ eval "$(git workon shell-init bash)"
 git workon shell-init fish | source
 ```
 
-After setup, `git workon <name>` changes your current directory to the worktree.
+After setup, `workon <name>` changes your current directory to the worktree, and `workon new <name>` drops you directly into the newly created worktree.
+
+> **Scripting**: pass `--no-interactive` to `find` and `new`, and `--yes` to `prune`, to suppress all prompts.
 
 ## Man page
 
