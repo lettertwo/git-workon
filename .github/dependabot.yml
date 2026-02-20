@@ -8,11 +8,17 @@ updates:
       cargo-dependencies:
         patterns:
           - "*"
+    commit-message:
+      prefix: "build"
+      include: "scope"
 
   - package-ecosystem: rust-toolchain
     directory: /
     schedule:
       interval: weekly
+    commit-message:
+      prefix: "build"
+      include: "scope"
 
   - package-ecosystem: github-actions
     directory: /
@@ -22,3 +28,6 @@ updates:
       gh-actions:
         patterns:
           - "*"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
