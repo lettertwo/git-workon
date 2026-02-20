@@ -4,6 +4,7 @@ description = "Test fixture utility for git-workon"
 edition.workspace = true
 license.workspace = true
 name = "git-workon-fixture"
+publish = false
 repository.workspace = true
 rust-version.workspace = true
 version = "0.1.0"

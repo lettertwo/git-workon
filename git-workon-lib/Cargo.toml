@@ -10,6 +10,12 @@ name = "git-workon-lib"
 readme = "README.md"
 repository.workspace = true
 version = "0.1.0"
+include = [
+  "src/**/*",
+  "Cargo.toml",
+  "LICENSE*",
+  "README.md",
+]
 
 [lib]
 name = "workon"

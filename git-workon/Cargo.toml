@@ -10,16 +10,13 @@ name = "git-workon"
 readme = "README.md"
 repository.workspace = true
 version = "0.1.0"
-# include = [
-#   "build.rs",
-#   "src/**/*",
-#   "Cargo.toml",
-#   "Cargo.lock",
-#   "LICENSE*",
-#   "README.md",
-#   "benches/**/*",
-#   "examples/**/*"
-# ]
+include = [
+  "build.rs",
+  "src/**/*",
+  "Cargo.toml",
+  "LICENSE*",
+  "README.md",
+]
 
 [dependencies]
 clap.workspace = true
