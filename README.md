@@ -123,8 +123,11 @@ cd (git workon find main)
 The shell integration sets up a `workon` wrapper function that captures the output and `cd`s automatically when the result is a directory:
 
 ```sh
-# bash / zsh
+# bash
 eval "$(git workon shell-init bash)"
+
+# zsh
+eval "$(git workon shell-init zsh)"
 
 # fish
 git workon shell-init fish | source
