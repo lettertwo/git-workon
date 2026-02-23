@@ -45,6 +45,9 @@ pub enum Cmd {
     ShellInit(ShellInit),
     #[command(name = "_complete", hide = true)]
     Complete(Complete),
+    /// Output the man page to stdout (hidden).
+    #[command(name = "generate-man", hide = true)]
+    GenerateMan(GenerateMan),
 }
 
 /// Perform a bare clone of a repository and create an initial worktree.
@@ -272,6 +275,10 @@ pub struct ShellInit {
     #[arg(long, default_value = "workon")]
     pub cmd: String,
 }
+
+/// Output the man page to stdout.
+#[derive(Debug, Args)]
+pub struct GenerateMan {}
 
 /// List worktree names for shell completion (hidden).
 #[derive(Debug, Args)]

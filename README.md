@@ -12,7 +12,9 @@ An opinionated [git worktree][git-worktree] workflow for managing multiple branc
 
 ```sh
 cargo install git-workon
-make install-man   # optional: install man page to /usr/local/share/man/man1/
+
+# Optional: install man page
+git workon generate-man | install -m 644 /dev/stdin /usr/local/share/man/man1/git-workon.1
 ```
 
 ### From source

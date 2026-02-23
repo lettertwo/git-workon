@@ -3,6 +3,7 @@ mod complete;
 mod copy_untracked;
 mod doctor;
 mod find;
+mod generate_man;
 mod init;
 mod list;
 mod r#move; // r#move because "move" is a reserved keyword
@@ -33,6 +34,7 @@ impl Run for Cmd {
             Cmd::New(cmd) => cmd.run(),
             Cmd::Prune(cmd) => cmd.run(),
             Cmd::ShellInit(cmd) => cmd.run(),
+            Cmd::GenerateMan(cmd) => cmd.run(),
         }
     }
 }
