@@ -1,6 +1,9 @@
 #!/bin/sh
 #
-# Install git hooks from git-hooks/ into .git/hooks/
+# Install git hooks for local development
+#
+# This script copies hooks from git-hooks/ to .git/hooks/
+# and makes them executable.
 #
 # Handles worktrees correctly by using git rev-parse --git-dir.
 # If a global core.hooksPath is configured, sets a local override so
@@ -12,23 +15,71 @@
 
 set -e
 
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+echo "${GREEN}Installing git hooks...${NC}"
+echo ""
+
+# Ensure we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+  echo "Error: Not in a git repository"
+  exit 1
+fi
+
+# Get the git directory (handles both .git and worktrees)
 GIT_DIR=$(git rev-parse --git-dir)
 HOOKS_DIR="$GIT_DIR/hooks"
 
+# Create hooks directory if it doesn't exist
 mkdir -p "$HOOKS_DIR"
 
-cp git-hooks/commit-msg "$HOOKS_DIR/commit-msg"
-chmod +x "$HOOKS_DIR/commit-msg"
-
-cp git-hooks/pre-push "$HOOKS_DIR/pre-push"
-chmod +x "$HOOKS_DIR/pre-push"
-
-# If global core.hooksPath is set, set a local override so our hooks run.
-# The commit-msg hook chains to the global hook automatically.
-GLOBAL_HOOKS_PATH=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
-if [ -n "$GLOBAL_HOOKS_PATH" ]; then
-  git config --local core.hooksPath "$HOOKS_DIR"
-  echo "Note: global core.hooksPath detected; set local override to $HOOKS_DIR"
+# Install commit-msg hook
+if [ -f git-hooks/commit-msg ]; then
+  cp git-hooks/commit-msg "$HOOKS_DIR/commit-msg"
+  chmod +x "$HOOKS_DIR/commit-msg"
+  echo "  ✓ Installed commit-msg → $HOOKS_DIR/commit-msg"
+else
+  echo "Warning: git-hooks/commit-msg not found"
+  exit 1
 fi
 
-echo "✓ Installed hooks to $HOOKS_DIR"
+# Install pre-push hook
+if [ -f git-hooks/pre-push ]; then
+  cp git-hooks/pre-push "$HOOKS_DIR/pre-push"
+  chmod +x "$HOOKS_DIR/pre-push"
+  echo "  ✓ Installed pre-push   → $HOOKS_DIR/pre-push"
+else
+  echo "Warning: git-hooks/pre-push not found"
+fi
+
+# Check if a global hooks path is configured
+GLOBAL_HOOKS_PATH=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
+
+if [ -n "$GLOBAL_HOOKS_PATH" ]; then
+  echo ""
+  echo "${YELLOW}Note: Global core.hooksPath is set to: $GLOBAL_HOOKS_PATH${NC}"
+  echo "Setting local core.hooksPath to use repo-specific hooks."
+  echo "The commit-msg hook will chain to your global hook automatically."
+
+  # Set local hooksPath to override global setting for this repo
+  git config --local core.hooksPath "$HOOKS_DIR"
+  echo ""
+  echo "  ✓ Configured local core.hooksPath = $HOOKS_DIR"
+fi
+
+echo ""
+echo "${GREEN}Git hooks installed successfully!${NC}"
+echo ""
+echo "Installed hooks:"
+echo "  • commit-msg  Validates Conventional Commits format"
+echo "  • pre-push    Prevents pushing fixup/squash/amend commits"
+echo ""
+echo "To load the commit message template (recommended):"
+echo "  ${YELLOW}git config commit.template .gitmessage${NC}"
+echo ""
+echo "To bypass pre-push check (for WIP branches):"
+echo "  ${YELLOW}git push --no-verify${NC}"
+echo ""
