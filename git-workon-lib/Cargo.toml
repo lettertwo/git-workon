@@ -20,6 +20,9 @@ include = [
 [lib]
 name = "workon"
 
+[features]
+vendored = ["git2/vendored-libgit2", "git2/vendored-openssl"]
+
 [dependencies]
 dialoguer.workspace = true
 env_logger.workspace = true
