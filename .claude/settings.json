@@ -1,0 +1,25 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=$(cat | jq -r '.tool_input.file_path // empty'); if [ -n \"$file\" ] && echo \"$file\" | grep -q '\\.rs$'; then cargo fmt -- \"$file\" 2>&1; fi"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo clippy --all-targets --all-features --quiet 2>&1"
+          }
+        ]
+      }
+    ]
+  }
+}

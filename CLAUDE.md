@@ -61,7 +61,7 @@ cargo run -p git-workon -- <command>               # run CLI during development
 cargo watch --ignore contrib --ignore man -- cargo check --tests  # watch mode
 ```
 
-**Pre-commit:** `cargo fmt && cargo clippy --all-targets --all-features && cargo test`
+**Pre-commit:** `cargo test` (formatting and linting are handled by Claude hooks)
 
 ## Git Commit Style
 
