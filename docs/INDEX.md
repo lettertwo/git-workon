@@ -89,3 +89,9 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 - `docs/adr/018-implementation-principles-guide.md`
 - `docs/adr/018-implementation-principles.md`
 - `docs/adr/016-self-documenting-code.md`
+
+## RFCs and Research
+
+### stacked-diffs / stacked
+
+- `docs/rfc/stacked-diffs.md`
