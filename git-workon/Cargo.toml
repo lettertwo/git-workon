@@ -18,6 +18,9 @@ include = [
   "README.md",
 ]
 
+[features]
+vendored = ["git-workon-lib/vendored", "git2/vendored-libgit2", "git2/vendored-openssl"]
+
 [dependencies]
 clap.workspace = true
 clap-verbosity-flag.workspace = true
