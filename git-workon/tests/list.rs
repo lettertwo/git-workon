@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 
 // ============================================================================
@@ -16,7 +16,7 @@ fn list_no_filters_shows_all_worktrees() -> Result<(), Box<dyn std::error::Error
         .build()?;
 
     // Run list without filters
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .assert()
@@ -44,7 +44,7 @@ fn list_dirty_shows_only_dirty_worktrees() -> Result<(), Box<dyn std::error::Err
     )?;
 
     // Run list --dirty
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--dirty")
@@ -72,7 +72,7 @@ fn list_clean_shows_only_clean_worktrees() -> Result<(), Box<dyn std::error::Err
     )?;
 
     // Run list --clean
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--clean")
@@ -103,7 +103,7 @@ fn list_ahead_shows_only_worktrees_with_unpushed() -> Result<(), Box<dyn std::er
         .create("Test commit")?;
 
     // Run list --ahead
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--ahead")
@@ -147,7 +147,7 @@ fn list_behind_shows_only_worktrees_behind_upstream() -> Result<(), Box<dyn std:
     head.set_target(parent.id(), "Reset feature behind")?;
 
     // Run list --behind
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--behind")
@@ -179,7 +179,7 @@ fn list_gone_shows_only_worktrees_with_deleted_upstream() -> Result<(), Box<dyn 
         .delete()?;
 
     // Run list --gone
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--gone")
@@ -232,7 +232,7 @@ fn list_dirty_and_ahead_combines_filters() -> Result<(), Box<dyn std::error::Err
         .create("Ahead commit")?;
 
     // Run list --dirty --ahead (should only show dirty-ahead)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--dirty")
@@ -290,7 +290,7 @@ fn list_ahead_and_behind_shows_diverged_worktrees() -> Result<(), Box<dyn std::e
 
     // At this point, diverged should be both ahead and behind
     // Run list --ahead --behind (should show diverged)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--ahead")
@@ -332,7 +332,7 @@ fn list_gone_and_ahead_shows_deleted_upstream_with_local_commits(
     // Run list --gone --ahead
     // Note: has_unpushed_commits() conservatively returns true for gone upstreams,
     // so both worktrees will match --ahead even though gone-without-commits has no commits
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--gone")
@@ -374,7 +374,7 @@ fn list_multiple_filters_uses_and_logic() -> Result<(), Box<dyn std::error::Erro
     )?;
 
     // Run list --dirty --ahead --clean (should show nothing - clean contradicts dirty)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--dirty")
@@ -408,7 +408,7 @@ fn list_worktree_without_upstream_excluded_from_behind_filter(
 
     // no-upstream has no upstream configured
     // Run list --behind (should not show no-upstream)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--behind")
@@ -433,7 +433,7 @@ fn list_worktree_without_upstream_excluded_from_gone_filter(
 
     // no-upstream has no upstream configured
     // Run list --gone (should not show no-upstream)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--gone")
@@ -453,7 +453,7 @@ fn list_dirty_and_clean_both_specified_returns_error() -> Result<(), Box<dyn std
         .build()?;
 
     // Run list --dirty --clean (should error)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("list")
         .arg("--dirty")
@@ -476,7 +476,7 @@ fn list_empty_result_when_no_worktrees_match_filters() -> Result<(), Box<dyn std
         .build()?;
 
     // Run list --dirty (nothing is dirty, should show nothing)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     let output = cmd
         .current_dir(&fixture)
         .arg("list")

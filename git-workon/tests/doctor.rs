@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 
 #[test]
@@ -10,7 +10,7 @@ fn doctor_healthy_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Doctor should succeed and report no worktree-level issues
-    let output = Command::cargo_bin("git-workon")?
+    let output = cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("doctor")
         .output()?;
@@ -44,7 +44,7 @@ fn doctor_detects_missing_directory() -> Result<(), Box<dyn std::error::Error>> 
 
     // Run doctor from the main worktree
     let main_path = fixture.root()?.join("main");
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&main_path)
         .arg("doctor")
         .assert()
@@ -69,7 +69,7 @@ fn doctor_fix_missing_directory() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run doctor --fix from the main worktree
     let main_path = fixture.root()?.join("main");
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&main_path)
         .arg("doctor")
         .arg("--fix")
@@ -103,7 +103,7 @@ fn doctor_dry_run_does_not_fix() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run doctor --dry-run from the main worktree
     let main_path = fixture.root()?.join("main");
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&main_path)
         .arg("doctor")
         .arg("--dry-run")
@@ -136,7 +136,7 @@ fn doctor_json_output() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::remove_dir_all(&feature_path)?;
 
     let main_path = fixture.root()?.join("main");
-    let output = Command::cargo_bin("git-workon")?
+    let output = cargo_bin_cmd!("git-workon")
         .current_dir(&main_path)
         .arg("doctor")
         .arg("--json")

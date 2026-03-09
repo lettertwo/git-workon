@@ -122,7 +122,7 @@ fn remote_auto_detection_no_remote_error() -> Result {
 
 #[test]
 fn pr_reference_with_base_flag_creates_literal_branch() -> Result {
-    use assert_cmd::Command;
+    use assert_cmd::cargo_bin_cmd;
 
     // Create a bare repo with a worktree
     let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
@@ -132,7 +132,7 @@ fn pr_reference_with_base_flag_creates_literal_branch() -> Result {
 
     // Try to create worktree with PR-like name but --base flag
     // Should create literal branch named "#123" based on main
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&worktree_path)
         .arg("new")
         .arg("#123")
@@ -151,7 +151,7 @@ fn pr_reference_with_base_flag_creates_literal_branch() -> Result {
 
 #[test]
 fn pr_reference_with_orphan_flag_creates_literal_branch() -> Result {
-    use assert_cmd::Command;
+    use assert_cmd::cargo_bin_cmd;
 
     // Create a bare repo with a worktree
     let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
@@ -161,7 +161,7 @@ fn pr_reference_with_orphan_flag_creates_literal_branch() -> Result {
 
     // Try to create worktree with PR-like name but --orphan flag
     // Should create orphan branch named "pr#456"
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&worktree_path)
         .arg("new")
         .arg("pr#456")

@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use assert_fs::TempDir;
 use git2::Repository;
 use git_workon_fixture::prelude::*;
@@ -15,7 +15,7 @@ fn clone_default() -> Result<(), Box<dyn std::error::Error>> {
     let clone_dest = TempDir::new()?;
 
     // Clone the remote repository
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&clone_dest)
         .arg("clone")
         .arg(remote.cwd()?.to_str().unwrap())
@@ -59,7 +59,7 @@ fn clone_with_name() -> Result<(), Box<dyn std::error::Error>> {
     let temp = TempDir::new()?;
 
     // Clone the remote repository with a custom directory name
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&temp)
         .arg("clone")
         .arg(remote.cwd()?.to_str().unwrap())

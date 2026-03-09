@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 use std::fs;
 
@@ -24,7 +24,7 @@ fn copy_basic() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Copy files from main to feature (uses config patterns)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
         .arg("main")
@@ -70,7 +70,7 @@ fn copy_with_config_patterns() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(main_worktree.join("build/output.js"), "build output")?;
 
     // Copy using config patterns (default behavior)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
         .arg("main")
@@ -117,7 +117,7 @@ fn copy_with_excludes() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(main_worktree.join("temp/cache.dat"), "cached data")?;
 
     // Copy all files using config pattern
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
         .arg("main")
@@ -160,7 +160,7 @@ fn copy_with_pattern_override() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(main_worktree.join("app.js"), "app code")?;
 
     // Copy with --pattern flag (should override config)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
         .arg("--pattern")
@@ -201,7 +201,7 @@ fn copy_respects_force_flag() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(feature_worktree.join("data.txt"), "feature version")?;
 
     // Copy without --force (should skip existing file)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     let output = cmd
         .current_dir(&fixture)
         .arg("copy-untracked")
@@ -219,7 +219,7 @@ fn copy_respects_force_flag() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Now copy with --force (should overwrite)
-    let mut cmd2 = Command::cargo_bin("git-workon")?;
+    let mut cmd2 = cargo_bin_cmd!("git-workon");
     cmd2.current_dir(&fixture)
         .arg("copy-untracked")
         .arg("--force")
@@ -255,7 +255,7 @@ fn copy_creates_directories() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Copy files
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
         .arg("main")
@@ -296,7 +296,7 @@ fn copy_with_no_matching_files() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(main_worktree.join("readme.txt"), "readme")?;
 
     // Try to copy with non-matching pattern
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     let output = cmd
         .current_dir(&fixture)
         .arg("copy-untracked")
@@ -338,7 +338,7 @@ fn copy_without_config_defaults_to_all() -> Result<(), Box<dyn std::error::Error
     fs::write(main_worktree.join("src/main.rs"), "fn main() {}")?;
 
     // Copy without config or pattern (should copy everything)
-    let mut cmd = Command::cargo_bin("git-workon")?;
+    let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
         .arg("copy-untracked")
         .arg("main")

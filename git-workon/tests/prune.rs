@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 
 #[test]
@@ -12,7 +12,7 @@ fn prune_with_no_stale_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Run prune - should report nothing to prune
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -42,7 +42,7 @@ fn prune_removes_worktree_for_deleted_branch() -> Result<(), Box<dyn std::error:
     repo.find_reference("refs/heads/feature")?.delete()?;
 
     // Run prune - should remove the worktree
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -75,7 +75,7 @@ fn prune_dry_run_does_not_remove_anything() -> Result<(), Box<dyn std::error::Er
     repo.find_reference("refs/heads/feature")?.delete()?;
 
     // Run prune with --dry-run
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -117,7 +117,7 @@ fn prune_handles_multiple_stale_worktrees() -> Result<(), Box<dyn std::error::Er
     }
 
     // Run prune
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -153,7 +153,7 @@ fn prune_preserves_worktrees_with_existing_branches() -> Result<(), Box<dyn std:
         .delete()?;
 
     // Run prune
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -195,7 +195,7 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
         .delete()?;
 
     // Run prune without --gone - should NOT remove the worktree
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -208,7 +208,7 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
     fixture.cwd()?.assert(predicate::path::is_dir());
 
     // Run prune with --gone - should remove the worktree (feature is merged into main)
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -234,7 +234,7 @@ fn prune_gone_skips_branches_without_upstream() -> Result<(), Box<dyn std::error
         .build()?;
 
     // Run prune with --gone - should not remove worktree without upstream
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -267,7 +267,7 @@ fn prune_gone_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         .delete()?;
 
     // Run prune with --gone and --dry-run (feature is merged into main, no --allow-unmerged needed)
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -302,7 +302,7 @@ fn prune_skips_dirty_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .delete()?;
 
     // Run prune - should skip dirty worktree
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -337,7 +337,7 @@ fn prune_with_allow_dirty_removes_dirty_worktrees() -> Result<(), Box<dyn std::e
         .delete()?;
 
     // Run prune with --allow-dirty
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -376,7 +376,7 @@ fn prune_gone_skips_worktrees_with_unmerged_commits() -> Result<(), Box<dyn std:
         .create("New commit")?;
 
     // Run prune --gone (without --allow-unmerged)
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -418,7 +418,7 @@ fn prune_gone_with_allow_unmerged_removes_worktrees_with_unmerged_commits(
         .create("New commit")?;
 
     // Run prune --gone with --allow-unmerged
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -456,7 +456,7 @@ fn prune_merged_removes_merged_branch() -> Result<(), Box<dyn std::error::Error>
         .set_target(feature_commit.id(), "Fast-forward to feature")?;
 
     // Run prune --merged
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -487,7 +487,7 @@ fn prune_merged_skips_unmerged_branch() -> Result<(), Box<dyn std::error::Error>
         .create("Feature commit")?;
 
     // Run prune --merged (should not prune unmerged branch)
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -526,7 +526,7 @@ fn prune_merged_with_specific_target() -> Result<(), Box<dyn std::error::Error>>
         .set_target(feature_commit.id(), "Fast-forward to feature")?;
 
     // Run prune --merged=develop
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -576,7 +576,7 @@ fn prune_skips_protected_branch_exact_match() -> Result<(), Box<dyn std::error::
     repo.find_reference("refs/heads/develop")?.delete()?;
 
     // Run prune - should skip protected branch
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -616,7 +616,7 @@ fn prune_skips_protected_branch_with_glob_pattern() -> Result<(), Box<dyn std::e
     repo.find_reference("refs/heads/feature/test")?.delete()?;
 
     // Run prune - should skip release/* but prune feature/test
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -673,7 +673,7 @@ fn prune_respects_multiple_protected_patterns() -> Result<(), Box<dyn std::error
     repo.find_reference("refs/heads/feature/test")?.delete()?;
 
     // Run prune - should skip all protected branches but prune feature/test
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -726,7 +726,7 @@ fn prune_without_protected_config_prunes_all_candidates() -> Result<(), Box<dyn 
     repo.find_reference("refs/heads/feature-2")?.delete()?;
 
     // Run prune without any protection config - should prune both
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -758,7 +758,7 @@ fn prune_single_named_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Prune feature-1 by name
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -793,7 +793,7 @@ fn prune_multiple_named_worktrees() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Prune feature-1 and feature-2 by name
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -837,7 +837,7 @@ fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error:
     repo.find_reference("refs/heads/feature-2")?.delete()?;
 
     // Prune feature-1 by name AND all worktrees with deleted branches
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -873,7 +873,7 @@ fn prune_named_worktree_not_found() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Try to prune non-existent worktree
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -906,7 +906,7 @@ fn prune_named_worktree_respects_protected_branches() -> Result<(), Box<dyn std:
         .build()?;
 
     // Try to prune protected branch by name
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -942,7 +942,7 @@ fn prune_named_worktree_respects_dirty_check() -> Result<(), Box<dyn std::error:
     std::fs::write(feature_dir.join("dirty.txt"), "uncommitted")?;
 
     // Try to prune dirty worktree by name
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -975,7 +975,7 @@ fn prune_named_worktree_with_allow_dirty() -> Result<(), Box<dyn std::error::Err
     std::fs::write(feature_dir.join("dirty.txt"), "uncommitted")?;
 
     // Prune dirty worktree with --allow-dirty
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -1003,7 +1003,7 @@ fn prune_named_worktree_dry_run() -> Result<(), Box<dyn std::error::Error>> {
     let feature_dir = fixture.cwd()?;
 
     // Dry run prune of named worktree
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -1034,7 +1034,7 @@ fn prune_force_overrides_protected_branch() -> Result<(), Box<dyn std::error::Er
     develop_dir.assert(predicate::path::is_dir());
 
     // Prune protected branch with --force
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -1064,7 +1064,7 @@ fn prune_force_overrides_dirty_check() -> Result<(), Box<dyn std::error::Error>>
     std::fs::write(feature_dir.join("dirty.txt"), "uncommitted")?;
 
     // Prune dirty worktree with --force
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -1104,7 +1104,7 @@ fn prune_force_overrides_unmerged_check() -> Result<(), Box<dyn std::error::Erro
         .create("New commit")?;
 
     // Prune worktree with unmerged commits using --force
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
@@ -1131,7 +1131,7 @@ fn prune_force_overrides_default_branch() -> Result<(), Box<dyn std::error::Erro
         .build()?;
 
     // Prune default branch worktree with --force
-    let mut prune_cmd = Command::cargo_bin("git-workon")?;
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
