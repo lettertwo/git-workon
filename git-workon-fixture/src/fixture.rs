@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use assert_fs::fixture::ChildPath;
 use assert_fs::TempDir;
-use git2::{Oid, Repository};
+use git2::{Oid, Reference, Repository};
 use predicates::Predicate;
 
 use crate::assert::{FixtureAssert, IntoFixturePredicate};
@@ -92,7 +92,7 @@ impl Fixture {
         self.repo.as_ref().ok_or_else(|| "No repository".into())
     }
 
-    pub fn head(&self) -> Result<git2::Reference> {
+    pub fn head<'a>(&'a self) -> Result<Reference<'a>> {
         let repo = self.repo()?;
         Ok(repo.head()?)
     }
