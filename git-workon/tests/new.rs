@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
+use expectrl::{
+    session::{OsProcess, OsStream},
+    Expect, Session,
+};
 use git_workon_fixture::prelude::*;
 
 #[test]
@@ -12,7 +16,7 @@ fn new_creates_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a new worktree for a new branch
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -41,7 +45,7 @@ fn new_with_slashes_in_name() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a new worktree with slashes in the branch name
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -77,7 +81,7 @@ fn new_orphan_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .create("Test commit")?;
 
     // Create an orphan worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -132,7 +136,7 @@ fn new_detached_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a detached worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -175,7 +179,7 @@ fn new_uses_config_default_branch() -> Result<(), Box<dyn std::error::Error>> {
         .create("Commit on develop")?;
 
     // Create a new worktree without specifying base - should use config default
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -231,7 +235,7 @@ fn new_cli_base_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
         .create("Commit on staging")?;
 
     // Create new worktree with --base flag (should override config)
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -276,7 +280,7 @@ fn new_without_config_uses_default_branch() -> Result<(), Box<dyn std::error::Er
         .build()?;
 
     // Create new worktree without config (should branch from default branch)
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -332,7 +336,7 @@ fn new_with_auto_copy_enabled() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(main_worktree.join("node_modules/lib/index.js"), "module")?;
 
     // Create new worktree from main (should auto-copy matching files)
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -379,7 +383,7 @@ fn new_with_auto_copy_respects_excludes() -> Result<(), Box<dyn std::error::Erro
     fs::write(main_worktree.join("debug.log"), "debug")?;
 
     // Create new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -419,7 +423,7 @@ fn new_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::error::
     fs::write(main_worktree.join("test.txt"), "content")?;
 
     // Create new worktree with --copy-untracked flag
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -456,7 +460,7 @@ fn new_no_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::erro
     fs::write(main_worktree.join("test.txt"), "content")?;
 
     // Create new worktree with --no-copy-untracked flag
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -487,7 +491,7 @@ fn new_auto_copy_skips_when_base_worktree_missing() -> Result<(), Box<dyn std::e
         .build()?;
 
     // Create new worktree (should succeed even though base worktree doesn't exist)
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -523,7 +527,7 @@ fn new_auto_copy_without_patterns_copies_everything() -> Result<(), Box<dyn std:
     fs::write(main_worktree.join("src/main.rs"), "code")?;
 
     // Create new worktree (should copy all files using default pattern)
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -557,7 +561,7 @@ fn new_no_name_errors_with_no_interactive() -> Result<(), Box<dyn std::error::Er
         .default_branch("main")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("new")
         .arg("--no-interactive")
@@ -575,7 +579,7 @@ fn new_with_explicit_name_works_non_interactively() -> Result<(), Box<dyn std::e
         .default_branch("main")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("new")
         .arg("feature")
@@ -598,7 +602,7 @@ fn cargo_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_git-workon"))
 }
 
-fn spawn_interactive(cwd: &Path, args: &[&str]) -> expectrl::Session {
+fn spawn_interactive(cwd: &Path, args: &[&str]) -> Session<OsProcess, OsStream> {
     let mut cmd = std::process::Command::new(cargo_bin_path());
     cmd.current_dir(cwd);
     for arg in args {

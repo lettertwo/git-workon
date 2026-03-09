@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 
 #[test]
@@ -11,7 +11,7 @@ fn complete_lists_worktree_names() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Complete the name arg in the "find" subcommand (index 1 = after "find")
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("_complete")
         .arg("--index")
@@ -29,7 +29,7 @@ fn complete_lists_worktree_names() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn shell_init_bash_outputs_function() -> Result<(), Box<dyn std::error::Error>> {
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .arg("shell-init")
         .arg("bash")
         .assert()
@@ -42,7 +42,7 @@ fn shell_init_bash_outputs_function() -> Result<(), Box<dyn std::error::Error>> 
 
 #[test]
 fn shell_init_zsh_outputs_compdef() -> Result<(), Box<dyn std::error::Error>> {
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .arg("shell-init")
         .arg("zsh")
         .assert()
@@ -55,7 +55,7 @@ fn shell_init_zsh_outputs_compdef() -> Result<(), Box<dyn std::error::Error>> {
 
 #[test]
 fn shell_init_fish_outputs_function() -> Result<(), Box<dyn std::error::Error>> {
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .arg("shell-init")
         .arg("fish")
         .assert()
@@ -68,7 +68,7 @@ fn shell_init_fish_outputs_function() -> Result<(), Box<dyn std::error::Error>> 
 
 #[test]
 fn shell_init_custom_cmd() -> Result<(), Box<dyn std::error::Error>> {
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .arg("shell-init")
         .arg("bash")
         .arg("--cmd")

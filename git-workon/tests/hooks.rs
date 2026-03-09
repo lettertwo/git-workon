@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 use std::fs;
 
@@ -14,7 +14,7 @@ fn hook_executes_successfully() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -53,7 +53,7 @@ fn hook_failure_shows_warning() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a new worktree with a failing hook
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     let output = new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -96,7 +96,7 @@ fn no_hooks_flag_skips_execution() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a new worktree with --no-hooks flag
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -131,7 +131,7 @@ fn multiple_hooks_execute_sequentially() -> Result<(), Box<dyn std::error::Error
         .build()?;
 
     // Create a new worktree
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -168,7 +168,7 @@ fn hook_environment_variables_set() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a new worktree with a base branch
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
@@ -224,7 +224,7 @@ fn hook_executes_in_clone_command() -> Result<(), Box<dyn std::error::Error>> {
     let clone_temp = assert_fs::TempDir::new()?;
 
     // Clone the repository
-    let mut clone_cmd = Command::cargo_bin("git-workon")?;
+    let mut clone_cmd = cargo_bin_cmd!("git-workon");
     clone_cmd
         .current_dir(&clone_temp)
         .arg("clone")
@@ -246,7 +246,7 @@ fn hook_executes_in_clone_command() -> Result<(), Box<dyn std::error::Error>> {
     drop(cloned_repo);
 
     // Now create a new worktree in the cloned repo to test hooks
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&clone_path)
         .arg("new")
@@ -271,7 +271,7 @@ fn hook_executes_in_init_command() -> Result<(), Box<dyn std::error::Error>> {
     let init_path = test_dir.join("initialized");
 
     // Initialize a new repository
-    let mut init_cmd = Command::cargo_bin("git-workon")?;
+    let mut init_cmd = cargo_bin_cmd!("git-workon");
     init_cmd
         .current_dir(&test_dir)
         .arg("init")
@@ -287,7 +287,7 @@ fn hook_executes_in_init_command() -> Result<(), Box<dyn std::error::Error>> {
     drop(init_repo);
 
     // Create a new worktree to test hooks
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&init_path)
         .arg("new")
@@ -313,7 +313,7 @@ fn no_hooks_configured_succeeds() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Create a new worktree without any hooks configured
-    let mut new_cmd = Command::cargo_bin("git-workon")?;
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")

@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
+use expectrl::{
+    session::{OsProcess, OsStream},
+    Expect, Session,
+};
 use git_workon_fixture::prelude::*;
 
 #[test]
@@ -12,7 +16,7 @@ fn find_exact_match() -> Result<(), Box<dyn std::error::Error>> {
         .worktree("feature")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("feature")
@@ -31,7 +35,7 @@ fn find_no_match_errors() -> Result<(), Box<dyn std::error::Error>> {
         .worktree("feature")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("nonexistent")
@@ -52,7 +56,7 @@ fn find_multiple_fuzzy_matches_errors_with_no_interactive() -> Result<(), Box<dy
         .worktree("feature-2")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("feature")
@@ -72,7 +76,7 @@ fn find_no_name_errors_with_no_interactive() -> Result<(), Box<dyn std::error::E
         .worktree("feature")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("--no-interactive")
@@ -99,7 +103,7 @@ fn find_with_dirty_filter() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     // Should find dirty when searching with --dirty
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("dirty")
@@ -108,7 +112,7 @@ fn find_with_dirty_filter() -> Result<(), Box<dyn std::error::Error>> {
         .success();
 
     // Should NOT find clean with --dirty filter
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("clean")
@@ -127,7 +131,7 @@ fn find_all_filtered_out_errors() -> Result<(), Box<dyn std::error::Error>> {
         .worktree("clean")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("--dirty")
@@ -149,7 +153,7 @@ fn find_single_fuzzy_match_returns_directly() -> Result<(), Box<dyn std::error::
         .build()?;
 
     // "feature" matches only "feature-branch" → return without interaction
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("feature")
@@ -169,7 +173,7 @@ fn find_case_insensitive_fuzzy_match() -> Result<(), Box<dyn std::error::Error>>
         .build()?;
 
     // "feature" should match "Feature-Branch" (case-insensitive)
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("find")
         .arg("feature")
@@ -188,7 +192,7 @@ fn cargo_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_git-workon"))
 }
 
-fn spawn_interactive(cwd: &Path, args: &[&str]) -> expectrl::Session {
+fn spawn_interactive(cwd: &Path, args: &[&str]) -> Session<OsProcess, OsStream> {
     let mut cmd = std::process::Command::new(cargo_bin_path());
     cmd.current_dir(cwd);
     for arg in args {

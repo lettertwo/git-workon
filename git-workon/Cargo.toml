@@ -35,16 +35,16 @@ log.workspace = true
 miette.workspace = true
 serde_json.workspace = true
 owo-colors.workspace = true
-pathdiff = "0.2.3"
+pathdiff.workspace = true
 supports-color.workspace = true
-unicode-width = "0.2.2"
+unicode-width.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
 assert_fs.workspace = true
 git2.workspace = true
 git-workon-fixture.workspace = true
-expectrl = "0.7"
+expectrl.workspace = true
 predicates.workspace = true
 
 [build-dependencies]

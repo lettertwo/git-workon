@@ -1,4 +1,4 @@
-use assert_cmd::Command;
+use assert_cmd::cargo_bin_cmd;
 use git2::BranchType;
 use git_workon_fixture::prelude::*;
 
@@ -21,7 +21,7 @@ fn move_basic_rename() -> Result<(), Box<dyn std::error::Error>> {
         .assert(predicate::path::is_dir());
 
     // Execute move
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("feature")
@@ -59,7 +59,7 @@ fn move_namespace_change() -> Result<(), Box<dyn std::error::Error>> {
     let repo = fixture.repo()?;
 
     // Move into namespace
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("feature")
@@ -92,7 +92,7 @@ fn move_fails_if_target_exists() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     // Try to move feature to bugfix (which already exists)
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("feature")
@@ -111,7 +111,7 @@ fn move_fails_if_source_not_found() -> Result<(), Box<dyn std::error::Error>> {
         .default_branch("main")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("nonexistent")
@@ -137,7 +137,7 @@ fn move_fails_on_detached_head() -> Result<(), Box<dyn std::error::Error>> {
     let head_commit = worktree_repo.head()?.peel_to_commit()?;
     worktree_repo.set_head_detached(head_commit.id())?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("main")
@@ -160,7 +160,7 @@ fn move_fails_on_dirty_worktree() -> Result<(), Box<dyn std::error::Error>> {
     // Create uncommitted changes
     std::fs::write(fixture.cwd()?.join("uncommitted.txt"), "test")?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("feature")
@@ -205,7 +205,7 @@ fn move_fails_on_unpushed_commits() -> Result<(), Box<dyn std::error::Error>> {
         &[&parent],
     )?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("feature")
@@ -226,7 +226,7 @@ fn move_fails_on_protected_branch() -> Result<(), Box<dyn std::error::Error>> {
         .config("workon.pruneProtectedBranches", "develop")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("develop")
@@ -251,7 +251,7 @@ fn move_force_overrides_all_checks() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(fixture.cwd()?.join("uncommitted.txt"), "test")?;
 
     // With --force, should succeed despite being protected and dirty
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("--force")
@@ -282,7 +282,7 @@ fn move_preserves_upstream_config() -> Result<(), Box<dyn std::error::Error>> {
     repo.assert(predicate::repo::has_upstream("feature", None));
 
     // Move the worktree
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("feature")
@@ -307,7 +307,7 @@ fn move_dry_run_preview_only() -> Result<(), Box<dyn std::error::Error>> {
     let repo = fixture.repo()?;
 
     // Execute with --dry-run
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("--dry-run")
@@ -343,7 +343,7 @@ fn move_identical_names_fails() -> Result<(), Box<dyn std::error::Error>> {
         .worktree("feature")
         .build()?;
 
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .arg("move")
         .arg("feature")
@@ -367,7 +367,7 @@ fn move_current_worktree_single_arg() -> Result<(), Box<dyn std::error::Error>> 
 
     // The fixture is opened in the feature worktree (last worktree specified)
     // Execute move with single arg (rename current worktree)
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(fixture.cwd()?)
         .arg("move")
         .arg("bugfix")
@@ -402,7 +402,7 @@ fn move_current_worktree_fails_outside_worktree() -> Result<(), Box<dyn std::err
 
     // Try to move with single arg from the bare repo (not in a worktree)
     let bare_dir = fixture.root()?.join(".bare");
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(&bare_dir)
         .arg("move")
         .arg("bugfix")
@@ -424,7 +424,7 @@ fn move_current_worktree_dry_run() -> Result<(), Box<dyn std::error::Error>> {
     let repo = fixture.repo()?;
 
     // Execute with --dry-run and single arg (from within the worktree)
-    Command::cargo_bin("git-workon")?
+    cargo_bin_cmd!("git-workon")
         .current_dir(fixture.cwd()?)
         .arg("move")
         .arg("--dry-run")
