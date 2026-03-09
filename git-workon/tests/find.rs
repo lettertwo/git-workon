@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use assert_cmd::cargo_bin_cmd;
+use expectrl::{
+    session::{OsProcess, OsStream},
+    Expect, Session,
+};
 use git_workon_fixture::prelude::*;
 
 #[test]
@@ -188,7 +192,7 @@ fn cargo_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_git-workon"))
 }
 
-fn spawn_interactive(cwd: &Path, args: &[&str]) -> expectrl::Session {
+fn spawn_interactive(cwd: &Path, args: &[&str]) -> Session<OsProcess, OsStream> {
     let mut cmd = std::process::Command::new(cargo_bin_path());
     cmd.current_dir(cwd);
     for arg in args {
