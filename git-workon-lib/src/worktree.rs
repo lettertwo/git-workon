@@ -138,6 +138,19 @@ impl WorktreeDescriptor {
         Ok(!statuses.is_empty())
     }
 
+    /// Returns true if the worktree has uncommitted changes to tracked files.
+    ///
+    /// Unlike `is_dirty()`, this excludes untracked files. Use this when
+    /// untracked files should not block an operation (e.g. pruning a worktree
+    /// whose remote branch is gone).
+    pub fn has_tracked_changes(&self) -> Result<bool> {
+        let repo = Repository::open(self.path())?;
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(false);
+        let statuses = repo.statuses(Some(&mut opts))?;
+        Ok(!statuses.is_empty())
+    }
+
     /// Returns true if the worktree's branch has unpushed commits (ahead of upstream).
     ///
     /// Returns false if:

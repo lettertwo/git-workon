@@ -358,7 +358,9 @@ fn prune_with_allow_dirty_removes_dirty_worktrees() -> Result<(), Box<dyn std::e
 }
 
 #[test]
-fn prune_gone_skips_worktrees_with_unmerged_commits() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_gone_removes_worktrees_with_unmerged_commits() -> Result<(), Box<dyn std::error::Error>> {
+    // A gone upstream is strong evidence the PR was merged/closed upstream.
+    // prune --gone should not require --allow-unmerged in this case.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -367,19 +369,19 @@ fn prune_gone_skips_worktrees_with_unmerged_commits() -> Result<(), Box<dyn std:
         .upstream("feature", "origin/feature")
         .build()?;
 
-    // Delete reference to remote branch
+    // Delete reference to remote branch (simulate upstream gone after PR merge)
     fixture
         .repo()?
         .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
-    // Create a new commit in the worktree (unmerged into main)
+    // Create a new commit in the worktree (not reachable from main via graph)
     fixture
         .commit("feature")
         .file("test.txt", "test")
         .create("New commit")?;
 
-    // Run prune --gone (without --allow-unmerged)
+    // Run prune --gone (without --allow-unmerged) — should succeed without skipping
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
@@ -388,12 +390,10 @@ fn prune_gone_skips_worktrees_with_unmerged_commits() -> Result<(), Box<dyn std:
         .arg("--yes")
         .assert()
         .success()
-        .stderr(predicate::str::contains("Skipped worktrees"))
-        .stderr(predicate::str::contains("unmerged commits"))
-        .stderr(predicate::str::contains("No worktrees to prune"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
-    // Verify worktree still exists
-    fixture.cwd()?.assert(predicate::path::is_dir());
+    // Verify worktree was pruned
+    fixture.cwd()?.assert(predicate::path::missing());
 
     Ok(())
 }

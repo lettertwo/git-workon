@@ -882,4 +882,63 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_has_tracked_changes_clean_worktree() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        assert!(!(worktree.has_tracked_changes()?));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_has_tracked_changes_with_untracked_file() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        // Add an untracked file
+        std::fs::write(worktree.path().join("untracked.txt"), "new file")?;
+
+        // has_tracked_changes should remain false (untracked files are excluded)
+        assert!(!(worktree.has_tracked_changes()?));
+        // is_dirty should be true (it includes untracked files)
+        assert!(worktree.is_dirty()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_has_tracked_changes_with_modified_tracked_file(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .build()?;
+        let repo = fixture.repo()?;
+
+        fixture
+            .commit("main")
+            .file("test.txt", "original content")
+            .create("Add test file")?;
+
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        // Modify a tracked file
+        std::fs::write(worktree.path().join("test.txt"), "modified content")?;
+
+        assert!(worktree.has_tracked_changes()?);
+
+        Ok(())
+    }
 }

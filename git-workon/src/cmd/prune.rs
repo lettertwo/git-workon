@@ -23,6 +23,9 @@
 //! When using `--gone` or `--merged`, the command uses WorktreeDescriptor's status
 //! methods to detect which worktrees can be safely pruned.
 
+// FIXME: Prune leaves branches behind even though it cleans up the worktrees.
+// Is this expected behavior?
+
 use dialoguer::Confirm;
 use git2::BranchType;
 use log::debug;
@@ -195,9 +198,16 @@ impl Run for Prune {
                     }
                 }
 
-                // Check for uncommitted changes
+                // Check for uncommitted changes.
+                // For RemoteGone, only block on tracked-file changes — untracked files
+                // (build artifacts, IDE dirs, etc.) are common and not a safety concern.
                 if !self.force && !self.allow_dirty {
-                    match wt.is_dirty() {
+                    let dirty = if matches!(candidate.reason, PruneReason::RemoteGone) {
+                        wt.has_tracked_changes()
+                    } else {
+                        wt.is_dirty()
+                    };
+                    match dirty {
                         Ok(true) => {
                             skipped.push((
                                 candidate,
@@ -221,7 +231,9 @@ impl Run for Prune {
                     && !self.allow_unmerged
                     && !matches!(
                         candidate.reason,
-                        PruneReason::BranchDeleted | PruneReason::Merged(_)
+                        PruneReason::BranchDeleted
+                            | PruneReason::RemoteGone
+                            | PruneReason::Merged(_)
                     )
                 {
                     if let Some(ref branch) = default_branch {
