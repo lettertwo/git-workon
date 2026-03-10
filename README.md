@@ -86,6 +86,8 @@ git workon prune --dry-run       # preview without deleting
 git workon prune my-feature      # prune a specific worktree
 git workon prune --gone          # also prune worktrees whose upstream branch is gone
 git workon prune --merged        # also prune worktrees merged into the default branch
+git workon prune --keep-branch   # prune worktrees but keep local branch refs
+git workon prune --force         # override all safety checks
 ```
 
 ### Rename a worktree

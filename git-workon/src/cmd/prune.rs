@@ -10,6 +10,8 @@
 //! - **Protected branches**: Respects `workon.pruneProtectedBranches` glob patterns
 //! - **Safety checks**: `--allow-dirty` and `--allow-unmerged` to override warnings
 //! - **Dry run**: `--dry-run` to preview without deleting
+//! - **Branch cleanup**: Local branch refs are deleted after pruning by default; use `--keep-branch` to preserve them
+//! - **Force mode**: `--force` overrides all safety checks (protected, default-branch, dirty, unmerged)
 //!
 //! ## Protected Branch Matching
 //!
@@ -21,7 +23,10 @@
 //! ## Status Filtering
 //!
 //! When using `--gone` or `--merged`, the command uses WorktreeDescriptor's status
-//! methods to detect which worktrees can be safely pruned.
+//! methods to detect which worktrees can be safely pruned. For `--gone` candidates
+//! (`RemoteGone`), the dirty check uses `has_tracked_changes()` instead of `is_dirty()`,
+//! so untracked files (build artifacts, IDE directories) do not block pruning. The
+//! unmerged check is also skipped for `RemoteGone` candidates.
 
 use dialoguer::Confirm;
 use git2::BranchType;

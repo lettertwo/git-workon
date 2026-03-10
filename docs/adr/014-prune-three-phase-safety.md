@@ -14,10 +14,10 @@ Pruning worktrees is destructive and hard to undo: it deletes the working direct
 
 1. Protected branch (`workon.pruneProtectedBranches`)
 2. Default worktree
-3. Dirty (uncommitted changes) — override with `--allow-dirty`
-4. Unmerged commits — override with `--allow-unmerged` (skipped for `BranchDeleted` and `Merged` candidates)
+3. Dirty (uncommitted changes) — override with `--allow-dirty`. `RemoteGone` candidates use `has_tracked_changes()` instead of `is_dirty()`, so untracked files (build artifacts, IDE dirs) do not block pruning.
+4. Unmerged commits — override with `--allow-unmerged` (skipped for `BranchDeleted`, `Merged`, and `RemoteGone` candidates)
 
-**Phase 3 — Execution**: Displays skipped and to-prune lists, then (unless `--dry-run`) confirms interactively or proceeds with `--yes`. Execution removes the directory with `fs::remove_dir_all` and calls `worktree.prune()`.
+**Phase 3 — Execution**: Displays skipped and to-prune lists, then (unless `--dry-run`) confirms interactively or proceeds with `--yes`. Execution removes the directory with `fs::remove_dir_all`, calls `worktree.prune()`, then deletes the local branch ref (unless `--keep-branch`).
 
 `--force` disables all four safety checks simultaneously. JSON mode skips interactive confirmation and prints a structured result.
 
@@ -27,6 +27,8 @@ Pruning worktrees is destructive and hard to undo: it deletes the working direct
 - Phases are independent: safety checks always run even for explicitly named worktrees.
 - `--force` is a single escape hatch rather than four separate `--no-*` flags, keeping the interface simple.
 - `BranchDeleted` and `Merged` candidates skip the "unmerged commits" check because the branch state already implies the work is handled.
+- `RemoteGone` candidates skip the "unmerged commits" check and use `has_tracked_changes()` for the dirty check, reducing false positives from untracked files.
+- Branch cleanup is default behavior: local branch refs are deleted after pruning unless `--keep-branch` is passed.
 
 ## References
 

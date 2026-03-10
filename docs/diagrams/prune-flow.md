@@ -36,11 +36,11 @@ flowchart TD
         S2 -->|"yes + !force"| SKIP_DEFAULT["skip: is default worktree"]
         S2 -->|no or force| S3
 
-        S3{is_dirty?}
+        S3{"is_dirty?\n(RemoteGone: has_tracked_changes?)"}
         S3 -->|"yes + !force + !allow_dirty"| SKIP_DIRTY["skip: uncommitted changes\nuse --allow-dirty"]
         S3 -->|no or overridden| S4
 
-        S4{unmerged commits?\nAND NOT BranchDeleted\nAND NOT Merged reason}
+        S4{unmerged commits?\nAND NOT BranchDeleted\nAND NOT Merged reason\nAND NOT RemoteGone}
         S4 -->|"yes + !force + !allow_unmerged"| SKIP_UNMERGED["skip: unmerged commits\nuse --allow-unmerged"]
         S4 -->|no or overridden| KEEP["→ to_prune list"]
     end
@@ -66,7 +66,7 @@ flowchart TD
         DIALOG -->|denied| MSG_CANCEL["print: cancelled"]
         CONFIRM -->|yes| EXEC
 
-        EXEC["for each candidate:\n1. fs::remove_dir_all(path)\n2. repo.find_worktree(name)\n3. worktree.prune(valid=true)"]
+        EXEC["for each candidate:\n1. fs::remove_dir_all(path)\n2. repo.find_worktree(name)\n3. worktree.prune(valid=true)\n4. delete local branch ref\n   (unless --keep-branch)"]
         EXEC --> MSG_OK["print: pruned N worktree(s)"]
     end
 
@@ -79,7 +79,7 @@ flowchart TD
 |---|---|---|
 | `Explicit` | user-named argument | yes (checked against default branch) |
 | `BranchDeleted` | local branch ref missing | skipped (work already handled) |
-| `RemoteGone` | `--gone` flag, upstream ref missing | yes |
+| `RemoteGone` | `--gone` flag, upstream ref missing | skipped (upstream gone implies work is pushed or abandoned) |
 | `Merged(target)` | `--merged`, `is_merged_into()` returned true | skipped (already verified) |
 
 ## Force flag
@@ -89,5 +89,5 @@ flowchart TD
 ## Key files
 
 - `git-workon/src/cmd/prune.rs` — all three phases, `PruneReason`, `PruneCandidate`, `is_upstream_gone()`, `is_protected()`
-- `git-workon-lib/src/worktree.rs` — `WorktreeDescriptor::is_dirty()`, `is_merged_into()`, `has_gone_upstream()`
+- `git-workon-lib/src/worktree.rs` — `WorktreeDescriptor::is_dirty()`, `has_tracked_changes()`, `is_merged_into()`, `has_gone_upstream()`
 - `git-workon-lib/src/config.rs` — `prune_protected_branches()`, `is_protected()`
