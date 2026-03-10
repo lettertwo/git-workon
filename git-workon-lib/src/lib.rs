@@ -24,7 +24,7 @@
 //! | [`find_worktree`] | Locate a worktree by name or branch |
 //! | [`current_worktree`] | Return the worktree containing the current directory |
 //! | [`move_worktree`] | Atomically rename a worktree and its branch |
-//! | [`copy_files`] | Copy files between worktrees using glob patterns |
+//! | [`copy_untracked`] | Copy untracked files between worktrees using git status |
 //! | [`workon_root`] | Resolve the directory that holds all worktrees |
 //!
 //! ## Example
@@ -48,7 +48,7 @@
 mod clone;
 mod config;
 mod convert_to_bare;
-mod copy;
+mod copy_untracked;
 mod default_branch;
 mod empty_commit;
 mod error;
@@ -63,7 +63,7 @@ mod worktree;
 pub use crate::clone::*;
 pub use crate::config::*;
 pub use crate::convert_to_bare::*;
-pub use crate::copy::*;
+pub use crate::copy_untracked::*;
 pub use crate::default_branch::*;
 pub use crate::empty_commit::*;
 pub use crate::error::*;

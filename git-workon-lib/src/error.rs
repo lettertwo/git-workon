@@ -257,13 +257,6 @@ pub enum PrError {
 /// File copy errors
 #[derive(Error, Diagnostic, Debug)]
 pub enum CopyError {
-    #[error("Pattern path is not valid UTF-8: {}", path.display())]
-    #[diagnostic(
-        code(workon::copy::invalid_pattern_path),
-        help("Ensure file paths contain only valid UTF-8 characters")
-    )]
-    InvalidPatternPath { path: PathBuf },
-
     #[error("Invalid glob pattern '{pattern}'")]
     #[diagnostic(
         code(workon::copy::invalid_glob_pattern),
@@ -290,5 +283,16 @@ pub enum CopyError {
         dest: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+
+    #[error("Failed to get git status for '{}'", path.display())]
+    #[diagnostic(
+        code(workon::copy::git_status_error),
+        help("Ensure the path is a valid git repository")
+    )]
+    GitStatus {
+        path: PathBuf,
+        #[source]
+        source: git2::Error,
     },
 }

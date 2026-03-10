@@ -161,6 +161,24 @@ impl<'repo> WorkonConfig<'repo> {
         self.read_multivar("workon.copyExclude")
     }
 
+    /// Get whether to include git-ignored files when copying untracked files.
+    ///
+    /// Precedence: CLI override > workon.copyIncludeIgnored config > false
+    ///
+    /// When enabled, files matching .gitignore (e.g., `.env.local`, `node_modules/`)
+    /// will also be included as copy candidates.
+    pub fn copy_include_ignored(&self, cli_override: Option<bool>) -> Result<bool> {
+        if let Some(override_val) = cli_override {
+            return Ok(override_val);
+        }
+
+        let config = self.repo.config()?;
+        match config.get_bool("workon.copyIncludeIgnored") {
+            Ok(val) => Ok(val),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Get whether to automatically copy untracked files when creating new worktrees.
     ///
     /// Precedence: CLI override > workon.autoCopyUntracked config > false

@@ -84,6 +84,11 @@ pub struct CopyUntracked {
     pub pattern: Option<String>,
     #[arg(short, long, help = "Overwrite existing files in destination")]
     pub force: bool,
+    #[arg(
+        long,
+        help = "Also copy git-ignored files (e.g., .env.local, node_modules)"
+    )]
+    pub include_ignored: bool,
 }
 
 /// Create a new bare repository and an initial worktree.
@@ -163,6 +168,8 @@ pub struct New {
         help = "Do not copy untracked files (overrides config)"
     )]
     pub no_copy_untracked: bool,
+    #[arg(long, help = "Include git-ignored files when copying untracked")]
+    pub copy_ignored: bool,
     #[arg(long, help = "Disable interactive mode (for testing/scripting)")]
     pub no_interactive: bool,
 }

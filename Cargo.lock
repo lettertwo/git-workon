@@ -583,6 +583,7 @@ dependencies = [
  "git2",
  "git2_credentials",
  "glob",
+ "libc",
  "log",
  "miette",
  "predicates",

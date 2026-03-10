@@ -1,5 +1,5 @@
 use miette::{Result, WrapErr};
-use workon::{copy_files, get_repo, workon_root, WorkonConfig, WorktreeDescriptor};
+use workon::{copy_untracked, get_repo, workon_root, WorkonConfig, WorktreeDescriptor};
 
 use crate::cli::CopyUntracked;
 
@@ -33,14 +33,25 @@ impl Run for CopyUntracked {
             ));
         }
 
-        // Determine patterns: --pattern flag > config > error
+        // Determine patterns: --pattern flag > config > [] (match all untracked)
         let patterns = determine_patterns(self, &config)?;
         let excludes = config.copy_excludes()?;
+        let include_ignored =
+            config.copy_include_ignored(Some(self.include_ignored).filter(|&v| v))?;
 
-        // Copy files
-        let copied = copy_files(&from_path, &to_path, &patterns, &excludes, self.force).wrap_err(
-            format!("Failed to copy files from '{}' to '{}'", self.from, self.to),
-        )?;
+        // Copy files using git status to enumerate candidates
+        let copied = copy_untracked(
+            &from_path,
+            &to_path,
+            &patterns,
+            &excludes,
+            self.force,
+            include_ignored,
+        )
+        .wrap_err(format!(
+            "Failed to copy files from '{}' to '{}'",
+            self.from, self.to
+        ))?;
 
         // Print results
         for file in &copied {
@@ -55,7 +66,7 @@ impl Run for CopyUntracked {
 
 /// Determine which patterns to use for copying
 ///
-/// Priority: --pattern flag > config > default **/*
+/// Priority: --pattern flag > config > [] (empty = copy all untracked)
 fn determine_patterns(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<String>> {
     // If --pattern is specified, use it (overrides everything)
     if let Some(pattern) = &cmd.pattern {
@@ -63,11 +74,5 @@ fn determine_patterns(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<
     }
 
     // Use config patterns if configured
-    let patterns = config.copy_patterns()?;
-    if !patterns.is_empty() {
-        return Ok(patterns);
-    }
-
-    // Default: copy everything
-    Ok(vec!["**/*".to_string()])
+    Ok(config.copy_patterns()?)
 }

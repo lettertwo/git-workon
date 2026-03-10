@@ -7,6 +7,7 @@ fn copy_basic() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
+        .worktree("main")
         .worktree("feature")
         .config("workon.copyPattern", "**/*")
         .build()?;
@@ -240,6 +241,7 @@ fn copy_creates_directories() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
+        .worktree("main")
         .worktree("feature")
         .config("workon.copyPattern", "**/*")
         .build()?;

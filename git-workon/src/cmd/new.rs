@@ -53,7 +53,10 @@ use miette::{bail, IntoDiagnostic, Result, WrapErr};
 use crate::cli::New;
 use crate::hooks::execute_post_create_hooks;
 use crate::output;
-use workon::{add_worktree, copy_files, get_repo, workon_root, BranchType, WorktreeDescriptor};
+use workon::{
+    add_worktree, copy_untracked, get_repo, get_worktrees, workon_root, BranchType,
+    WorktreeDescriptor,
+};
 
 use super::Run;
 
@@ -151,7 +154,13 @@ impl Run for New {
             };
 
             if config.auto_copy_untracked(copy_override)? {
-                if let Err(e) = copy_untracked_files(&repo, &worktree, Some(&base_ref), &config) {
+                if let Err(e) = copy_untracked_files(
+                    &repo,
+                    &worktree,
+                    Some(&base_ref),
+                    &config,
+                    self.copy_ignored,
+                ) {
                     output::warn(&format!("Failed to copy untracked files: {}", e));
                 }
             }
@@ -205,8 +214,13 @@ impl Run for New {
 
         if config.auto_copy_untracked(copy_override)? {
             debug!("Auto-copy enabled, copying from base worktree");
-            if let Err(e) = copy_untracked_files(&repo, &worktree, base_branch.as_deref(), &config)
-            {
+            if let Err(e) = copy_untracked_files(
+                &repo,
+                &worktree,
+                base_branch.as_deref(),
+                &config,
+                self.copy_ignored,
+            ) {
                 output::warn(&format!("Failed to copy untracked files: {}", e));
                 // Continue - worktree is still valid
             }
@@ -276,53 +290,46 @@ fn copy_untracked_files(
     worktree: &WorktreeDescriptor,
     base_branch: Option<&str>,
     config: &workon::WorkonConfig,
+    include_ignored: bool,
 ) -> Result<()> {
-    // Get copy patterns from config, or default to copying everything
     let patterns = config.copy_patterns()?;
-    let patterns = if patterns.is_empty() {
-        vec!["**/*".to_string()]
-    } else {
-        patterns
-    };
-
     let excludes = config.copy_excludes()?;
+    let include_ignored = config.copy_include_ignored(Some(include_ignored).filter(|&v| v))?;
 
-    // Determine which branch to copy from
+    // Determine source branch name: explicit base, or HEAD's branch
     let source_branch_name = if let Some(base) = base_branch {
         base.to_string()
     } else {
-        // No base branch specified, use HEAD's branch
         match repo.head() {
-            Ok(head) => {
-                if let Some(shorthand) = head.shorthand() {
-                    shorthand.to_string()
-                } else {
-                    // HEAD is detached or not a branch, skip copying
-                    return Ok(());
-                }
-            }
-            Err(_) => {
-                // Can't determine HEAD, skip copying
-                return Ok(());
-            }
+            Ok(head) => match head.shorthand() {
+                Some(s) => s.to_string(),
+                None => return Ok(()), // detached HEAD, skip
+            },
+            Err(_) => return Ok(()), // can't determine HEAD, skip
         }
     };
 
-    // Find the source worktree path
-    let root = workon_root(repo)?;
-    let source_path = root.join(&source_branch_name);
-    if !source_path.exists() {
+    // Find source worktree path via libgit2 worktree list, then fall back to root join.
+    // Using get_worktrees avoids breaking on slashed branch names that differ from the
+    // worktree's filesystem path, or on PR base refs like "origin/main".
+    let source_path = find_worktree_path(repo, &source_branch_name)?;
+
+    let Some(source_path) = source_path else {
         // Source worktree doesn't exist, skip copying
         return Ok(());
-    }
+    };
 
-    // Get destination path
     let dest_path = worktree.path().to_path_buf();
 
-    // Copy files
-    let copied = copy_files(&source_path, &dest_path, &patterns, &excludes, false)?;
+    let copied = copy_untracked(
+        &source_path,
+        &dest_path,
+        &patterns,
+        &excludes,
+        false,
+        include_ignored,
+    )?;
 
-    // Report what was copied
     if !copied.is_empty() {
         output::success(&format!(
             "Copied {} file(s) from base worktree",
@@ -331,4 +338,39 @@ fn copy_untracked_files(
     }
 
     Ok(())
+}
+
+/// Find the filesystem path of a worktree by branch name or worktree name.
+///
+/// Checks registered worktrees first (handles any naming scheme), then falls back
+/// to `root/<name>` which covers the common case of branch-named worktrees.
+fn find_worktree_path(
+    repo: &git2::Repository,
+    branch_name: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    // Strip remote prefix (e.g., "origin/main" → "main") for matching against branch names
+    let local_name = branch_name
+        .split_once('/')
+        .map(|(_, b)| b)
+        .unwrap_or(branch_name);
+
+    if let Ok(worktrees) = get_worktrees(repo) {
+        for wt in worktrees {
+            // Match by worktree name
+            if wt.name() == Some(branch_name) || wt.name() == Some(local_name) {
+                return Ok(Some(wt.path().to_path_buf()));
+            }
+            // Match by branch name
+            if let Ok(Some(branch)) = wt.branch() {
+                if branch == branch_name || branch == local_name {
+                    return Ok(Some(wt.path().to_path_buf()));
+                }
+            }
+        }
+    }
+
+    // Fall back to root/<local_name> (the standard git-workon layout)
+    let root = workon_root(repo)?;
+    let path = root.join(local_name);
+    Ok(path.exists().then_some(path))
 }
