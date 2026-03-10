@@ -82,7 +82,7 @@ Run `make install-hooks` to install the commit-msg validation hook locally.
 1. **CLAUDE.md overrides Claude Code defaults** (commit style, code style, etc.)
 2. **Module docs (`//!`) and code define what exists; TODOs define what's planned**
 3. **User requests override everything** — clarify if request conflicts with project principles
-4. **Testing standards are non-negotiable** — always use FixtureBuilder and custom predicates
+4. **Testing standards are non-negotiable** — always read `/docs testing` before writing tests, then use FixtureBuilder and custom predicates; existing tests may not demonstrate all available patterns
 5. **Simplicity wins** — 3 simple lines beats 1 complex abstraction; write tests while implementing, not after
 
 **If truly unsure, ask the user rather than guessing.**
@@ -91,8 +91,8 @@ Run `make install-hooks` to install the commit-msg validation hook locally.
 
 Load detailed guides only when needed — they are not in this file to save context:
 
-- `/docs testing` — fixture-based testing guide (FixtureBuilder, predicates, test patterns)
-- `/docs errors` — error handling with Miette (library vs CLI patterns)
+- `/docs testing` — **always load before writing any tests** (FixtureBuilder, predicates, test patterns)
+- `/docs errors` — **always load before adding or modifying error types** (library vs CLI patterns; the wrong pattern is easy to copy from existing code)
 - `/docs implementation` — implementation principles and workflow
 - `/list-tasks` — overview of all TODOs, FIXMEs, and unimplemented work
 - `/next-task` — find and prioritize the next task to work on
