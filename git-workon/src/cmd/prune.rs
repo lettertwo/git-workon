@@ -23,9 +23,6 @@
 //! When using `--gone` or `--merged`, the command uses WorktreeDescriptor's status
 //! methods to detect which worktrees can be safely pruned.
 
-// FIXME: Prune leaves branches behind even though it cleans up the worktrees.
-// Is this expected behavior?
-
 use dialoguer::Confirm;
 use git2::BranchType;
 use log::debug;
@@ -254,18 +251,26 @@ impl Run for Prune {
 
         if self.json {
             // JSON mode: skip confirmation, output structured result
+            let delete_branch = !self.keep_branch;
+            let mut pruned_with_status: Vec<(&PruneCandidate, bool)> = Vec::new();
             if !self.dry_run {
                 for candidate in &to_prune {
-                    prune_worktree(&repo, candidate)?;
+                    let branch_deleted = prune_worktree(&repo, candidate, delete_branch)?;
+                    pruned_with_status.push((candidate, branch_deleted));
+                }
+            } else {
+                for candidate in &to_prune {
+                    pruned_with_status.push((candidate, false));
                 }
             }
 
             let result = json!({
-                "pruned": to_prune.iter().map(|c| json!({
+                "pruned": pruned_with_status.iter().map(|(c, branch_deleted)| json!({
                     "name": c.worktree_name,
                     "path": c.worktree_path.to_str(),
                     "branch": c.branch_name,
                     "reason": c.reason.to_string(),
+                    "branch_deleted": branch_deleted,
                 })).collect::<Vec<_>>(),
                 "skipped": skipped.iter().map(|(c, reason)| json!({
                     "name": c.worktree_name,
@@ -317,8 +322,16 @@ impl Run for Prune {
 
         // Confirm with user unless --yes flag is set
         if !self.yes {
+            let prompt = if !self.keep_branch {
+                format!(
+                    "Prune {} worktree(s) and delete their branches?",
+                    to_prune.len()
+                )
+            } else {
+                format!("Prune {} worktree(s)?", to_prune.len())
+            };
             let confirmed = Confirm::new()
-                .with_prompt(format!("Prune {} worktree(s)?", to_prune.len()))
+                .with_prompt(prompt)
                 .default(false)
                 .interact()
                 .into_diagnostic()?;
@@ -330,8 +343,9 @@ impl Run for Prune {
         }
 
         // Prune the worktrees
+        let delete_branch = !self.keep_branch;
         for candidate in &to_prune {
-            prune_worktree(&repo, candidate)?;
+            prune_worktree(&repo, candidate, delete_branch)?;
         }
 
         output::success(&format!("Pruned {} worktree(s)", to_prune.len()));
@@ -397,7 +411,11 @@ fn is_upstream_gone(repo: &git2::Repository, branch_name: &str) -> Result<bool> 
     }
 }
 
-fn prune_worktree(repo: &git2::Repository, candidate: &PruneCandidate) -> Result<()> {
+fn prune_worktree(
+    repo: &git2::Repository,
+    candidate: &PruneCandidate,
+    delete_branch: bool,
+) -> Result<bool> {
     // Remove the worktree directory first
     if candidate.worktree_path.exists() {
         std::fs::remove_dir_all(&candidate.worktree_path).into_diagnostic()?;
@@ -411,8 +429,40 @@ fn prune_worktree(repo: &git2::Repository, candidate: &PruneCandidate) -> Result
     opts.valid(true); // Allow pruning even if worktree is valid
     worktree.prune(Some(&mut opts)).into_diagnostic()?;
 
-    output::success(&format!("  Pruned {}", candidate.worktree_path.display()));
-    Ok(())
+    // Optionally delete the local branch ref.
+    // Skip if: --keep-branch, branch already deleted, or detached/error sentinel.
+    let branch_deleted = if delete_branch
+        && !matches!(candidate.reason, PruneReason::BranchDeleted)
+        && !candidate.branch_name.starts_with('(')
+    {
+        match repo.find_branch(&candidate.branch_name, BranchType::Local) {
+            Ok(mut branch) => match branch.delete() {
+                Ok(()) => true,
+                Err(e) => {
+                    output::warn(&format!(
+                        "could not delete branch '{}': {}",
+                        candidate.branch_name, e
+                    ));
+                    false
+                }
+            },
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    if branch_deleted {
+        output::success(&format!(
+            "  Pruned {} (branch '{}' deleted)",
+            candidate.worktree_path.display(),
+            candidate.branch_name
+        ));
+    } else {
+        output::success(&format!("  Pruned {}", candidate.worktree_path.display()));
+    }
+
+    Ok(branch_deleted)
 }
 
 /// Check if a branch name matches any of the protection patterns

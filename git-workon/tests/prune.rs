@@ -226,6 +226,9 @@ fn prune_with_gone_flag_removes_worktrees_with_deleted_remote_branch(
     // Verify worktree directory is gone
     fixture.cwd()?.assert(predicate::path::missing());
 
+    // Verify local branch ref was also deleted
+    fixture.assert(predicate::repo::has_branch("feature").not());
+
     Ok(())
 }
 
@@ -473,6 +476,9 @@ fn prune_merged_removes_merged_branch() -> Result<(), Box<dyn std::error::Error>
 
     // Verify worktree is gone
     fixture.cwd()?.assert(predicate::path::missing());
+
+    // Verify local branch ref was also deleted
+    fixture.assert(predicate::repo::has_branch("feature").not());
 
     Ok(())
 }
@@ -782,6 +788,10 @@ fn prune_single_named_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .root()?
         .child("feature-2")
         .assert(predicate::path::is_dir());
+
+    // Verify branch ref was deleted
+    fixture.assert(predicate::repo::has_branch("feature-1").not());
+    fixture.assert(predicate::repo::has_branch("feature-2"));
 
     Ok(())
 }
@@ -1148,6 +1158,172 @@ fn prune_force_overrides_default_branch() -> Result<(), Box<dyn std::error::Erro
 
     // Verify main worktree is gone
     fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+// --- Branch deletion tests ---
+
+#[test]
+fn prune_keep_branch_preserves_local_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Prune with --keep-branch
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--keep-branch")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify worktree directory is gone
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::missing());
+
+    // Verify branch ref is still present
+    fixture.assert(predicate::repo::has_branch("feature"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_deletes_branch_for_gone_upstream() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    // Delete reference to remote branch
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    // Prune with --gone (default: delete branch)
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--gone")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify local branch ref was deleted
+    fixture.assert(predicate::repo::has_branch("feature").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_deletes_branch_for_merged() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let feature_commit_oid = fixture
+        .commit("feature")
+        .file("feature.txt", "feature")
+        .create("Feature commit")?;
+
+    // Fast-forward main to include the feature commit
+    let repo = fixture.repo()?;
+    let feature_commit = repo.find_commit(feature_commit_oid)?;
+    repo.find_branch("main", git2::BranchType::Local)?
+        .get_mut()
+        .set_target(feature_commit.id(), "Fast-forward to feature")?;
+
+    // Prune with --merged (default: delete branch)
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--merged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify local branch ref was deleted
+    fixture.assert(predicate::repo::has_branch("feature").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_dry_run_does_not_delete_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Dry run prune
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Dry run - no changes made"));
+
+    // Verify branch ref still exists
+    fixture.assert(predicate::repo::has_branch("feature"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_json_includes_branch_deleted_field() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Prune in JSON mode (default: delete branch)
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    let output = prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--json")
+        .arg("feature")
+        .arg("--yes")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
+    let pruned = json["pruned"].as_array().expect("pruned should be array");
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(
+        pruned[0]["branch_deleted"],
+        serde_json::Value::Bool(true),
+        "branch_deleted should be true"
+    );
 
     Ok(())
 }

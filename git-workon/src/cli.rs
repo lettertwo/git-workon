@@ -215,6 +215,8 @@ pub struct Prune {
         help = "Override all safety checks (protection, default branch, dirty, unmerged)"
     )]
     pub force: bool,
+    #[arg(long, help = "Keep local branch refs when pruning worktrees")]
+    pub keep_branch: bool,
 }
 
 /// Find a worktree to work on.
