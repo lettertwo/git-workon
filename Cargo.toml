@@ -34,6 +34,8 @@ git2 = { version = "0.20.4", default-features = false, features = [
   "https",
 ] }
 glob = "0.3"
+ignore = "0.4"
+indicatif = "0.17"
 libc = "0.2"
 log = "0.4.29"
 miette = { version = "7.6.0", features = ["fancy"] }

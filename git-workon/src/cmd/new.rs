@@ -54,7 +54,7 @@ use crate::cli::New;
 use crate::hooks::execute_post_create_hooks;
 use crate::output;
 use workon::{
-    add_worktree, copy_untracked, get_repo, get_worktrees, workon_root, BranchType,
+    add_worktree, copy_untracked, get_repo, get_worktrees, workon_root, BranchType, CopyOptions,
     WorktreeDescriptor,
 };
 
@@ -324,10 +324,12 @@ fn copy_untracked_files(
     let copied = copy_untracked(
         &source_path,
         &dest_path,
-        &patterns,
-        &excludes,
-        false,
-        include_ignored,
+        CopyOptions {
+            patterns: &patterns,
+            excludes: &excludes,
+            include_ignored,
+            ..Default::default()
+        },
     )?;
 
     if !copied.is_empty() {

@@ -28,6 +28,7 @@ clap_complete.workspace = true
 clap_mangen.workspace = true
 dialoguer.workspace = true
 env_logger.workspace = true
+indicatif.workspace = true
 git-workon-lib.workspace = true
 git2.workspace = true
 glob.workspace = true

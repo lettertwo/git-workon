@@ -285,12 +285,12 @@ pub enum CopyError {
         source: std::io::Error,
     },
 
-    #[error("Failed to get git status for '{}'", path.display())]
+    #[error("Failed to open repository at '{}'", path.display())]
     #[diagnostic(
-        code(workon::copy::git_status_error),
+        code(workon::copy::repo_open_error),
         help("Ensure the path is a valid git repository")
     )]
-    GitStatus {
+    RepoOpen {
         path: PathBuf,
         #[source]
         source: git2::Error,

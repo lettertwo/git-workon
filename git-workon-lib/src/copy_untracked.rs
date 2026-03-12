@@ -5,7 +5,10 @@
 //!
 //! ## Design
 //!
-//! - Uses `git status` to enumerate candidate files (untracked, not ignored by default).
+//! - Uses `ignore::WalkBuilder` + git index check to enumerate candidate files.
+//! - The walker respects `.gitignore` by default (never enters `node_modules/`, `target/`, etc.).
+//! - With `include_ignored`, gitignore filtering is disabled so ignored files are visited too.
+//! - The git index is checked per file (O(1) binary search) to skip tracked files.
 //! - Patterns filter the candidate list.
 //! - Opt-in ignored file support: `--include-ignored` / `workon.copyIncludeIgnored=true`.
 //!
@@ -47,50 +50,93 @@
 //! git config --add workon.copyPattern 'node_modules/'
 //! git config --add workon.copyExclude '.env.production'
 //! ```
-//!
-//! TODO: Add progress reporting for large copies
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CopyError, Result};
 
+type SkipCallback = Box<dyn FnMut(&'static str, &Path)>;
+
+/// Options for [`copy_untracked`].
+///
+/// Callbacks default to no-ops; override them to observe progress.
+pub struct CopyOptions<'a> {
+    /// Glob patterns to include; empty means match all candidates.
+    pub patterns: &'a [String],
+    /// Glob patterns to exclude after include matching.
+    pub excludes: &'a [String],
+    /// Overwrite files that already exist at the destination.
+    pub force: bool,
+    /// Also copy git-ignored files (e.g., `node_modules/`, `.env.local`).
+    pub include_ignored: bool,
+    /// Called after each file is successfully copied.
+    pub on_copied: Box<dyn FnMut(&Path)>,
+    /// Called when a file is skipped, with a reason of `"tracked"` or `"exists"`.
+    pub on_skipped: SkipCallback,
+}
+
+impl Default for CopyOptions<'_> {
+    fn default() -> Self {
+        Self {
+            patterns: &[],
+            excludes: &[],
+            force: false,
+            include_ignored: false,
+            on_copied: Box::new(|_| {}),
+            on_skipped: Box::new(|_, _| {}),
+        }
+    }
+}
+
 /// Copy only untracked (and optionally ignored) files from source to destination.
 ///
-/// Uses `git status` to enumerate candidate files, then filters by patterns.
-/// This is much faster than glob-walking when `patterns` is broad (e.g., `**/*`),
-/// and avoids spurious "already exists" messages for tracked files.
-///
-/// `patterns` filter the git-status candidates. An empty slice matches all candidates.
-/// `include_ignored` also includes git-ignored files (e.g., `.env.local`, `node_modules/`).
+/// Uses `ignore::WalkBuilder` to walk `from_path`, skipping gitignored paths by default
+/// (so `node_modules/`, `target/`, etc. are never entered). With `include_ignored`, gitignore
+/// filtering is disabled and all files are visited. In both cases, tracked files are filtered
+/// out via an O(1) git index lookup.
 pub fn copy_untracked(
     from_path: &Path,
     to_path: &Path,
-    patterns: &[String],
-    excludes: &[String],
-    force: bool,
-    include_ignored: bool,
+    options: CopyOptions<'_>,
 ) -> Result<Vec<PathBuf>> {
-    let repo = git2::Repository::open(from_path).map_err(|source| CopyError::GitStatus {
+    let CopyOptions {
+        patterns,
+        excludes,
+        force,
+        include_ignored,
+        mut on_copied,
+        mut on_skipped,
+    } = options;
+
+    let repo = git2::Repository::open(from_path).map_err(|source| CopyError::RepoOpen {
         path: from_path.to_path_buf(),
         source,
     })?;
 
-    let mut opts = git2::StatusOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
-    if include_ignored {
-        opts.include_ignored(true).recurse_ignored_dirs(true);
-    }
-
-    let statuses = repo
-        .statuses(Some(&mut opts))
-        .map_err(|source| CopyError::GitStatus {
-            path: from_path.to_path_buf(),
-            source,
-        })?;
+    // Load git index once for O(1) tracked-file checks per file
+    let mut index = repo.index().map_err(|source| CopyError::RepoOpen {
+        path: from_path.to_path_buf(),
+        source,
+    })?;
+    index.read(false).map_err(|source| CopyError::RepoOpen {
+        path: from_path.to_path_buf(),
+        source,
+    })?;
 
     // Compile include patterns once. Empty list = match all.
     let include_patterns: Vec<glob::Pattern> = patterns
+        .iter()
+        .map(|p| {
+            glob::Pattern::new(p).map_err(|e| CopyError::InvalidGlobPattern {
+                pattern: p.clone(),
+                source: e,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, CopyError>>()?;
+
+    // Compile exclude patterns once (previously compiled per-file — now O(1) per check).
+    let exclude_patterns: Vec<glob::Pattern> = excludes
         .iter()
         .map(|p| {
             glob::Pattern::new(p).map_err(|e| CopyError::InvalidGlobPattern {
@@ -106,28 +152,52 @@ pub fn copy_untracked(
         require_literal_leading_dot: false,
     };
 
+    // Build walker. Include hidden files (e.g., .env, .vscode/).
+    // By default, respects .gitignore — never descends into node_modules/, target/, etc.
+    // With include_ignored, disable all git-based filtering to visit ignored files too.
+    let mut builder = ignore::WalkBuilder::new(from_path);
+    builder.hidden(false);
+    if include_ignored {
+        builder
+            .git_ignore(false)
+            .git_global(false)
+            .git_exclude(false);
+    }
+
     let mut copied_files = Vec::new();
 
-    for entry in statuses.iter() {
-        let status = entry.status();
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                log::debug!("Walk error: {}", e);
+                continue;
+            }
+        };
 
-        // Only copy untracked (WT_NEW) or, if opted in, ignored files
-        let is_candidate = status.contains(git2::Status::WT_NEW)
-            || (include_ignored && status.contains(git2::Status::IGNORED));
-
-        if !is_candidate {
+        // Skip directories
+        if entry.file_type().is_none_or(|ft| ft.is_dir()) {
             continue;
         }
 
-        let rel_path = match entry.path() {
-            Some(p) => PathBuf::from(p),
-            None => continue,
+        let path = entry.path();
+
+        // Get relative path from from_path
+        let rel_path = match path.strip_prefix(from_path) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => continue,
         };
 
         let rel_path_str = match rel_path.to_str() {
             Some(s) => s,
             None => continue,
         };
+
+        // Skip files tracked in the git index (handles `git add -f`'d ignored files correctly)
+        if index.get_path(&rel_path, 0).is_some() {
+            on_skipped("tracked", &rel_path);
+            continue;
+        }
 
         // Apply include patterns (empty = match all)
         if !include_patterns.is_empty()
@@ -139,20 +209,18 @@ pub fn copy_untracked(
         }
 
         // Apply exclude patterns
-        if should_exclude(&from_path.join(&rel_path), from_path, excludes)? {
+        if exclude_patterns
+            .iter()
+            .any(|p| p.matches_with(rel_path_str, match_opts))
+        {
             continue;
         }
 
-        let src_file = from_path.join(&rel_path);
         let dest_file = to_path.join(&rel_path);
-
-        // Skip directories (git status shouldn't return dirs with recurse, but be safe)
-        if src_file.is_dir() {
-            continue;
-        }
 
         // Skip if destination exists and not forcing
         if dest_file.exists() && !force {
+            on_skipped("exists", &rel_path);
             continue;
         }
 
@@ -161,40 +229,12 @@ pub fn copy_untracked(
             fs::create_dir_all(parent)?;
         }
 
-        copy_file_platform(&src_file, &dest_file)?;
+        copy_file_platform(path, &dest_file)?;
+        on_copied(&rel_path);
         copied_files.push(rel_path);
     }
 
     Ok(copied_files)
-}
-
-/// Check if a file should be excluded based on exclusion patterns
-fn should_exclude(path: &Path, base: &Path, excludes: &[String]) -> Result<bool> {
-    // Get relative path from base
-    let rel_path = match path.strip_prefix(base) {
-        Ok(p) => p,
-        Err(_) => return Ok(false), // If not under base, don't exclude
-    };
-
-    let rel_path_str = rel_path.to_str().ok_or_else(|| CopyError::InvalidPath {
-        path: rel_path.to_path_buf(),
-    })?;
-
-    // Check against each exclusion pattern
-    for exclude_pattern in excludes {
-        // Simple glob pattern matching
-        if glob::Pattern::new(exclude_pattern)
-            .map_err(|e| CopyError::InvalidGlobPattern {
-                pattern: exclude_pattern.clone(),
-                source: e,
-            })?
-            .matches(rel_path_str)
-        {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 /// Copy a file using platform-specific copy-on-write when available.

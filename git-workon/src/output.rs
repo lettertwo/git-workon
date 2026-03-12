@@ -35,7 +35,7 @@ pub fn set_json_mode(enabled: bool) {
     JSON_MODE.store(enabled, Ordering::Relaxed);
 }
 
-fn is_json_mode() -> bool {
+pub fn is_json_mode() -> bool {
     JSON_MODE.load(Ordering::Relaxed)
 }
 
@@ -189,6 +189,14 @@ pub mod style {
     pub fn red(s: &str) -> String {
         if use_color() {
             s.red().to_string()
+        } else {
+            s.to_string()
+        }
+    }
+
+    pub fn green_bold(s: &str) -> String {
+        if use_color() {
+            s.green().bold().to_string()
         } else {
             s.to_string()
         }

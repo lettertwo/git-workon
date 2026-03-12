@@ -1,7 +1,13 @@
+use std::time::Duration;
+
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use miette::{Result, WrapErr};
-use workon::{copy_untracked, get_repo, workon_root, WorkonConfig, WorktreeDescriptor};
+use workon::{
+    copy_untracked, get_repo, workon_root, CopyOptions, WorkonConfig, WorktreeDescriptor,
+};
 
 use crate::cli::CopyUntracked;
+use crate::output;
 
 use super::Run;
 
@@ -10,14 +16,10 @@ impl Run for CopyUntracked {
         let repo = get_repo(None)?;
         let config = WorkonConfig::new(&repo)?;
 
-        // Get worktree root directory
         let root = workon_root(&repo)?;
-
-        // Resolve worktree paths from names
         let from_path = root.join(&self.from);
         let to_path = root.join(&self.to);
 
-        // Verify both worktrees exist
         if !from_path.exists() {
             return Err(miette::miette!(
                 "Source worktree '{}' does not exist at {:?}",
@@ -33,33 +35,70 @@ impl Run for CopyUntracked {
             ));
         }
 
-        // Determine patterns: --pattern flag > config > [] (match all untracked)
         let patterns = determine_patterns(self, &config)?;
         let excludes = config.copy_excludes()?;
         let include_ignored =
             config.copy_include_ignored(Some(self.include_ignored).filter(|&v| v))?;
 
-        // Copy files using git status to enumerate candidates
+        let json_mode = output::is_json_mode();
+        let pb = ProgressBar::new_spinner();
+        if json_mode {
+            pb.set_draw_target(ProgressDrawTarget::hidden());
+        } else {
+            pb.set_style(
+                ProgressStyle::with_template("  {spinner:.green} {msg}")
+                    .unwrap()
+                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
+            );
+            pb.enable_steady_tick(Duration::from_millis(80));
+            pb.set_message("Copying files...");
+        }
+
+        let show_skipped = log::log_enabled!(log::Level::Debug);
+        let mut count = 0usize;
+        let pb_copied = pb.clone();
+        let pb_skipped = pb.clone();
         let copied = copy_untracked(
             &from_path,
             &to_path,
-            &patterns,
-            &excludes,
-            self.force,
-            include_ignored,
+            CopyOptions {
+                patterns: &patterns,
+                excludes: &excludes,
+                force: self.force,
+                include_ignored,
+                on_copied: Box::new(move |rel_path| {
+                    if !json_mode {
+                        count += 1;
+                        pb_copied.println(format!(
+                            "      {} {}",
+                            output::style::green_bold("Copied"),
+                            rel_path.display()
+                        ));
+                        pb_copied.set_message(format!("Copying files... ({} copied)", count));
+                    }
+                }),
+                on_skipped: Box::new(move |reason, rel_path| {
+                    if show_skipped && !json_mode {
+                        pb_skipped.println(format!(
+                            "      {} {} ({})",
+                            output::style::dim("Skipped"),
+                            rel_path.display(),
+                            reason,
+                        ));
+                    }
+                }),
+            },
         )
         .wrap_err(format!(
             "Failed to copy files from '{}' to '{}'",
             self.from, self.to
         ))?;
 
-        // Print results
-        for file in &copied {
-            println!("Copied: {}", file.display());
+        pb.finish_and_clear();
+        if !json_mode {
+            println!("\nCopied {} file(s)", copied.len());
         }
-        println!("\nCopied {} file(s)", copied.len());
 
-        // Return the destination worktree descriptor
         Ok(Some(WorktreeDescriptor::new(&repo, &self.to)?))
     }
 }
@@ -68,11 +107,8 @@ impl Run for CopyUntracked {
 ///
 /// Priority: --pattern flag > config > [] (empty = copy all untracked)
 fn determine_patterns(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<String>> {
-    // If --pattern is specified, use it (overrides everything)
     if let Some(pattern) = &cmd.pattern {
         return Ok(vec![pattern.clone()]);
     }
-
-    // Use config patterns if configured
     Ok(config.copy_patterns()?)
 }
