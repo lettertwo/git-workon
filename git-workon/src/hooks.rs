@@ -75,6 +75,8 @@ use log::debug;
 use miette::{IntoDiagnostic, Result};
 use workon::{WorkonConfig, WorktreeDescriptor};
 
+use crate::output;
+
 /// Execute post-creation hooks configured in workon.postCreateHook
 ///
 /// Hooks are executed sequentially in the worktree directory with environment variables set.
@@ -94,7 +96,8 @@ pub fn execute_post_create_hooks(
     debug!("Found {} post-create hook(s)", hooks.len());
 
     for (i, hook_cmd) in hooks.iter().enumerate() {
-        eprintln!("Running hook {}/{}: {}", i + 1, hooks.len(), hook_cmd);
+        let pb = output::create_spinner();
+        pb.set_message(format!("Hook {}/{}: {}", i + 1, hooks.len(), hook_cmd));
 
         // Set up environment variables for the hook
         debug!("Setting WORKON_WORKTREE_PATH={}", worktree.path().display());
@@ -135,6 +138,7 @@ pub fn execute_post_create_hooks(
             // No timeout - blocking wait
             let status = child.wait().into_diagnostic()?;
             if !status.success() {
+                pb.finish_and_clear();
                 return Err(miette::miette!(
                     "Hook failed with exit code: {:?}",
                     status.code()
@@ -146,6 +150,7 @@ pub fn execute_post_create_hooks(
                 match child.try_wait().into_diagnostic()? {
                     Some(status) if status.success() => break,
                     Some(status) => {
+                        pb.finish_and_clear();
                         return Err(miette::miette!(
                             "Hook failed with exit code: {:?}",
                             status.code()
@@ -154,6 +159,7 @@ pub fn execute_post_create_hooks(
                     None if start.elapsed() >= timeout => {
                         let _ = child.kill();
                         let _ = child.wait();
+                        pb.finish_and_clear();
                         return Err(miette::miette!(
                             "Hook timed out after {}s: {}",
                             timeout.as_secs(),
@@ -165,7 +171,8 @@ pub fn execute_post_create_hooks(
             }
         }
 
-        eprintln!("✓ Hook completed successfully");
+        pb.finish_and_clear();
+        output::success("✓ Hook completed successfully");
     }
 
     Ok(())
