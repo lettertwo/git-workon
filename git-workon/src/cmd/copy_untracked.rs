@@ -1,6 +1,3 @@
-use std::time::Duration;
-
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use miette::{Result, WrapErr};
 use workon::{
     copy_untracked, get_repo, workon_root, CopyOptions, WorkonConfig, WorktreeDescriptor,
@@ -41,18 +38,8 @@ impl Run for CopyUntracked {
             config.copy_include_ignored(Some(self.include_ignored).filter(|&v| v))?;
 
         let json_mode = output::is_json_mode();
-        let pb = ProgressBar::new_spinner();
-        if json_mode {
-            pb.set_draw_target(ProgressDrawTarget::hidden());
-        } else {
-            pb.set_style(
-                ProgressStyle::with_template("  {spinner:.green} {msg}")
-                    .unwrap()
-                    .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
-            );
-            pb.enable_steady_tick(Duration::from_millis(80));
-            pb.set_message("Copying files...");
-        }
+        let pb = output::create_spinner();
+        pb.set_message("Copying files...");
 
         let show_skipped = log::log_enabled!(log::Level::Debug);
         let mut count = 0usize;
