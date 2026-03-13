@@ -6,6 +6,20 @@ use log::debug;
 use crate::error::Result;
 use crate::{convert_to_bare, get_default_branch_name, get_remote_callbacks};
 
+/// Options for [`clone`].
+pub struct CloneOptions {
+    /// Called during the network transfer with `(received_objects, total_objects, received_bytes)`.
+    pub on_transfer_progress: Box<dyn FnMut(usize, usize, usize)>,
+}
+
+impl Default for CloneOptions {
+    fn default() -> Self {
+        Self {
+            on_transfer_progress: Box::new(|_, _, _| {}),
+        }
+    }
+}
+
 /// Clone a remote repository into the worktrees layout.
 ///
 /// The repository is cloned as a bare repo at `<path>/.bare` and a `.git` link
@@ -14,7 +28,10 @@ use crate::{convert_to_bare, get_default_branch_name, get_remote_callbacks};
 ///
 /// If `path` already ends with `.bare` it is used as-is; otherwise `.bare` is
 /// appended.
-pub fn clone(path: PathBuf, url: &str) -> Result<Repository> {
+pub fn clone(path: PathBuf, url: &str, options: CloneOptions) -> Result<Repository> {
+    let CloneOptions {
+        mut on_transfer_progress,
+    } = options;
     debug!("path {}", path.display());
     let path = if path.ends_with(".bare") {
         debug!("ended with .bare!");
@@ -26,8 +43,18 @@ pub fn clone(path: PathBuf, url: &str) -> Result<Repository> {
 
     debug!("final path {}", path.display());
 
+    let mut callbacks = get_remote_callbacks()?;
+    callbacks.transfer_progress(move |progress| {
+        on_transfer_progress(
+            progress.received_objects(),
+            progress.total_objects(),
+            progress.received_bytes(),
+        );
+        true
+    });
+
     let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(get_remote_callbacks()?);
+    fetch_options.remote_callbacks(callbacks);
 
     let mut builder = RepoBuilder::new();
     builder.bare(true);

@@ -2,7 +2,7 @@
 mod tests {
     use assert_fs::TempDir;
     use git_workon_fixture::prelude::*;
-    use workon::clone;
+    use workon::{clone, CloneOptions};
 
     #[test]
     fn test_clone_basic() -> Result<(), Box<dyn std::error::Error>> {
@@ -11,7 +11,11 @@ mod tests {
 
         // Clone into a new dir using the clone logic
         let dir = TempDir::new()?;
-        let repo = clone(dir.to_path_buf(), remote.cwd()?.to_str().unwrap())?;
+        let repo = clone(
+            dir.to_path_buf(),
+            remote.cwd()?.to_str().unwrap(),
+            CloneOptions::default(),
+        )?;
 
         repo.assert(predicate::repo::is_bare());
         repo.assert(predicate::repo::has_branch("main"));
