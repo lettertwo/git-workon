@@ -24,7 +24,9 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::time::Duration;
 
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use owo_colors::OwoColorize;
 
 static JSON_MODE: AtomicBool = AtomicBool::new(false);
@@ -156,6 +158,25 @@ pub fn check_warn(label: &str, detail: &str) {
     } else {
         eprintln!("  ⚠ {} — {}", label, detail);
     }
+}
+
+/// Create a consistently-styled spinner progress bar.
+///
+/// The spinner is automatically hidden in JSON mode (draw target set to hidden).
+/// Callers should call `pb.set_message(...)` and then `pb.finish_and_clear()` when done.
+pub fn create_spinner() -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    if is_json_mode() {
+        pb.set_draw_target(ProgressDrawTarget::hidden());
+    } else {
+        pb.set_style(
+            ProgressStyle::with_template("  {spinner:.green} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "✓"]),
+        );
+        pb.enable_steady_tick(Duration::from_millis(80));
+    }
+    pb
 }
 
 /// Style module for inline string formatting (checks stdout color support).
