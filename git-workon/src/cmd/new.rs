@@ -127,13 +127,23 @@ impl Run for New {
         let (worktree_name, base_branch, branch_type) = if let Some(pr) = pr_info {
             // This is a PR reference - use gh CLI workflow
             let pr_format = config.pr_format(None)?;
+
+            // Phase 1: fetch PR metadata
+            let pb = output::create_spinner();
+            pb.set_message(format!("Fetching PR #{} metadata...", pr.number));
             let (worktree_name, remote_ref, base_ref) =
                 workon::prepare_pr_worktree(&repo, pr.number, &pr_format)
-                    .wrap_err(format!("Failed to prepare PR #{} worktree", pr.number))?;
+                    .wrap_err(format!("Failed to prepare PR #{} worktree", pr.number))
+                    .inspect_err(|_| pb.finish_and_clear())?;
+            pb.finish_and_clear();
 
-            // Create worktree
+            // Phase 2: create worktree
+            let pb = output::create_spinner();
+            pb.set_message("Creating worktree...");
             let worktree =
-                add_worktree(&repo, &worktree_name, BranchType::Normal, Some(&remote_ref))?;
+                add_worktree(&repo, &worktree_name, BranchType::Normal, Some(&remote_ref))
+                    .inspect_err(|_| pb.finish_and_clear())?;
+            pb.finish_and_clear();
 
             // Fix upstream tracking
             // remote_ref is in format "remote/branch" - extract both parts
@@ -321,6 +331,12 @@ fn copy_untracked_files(
 
     let dest_path = worktree.path().to_path_buf();
 
+    let json_mode = output::is_json_mode();
+    let pb = output::create_spinner();
+    pb.set_message("Copying files...");
+
+    let mut count = 0usize;
+    let pb_copied = pb.clone();
     let copied = copy_untracked(
         &source_path,
         &dest_path,
@@ -328,10 +344,22 @@ fn copy_untracked_files(
             patterns: &patterns,
             excludes: &excludes,
             include_ignored,
+            on_copied: Box::new(move |rel_path| {
+                if !json_mode {
+                    count += 1;
+                    pb_copied.println(format!(
+                        "      {} {}",
+                        output::style::green_bold("Copied"),
+                        rel_path.display()
+                    ));
+                    pb_copied.set_message(format!("Copying files... ({} copied)", count));
+                }
+            }),
             ..Default::default()
         },
     )?;
 
+    pb.finish_and_clear();
     if !copied.is_empty() {
         output::success(&format!(
             "Copied {} file(s) from base worktree",
