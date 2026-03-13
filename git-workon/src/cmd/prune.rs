@@ -90,6 +90,8 @@ impl Run for Prune {
         }
 
         // Then, add filter-based worktrees (if any filters are specified)
+        let pb = output::create_spinner();
+        pb.set_message("Checking worktree status...");
         let filter_candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = worktrees
             .iter()
             .filter_map(|wt| {
@@ -168,6 +170,7 @@ impl Run for Prune {
                 }
             })
             .collect();
+        pb.finish_and_clear();
 
         // Combine explicit and filter-based candidates
         candidates.extend(filter_candidates);
