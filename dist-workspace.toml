@@ -21,3 +21,8 @@ publish-jobs = ["homebrew"]
 cargo-dist-version = "0.31.0"
 # Whether to install an updater program
 install-updater = false
+
+[dist.github-action-commits]
+"actions/checkout" = "v6"
+"actions/download-artifact" = "v8"
+"actions/upload-artifact" = "v7"
