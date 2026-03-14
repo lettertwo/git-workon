@@ -1,4 +1,4 @@
-use std::{env::var_os, fs::create_dir_all, fs::write, io, process::Command};
+use std::{env::var_os, fs::write, io, process::Command};
 
 #[path = "src/cli.rs"]
 mod cli;
@@ -163,8 +163,6 @@ fn generate_manpages() -> io::Result<()> {
 
     use crate::cli::Cli;
 
-    let dir = "man";
-    let path = format!("{}/{}.1", dir, env!("CARGO_PKG_NAME"));
     let cmd = Cli::command();
     let man = Man::new(cmd);
 
@@ -201,12 +199,7 @@ fn generate_manpages() -> io::Result<()> {
         }
     }
 
-    create_dir_all(dir)?;
-    write(&path, man_content.as_bytes())?;
-
-    println!("cargo:warning=generated manpage: {:?}", &path);
-
-    // Also write to OUT_DIR so the binary can embed it via include_str!
+    // Write to OUT_DIR so the binary can embed it via include_str!
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
     let out_path = format!("{}/git-workon.1", out_dir);
     write(&out_path, man_content.as_bytes())?;

@@ -9,8 +9,9 @@ install-dev: install-hooks install-man
 	cargo install --path ./git-workon --debug
 
 install-man:
+	@cargo build -p git-workon
 	@mkdir -p "$(PREFIX)/share/man/man1"
-	@ln -sf "$(abspath git-workon/man/git-workon.1)" "$(PREFIX)/share/man/man1/git-workon.1"
+	@ln -sf "$$(find target/debug/build -path '*/git-workon-*/out/git-workon.1' -print -quit)" "$(PREFIX)/share/man/man1/git-workon.1"
 	@echo "Installed man page to $(PREFIX)/share/man/man1/git-workon.1"
 
 install-hooks:
