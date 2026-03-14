@@ -1,6 +1,6 @@
 [package]
 authors.workspace = true
-categories = ["command-line-utilities", "git"]
+categories = ["command-line-utilities", "development-tools"]
 description = "A git plugin for managing worktrees"
 edition.workspace = true
 homepage.workspace = true

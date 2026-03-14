@@ -1,6 +1,6 @@
 [package]
 authors.workspace = true
-categories = ["git"]
+categories = ["development-tools", "command-line-utilities"]
 description = "API for managing worktrees"
 edition.workspace = true
 homepage.workspace = true
