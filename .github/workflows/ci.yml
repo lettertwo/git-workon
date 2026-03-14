@@ -17,7 +17,7 @@ jobs:
   conventional-commits:
     name: Conventional Commits
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'dependabot/') && !startsWith(github.head_ref, 'release-please--')
+    if: github.event_name == 'pull_request' && !startsWith(github.head_ref, 'dependabot/') && !startsWith(github.head_ref, 'release-plz-')
     steps:
       - uses: actions/checkout@v6
         with:
@@ -82,6 +82,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
     steps:
       - uses: actions/checkout@v6
       - run: rustup toolchain install
@@ -90,6 +91,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
     steps:
       - uses: actions/checkout@v6
       - run: rustup toolchain install
@@ -99,6 +101,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
     strategy:
       fail-fast: false
       matrix:
