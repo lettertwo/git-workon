@@ -82,6 +82,12 @@ pub struct CopyUntracked {
     pub to: String,
     #[arg(short, long, help = "Override patterns for one-off copy")]
     pub pattern: Option<String>,
+    #[arg(
+        short = 'x',
+        long,
+        help = "Exclude files matching pattern (additive with config)"
+    )]
+    pub exclude: Vec<String>,
     #[arg(short, long, help = "Overwrite existing files in destination")]
     pub force: bool,
     #[arg(

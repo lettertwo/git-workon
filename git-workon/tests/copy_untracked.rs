@@ -322,6 +322,134 @@ fn copy_with_no_matching_files() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn copy_with_cli_exclude() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .config("workon.copyPattern", "**/*")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    fs::write(main_worktree.join("app.js"), "app code")?;
+    fs::write(main_worktree.join("debug.log"), "log data")?;
+
+    let mut cmd = cargo_bin_cmd!("git-workon");
+    cmd.current_dir(&fixture)
+        .arg("copy-untracked")
+        .arg("--exclude")
+        .arg("*.log")
+        .arg("main")
+        .arg("feature")
+        .assert()
+        .success();
+
+    assert!(
+        feature_worktree.join("app.js").exists(),
+        "Should copy app.js (not excluded)"
+    );
+    assert!(
+        !feature_worktree.join("debug.log").exists(),
+        "Should not copy debug.log (excluded by --exclude *.log)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn copy_with_cli_exclude_additive_with_config() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .config("workon.copyPattern", "**/*")
+        .config("workon.copyExclude", "*.log")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    fs::write(main_worktree.join("app.js"), "app code")?;
+    fs::write(main_worktree.join("debug.log"), "log data")?;
+    fs::write(main_worktree.join("secret.tmp"), "temp data")?;
+
+    let mut cmd = cargo_bin_cmd!("git-workon");
+    cmd.current_dir(&fixture)
+        .arg("copy-untracked")
+        .arg("--exclude")
+        .arg("*.tmp")
+        .arg("main")
+        .arg("feature")
+        .assert()
+        .success();
+
+    assert!(
+        feature_worktree.join("app.js").exists(),
+        "Should copy app.js (not excluded)"
+    );
+    assert!(
+        !feature_worktree.join("debug.log").exists(),
+        "Should not copy debug.log (excluded by config)"
+    );
+    assert!(
+        !feature_worktree.join("secret.tmp").exists(),
+        "Should not copy secret.tmp (excluded by --exclude)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn copy_with_multiple_cli_excludes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .config("workon.copyPattern", "**/*")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    fs::write(main_worktree.join("app.js"), "app code")?;
+    fs::write(main_worktree.join("debug.log"), "log data")?;
+    fs::create_dir_all(main_worktree.join("temp"))?;
+    fs::write(main_worktree.join("temp/cache.dat"), "cached data")?;
+
+    let mut cmd = cargo_bin_cmd!("git-workon");
+    cmd.current_dir(&fixture)
+        .arg("copy-untracked")
+        .arg("--exclude")
+        .arg("*.log")
+        .arg("--exclude")
+        .arg("temp/*")
+        .arg("main")
+        .arg("feature")
+        .assert()
+        .success();
+
+    assert!(
+        feature_worktree.join("app.js").exists(),
+        "Should copy app.js (not excluded)"
+    );
+    assert!(
+        !feature_worktree.join("debug.log").exists(),
+        "Should not copy debug.log (excluded by first --exclude)"
+    );
+    assert!(
+        !feature_worktree.join("temp/cache.dat").exists(),
+        "Should not copy temp/cache.dat (excluded by second --exclude)"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn copy_without_config_defaults_to_all() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)

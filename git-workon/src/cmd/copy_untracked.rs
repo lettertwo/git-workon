@@ -33,7 +33,7 @@ impl Run for CopyUntracked {
         }
 
         let patterns = determine_patterns(self, &config)?;
-        let excludes = config.copy_excludes()?;
+        let excludes = determine_excludes(self, &config)?;
         let include_ignored =
             config.copy_include_ignored(Some(self.include_ignored).filter(|&v| v))?;
 
@@ -98,4 +98,13 @@ fn determine_patterns(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<
         return Ok(vec![pattern.clone()]);
     }
     Ok(config.copy_patterns()?)
+}
+
+/// Determine which excludes to use for copying
+///
+/// CLI excludes are additive with config excludes.
+fn determine_excludes(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<String>> {
+    let mut excludes = config.copy_excludes()?;
+    excludes.extend(cmd.exclude.iter().cloned());
+    Ok(excludes)
 }
