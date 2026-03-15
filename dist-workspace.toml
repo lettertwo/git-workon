@@ -10,7 +10,12 @@ installers = ["shell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "lettertwo/homebrew-tap"
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+targets = [
+  "aarch64-apple-darwin",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Features to pass to cargo build
@@ -21,6 +26,12 @@ publish-jobs = ["homebrew"]
 cargo-dist-version = "0.31.0"
 # Whether to install an updater program
 install-updater = false
+# Manual release rather than automatic on git tag
+# We do this because our tagging is automated through another workflow,
+# but due to GitHub Actions limitations around triggering workflows from other workflows,
+# the dist workflow has to be triggered manually anyway.
+# See the release-plz workflow for a manual trigger after the tag is created.
+dispatch-releases = true
 
 [dist.github-action-commits]
 "actions/checkout" = "v6"
