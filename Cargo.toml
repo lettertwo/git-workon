@@ -23,9 +23,9 @@ clap = { version = "4.6.0", features = [
 ] }
 clap-verbosity-flag = "3.0.4"
 clap_complete = { version = "4.6.0", features = ["unstable-dynamic"] }
-clap_mangen = "0.2.33"
+clap_mangen = "0.3.0"
 dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
-env_logger = "0.11.6"
+env_logger = "0.11.10"
 git-workon-lib = { version = "0.1.0", path = "./git-workon-lib" }
 git-workon-fixture = { path = "./git-workon-fixture" }
 git2_credentials = { version = "0.15.0", features = ["ui4dialoguer"] }
