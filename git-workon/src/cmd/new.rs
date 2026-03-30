@@ -140,9 +140,14 @@ impl Run for New {
             // Phase 2: create worktree
             let pb = output::create_spinner();
             pb.set_message("Creating worktree...");
-            let worktree =
-                add_worktree(&repo, &worktree_name, BranchType::Normal, Some(&remote_ref))
-                    .inspect_err(|_| pb.finish_and_clear())?;
+            let worktree = add_worktree(
+                &repo,
+                &worktree_name,
+                BranchType::Normal,
+                Some(&remote_ref),
+                self.lock,
+            )
+            .inspect_err(|_| pb.finish_and_clear())?;
             pb.finish_and_clear();
 
             // Fix upstream tracking
@@ -210,8 +215,14 @@ impl Run for New {
             (name, base_branch, branch_type)
         };
 
-        let worktree = add_worktree(&repo, &worktree_name, branch_type, base_branch.as_deref())
-            .wrap_err(format!("Failed to create worktree '{}'", worktree_name))?;
+        let worktree = add_worktree(
+            &repo,
+            &worktree_name,
+            branch_type,
+            base_branch.as_deref(),
+            self.lock,
+        )
+        .wrap_err(format!("Failed to create worktree '{}'", worktree_name))?;
 
         // Copy untracked files if enabled
         let copy_override = if self.copy_untracked {

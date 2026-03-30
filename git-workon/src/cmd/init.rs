@@ -18,8 +18,8 @@ impl Run for Init {
         let config = workon::WorkonConfig::new(&repo)?;
         let default_branch =
             get_default_branch_name(&repo, None).wrap_err("Failed to determine default branch")?;
-        let worktree =
-            add_worktree(&repo, &default_branch, BranchType::default(), None).wrap_err(format!(
+        let worktree = add_worktree(&repo, &default_branch, BranchType::default(), None, false)
+            .wrap_err(format!(
                 "Failed to create worktree for default branch '{}'",
                 default_branch
             ))?;

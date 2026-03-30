@@ -39,7 +39,7 @@
 //!     println!("{}: {}", wt.name().unwrap_or("?"), wt.path().display());
 //! }
 //!
-//! let wt = add_worktree(&repo, "my-feature", BranchType::Normal, None)?;
+//! let wt = add_worktree(&repo, "my-feature", BranchType::Normal, None, false)?;
 //! println!("Created: {}", wt.path().display());
 //! # Ok(())
 //! # }

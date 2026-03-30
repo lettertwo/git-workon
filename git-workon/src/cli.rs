@@ -178,6 +178,8 @@ pub struct New {
     pub copy_ignored: bool,
     #[arg(long, help = "Disable interactive mode (for testing/scripting)")]
     pub no_interactive: bool,
+    #[arg(long, help = "Lock the worktree after creation")]
+    pub lock: bool,
 }
 
 /// Prune stale worktrees.
@@ -230,6 +232,9 @@ pub struct Prune {
     pub force: bool,
     #[arg(long, help = "Keep local branch refs when pruning worktrees")]
     pub keep_branch: bool,
+    // TODO(agent-integration): Add `--include-locked` flag (bool). When set (or when
+    // `--force` is active), the locked-worktree Phase 2 safety check in `cmd/prune.rs`
+    // is bypassed. Requires `WorktreeDescriptor::is_locked()` to be implemented first.
 }
 
 /// Find a worktree to work on.

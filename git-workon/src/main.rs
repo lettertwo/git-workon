@@ -110,6 +110,7 @@ fn route_pr_ref_to_command(pr_ref: &str) -> Option<Cmd> {
             no_copy_untracked: false,
             copy_ignored: false,
             no_interactive: false,
+            lock: false,
         })),
     }
 }

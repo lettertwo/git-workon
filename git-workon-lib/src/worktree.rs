@@ -642,16 +642,12 @@ pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor
 ///   seeded with an empty initial commit.
 /// - [`BranchType::Detached`] — creates a worktree with a detached HEAD pointing to
 ///   the current HEAD commit.
-// TODO(agent-integration): Add `lock: bool` parameter to `add_worktree()`. When true,
-// write a lock file at `.git/worktrees/<name>/locked` after the worktree is created.
-// This pairs with the `--lock` flag on `git workon new` (see `git-workon/src/cli.rs`)
-// and `is_locked()` above. Git's own `git worktree add --lock` writes an empty lock
-// file; optionally accept a reason string to write as the file content.
 pub fn add_worktree(
     repo: &Repository,
     branch_name: &str,
     branch_type: BranchType,
     base_branch: Option<&str>,
+    lock: bool,
 ) -> Result<WorktreeDescriptor> {
     // git worktree add <branch>
     debug!(
@@ -730,6 +726,9 @@ pub fn add_worktree(
     let mut opts = WorktreeAddOptions::new();
     if let Some(ref r) = reference {
         opts.reference(Some(r));
+    }
+    if lock {
+        opts.lock(true);
     }
 
     debug!(
