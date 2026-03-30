@@ -138,6 +138,25 @@ impl WorktreeDescriptor {
         Ok(!statuses.is_empty())
     }
 
+    /// Returns true if the worktree has a lock file.
+    ///
+    /// Locked worktrees are protected from pruning unless `--include-locked`
+    /// or `--force` is used.
+    pub fn is_locked(&self) -> Result<bool> {
+        Ok(!matches!(
+            self.worktree.is_locked()?,
+            git2::WorktreeLockStatus::Unlocked
+        ))
+    }
+
+    /// Returns true if the worktree's path and git metadata are intact.
+    ///
+    /// A worktree is invalid if its directory is missing or its git
+    /// metadata is broken.
+    pub fn is_valid(&self) -> bool {
+        self.worktree.validate().is_ok()
+    }
+
     /// Returns true if the worktree has uncommitted changes to tracked files.
     ///
     /// Unlike `is_dirty()`, this excludes untracked files. Use this when
@@ -623,6 +642,11 @@ pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor
 ///   seeded with an empty initial commit.
 /// - [`BranchType::Detached`] — creates a worktree with a detached HEAD pointing to
 ///   the current HEAD commit.
+// TODO(agent-integration): Add `lock: bool` parameter to `add_worktree()`. When true,
+// write a lock file at `.git/worktrees/<name>/locked` after the worktree is created.
+// This pairs with the `--lock` flag on `git workon new` (see `git-workon/src/cli.rs`)
+// and `is_locked()` above. Git's own `git worktree add --lock` writes an empty lock
+// file; optionally accept a reason string to write as the file content.
 pub fn add_worktree(
     repo: &Repository,
     branch_name: &str,

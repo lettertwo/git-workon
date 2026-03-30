@@ -941,4 +941,50 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn test_is_locked_unlocked_worktree() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        assert!(!worktree.is_locked()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_locked_locked_worktree() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        // Lock the worktree via the underlying git2 API
+        let raw_wt = repo.find_worktree("feature")?;
+        raw_wt.lock(None)?;
+
+        assert!(worktree.is_locked()?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_valid_existing_worktree() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+        let worktree = add_worktree(repo, "feature", BranchType::Normal, None)?;
+
+        assert!(worktree.is_valid());
+
+        Ok(())
+    }
 }
