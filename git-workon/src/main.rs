@@ -62,7 +62,17 @@ fn main() -> Result<()> {
         }
     }
 
-    let worktree = cmd.run()?;
+    let worktree = match cmd.run() {
+        Ok(wt) => wt,
+        Err(ref e) if json_mode => {
+            let code = e.code().map(|c| c.to_string());
+            let msg = e.to_string();
+            let json = serde_json::json!({"error": {"code": code, "message": msg}});
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            std::process::exit(1);
+        }
+        Err(e) => return Err(e),
+    };
 
     if json_mode {
         if let Some(wt) = worktree {
