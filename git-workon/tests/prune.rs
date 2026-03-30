@@ -1328,6 +1328,71 @@ fn prune_json_includes_branch_deleted_field() -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+#[test]
+fn prune_skips_locked_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Lock the worktree
+    let repo = fixture.repo()?;
+    repo.find_worktree("feature")?.lock(None)?;
+
+    // Delete the branch to make it a prune candidate
+    repo.find_reference("refs/heads/feature")?.delete()?;
+
+    // Run prune - should skip locked worktree
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Skipped worktrees"))
+        .stderr(predicate::str::contains("locked"))
+        .stderr(predicate::str::contains("No worktrees to prune"));
+
+    // Verify worktree still exists
+    fixture.cwd()?.assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_include_locked_removes_locked_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // Lock the worktree
+    let repo = fixture.repo()?;
+    repo.find_worktree("feature")?.lock(None)?;
+
+    // Delete the branch to make it a prune candidate
+    repo.find_reference("refs/heads/feature")?.delete()?;
+
+    // Run prune with --include-locked - should prune despite lock
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .arg("--include-locked")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify worktree is gone
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
 // --- Interactive PTY tests ---
 
 fn cargo_bin_path() -> PathBuf {

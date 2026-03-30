@@ -11,6 +11,7 @@ pub fn worktree_to_json(wt: &WorktreeDescriptor) -> Value {
         "branch": wt.branch().ok().flatten(),
         "head_commit": wt.head_commit().ok().flatten(),
         "is_dirty": wt.is_dirty().ok(),
+        "is_locked": wt.is_locked().ok(),
         "has_unpushed_commits": wt.has_unpushed_commits().ok(),
         "is_behind_upstream": wt.is_behind_upstream().ok(),
         "has_gone_upstream": wt.has_gone_upstream().ok(),

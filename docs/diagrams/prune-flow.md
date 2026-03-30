@@ -34,7 +34,11 @@ flowchart TD
 
         S2{is default\nbranch?}
         S2 -->|"yes + !force"| SKIP_DEFAULT["skip: is default worktree"]
-        S2 -->|no or force| S3
+        S2 -->|no or force| S2B
+
+        S2B{"is_locked?\nTODO(agent-integration)"}
+        S2B -->|"yes + !force + !include_locked"| SKIP_LOCKED["skip: locked\nuse --include-locked"]
+        S2B -->|no or overridden| S3
 
         S3{"is_dirty?\n(RemoteGone: has_tracked_changes?)"}
         S3 -->|"yes + !force + !allow_dirty"| SKIP_DIRTY["skip: uncommitted changes\nuse --allow-dirty"]
@@ -84,7 +88,9 @@ flowchart TD
 
 ## Force flag
 
-`--force` is a single override that disables all four safety checks simultaneously: protected, default-branch, dirty, and unmerged. It does not affect JSON mode or dry-run behavior.
+`--force` is a single override that disables all five safety checks simultaneously: protected, default-branch, locked, dirty, and unmerged. It does not affect JSON mode or dry-run behavior.
+
+`--include-locked` opts in to pruning locked worktrees without disabling other safety checks (TODO(agent-integration): implement with `--lock` / `is_locked()`).
 
 ## Key files
 

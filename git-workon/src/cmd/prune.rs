@@ -203,6 +203,17 @@ impl Run for Prune {
                     }
                 }
 
+                // Skip locked worktrees unless --include-locked or --force
+                if !self.force && !self.include_locked {
+                    if let Ok(true) = wt.is_locked() {
+                        skipped.push((
+                            candidate,
+                            "locked (use --include-locked to override)".to_string(),
+                        ));
+                        return None;
+                    }
+                }
+
                 // Check for uncommitted changes.
                 // For RemoteGone, only block on tracked-file changes — untracked files
                 // (build artifacts, IDE dirs, etc.) are common and not a safety concern.
@@ -261,9 +272,11 @@ impl Run for Prune {
             // JSON mode: skip confirmation, output structured result
             let delete_branch = !self.keep_branch;
             let mut pruned_with_status: Vec<(&PruneCandidate, bool)> = Vec::new();
+            let force_locked = self.force || self.include_locked;
             if !self.dry_run {
                 for candidate in &to_prune {
-                    let branch_deleted = prune_worktree(&repo, candidate, delete_branch)?;
+                    let branch_deleted =
+                        prune_worktree(&repo, candidate, delete_branch, force_locked)?;
                     pruned_with_status.push((candidate, branch_deleted));
                 }
             } else {
@@ -352,8 +365,9 @@ impl Run for Prune {
 
         // Prune the worktrees
         let delete_branch = !self.keep_branch;
+        let force_locked = self.force || self.include_locked;
         for candidate in &to_prune {
-            prune_worktree(&repo, candidate, delete_branch)?;
+            prune_worktree(&repo, candidate, delete_branch, force_locked)?;
         }
 
         output::success(&format!("Pruned {} worktree(s)", to_prune.len()));
@@ -423,6 +437,7 @@ fn prune_worktree(
     repo: &git2::Repository,
     candidate: &PruneCandidate,
     delete_branch: bool,
+    force_locked: bool,
 ) -> Result<bool> {
     // Remove the worktree directory first
     if candidate.worktree_path.exists() {
@@ -435,6 +450,9 @@ fn prune_worktree(
         .into_diagnostic()?;
     let mut opts = git2::WorktreePruneOptions::new();
     opts.valid(true); // Allow pruning even if worktree is valid
+    if force_locked {
+        opts.locked(true); // Allow pruning even if worktree is locked
+    }
     worktree.prune(Some(&mut opts)).into_diagnostic()?;
 
     // Optionally delete the local branch ref.

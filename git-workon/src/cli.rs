@@ -227,14 +227,13 @@ pub struct Prune {
     #[arg(
         short,
         long,
-        help = "Override all safety checks (protection, default branch, dirty, unmerged)"
+        help = "Override all safety checks (protection, default branch, dirty, unmerged, locked)"
     )]
     pub force: bool,
     #[arg(long, help = "Keep local branch refs when pruning worktrees")]
     pub keep_branch: bool,
-    // TODO(agent-integration): Add `--include-locked` flag (bool). When set (or when
-    // `--force` is active), the locked-worktree Phase 2 safety check in `cmd/prune.rs`
-    // is bypassed. Requires `WorktreeDescriptor::is_locked()` to be implemented first.
+    #[arg(long, help = "Include locked worktrees when pruning")]
+    pub include_locked: bool,
 }
 
 /// Find a worktree to work on.
