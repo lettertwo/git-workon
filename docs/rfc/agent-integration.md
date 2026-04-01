@@ -137,6 +137,7 @@ git-workon has a strong foundation for agent integration:
   "branch": "string | null",
   "head_commit": "string | null",
   "is_dirty": "boolean | null",
+  "is_locked": "boolean | null",
   "has_unpushed_commits": "boolean | null",
   "is_behind_upstream": "boolean | null",
   "has_gone_upstream": "boolean | null",
@@ -149,22 +150,24 @@ git-workon has a strong foundation for agent integration:
 
 Fields that error default to `null` rather than failing the command — a correct fail-safe for partial status information.
 
-### Current Gaps for Agent Integration
-
-**1. No machine-readable error output**
-
-Errors use Miette's human-readable diagnostic format on stderr. There is no error response JSON schema. An agent calling `git workon find nonexistent --json --no-interactive` gets rich terminal-formatted text on stderr that is not parseable. This makes error differentiation (not found vs. ambiguous match vs. git error) require exit code heuristics.
-
-A minimal structured error response in `--json` mode would address this:
+**Structured error output**: In `--json` mode, errors emit a JSON object to stdout before exiting non-zero. Error codes are derived from Miette's `#[diagnostic(code(...))]` attributes and are stable API surface:
 
 ```json
 {
   "error": {
-    "code": "not_found",
-    "message": "No worktree matching 'nonexistent'"
+    "code": "workon::worktree::not_found",
+    "message": "worktree 'foo' does not exist"
   }
 }
 ```
+
+See `docs/adr/021-structured-json-error-protocol.md` for full design rationale.
+
+### Current Gaps for Agent Integration
+
+**1. ~~No machine-readable error output~~ (implemented)**
+
+~~Errors use Miette's human-readable diagnostic format on stderr.~~ In `--json` mode, errors now emit a structured JSON object to stdout before exiting non-zero. Error codes come from Miette's `#[diagnostic(code(...))]` attributes and are stable API surface. Human-readable Miette output on stderr is unchanged in non-JSON mode. See `docs/adr/021-structured-json-error-protocol.md`.
 
 **2. No pre-creation hook**
 
@@ -176,7 +179,9 @@ Hooks receive only `WORKON_WORKTREE_PATH`, `WORKON_BRANCH_NAME`, and `WORKON_BAS
 
 **4. No session or ownership tracking**
 
-git-workon has no concept of which process or agent created a worktree, whether it is currently active, or when it was last used. `last_activity` in WorktreeDescriptor approximates this from filesystem timestamps but is not authoritative. Without ownership tracking, `prune` must be conservative about removing worktrees that may be in active use by an agent.
+git-workon has no concept of which process or agent created a worktree, whether it is currently active, or when it was last used. `last_activity` in WorktreeDescriptor approximates this from filesystem timestamps but is not authoritative.
+
+The minimum viable session awareness — using git's native lock mechanism — is now implemented: `git workon new --lock` atomically creates and locks a worktree, `prune` skips locked worktrees by default, and `--include-locked` overrides this. `is_locked` is exposed in the JSON schema. Full session/ownership tracking (session IDs, agent identity) remains unimplemented.
 
 **5. `--no-interactive` not universal**
 
@@ -347,13 +352,13 @@ The real risk is layout divergence: Claude Code creates worktrees inside the rep
 
 `git workon prune` checks for dirty working trees and unpushed commits before removing a worktree, but it has no way to know if an agent is actively using a worktree. A worktree that is clean and in sync could still be an agent's active workspace.
 
-Without session/ownership tracking, the conservative approach is:
+Without full session/ownership tracking, the conservative approach is now in place:
 
-- Agent-created worktrees should be `--lock`'d at creation time
-- `git workon prune` should respect the git locked state (skip locked worktrees)
+- Agent-created worktrees can be `--lock`'d at creation time via `git workon new --lock`
+- `git workon prune` skips locked worktrees by default (with `--include-locked` to override)
 - Agents should unlock and then call `prune` (or `WorktreeRemove`) on cleanup
 
-This would require two additions: (1) `git workon new --lock` flag that passes `--lock` through to `git worktree add`, and (2) `git workon prune` skipping locked worktrees by default (with `--include-locked` to override).
+Both additions are implemented: `git workon new --lock` passes `--lock` through to `git worktree add`, and `prune` respects the locked state.
 
 ### Application-Level Serialization
 
@@ -384,16 +389,11 @@ For high-concurrency scenarios (many parallel agents all calling `git workon new
 - A `--lock` / `--unlock` mechanism on `new` and `prune` would make lifecycle boundaries explicit
 - `WorktreeDescriptor` could expose whether a worktree is locked (this is already in git's worktree metadata)
 
-### 3. Structured Error Protocol
+### 3. Structured Error Protocol (implemented)
 
-**What it is**: The need for machine-readable error responses when git-workon is called programmatically by agents or the MCP server.
+**What it is**: Machine-readable error responses when git-workon is called programmatically by agents or the MCP server.
 
-**Implications for git-workon**:
-
-- In `--json` mode, errors should output a JSON error object to stdout (and still exit non-zero)
-- A minimal schema: `{"error": {"code": "string", "message": "string", "details": "..."}}`
-- Error codes should map to the existing error enum variants (not found, already exists, dirty, etc.)
-- This is purely additive — non-JSON mode (Miette formatting) is unchanged
+**Status**: Implemented. In `--json` mode, errors output a JSON error object to stdout (and still exit non-zero). Error codes come from Miette's `#[diagnostic(code(...))]` attributes, making them stable API surface. Non-JSON mode (Miette formatting) is unchanged. See `docs/adr/021-structured-json-error-protocol.md`.
 
 ### 4. MCP Tool Surface
 
@@ -406,16 +406,11 @@ For high-concurrency scenarios (many parallel agents all calling `git workon new
 - The MCP server should be a thin wrapper over the CLI (or lib) — it should not contain business logic
 - Start with the four core operations (list, create, find, remove) and add PR creation as a fifth
 
-### 5. Session Awareness
+### 5. Session Awareness (minimum viable — implemented)
 
 **What it is**: The ability to distinguish worktrees that are actively in use by agents from idle or abandoned worktrees.
 
-**Implications for git-workon**:
-
-- A `--lock` flag on `new` (passing through to `git worktree lock`) would let agents mark their worktrees as active
-- `prune` should skip locked worktrees by default
-- This is the minimum viable session awareness — no custom metadata, just git's existing lock mechanism
-- More sophisticated tracking (session IDs, timestamps, agent identity) is possible but likely over-engineering for now
+**Status**: Minimum viable session awareness is implemented using git's native lock mechanism: `git workon new --lock` atomically creates and locks a worktree; `prune` skips locked worktrees by default (`--include-locked` to override); `is_locked` is exposed in the WorktreeDescriptor JSON schema. More sophisticated tracking (session IDs, timestamps, agent identity) remains out of scope.
 
 ---
 
@@ -425,11 +420,11 @@ For high-concurrency scenarios (many parallel agents all calling `git workon new
 
 **Hook delegation documentation first**: Before writing any new code, document the `WorktreeCreate` hook pattern for Claude Code users. This is the highest-leverage action — it works today and requires only a README/docs addition.
 
-**Structured JSON errors**: When `--json` mode is active and a command fails, emit a JSON error object to stdout before exiting non-zero. This unblocks both scripted CLI use and the MCP server.
+**~~Structured JSON errors~~** ✓ Done — In `--json` mode, errors emit a JSON error object to stdout before exiting non-zero. See `docs/adr/021-structured-json-error-protocol.md`.
 
-**Respect git's lock state in prune**: `git workon prune` should skip worktrees where git's locked file is present, with a `--include-locked` flag to override. This is a one-line check and makes agent-created (locked) worktrees safe from accidental pruning.
+**~~Respect git's lock state in prune~~** ✓ Done — `git workon prune` skips locked worktrees by default; `--include-locked` overrides.
 
-**`new --lock` flag**: Pass `--lock` through to `git worktree add` so agents (via hook delegation) can atomically create-and-lock their worktrees.
+**~~`new --lock` flag~~** ✓ Done — `git workon new --lock` passes `--lock` through to `git worktree add`.
 
 **MCP server as a separate crate**: When implementing the MCP server, make it a standalone binary (`git-workon-mcp`) that depends on `workon` (git-workon-lib). Keep all worktree logic in the library; the MCP server is just protocol translation.
 
@@ -457,13 +452,13 @@ For high-concurrency scenarios (many parallel agents all calling `git workon new
 
 2. **Docs: Direct CLI scripting guide** — Document the `--json --no-interactive` patterns, list the available filters, and show the full WorktreeDescriptor schema.
 
-3. **`prune`: Respect locked worktrees** — Skip worktrees where `.git/worktrees/<id>/locked` exists. Add `--include-locked` flag to override. (~10 lines of code, no new dependencies.)
+3. ✓ **`prune`: Respect locked worktrees** — Skips worktrees where `.git/worktrees/<id>/locked` exists. `--include-locked` flag overrides.
 
-4. **`new --lock`** — Pass `--lock` to `git worktree add` when this flag is set, so hook-delegated worktrees can be atomically created and protected from pruning.
+4. ✓ **`new --lock`** — Passes `--lock` to `git worktree add` when this flag is set, atomically creating and protecting from pruning.
 
-### Phase 2: Structured Error Output
+### ~~Phase 2: Structured Error Output~~ (complete)
 
-5. **`--json` error protocol** — In JSON mode, emit `{"error": {"code": "...", "message": "..."}}` to stdout on failure. Map existing error enum variants to stable code strings. This is a prerequisite for the MCP server and improves all programmatic use.
+5. ✓ **`--json` error protocol** — In JSON mode, emits `{"error": {"code": "...", "message": "..."}}` to stdout on failure. Error codes come from Miette `#[diagnostic(code(...))]` attributes (stable API surface). See `docs/adr/021-structured-json-error-protocol.md`.
 
 ### Phase 3: MCP Server (New Crate)
 
