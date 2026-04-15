@@ -1,4 +1,5 @@
 use git2::{Direction, Remote, RemoteCallbacks, Repository};
+use log::debug;
 
 use crate::error::{DefaultBranchError, Result};
 use crate::get_remote_callbacks;
@@ -75,7 +76,18 @@ pub fn get_default_branch_name(repo: &Repository, remote: Option<Remote>) -> Res
         default_branch.remote(remote);
         default_branch.remote_callbacks(get_remote_callbacks().unwrap());
     }
-    default_branch.get_name()
+    default_branch.get_name().or_else(|_| {
+        debug!("Failed to read default branch from remote, trying git config");
+        let branch = repo
+            .config()
+            .ok()
+            .and_then(|config| config.get_string("init.defaultbranch").ok())
+            .unwrap_or_else(|| {
+                debug!("No init.defaultbranch config, falling back to 'main'");
+                "main".to_string()
+            });
+        Ok(branch)
+    })
 }
 
 /// Get the default branch name for a repository, validated to exist.
