@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2](https://github.com/lettertwo/git-workon/compare/git-workon-v0.1.1...git-workon-v0.1.2) - 2026-04-15
+
+### Added
+
+- *(cli)* add --include-locked to prune and is_locked to JSON output
+- *(lib)* add lock parameter to add_worktree() and --lock flag to new
+- *(cli)* emit structured JSON errors in --json mode
+
+### Other
+
+- *(dist)* remove leading article from description per brew style guide
+
 ## [0.1.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.1.0...git-workon-v0.1.1) - 2026-03-14
 
 ### Other
