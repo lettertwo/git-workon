@@ -57,6 +57,7 @@ mod get_repo;
 mod init;
 mod r#move;
 mod pr;
+mod ssh_config;
 mod workon_root;
 mod worktree;
 

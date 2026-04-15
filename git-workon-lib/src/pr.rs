@@ -469,8 +469,12 @@ pub fn fetch_branch(repo: &Repository, remote_name: &str, branch: &str) -> Resul
         branch, remote_name, branch
     );
 
+    let remote_url = repo
+        .find_remote(remote_name)
+        .ok()
+        .and_then(|r| r.url().map(str::to_string));
     let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(get_remote_callbacks()?);
+    fetch_options.remote_callbacks(get_remote_callbacks(remote_url.as_deref())?);
 
     repo.find_remote(remote_name)?
         .fetch(

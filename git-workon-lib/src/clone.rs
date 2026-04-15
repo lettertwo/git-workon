@@ -43,7 +43,7 @@ pub fn clone(path: PathBuf, url: &str, options: CloneOptions) -> Result<Reposito
 
     debug!("final path {}", path.display());
 
-    let mut callbacks = get_remote_callbacks()?;
+    let mut callbacks = get_remote_callbacks(Some(url))?;
     callbacks.transfer_progress(move |progress| {
         on_transfer_progress(
             progress.received_objects(),
