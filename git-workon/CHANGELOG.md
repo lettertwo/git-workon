@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/lettertwo/git-workon/compare/git-workon-v0.1.2...git-workon-v0.1.3) - 2026-04-17
+
+### Added
+
+- *(cli)* show worktree dir as primary label with trailing branch annotation
+- *(build)* install man page and completions via Homebrew formula
+
+### Fixed
+
+- *(copy)* skip .git file in worktrees and reduce skip message verbosity
+
 ## [0.1.2](https://github.com/lettertwo/git-workon/compare/git-workon-v0.1.1...git-workon-v0.1.2) - 2026-04-15
 
 ### Added
