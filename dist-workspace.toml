@@ -33,6 +33,10 @@ install-updater = false
 # See the release-plz workflow for a manual trigger after the tag is created.
 dispatch-releases = true
 
+# Prevents 'dist init'/'dist generate' from clobbering our manual edits
+# to .github/workflows/release.yml (homebrew formula patching for man/completions).
+allow-dirty = ["ci"]
+
 [dist.github-action-commits]
 "actions/checkout" = "v6"
 "actions/download-artifact" = "v8"

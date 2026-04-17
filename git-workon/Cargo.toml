@@ -40,6 +40,14 @@ pathdiff.workspace = true
 supports-color.workspace = true
 unicode-width.workspace = true
 
+[package.metadata.dist]
+include = [
+  "dist/git-workon.1",
+  "dist/git-workon.bash",
+  "dist/_git-workon",
+  "dist/git-workon.fish",
+]
+
 [dev-dependencies]
 assert_cmd.workspace = true
 assert_fs.workspace = true

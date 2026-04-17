@@ -306,6 +306,24 @@ jobs:
           pattern: artifacts-*
           path: Formula/
           merge-multiple: true
+      # Patch each generated formula to install man page and shell completions.
+      # cargo-dist 0.31 does not support this natively (see axodotdev/cargo-dist#27).
+      # We inject before the `doc_files = Dir[...]` line so that our files are
+      # installed explicitly and do not fall through to pkgshare.install.
+      - name: Patch formulae with man and completion install steps
+        run: |
+          for formula in Formula/*.rb; do
+            ruby -pi -e '
+              if /^(\s*)install_binary_aliases!/ =~ $_
+                indent = $1
+                $_ << "#{indent}# Install man page and shell completions bundled in the release archive.\n" \
+                    + "#{indent}man1.install \"git-workon.1\"\n" \
+                    + "#{indent}bash_completion.install \"git-workon.bash\" => \"git-workon\"\n" \
+                    + "#{indent}zsh_completion.install  \"_git-workon\"\n" \
+                    + "#{indent}fish_completion.install \"git-workon.fish\"\n"
+              end
+            ' "$formula"
+          done
       # This is extra complex because you can make your Formula name not match your app name
       # so we need to find releases with a *.rb file, and publish with that filename.
       - name: Commit formula files

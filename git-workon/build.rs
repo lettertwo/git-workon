@@ -20,6 +20,7 @@ fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed={}", readme_path.display());
 
     generate_manpages()?;
+    generate_completions()?;
     Ok(())
 }
 
@@ -203,6 +204,56 @@ fn generate_manpages() -> io::Result<()> {
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set by cargo");
     let out_path = format!("{}/git-workon.1", out_dir);
     write(&out_path, man_content.as_bytes())?;
+
+    // Also write to dist/ for packaging (cargo-dist include).
+    write_if_changed("dist/git-workon.1", man_content.as_bytes())?;
+
+    Ok(())
+}
+
+/// Write `content` to `<CARGO_MANIFEST_DIR>/<rel_path>`, but only if the file
+/// does not already contain identical bytes. This prevents Cargo from seeing a
+/// mtime change and triggering an unnecessary rebuild loop.
+fn write_if_changed(rel_path: &str, content: &[u8]) -> io::Result<()> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let path = dir.join(rel_path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let existing = std::fs::read(&path)?;
+        if existing == content {
+            return Ok(());
+        }
+    }
+    write(&path, content)
+}
+
+fn generate_completions() -> io::Result<()> {
+    use clap::CommandFactory;
+    use clap_complete::env::{Bash, EnvCompleter, Fish, Zsh};
+
+    use crate::cli::Cli;
+
+    let pkg_name = env!("CARGO_PKG_NAME");
+    let cmd = Cli::command();
+
+    let shells: &[(&dyn EnvCompleter, &str)] = &[
+        (&Bash, "dist/git-workon.bash"),
+        (&Zsh, "dist/_git-workon"),
+        (&Fish, "dist/git-workon.fish"),
+    ];
+
+    for (shell, rel_path) in shells {
+        let mut buf: Vec<u8> = Vec::new();
+        shell
+            .write_registration("COMPLETE", pkg_name, pkg_name, pkg_name, &mut buf)
+            .map_err(io::Error::other)?;
+        write_if_changed(rel_path, &buf)?;
+    }
+
+    // cmd is only needed to satisfy CommandFactory; keep it alive to the end.
+    drop(cmd);
 
     Ok(())
 }
