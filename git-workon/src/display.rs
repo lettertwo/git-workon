@@ -16,10 +16,14 @@
 //!
 //! ## Display Format
 //!
-//! Column-aligned output with active marker, indicators, path, and last activity:
+//! Column-aligned output: active marker, dimmed `./` + bold directory name, colored status
+//! indicators, dimmed last activity, and an optional dimmed branch name at the end (when the
+//! checked-out branch differs from the directory name).
+//!
 //! ```text
-//!   main              ./main           2 hours ago
-//! → feature-auth   *  ./feature-auth   3 days ago
+//!   ./main                    2 hours ago
+//! → ./feature-auth  *         3 days ago
+//!   ./my-feature    ↑         1 hour ago  my-feat-pt2
 //! ```
 //!
 //! Used by `list` for output and `find` for interactive selection.
@@ -35,9 +39,12 @@ use crate::output::style;
 /// Structured data for one row of the aligned worktree list.
 pub struct WorktreeDisplayRow {
     pub is_active: bool,
-    pub branch_name: String,
+    /// The directory name relative to the workon root (e.g., `my-feature` or `user/feature`).
+    pub dir_name: String,
+    /// Branch name shown (dimmed) when the checked-out branch differs from the directory name,
+    /// or `(detached HEAD)` when HEAD is detached.
+    pub branch_annotation: Option<String>,
     pub indicators: Vec<String>,
-    pub path: String,
     pub last_activity: String,
 }
 
@@ -49,9 +56,14 @@ pub fn worktree_display_row(
 ) -> Result<WorktreeDisplayRow> {
     let is_active = current_dir.starts_with(wt.path());
 
-    let branch_name = match wt.branch()? {
-        Some(name) => name,
-        None => "(detached HEAD)".to_string(),
+    let dir_name = pathdiff::diff_paths(wt.path(), root)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| wt.path().display().to_string());
+
+    let branch_annotation = match wt.branch()? {
+        Some(branch) if branch == dir_name => None,
+        Some(branch) => Some(branch),
+        None => Some("(detached HEAD)".to_string()),
     };
 
     let mut indicators: Vec<String> = Vec::new();
@@ -68,10 +80,6 @@ pub fn worktree_display_row(
         indicators.push("✗".to_string());
     }
 
-    let rel_path = pathdiff::diff_paths(wt.path(), root)
-        .map(|p| format!("./{}", p.display()))
-        .unwrap_or_else(|| wt.path().display().to_string());
-
     let last_activity = wt
         .last_activity()
         .ok()
@@ -81,9 +89,9 @@ pub fn worktree_display_row(
 
     Ok(WorktreeDisplayRow {
         is_active,
-        branch_name,
+        dir_name,
+        branch_annotation,
         indicators,
-        path: rel_path,
         last_activity,
     })
 }
@@ -98,45 +106,42 @@ pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool
         return Vec::new();
     }
 
-    let max_branch = rows
-        .iter()
-        .map(|r| r.branch_name.width())
-        .max()
-        .unwrap_or(0);
-    let max_indicators = rows
+    let max_name = rows.iter().map(|r| r.dir_name.width()).max().unwrap_or(0);
+
+    let indicator_widths: Vec<usize> = rows
         .iter()
         .map(|r| r.indicators.join(" ").width())
-        .max()
-        .unwrap_or(0);
-    let max_path = rows.iter().map(|r| r.path.width()).max().unwrap_or(0);
+        .collect();
+    let max_indicators = indicator_widths.iter().copied().max().unwrap_or(0);
 
     rows.iter()
-        .map(|row| {
-            let branch = style::bold(&row.branch_name);
-            let branch_pad = max_branch - row.branch_name.width();
+        .enumerate()
+        .map(|(i, row)| {
+            let prefix = style::dim("./");
+            let name = style::bold(&row.dir_name);
+            let name_pad = max_name - row.dir_name.width();
 
-            let indicators_plain = row.indicators.join(" ");
-            let indicators_display = if row.indicators.is_empty() {
-                indicators_plain.clone()
-            } else {
-                row.indicators
-                    .iter()
-                    .map(|i| match i.as_str() {
-                        "*" => style::yellow(i),
-                        "↑" => style::green(i),
-                        "↓" => style::red(i),
-                        "✗" => style::red_bold(i),
-                        _ => i.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            let indicators_pad = max_indicators - indicators_plain.width();
-
-            let path = style::dim(&row.path);
-            let path_pad = max_path - row.path.width();
+            let indicators_display = row
+                .indicators
+                .iter()
+                .map(|ind| match ind.as_str() {
+                    "*" => style::yellow(ind),
+                    "↑" => style::green(ind),
+                    "↓" => style::red(ind),
+                    "✗" => style::red_bold(ind),
+                    _ => ind.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let indicators_pad = max_indicators - indicator_widths[i];
 
             let activity = style::dim(&row.last_activity);
+
+            let branch = row
+                .branch_annotation
+                .as_deref()
+                .map(|ann| format!("  {}", style::dim(ann)))
+                .unwrap_or_default();
 
             if show_active_marker {
                 let marker = if row.is_active {
@@ -145,26 +150,26 @@ pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool
                     " ".to_string()
                 };
                 format!(
-                    "{} {}{} {}{} {}{}  {}",
+                    "{} {}{}{} {}{}  {}{}",
                     marker,
-                    branch,
-                    " ".repeat(branch_pad),
+                    prefix,
+                    name,
+                    " ".repeat(name_pad),
                     indicators_display,
                     " ".repeat(indicators_pad),
-                    path,
-                    " ".repeat(path_pad),
                     activity,
+                    branch,
                 )
             } else {
                 format!(
-                    "{}{} {}{} {}{}  {}",
-                    branch,
-                    " ".repeat(branch_pad),
+                    "{}{}{} {}{}  {}{}",
+                    prefix,
+                    name,
+                    " ".repeat(name_pad),
                     indicators_display,
                     " ".repeat(indicators_pad),
-                    path,
-                    " ".repeat(path_pad),
                     activity,
+                    branch,
                 )
             }
         })

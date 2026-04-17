@@ -21,9 +21,11 @@ fn worktree_help(wt: &WorktreeDescriptor, root: &Path, current_dir: &Path) -> Op
     if !row.indicators.is_empty() {
         parts.push(row.indicators.join(" "));
     }
-    parts.push(row.path);
     if !row.last_activity.is_empty() {
         parts.push(row.last_activity);
+    }
+    if let Some(ann) = row.branch_annotation {
+        parts.push(ann);
     }
 
     Some(StyledStr::from(parts.join("  ")))
