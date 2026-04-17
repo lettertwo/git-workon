@@ -41,7 +41,7 @@ impl Run for CopyUntracked {
         let pb = output::create_spinner();
         pb.set_message("Copying files...");
 
-        let show_skipped = log::log_enabled!(log::Level::Debug);
+        let show_skipped = log::log_enabled!(log::Level::Trace);
         let mut count = 0usize;
         let pb_copied = pb.clone();
         let pb_skipped = pb.clone();

@@ -193,6 +193,13 @@ pub fn copy_untracked(
             None => continue,
         };
 
+        // Skip .git entry — in worktrees this is a file (not a directory) containing
+        // a gitdir pointer, so the directory check above doesn't catch it. Copying it
+        // would corrupt the destination worktree's git pointer.
+        if rel_path == Path::new(".git") {
+            continue;
+        }
+
         // Skip files tracked in the git index (handles `git add -f`'d ignored files correctly)
         if index.get_path(&rel_path, 0).is_some() {
             on_skipped("tracked", &rel_path);

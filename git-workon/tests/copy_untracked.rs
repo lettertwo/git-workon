@@ -492,3 +492,49 @@ fn copy_without_config_defaults_to_all() -> Result<(), Box<dyn std::error::Error
 
     Ok(())
 }
+
+#[test]
+fn copy_does_not_copy_dot_git() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    // In a worktree, .git is a file (not directory) containing a gitdir pointer
+    assert!(
+        main_worktree.join(".git").exists(),
+        ".git must exist in source worktree"
+    );
+    let original_git = fs::read_to_string(feature_worktree.join(".git"))?;
+
+    // Create an untracked file so the copy actually runs
+    fs::write(main_worktree.join("test.txt"), "test")?;
+
+    let mut cmd = cargo_bin_cmd!("git-workon");
+    cmd.current_dir(&fixture)
+        .arg("copy-untracked")
+        .arg("main")
+        .arg("feature")
+        .assert()
+        .success();
+
+    // .git must not have been overwritten
+    let after_git = fs::read_to_string(feature_worktree.join(".git"))?;
+    assert_eq!(
+        original_git, after_git,
+        ".git file must not be modified by copy-untracked"
+    );
+
+    // Normal untracked file was still copied
+    assert!(
+        feature_worktree.join("test.txt").exists(),
+        "test.txt should be copied"
+    );
+
+    Ok(())
+}
