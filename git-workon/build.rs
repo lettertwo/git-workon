@@ -206,9 +206,22 @@ fn generate_manpages() -> io::Result<()> {
     write(&out_path, man_content.as_bytes())?;
 
     // Also write to dist/ for packaging (cargo-dist include).
-    write_if_changed("dist/git-workon.1", man_content.as_bytes())?;
+    // Skip during `cargo publish` verification — the dist/ dir is not part of the
+    // published crate and creating it would trigger a source-directory-modified error.
+    if !is_publish_verification() {
+        write_if_changed("dist/git-workon.1", man_content.as_bytes())?;
+    }
 
     Ok(())
+}
+
+/// Returns true when running inside `cargo publish`'s verification step.
+/// During verification, Cargo unpacks the tarball into `target/package/<name>-<version>/`,
+/// so `CARGO_MANIFEST_DIR` will contain that path. We use this to skip writes to the
+/// source tree that would cause Cargo to report a source-directory modification.
+fn is_publish_verification() -> bool {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    manifest_dir.contains("/target/package/")
 }
 
 /// Write `content` to `<CARGO_MANIFEST_DIR>/<rel_path>`, but only if the file
@@ -244,12 +257,16 @@ fn generate_completions() -> io::Result<()> {
         (&Fish, "dist/git-workon.fish"),
     ];
 
+    // Skip during `cargo publish` verification — same reason as in generate_manpages.
+    let skip_dist = is_publish_verification();
     for (shell, rel_path) in shells {
         let mut buf: Vec<u8> = Vec::new();
         shell
             .write_registration("COMPLETE", pkg_name, pkg_name, pkg_name, &mut buf)
             .map_err(io::Error::other)?;
-        write_if_changed(rel_path, &buf)?;
+        if !skip_dist {
+            write_if_changed(rel_path, &buf)?;
+        }
     }
 
     // cmd is only needed to satisfy CommandFactory; keep it alive to the end.
