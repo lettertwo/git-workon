@@ -79,7 +79,8 @@ pub struct Clone {
 #[derive(Debug, Args)]
 pub struct CopyUntracked {
     pub from: String,
-    pub to: String,
+    /// Destination worktree name. Defaults to the current worktree when omitted.
+    pub to: Option<String>,
     #[arg(short, long, help = "Override patterns for one-off copy")]
     pub pattern: Option<String>,
     #[arg(

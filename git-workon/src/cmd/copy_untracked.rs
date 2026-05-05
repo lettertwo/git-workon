@@ -1,4 +1,4 @@
-use miette::{Result, WrapErr};
+use miette::{IntoDiagnostic, Result, WrapErr};
 use workon::{
     copy_untracked, get_repo, workon_root, CopyOptions, WorkonConfig, WorktreeDescriptor,
 };
@@ -14,8 +14,9 @@ impl Run for CopyUntracked {
         let config = WorkonConfig::new(&repo)?;
 
         let root = workon_root(&repo)?;
-        let from_path = root.join(&self.from);
-        let to_path = root.join(&self.to);
+        let to_name = self.to.as_deref().unwrap_or(".");
+        let from_path = resolve_worktree_arg(&root, &self.from)?;
+        let to_path = resolve_worktree_arg(&root, to_name)?;
 
         if !from_path.exists() {
             return Err(miette::miette!(
@@ -27,7 +28,7 @@ impl Run for CopyUntracked {
         if !to_path.exists() {
             return Err(miette::miette!(
                 "Destination worktree '{}' does not exist at {:?}",
-                self.to,
+                to_name,
                 to_path
             ));
         }
@@ -78,7 +79,7 @@ impl Run for CopyUntracked {
         )
         .wrap_err(format!(
             "Failed to copy files from '{}' to '{}'",
-            self.from, self.to
+            self.from, to_name
         ))?;
 
         pb.finish_and_clear();
@@ -86,7 +87,7 @@ impl Run for CopyUntracked {
             println!("\nCopied {} file(s)", copied.len());
         }
 
-        Ok(WorktreeDescriptor::new(&repo, &self.to).ok())
+        Ok(WorktreeDescriptor::new(&repo, to_name).ok())
     }
 }
 
@@ -98,6 +99,27 @@ fn determine_patterns(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<
         return Ok(vec![pattern.clone()]);
     }
     Ok(config.copy_patterns()?)
+}
+
+/// Resolve a worktree name argument to a filesystem path.
+///
+/// The special value `.` resolves to the current worktree by finding the first
+/// path component of the CWD relative to root — handles the case where the user
+/// is inside a worktree and wants to refer to it without naming it explicitly.
+fn resolve_worktree_arg(root: &std::path::Path, name: &str) -> Result<std::path::PathBuf> {
+    if name == "." {
+        let cwd = std::env::current_dir()
+            .into_diagnostic()
+            .wrap_err("Failed to get current directory")?;
+        if let Ok(rel) = cwd.strip_prefix(root) {
+            if let Some(first) = rel.components().next() {
+                return Ok(root.join(first));
+            }
+        }
+        // CWD is at or above root — fall back to CWD itself
+        return Ok(cwd);
+    }
+    Ok(root.join(name))
 }
 
 /// Determine which excludes to use for copying

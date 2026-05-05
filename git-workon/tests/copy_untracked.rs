@@ -1,6 +1,7 @@
 use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 use std::fs;
+use std::path::Path;
 
 #[test]
 fn copy_basic() -> Result<(), Box<dyn std::error::Error>> {
@@ -535,6 +536,38 @@ fn copy_does_not_copy_dot_git() -> Result<(), Box<dyn std::error::Error>> {
         feature_worktree.join("test.txt").exists(),
         "test.txt should be copied"
     );
+
+    Ok(())
+}
+
+#[test]
+fn copy_omit_to_defaults_to_current_worktree() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    fs::write(main_worktree.join("data.txt"), "from main")?;
+
+    // Run from inside the feature worktree, omitting the `to` argument
+    let mut cmd = cargo_bin_cmd!("git-workon");
+    cmd.current_dir(Path::new(&feature_worktree))
+        .arg("copy-untracked")
+        .arg("main")
+        .assert()
+        .success();
+
+    assert!(
+        feature_worktree.join("data.txt").exists(),
+        "Should copy to current worktree when 'to' is omitted"
+    );
+    let content = fs::read_to_string(feature_worktree.join("data.txt"))?;
+    assert_eq!(content, "from main");
 
     Ok(())
 }
