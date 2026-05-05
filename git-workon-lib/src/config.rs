@@ -22,7 +22,7 @@
 //! - **workon.postCreateHook** - Commands to run after worktree creation (multi-value, default: [])
 //! - **workon.copyPattern** - Glob patterns for automatic file copying (multi-value, default: [])
 //! - **workon.copyExclude** - Patterns to exclude from copying (multi-value, default: [])
-//! - **workon.autoCopyUntracked** - Enable automatic file copying in new command (bool, default: false)
+//! - **workon.autoCopy** - Enable automatic file copying in new command (bool, default: false)
 //! - **workon.pruneProtectedBranches** - Branches protected from pruning (multi-value, default: [])
 //! - **workon.prFormat** - Format string for PR-based worktree names (string, default: "pr-{number}")
 //! - **workon.hookTimeout** - Timeout in seconds for hook execution (integer, default: 300, 0 = no timeout)
@@ -41,7 +41,7 @@
 //!   copyPattern = .env.local
 //!   copyPattern = .vscode/
 //!   copyExclude = .env.production
-//!   autoCopyUntracked = true
+//!   autoCopy = true
 //!   pruneProtectedBranches = main
 //!   pruneProtectedBranches = develop
 //!   pruneProtectedBranches = release/*
@@ -161,12 +161,13 @@ impl<'repo> WorkonConfig<'repo> {
         self.read_multivar("workon.copyExclude")
     }
 
-    /// Get whether to include git-ignored files when copying untracked files.
+    /// Get whether to include git-ignored files when copying.
     ///
-    /// Precedence: CLI override > workon.copyIncludeIgnored config > false
+    /// Precedence: CLI override > workon.copyIncludeIgnored config > true
     ///
-    /// When enabled, files matching .gitignore (e.g., `.env.local`, `node_modules/`)
-    /// will also be included as copy candidates.
+    /// Ignored files (e.g., `.env.local`, `node_modules/`) are included by default
+    /// since they are the primary use case for copying between worktrees.
+    /// Set `workon.copyIncludeIgnored = false` to opt out.
     pub fn copy_include_ignored(&self, cli_override: Option<bool>) -> Result<bool> {
         if let Some(override_val) = cli_override {
             return Ok(override_val);
@@ -175,27 +176,25 @@ impl<'repo> WorkonConfig<'repo> {
         let config = self.repo.config()?;
         match config.get_bool("workon.copyIncludeIgnored") {
             Ok(val) => Ok(val),
-            Err(_) => Ok(false),
+            Err(_) => Ok(true),
         }
     }
 
-    /// Get whether to automatically copy untracked files when creating new worktrees.
+    /// Get whether to automatically copy local files when creating new worktrees.
     ///
-    /// Precedence: CLI override > workon.autoCopyUntracked config > false
+    /// Precedence: CLI override > workon.autoCopy config > false
     ///
     /// When enabled, files matching workon.copyPattern (excluding workon.copyExclude)
     /// will be automatically copied from the base worktree to the new worktree.
-    pub fn auto_copy_untracked(&self, cli_override: Option<bool>) -> Result<bool> {
-        // CLI takes precedence
+    pub fn auto_copy(&self, cli_override: Option<bool>) -> Result<bool> {
         if let Some(override_val) = cli_override {
             return Ok(override_val);
         }
 
-        // Read from git config
         let config = self.repo.config()?;
-        match config.get_bool("workon.autoCopyUntracked") {
+        match config.get_bool("workon.autoCopy") {
             Ok(val) => Ok(val),
-            Err(_) => Ok(false), // Default to false
+            Err(_) => Ok(false),
         }
     }
 

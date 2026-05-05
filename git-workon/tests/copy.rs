@@ -28,7 +28,7 @@ fn copy_basic() -> Result<(), Box<dyn std::error::Error>> {
     // Copy files from main to feature (uses config patterns)
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .arg("feature")
         .assert()
@@ -74,7 +74,7 @@ fn copy_with_config_patterns() -> Result<(), Box<dyn std::error::Error>> {
     // Copy using config patterns (default behavior)
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .arg("feature")
         .assert()
@@ -121,7 +121,7 @@ fn copy_with_excludes() -> Result<(), Box<dyn std::error::Error>> {
     // Copy all files using config pattern
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .arg("feature")
         .assert()
@@ -164,7 +164,7 @@ fn copy_with_pattern_override() -> Result<(), Box<dyn std::error::Error>> {
     // Copy with --pattern flag (should override config)
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("--pattern")
         .arg("*.js")
         .arg("main")
@@ -206,7 +206,7 @@ fn copy_respects_force_flag() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = cargo_bin_cmd!("git-workon");
     let output = cmd
         .current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .arg("feature")
         .output()?;
@@ -223,7 +223,7 @@ fn copy_respects_force_flag() -> Result<(), Box<dyn std::error::Error>> {
     // Now copy with --force (should overwrite)
     let mut cmd2 = cargo_bin_cmd!("git-workon");
     cmd2.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("--force")
         .arg("main")
         .arg("feature")
@@ -260,7 +260,7 @@ fn copy_creates_directories() -> Result<(), Box<dyn std::error::Error>> {
     // Copy files
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .arg("feature")
         .assert()
@@ -302,7 +302,7 @@ fn copy_with_no_matching_files() -> Result<(), Box<dyn std::error::Error>> {
     let mut cmd = cargo_bin_cmd!("git-workon");
     let output = cmd
         .current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("--pattern")
         .arg("*.js")
         .arg("main")
@@ -340,7 +340,7 @@ fn copy_with_cli_exclude() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("--exclude")
         .arg("*.log")
         .arg("main")
@@ -380,7 +380,7 @@ fn copy_with_cli_exclude_additive_with_config() -> Result<(), Box<dyn std::error
 
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("--exclude")
         .arg("*.tmp")
         .arg("main")
@@ -424,7 +424,7 @@ fn copy_with_multiple_cli_excludes() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("--exclude")
         .arg("*.log")
         .arg("--exclude")
@@ -471,7 +471,7 @@ fn copy_without_config_defaults_to_all() -> Result<(), Box<dyn std::error::Error
     // Copy without config or pattern (should copy everything)
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .arg("feature")
         .assert()
@@ -518,7 +518,7 @@ fn copy_does_not_copy_dot_git() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(&fixture)
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .arg("feature")
         .assert()
@@ -528,7 +528,7 @@ fn copy_does_not_copy_dot_git() -> Result<(), Box<dyn std::error::Error>> {
     let after_git = fs::read_to_string(feature_worktree.join(".git"))?;
     assert_eq!(
         original_git, after_git,
-        ".git file must not be modified by copy-untracked"
+        ".git file must not be modified by copy"
     );
 
     // Normal untracked file was still copied
@@ -557,7 +557,7 @@ fn copy_omit_to_defaults_to_current_worktree() -> Result<(), Box<dyn std::error:
     // Run from inside the feature worktree, omitting the `to` argument
     let mut cmd = cargo_bin_cmd!("git-workon");
     cmd.current_dir(Path::new(&feature_worktree))
-        .arg("copy-untracked")
+        .arg("copy")
         .arg("main")
         .assert()
         .success();

@@ -24,7 +24,7 @@
 //! | [`find_worktree`] | Locate a worktree by name or branch |
 //! | [`current_worktree`] | Return the worktree containing the current directory |
 //! | [`move_worktree`] | Atomically rename a worktree and its branch |
-//! | [`copy_untracked`] | Copy untracked files between worktrees using git status |
+//! | [`copy_untracked`] | Copy local (git-unmanaged) files between worktrees |
 //! | [`workon_root`] | Resolve the directory that holds all worktrees |
 //!
 //! ## Example

@@ -3,20 +3,20 @@ use workon::{
     copy_untracked, get_repo, workon_root, CopyOptions, WorkonConfig, WorktreeDescriptor,
 };
 
-use crate::cli::CopyUntracked;
+use crate::cli::Copy;
 use crate::output;
 
 use super::Run;
 
-impl Run for CopyUntracked {
+impl Run for Copy {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let repo = get_repo(None)?;
         let config = WorkonConfig::new(&repo)?;
 
         let root = workon_root(&repo)?;
         let to_name = self.to.as_deref().unwrap_or(".");
-        let from_path = resolve_worktree_arg(&root, &self.from)?;
-        let to_path = resolve_worktree_arg(&root, to_name)?;
+        let from_path = resolve_worktree_arg(root, &self.from)?;
+        let to_path = resolve_worktree_arg(root, to_name)?;
 
         if !from_path.exists() {
             return Err(miette::miette!(
@@ -36,7 +36,7 @@ impl Run for CopyUntracked {
         let patterns = determine_patterns(self, &config)?;
         let excludes = determine_excludes(self, &config)?;
         let include_ignored =
-            config.copy_include_ignored(Some(self.include_ignored).filter(|&v| v))?;
+            config.copy_include_ignored(self.no_include_ignored.then_some(false))?;
 
         let json_mode = output::is_json_mode();
         let pb = output::create_spinner();
@@ -94,7 +94,7 @@ impl Run for CopyUntracked {
 /// Determine which patterns to use for copying
 ///
 /// Priority: --pattern flag > config > [] (empty = copy all untracked)
-fn determine_patterns(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<String>> {
+fn determine_patterns(cmd: &Copy, config: &WorkonConfig) -> Result<Vec<String>> {
     if let Some(pattern) = &cmd.pattern {
         return Ok(vec![pattern.clone()]);
     }
@@ -125,7 +125,7 @@ fn resolve_worktree_arg(root: &std::path::Path, name: &str) -> Result<std::path:
 /// Determine which excludes to use for copying
 ///
 /// CLI excludes are additive with config excludes.
-fn determine_excludes(cmd: &CopyUntracked, config: &WorkonConfig) -> Result<Vec<String>> {
+fn determine_excludes(cmd: &Copy, config: &WorkonConfig) -> Result<Vec<String>> {
     let mut excludes = config.copy_excludes()?;
     excludes.extend(cmd.exclude.iter().cloned());
     Ok(excludes)

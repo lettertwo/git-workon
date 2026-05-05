@@ -25,12 +25,13 @@
 //!
 //! ## Automatic File Copying
 //!
-//! If `workon.autoCopyUntracked=true`:
-//! - Copies files from base branch's worktree (or HEAD's worktree if no base)
+//! If `workon.autoCopy=true`:
+//! - Copies local files from base branch's worktree (or HEAD's worktree if no base)
+//! - Includes git-ignored files by default (build artifacts, local config, secrets)
 //! - Uses `workon.copyPattern` patterns (or defaults to `**/*`)
 //! - Respects `workon.copyExclude` patterns
 //! - Runs after worktree creation, before post-create hooks
-//! - Can be overridden with `--(no-)copy-untracked` flags
+//! - Can be overridden with `--(no-)copy` flags
 //!
 //! ## Execution Order
 //!
@@ -160,23 +161,23 @@ impl Run for New {
                 .wrap_err("Failed to set upstream tracking for PR branch")?;
 
             // Copy files if configured
-            let copy_override = if self.copy_untracked {
+            let copy_override = if self.copy {
                 Some(true)
-            } else if self.no_copy_untracked {
+            } else if self.no_copy {
                 Some(false)
             } else {
                 None
             };
 
-            if config.auto_copy_untracked(copy_override)? {
+            if config.auto_copy(copy_override)? {
                 if let Err(e) = copy_untracked_files(
                     &repo,
                     &worktree,
                     Some(&base_ref),
                     &config,
-                    self.copy_ignored,
+                    self.no_copy_ignored,
                 ) {
-                    output::warn(&format!("Failed to copy untracked files: {}", e));
+                    output::warn(&format!("Failed to copy local files: {}", e));
                 }
             }
 
@@ -224,25 +225,25 @@ impl Run for New {
         )
         .wrap_err(format!("Failed to create worktree '{}'", worktree_name))?;
 
-        // Copy untracked files if enabled
-        let copy_override = if self.copy_untracked {
+        // Copy local files if enabled
+        let copy_override = if self.copy {
             Some(true)
-        } else if self.no_copy_untracked {
+        } else if self.no_copy {
             Some(false)
         } else {
             None
         };
 
-        if config.auto_copy_untracked(copy_override)? {
+        if config.auto_copy(copy_override)? {
             debug!("Auto-copy enabled, copying from base worktree");
             if let Err(e) = copy_untracked_files(
                 &repo,
                 &worktree,
                 base_branch.as_deref(),
                 &config,
-                self.copy_ignored,
+                self.no_copy_ignored,
             ) {
-                output::warn(&format!("Failed to copy untracked files: {}", e));
+                output::warn(&format!("Failed to copy local files: {}", e));
                 // Continue - worktree is still valid
             }
         } else {
@@ -305,17 +306,17 @@ fn prompt_for_base_branch(
     }
 }
 
-/// Copy untracked files from the base worktree to the new worktree
+/// Copy local files from the base worktree to the new worktree
 fn copy_untracked_files(
     repo: &git2::Repository,
     worktree: &WorktreeDescriptor,
     base_branch: Option<&str>,
     config: &workon::WorkonConfig,
-    include_ignored: bool,
+    no_copy_ignored: bool,
 ) -> Result<()> {
     let patterns = config.copy_patterns()?;
     let excludes = config.copy_excludes()?;
-    let include_ignored = config.copy_include_ignored(Some(include_ignored).filter(|&v| v))?;
+    let include_ignored = config.copy_include_ignored(no_copy_ignored.then_some(false))?;
 
     // Determine source branch name: explicit base, or HEAD's branch
     let source_branch_name = if let Some(base) = base_branch {

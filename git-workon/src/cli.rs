@@ -30,7 +30,7 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
     Clone(Clone),
-    CopyUntracked(CopyUntracked),
+    Copy(Copy),
     /// Detect and repair workspace issues
     #[command(visible_alias = "check")]
     Doctor(Doctor),
@@ -59,25 +59,16 @@ pub struct Clone {
     pub no_hooks: bool,
 }
 
-/// Copy any untracked files in <from> to <to>.
+/// Copy local (git-unmanaged) files from one worktree to another.
 ///
-/// Untracked files are files that are ignored by git, or files that are not in the git index.
-///
-/// This util is a useful complement to a git worktree workflow. Git worktrees provide
-/// a mechanism for maintaining multiple branches of a repository simultaneously, without
-/// having to switch between branches (and using stash to keep WIP stuff around, etc).
-/// See `man git-worktree` for more information.
-///
-/// However, one drawback of this approach vs. the traditional branch workflow is that any untracked
-/// artifacts in the working directory, such as installed node modules, build caches, etc.,
-/// have to be recreated or otherwise manually copied over when creating a new worktree.
-///
-/// That's where `copyuntracked` comes in!
+/// Copies files that git doesn't track — ignored files (build artifacts, local config,
+/// secrets) and untracked-but-not-staged files. Ignored files are included by default
+/// since they are the primary use case; use --no-include-ignored to skip them.
 ///
 /// If possible, copying will be done using `clonefile` (`man clonefile`),
 /// which is a copy-on-write optimization over a potentially much slower copy operation.
 #[derive(Debug, Args)]
-pub struct CopyUntracked {
+pub struct Copy {
     pub from: String,
     /// Destination worktree name. Defaults to the current worktree when omitted.
     pub to: Option<String>,
@@ -91,11 +82,8 @@ pub struct CopyUntracked {
     pub exclude: Vec<String>,
     #[arg(short, long, help = "Overwrite existing files in destination")]
     pub force: bool,
-    #[arg(
-        long,
-        help = "Also copy git-ignored files (e.g., .env.local, node_modules)"
-    )]
-    pub include_ignored: bool,
+    #[arg(long, help = "Skip git-ignored files (e.g., .env.local, node_modules)")]
+    pub no_include_ignored: bool,
 }
 
 /// Create a new bare repository and an initial worktree.
@@ -164,19 +152,19 @@ pub struct New {
     #[arg(long, help = "Skip post-create hooks")]
     pub no_hooks: bool,
     #[arg(
-        long = "copy-untracked",
-        overrides_with = "no_copy_untracked",
-        help = "Copy untracked files from base worktree using configured patterns"
+        long = "copy",
+        overrides_with = "no_copy",
+        help = "Copy local files from base worktree using configured patterns"
     )]
-    pub copy_untracked: bool,
+    pub copy: bool,
     #[arg(
-        long = "no-copy-untracked",
-        overrides_with = "copy_untracked",
-        help = "Do not copy untracked files (overrides config)"
+        long = "no-copy",
+        overrides_with = "copy",
+        help = "Do not copy local files (overrides config)"
     )]
-    pub no_copy_untracked: bool,
-    #[arg(long, help = "Include git-ignored files when copying untracked")]
-    pub copy_ignored: bool,
+    pub no_copy: bool,
+    #[arg(long, help = "Skip git-ignored files when copying")]
+    pub no_copy_ignored: bool,
     #[arg(long, help = "Disable interactive mode (for testing/scripting)")]
     pub no_interactive: bool,
     #[arg(long, help = "Lock the worktree after creation")]

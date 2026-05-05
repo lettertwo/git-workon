@@ -88,7 +88,7 @@ pub fn augment(cmd: Command) -> Command {
             a.add(ArgValueCompleter::new(complete_worktree_names))
         })
     })
-    .mut_subcommand("copy-untracked", |sub| {
+    .mut_subcommand("copy", |sub| {
         sub.mut_arg("from", |a| {
             a.add(ArgValueCompleter::new(complete_worktree_names))
         })

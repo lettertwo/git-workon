@@ -353,13 +353,9 @@ fn read_config_entries(
     };
     entries.push(("workon.defaultBranch".to_string(), val, src));
 
-    let auto_copy = config.auto_copy_untracked(None)?;
-    let src = scalar_source(repo, &git_config, "workon.autoCopyUntracked");
-    entries.push((
-        "workon.autoCopyUntracked".to_string(),
-        auto_copy.to_string(),
-        src,
-    ));
+    let auto_copy = config.auto_copy(None)?;
+    let src = scalar_source(repo, &git_config, "workon.autoCopy");
+    entries.push(("workon.autoCopy".to_string(), auto_copy.to_string(), src));
 
     let (val, src) = match config.pr_format(None) {
         Ok(val) => (val, scalar_source(repo, &git_config, "workon.prFormat")),

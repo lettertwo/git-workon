@@ -322,7 +322,7 @@ fn new_with_auto_copy_enabled() -> Result<(), Box<dyn std::error::Error>> {
         .bare(true)
         .default_branch("main")
         .worktree("main")
-        .config("workon.autoCopyUntracked", "true")
+        .config("workon.autoCopy", "true")
         .config("workon.copyPattern", ".env*")
         .config("workon.copyPattern", "node_modules/**/*")
         .build()?;
@@ -371,7 +371,7 @@ fn new_with_auto_copy_respects_excludes() -> Result<(), Box<dyn std::error::Erro
         .bare(true)
         .default_branch("main")
         .worktree("main")
-        .config("workon.autoCopyUntracked", "true")
+        .config("workon.autoCopy", "true")
         .config("workon.copyPattern", "**/*")
         .config("workon.copyExclude", "*.log")
         .build()?;
@@ -407,7 +407,7 @@ fn new_with_auto_copy_respects_excludes() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
-fn new_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
+fn new_copy_flag_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
     use std::fs;
 
     let fixture = FixtureBuilder::new()
@@ -415,19 +415,19 @@ fn new_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::error::
         .default_branch("main")
         .worktree("main")
         // Config disabled, but flag should enable it
-        .config("workon.autoCopyUntracked", "false")
+        .config("workon.autoCopy", "false")
         .config("workon.copyPattern", "*.txt")
         .build()?;
 
     let main_worktree = fixture.root()?.join("main");
     fs::write(main_worktree.join("test.txt"), "content")?;
 
-    // Create new worktree with --copy-untracked flag
+    // Create new worktree with --copy flag
     let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
-        .arg("--copy-untracked")
+        .arg("--copy")
         .arg("feature")
         .assert()
         .success();
@@ -437,14 +437,14 @@ fn new_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::error::
     // Verify file was copied despite config being false
     assert!(
         feature_worktree.join("test.txt").exists(),
-        "Should copy file when --copy-untracked flag is used"
+        "Should copy file when --copy flag is used"
     );
 
     Ok(())
 }
 
 #[test]
-fn new_no_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
+fn new_no_copy_flag_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
     use std::fs;
 
     let fixture = FixtureBuilder::new()
@@ -452,19 +452,19 @@ fn new_no_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::erro
         .default_branch("main")
         .worktree("main")
         // Config enabled, but flag should disable it
-        .config("workon.autoCopyUntracked", "true")
+        .config("workon.autoCopy", "true")
         .config("workon.copyPattern", "*.txt")
         .build()?;
 
     let main_worktree = fixture.root()?.join("main");
     fs::write(main_worktree.join("test.txt"), "content")?;
 
-    // Create new worktree with --no-copy-untracked flag
+    // Create new worktree with --no-copy flag
     let mut new_cmd = cargo_bin_cmd!("git-workon");
     new_cmd
         .current_dir(&fixture)
         .arg("new")
-        .arg("--no-copy-untracked")
+        .arg("--no-copy")
         .arg("feature")
         .assert()
         .success();
@@ -474,7 +474,7 @@ fn new_no_copy_untracked_flag_overrides_config() -> Result<(), Box<dyn std::erro
     // Verify file was NOT copied despite config being true
     assert!(
         !feature_worktree.join("test.txt").exists(),
-        "Should not copy file when --no-copy-untracked flag is used"
+        "Should not copy file when --no-copy flag is used"
     );
 
     Ok(())
@@ -486,7 +486,7 @@ fn new_auto_copy_skips_when_base_worktree_missing() -> Result<(), Box<dyn std::e
         .bare(true)
         .default_branch("main")
         // Note: no main worktree created
-        .config("workon.autoCopyUntracked", "true")
+        .config("workon.autoCopy", "true")
         .config("workon.copyPattern", "*.txt")
         .build()?;
 
@@ -516,7 +516,7 @@ fn new_auto_copy_without_patterns_copies_everything() -> Result<(), Box<dyn std:
         .bare(true)
         .default_branch("main")
         .worktree("main")
-        .config("workon.autoCopyUntracked", "true")
+        .config("workon.autoCopy", "true")
         // Note: no copyPattern configured - should default to copying everything
         .build()?;
 

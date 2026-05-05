@@ -10,7 +10,7 @@
 //! - With `include_ignored`, gitignore filtering is disabled so ignored files are visited too.
 //! - The git index is checked per file (O(1) binary search) to skip tracked files.
 //! - Patterns filter the candidate list.
-//! - Opt-in ignored file support: `--include-ignored` / `workon.copyIncludeIgnored=true`.
+//! - Opt-out ignored file support: `--no-include-ignored` / `workon.copyIncludeIgnored=false`.
 //!
 //! ## Pattern Matching
 //!
@@ -40,12 +40,11 @@
 //! ## Example Usage
 //!
 //! ```bash
-//! # Copy specific patterns
-//! git workon copy-untracked --pattern '.env*' --pattern '.vscode/'
+//! # Copy specific patterns (ignored files included by default)
+//! git workon copy --pattern '.env*' --pattern '.vscode/'
 //!
-//! # Configure automatic copying with ignored files
-//! git config workon.autoCopyUntracked true
-//! git config workon.copyIncludeIgnored true
+//! # Configure automatic copying
+//! git config workon.autoCopy true
 //! git config --add workon.copyPattern '.env.local'
 //! git config --add workon.copyPattern 'node_modules/'
 //! git config --add workon.copyExclude '.env.production'
@@ -82,7 +81,7 @@ impl Default for CopyOptions<'_> {
             patterns: &[],
             excludes: &[],
             force: false,
-            include_ignored: false,
+            include_ignored: true,
             on_copied: Box::new(|_| {}),
             on_skipped: Box::new(|_, _| {}),
         }
