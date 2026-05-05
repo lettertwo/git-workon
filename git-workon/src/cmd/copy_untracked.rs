@@ -86,7 +86,7 @@ impl Run for CopyUntracked {
             println!("\nCopied {} file(s)", copied.len());
         }
 
-        Ok(Some(WorktreeDescriptor::new(&repo, &self.to)?))
+        Ok(WorktreeDescriptor::new(&repo, &self.to).ok())
     }
 }
 

@@ -114,7 +114,10 @@ pub fn copy_untracked(
         source,
     })?;
 
-    // Load git index once for O(1) tracked-file checks per file
+    // Build a set of tracked paths for O(1) per-file lookup.
+    // Using a HashSet instead of index.get_path() per file avoids a libgit2 quirk:
+    // git_index_get_bypath sets the error buffer even when returning NULL (path not
+    // found), which poisons the next try_call! error message with a stale value.
     let mut index = repo.index().map_err(|source| CopyError::RepoOpen {
         path: from_path.to_path_buf(),
         source,
@@ -123,6 +126,7 @@ pub fn copy_untracked(
         path: from_path.to_path_buf(),
         source,
     })?;
+    let tracked: std::collections::HashSet<Vec<u8>> = index.iter().map(|e| e.path).collect();
 
     // Compile include patterns once. Empty list = match all.
     let include_patterns: Vec<glob::Pattern> = patterns
@@ -201,7 +205,7 @@ pub fn copy_untracked(
         }
 
         // Skip files tracked in the git index (handles `git add -f`'d ignored files correctly)
-        if index.get_path(&rel_path, 0).is_some() {
+        if tracked.contains(rel_path_str.as_bytes()) {
             on_skipped("tracked", &rel_path);
             continue;
         }
