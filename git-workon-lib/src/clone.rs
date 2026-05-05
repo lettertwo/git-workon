@@ -4,7 +4,7 @@ use git2::{build::RepoBuilder, FetchOptions, Repository};
 use log::debug;
 
 use crate::error::Result;
-use crate::{convert_to_bare, get_default_branch_name, get_remote_callbacks};
+use crate::{convert_to_bare, get_default_branch_name, get_remote_callbacks_default};
 
 /// Options for [`clone`].
 pub struct CloneOptions {
@@ -43,7 +43,7 @@ pub fn clone(path: PathBuf, url: &str, options: CloneOptions) -> Result<Reposito
 
     debug!("final path {}", path.display());
 
-    let mut callbacks = get_remote_callbacks(Some(url))?;
+    let mut callbacks = get_remote_callbacks_default(Some(url))?;
     callbacks.transfer_progress(move |progress| {
         on_transfer_progress(
             progress.received_objects(),

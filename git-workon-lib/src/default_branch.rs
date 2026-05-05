@@ -75,7 +75,7 @@ pub fn get_default_branch_name(repo: &Repository, remote: Option<Remote>) -> Res
     if let Some(remote) = remote {
         let url = remote.url().map(str::to_string);
         default_branch.remote(remote);
-        default_branch.remote_callbacks(get_remote_callbacks(url.as_deref()).unwrap());
+        default_branch.remote_callbacks(get_remote_callbacks(repo, url.as_deref())?);
     }
     default_branch.get_name().or_else(|_| {
         debug!("Failed to read default branch from remote, trying git config");

@@ -474,7 +474,7 @@ pub fn fetch_branch(repo: &Repository, remote_name: &str, branch: &str) -> Resul
         .ok()
         .and_then(|r| r.url().map(str::to_string));
     let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(get_remote_callbacks(remote_url.as_deref())?);
+    fetch_options.remote_callbacks(get_remote_callbacks(repo, remote_url.as_deref())?);
 
     repo.find_remote(remote_name)?
         .fetch(
