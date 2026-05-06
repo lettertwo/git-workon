@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.2.1...git-workon-lib-v0.3.0) - 2026-05-06
+
+### Added
+
+- *(copy)* [**breaking**] rename to 'copy', include ignored files by default
+
+### Fixed
+
+- *(copy)* use hashset for index check, tolerate unknown dest worktree
+- *(lib)* use repo config for credentials and tolerate absent gitconfig
+
 ## [0.2.1](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.2.0...git-workon-lib-v0.2.1) - 2026-04-17
 
 ### Fixed

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.1.3...git-workon-v0.2.0) - 2026-05-06
+
+### Added
+
+- *(copy)* [**breaking**] rename to 'copy', include ignored files by default
+
+### Fixed
+
+- *(copy)* resolve worktree arg from CWD and make 'to' optional
+- *(copy)* use hashset for index check, tolerate unknown dest worktree
+
 ## [0.1.3](https://github.com/lettertwo/git-workon/compare/git-workon-v0.1.2...git-workon-v0.1.3) - 2026-04-17
 
 ### Added
