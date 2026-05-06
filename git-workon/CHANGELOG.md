@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.2.0...git-workon-v0.2.1) - 2026-05-06
+
+### Added
+
+- *(cli)* detect renamed workon.autoCopyUntracked in doctor
+
 ## [0.2.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.1.3...git-workon-v0.2.0) - 2026-05-06
 
 ### Added
