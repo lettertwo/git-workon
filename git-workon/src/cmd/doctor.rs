@@ -28,13 +28,28 @@ use crate::output;
 
 use super::Run;
 
+/// Config keys that were renamed in a breaking change and are no longer read.
+/// Each (old_key, new_key) pair is scanned at every config scope.
+const RENAMED_SCALAR_KEYS: &[(&str, &str)] = &[("workon.autoCopyUntracked", "workon.autoCopy")];
+
 #[derive(Debug)]
 enum IssueKind {
     MissingDirectory,
     BrokenGitLink,
     GoneUpstream,
-    HookNotFound { hook: String, command: String },
+    HookNotFound {
+        hook: String,
+        command: String,
+    },
     GhNotFound,
+    RenamedConfigKey {
+        old_key: String,
+        new_key: String,
+        level: git2::ConfigLevel,
+        source: String,
+        value: String,
+        new_already_set: bool,
+    },
 }
 
 struct Issue {
@@ -60,8 +75,19 @@ impl Issue {
         }
     }
 
+    fn config(kind: IssueKind) -> Self {
+        Self {
+            kind,
+            name: None,
+            path: None,
+        }
+    }
+
     fn fixable(&self) -> bool {
-        matches!(self.kind, IssueKind::MissingDirectory)
+        matches!(
+            self.kind,
+            IssueKind::MissingDirectory | IssueKind::RenamedConfigKey { .. }
+        )
     }
 
     fn message(&self) -> String {
@@ -77,6 +103,24 @@ impl Issue {
                 format!("hook command '{command}' not found in PATH (from hook \"{hook}\")")
             }
             IssueKind::GhNotFound => "gh CLI not found (PR features unavailable)".to_string(),
+            IssueKind::RenamedConfigKey {
+                old_key,
+                new_key,
+                source,
+                value,
+                new_already_set,
+                ..
+            } => {
+                if *new_already_set {
+                    format!(
+                        "'{old_key}' at {source} — renamed to '{new_key}' (already set); run --fix to remove old key"
+                    )
+                } else {
+                    format!(
+                        "'{old_key} = {value}' at {source} — renamed to '{new_key}', no longer read; run --fix to migrate"
+                    )
+                }
+            }
         }
     }
 
@@ -87,6 +131,7 @@ impl Issue {
             IssueKind::GoneUpstream => "gone_upstream",
             IssueKind::HookNotFound { .. } => "hook_not_found",
             IssueKind::GhNotFound => "gh_not_found",
+            IssueKind::RenamedConfigKey { .. } => "renamed_config_key",
         }
     }
 }
@@ -171,13 +216,48 @@ impl Run for Doctor {
             }
         }
 
-        // Configuration section — informational only, not included in fixable issues
+        // Configuration section — informational display plus renamed-key detection
         output::status("\nChecking configuration...");
         let config_entries = read_config_entries(&repo, &config)?;
         for (key, value, source) in &config_entries {
             match source {
                 Some(src) => output::check_pass(&format!("{key} = {value} ({src})")),
                 None => output::check_pass(&format!("{key} = {value}")),
+            }
+        }
+
+        let git_config = repo.config().into_diagnostic()?;
+        for (old_key, new_key) in RENAMED_SCALAR_KEYS {
+            for level in [
+                git2::ConfigLevel::Local,
+                git2::ConfigLevel::Worktree,
+                git2::ConfigLevel::Global,
+                git2::ConfigLevel::XDG,
+                git2::ConfigLevel::System,
+            ] {
+                if let Some(value) = git_config
+                    .open_level(level)
+                    .ok()
+                    .and_then(|c| c.get_string(old_key).ok())
+                {
+                    let new_already_set = git_config
+                        .open_level(level)
+                        .ok()
+                        .and_then(|c| c.get_string(new_key).ok())
+                        .is_some();
+                    let source =
+                        config_level_path(&repo, level).unwrap_or_else(|| "(unknown)".to_string());
+                    let issue = Issue::config(IssueKind::RenamedConfigKey {
+                        old_key: old_key.to_string(),
+                        new_key: new_key.to_string(),
+                        level,
+                        source,
+                        value,
+                        new_already_set,
+                    });
+                    output::check_warn(old_key, &issue.message());
+                    issues.push(issue);
+                }
             }
         }
 
@@ -208,6 +288,21 @@ impl Run for Doctor {
                     if let IssueKind::HookNotFound { hook, command } = &issue.kind {
                         obj["hook"] = json!(hook);
                         obj["command"] = json!(command);
+                    }
+                    if let IssueKind::RenamedConfigKey {
+                        old_key,
+                        new_key,
+                        source,
+                        value,
+                        new_already_set,
+                        ..
+                    } = &issue.kind
+                    {
+                        obj["old_key"] = json!(old_key);
+                        obj["new_key"] = json!(new_key);
+                        obj["source"] = json!(source);
+                        obj["value"] = json!(value);
+                        obj["new_already_set"] = json!(new_already_set);
                     }
                     obj
                 })
@@ -257,8 +352,8 @@ impl Run for Doctor {
             } else {
                 output::info(&format!("Fixing {} issue(s)...", fixable_count));
                 let fixed = fix_issues(&repo, &issues)?;
-                for name in &fixed {
-                    output::success(&format!("  ✓ Pruned: {name}"));
+                for desc in &fixed {
+                    output::success(&format!("  ✓ {desc}"));
                 }
             }
         } else if fixable_count > 0 {
@@ -282,17 +377,21 @@ fn abbreviate_home(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Returns the abbreviated file path for a given config level.
-fn config_level_path(repo: &git2::Repository, level: git2::ConfigLevel) -> Option<String> {
-    let path = match level {
+/// Returns the filesystem path for a given config level, or None for unsupported levels.
+fn level_to_path(repo: &git2::Repository, level: git2::ConfigLevel) -> Option<PathBuf> {
+    match level {
         git2::ConfigLevel::Local => Some(repo.path().join("config")),
         git2::ConfigLevel::Worktree => Some(repo.path().join("config.worktree")),
         git2::ConfigLevel::Global => git2::Config::find_global().ok(),
         git2::ConfigLevel::XDG => git2::Config::find_xdg().ok(),
         git2::ConfigLevel::System => git2::Config::find_system().ok(),
         _ => None,
-    }?;
-    Some(abbreviate_home(&path))
+    }
+}
+
+/// Returns the abbreviated file path for a given config level.
+fn config_level_path(repo: &git2::Repository, level: git2::ConfigLevel) -> Option<String> {
+    Some(abbreviate_home(&level_to_path(repo, level)?))
 }
 
 /// Return the config file path for a scalar key, or None if not set anywhere.
@@ -413,18 +512,48 @@ fn read_config_entries(
     Ok(entries)
 }
 
-/// Prune worktrees with missing directories. Returns the names of pruned worktrees.
+/// Fix all fixable issues. Returns a description string for each successfully fixed issue.
 fn fix_issues(repo: &git2::Repository, issues: &[Issue]) -> Result<Vec<String>> {
     let mut fixed = Vec::new();
     for issue in issues.iter().filter(|i| i.fixable()) {
-        if let Some(name) = &issue.name {
-            debug!("pruning worktree '{}'", name);
-            let worktree = repo.find_worktree(name).into_diagnostic()?;
-            let mut opts = git2::WorktreePruneOptions::new();
-            opts.valid(true);
-            worktree.prune(Some(&mut opts)).into_diagnostic()?;
-            debug!("pruned worktree '{}'", name);
-            fixed.push(name.clone());
+        match &issue.kind {
+            IssueKind::MissingDirectory => {
+                if let Some(name) = &issue.name {
+                    debug!("pruning worktree '{}'", name);
+                    let worktree = repo.find_worktree(name).into_diagnostic()?;
+                    let mut opts = git2::WorktreePruneOptions::new();
+                    opts.valid(true);
+                    worktree.prune(Some(&mut opts)).into_diagnostic()?;
+                    debug!("pruned worktree '{}'", name);
+                    fixed.push(format!("Pruned: {name}"));
+                }
+            }
+            IssueKind::RenamedConfigKey {
+                old_key,
+                new_key,
+                level,
+                source,
+                value,
+                new_already_set,
+            } => {
+                if let Some(path) = level_to_path(repo, *level) {
+                    match git2::Config::open(&path) {
+                        Ok(mut leveled) => {
+                            if !new_already_set {
+                                debug!("writing {new_key} = {value} to {}", path.display());
+                                leveled.set_str(new_key, value).into_diagnostic()?;
+                            }
+                            debug!("removing {old_key} from {}", path.display());
+                            leveled.remove(old_key).into_diagnostic()?;
+                            fixed.push(format!("Migrated: {old_key} → {new_key} ({source})"));
+                        }
+                        Err(e) => {
+                            debug!("failed to open config at {}: {}", path.display(), e);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(fixed)
