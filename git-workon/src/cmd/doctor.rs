@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
-use workon::{get_repo, get_worktrees, WorkonConfig, WorktreeDescriptor};
+use workon::{get_repo, get_worktrees, Granularity, StackModel, WorkonConfig, WorktreeDescriptor};
 
 use crate::cli::Doctor;
 use crate::output;
@@ -49,6 +49,12 @@ enum IssueKind {
         source: String,
         value: String,
         new_already_set: bool,
+    },
+    GtNotFound,
+    InvalidStackConfig {
+        key: String,
+        value: String,
+        reason: String,
     },
 }
 
@@ -103,6 +109,10 @@ impl Issue {
                 format!("hook command '{command}' not found in PATH (from hook \"{hook}\")")
             }
             IssueKind::GhNotFound => "gh CLI not found (PR features unavailable)".to_string(),
+            IssueKind::GtNotFound => "gt CLI not found (stack features unavailable)".to_string(),
+            IssueKind::InvalidStackConfig { key, value, reason } => {
+                format!("'{key} = {value}': {reason}")
+            }
             IssueKind::RenamedConfigKey {
                 old_key,
                 new_key,
@@ -132,6 +142,8 @@ impl Issue {
             IssueKind::HookNotFound { .. } => "hook_not_found",
             IssueKind::GhNotFound => "gh_not_found",
             IssueKind::RenamedConfigKey { .. } => "renamed_config_key",
+            IssueKind::GtNotFound => "gt_not_found",
+            IssueKind::InvalidStackConfig { .. } => "invalid_stack_config",
         }
     }
 }
@@ -190,6 +202,17 @@ impl Run for Doctor {
             debug!("gh CLI not found in PATH");
             let issue = Issue::dependency(IssueKind::GhNotFound);
             output::check_fail("gh", "not found in PATH");
+            issues.push(issue);
+        }
+
+        debug!("checking gt CLI availability");
+        if gt_available() {
+            debug!("gt CLI: ok");
+            output::check_pass("gt");
+        } else {
+            debug!("gt CLI not found in PATH");
+            let issue = Issue::dependency(IssueKind::GtNotFound);
+            output::check_warn("gt", "not found in PATH (stack features unavailable)");
             issues.push(issue);
         }
 
@@ -261,6 +284,36 @@ impl Run for Doctor {
             }
         }
 
+        // Stack config validation
+        if let Err(e) = config.stack_model(None) {
+            let value = repo
+                .config()
+                .ok()
+                .and_then(|c| c.get_string("workon.stackModel").ok())
+                .unwrap_or_default();
+            let issue = Issue::config(IssueKind::InvalidStackConfig {
+                key: "workon.stackModel".to_string(),
+                value,
+                reason: e.to_string(),
+            });
+            output::check_fail("workon.stackModel", &issue.message());
+            issues.push(issue);
+        }
+        if let Err(e) = config.stack_worktree_granularity(None) {
+            let value = repo
+                .config()
+                .ok()
+                .and_then(|c| c.get_string("workon.stackWorktreeGranularity").ok())
+                .unwrap_or_default();
+            let issue = Issue::config(IssueKind::InvalidStackConfig {
+                key: "workon.stackWorktreeGranularity".to_string(),
+                value,
+                reason: e.to_string(),
+            });
+            output::check_fail("workon.stackWorktreeGranularity", &issue.message());
+            issues.push(issue);
+        }
+
         debug!("found {} issue(s) total", issues.len());
 
         // JSON output: serialize all collected issues
@@ -288,6 +341,11 @@ impl Run for Doctor {
                     if let IssueKind::HookNotFound { hook, command } = &issue.kind {
                         obj["hook"] = json!(hook);
                         obj["command"] = json!(command);
+                    }
+                    if let IssueKind::InvalidStackConfig { key, value, reason } = &issue.kind {
+                        obj["key"] = json!(key);
+                        obj["value"] = json!(value);
+                        obj["reason"] = json!(reason);
                     }
                     if let IssueKind::RenamedConfigKey {
                         old_key,
@@ -509,6 +567,46 @@ fn read_config_entries(
     };
     entries.push(("workon.postCreateHook".to_string(), val, src));
 
+    let (stack_model_val, src) = match config.stack_model(None) {
+        Ok(StackModel::None) => (
+            "none".to_string(),
+            scalar_source(repo, &git_config, "workon.stackModel"),
+        ),
+        Ok(StackModel::Graphite) => (
+            "graphite".to_string(),
+            scalar_source(repo, &git_config, "workon.stackModel"),
+        ),
+        Err(_) => (
+            "(invalid)".to_string(),
+            scalar_source(repo, &git_config, "workon.stackModel"),
+        ),
+    };
+    entries.push(("workon.stackModel".to_string(), stack_model_val, src));
+
+    let (granularity_val, src) = match config.stack_worktree_granularity(None) {
+        Ok(Granularity::Stack) => (
+            "stack".to_string(),
+            scalar_source(repo, &git_config, "workon.stackWorktreeGranularity"),
+        ),
+        Err(_) => (
+            "(invalid)".to_string(),
+            scalar_source(repo, &git_config, "workon.stackWorktreeGranularity"),
+        ),
+    };
+    entries.push((
+        "workon.stackWorktreeGranularity".to_string(),
+        granularity_val,
+        src,
+    ));
+
+    let gt_auto_track = config.gt_auto_track(None)?;
+    let src = scalar_source(repo, &git_config, "workon.gtAutoTrack");
+    entries.push((
+        "workon.gtAutoTrack".to_string(),
+        gt_auto_track.to_string(),
+        src,
+    ));
+
     Ok(entries)
 }
 
@@ -573,4 +671,9 @@ fn command_in_path(cmd: &str) -> bool {
 /// Check if the gh CLI is available.
 fn gh_available() -> bool {
     command_in_path("gh")
+}
+
+/// Check if the gt CLI (Graphite) is available.
+fn gt_available() -> bool {
+    command_in_path("gt")
 }

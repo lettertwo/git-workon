@@ -327,3 +327,212 @@ fn doctor_fix_removes_old_key_when_new_already_set() -> Result<(), Box<dyn std::
 
     Ok(())
 }
+
+// ── stack / gt checks ─────────────────────────────────────────────────────────
+
+/// Builds a PATH that excludes any directory containing a `gt` binary.
+fn path_without_gt() -> String {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|dir| !std::path::Path::new(dir).join("gt").exists())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+#[test]
+fn doctor_warns_when_gt_not_found_but_does_not_fail() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("PATH", path_without_gt())
+        .arg("doctor")
+        .output()?;
+
+    // gt missing must not cause a non-zero exit
+    assert!(
+        output.status.success(),
+        "doctor should exit 0 even without gt; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        stderr.contains("gt"),
+        "expected gt mention in stderr: {stderr}"
+    );
+    // Must use ⚠ (check_warn), not ✗ (check_fail)
+    assert!(
+        !stderr.contains("✗ gt"),
+        "gt should warn not fail: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_gt_not_found_emits_gt_not_found_kind() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("PATH", path_without_gt())
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let issues = parsed["issues"].as_array().expect("issues must be array");
+    assert!(
+        issues.iter().any(|i| i["kind"] == "gt_not_found"),
+        "expected gt_not_found issue in: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn doctor_flags_invalid_stack_model_with_check_fail() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "branchless")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stderr = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("doctor")
+            .output()?
+            .stderr,
+    )?;
+
+    assert!(
+        stderr.contains("workon.stackModel"),
+        "expected key name in stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("branchless"),
+        "expected invalid value in stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_invalid_stack_model_emits_invalid_stack_config(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "branchless")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let issues = parsed["issues"].as_array().expect("issues must be array");
+    let issue = issues
+        .iter()
+        .find(|i| i["kind"] == "invalid_stack_config")
+        .unwrap_or_else(|| panic!("expected invalid_stack_config issue in: {stdout}"));
+
+    assert_eq!(issue["key"], "workon.stackModel");
+    assert_eq!(issue["value"], "branchless");
+    assert!(issue["reason"].as_str().is_some(), "reason must be present");
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_invalid_stack_granularity_emits_invalid_stack_config(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackWorktreeGranularity", "diff")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let issues = parsed["issues"].as_array().expect("issues must be array");
+    let issue = issues
+        .iter()
+        .find(|i| {
+            i["kind"] == "invalid_stack_config" && i["key"] == "workon.stackWorktreeGranularity"
+        })
+        .unwrap_or_else(|| panic!("expected invalid_stack_config for granularity in: {stdout}"));
+
+    assert_eq!(issue["value"], "diff");
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_configuration_includes_stack_keys() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "none")
+        .config("workon.gtAutoTrack", "false")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let config = &parsed["configuration"];
+
+    assert_eq!(
+        config["workon.stackModel"]["value"], "none",
+        "configuration must include stackModel: {stdout}"
+    );
+    assert!(
+        config.get("workon.stackWorktreeGranularity").is_some(),
+        "configuration must include stackWorktreeGranularity: {stdout}"
+    );
+    assert_eq!(
+        config["workon.gtAutoTrack"]["value"], "false",
+        "configuration must include gtAutoTrack with set value: {stdout}"
+    );
+
+    Ok(())
+}
