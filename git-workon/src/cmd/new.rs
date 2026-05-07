@@ -55,8 +55,8 @@ use crate::cli::New;
 use crate::hooks::execute_post_create_hooks;
 use crate::output;
 use workon::{
-    add_worktree, copy_untracked, get_repo, get_worktrees, workon_root, BranchType, CopyOptions,
-    WorktreeDescriptor,
+    add_worktree, copy_untracked, current_stack, current_worktree, get_repo, get_worktrees,
+    workon_root, BranchType, CopyOptions, StackModel, WorkonConfig, WorktreeDescriptor,
 };
 
 use super::Run;
@@ -110,7 +110,14 @@ impl Run for New {
         };
 
         let repo = get_repo(None).wrap_err("Failed to find git repository")?;
-        let config = workon::WorkonConfig::new(&repo)?;
+        let config = WorkonConfig::new(&repo)?;
+
+        // Effective stack model for this invocation
+        let effective_model = if self.no_stack {
+            StackModel::None
+        } else {
+            config.stack_model(None)?
+        };
 
         // Check if this is a PR reference
         // Only treat as PR if no conflicting flags are provided
@@ -200,6 +207,18 @@ impl Run for New {
                 // Interactive mode: prompt for base branch
                 debug!("Prompting for base branch (interactive mode)");
                 prompt_for_base_branch(&repo, &config)?
+            } else if effective_model != StackModel::None {
+                // Stack-aware: if in a stack-worktree, default base to current HEAD branch
+                match current_stack_branch(&repo, effective_model)? {
+                    Some(branch) => {
+                        debug!("Stack-aware: defaulting base to current branch: {}", branch);
+                        Some(branch)
+                    }
+                    None => {
+                        debug!("Not in a stack-worktree, using config default branch");
+                        config.default_branch(None)?
+                    }
+                }
             } else {
                 debug!("Using default base branch from config");
                 config.default_branch(None)?
@@ -224,6 +243,37 @@ impl Run for New {
             self.lock,
         )
         .wrap_err(format!("Failed to create worktree '{}'", worktree_name))?;
+
+        // Register the new branch with gt when stack-active (non-fatal on failure)
+        if effective_model == StackModel::Graphite
+            && !self.no_stack
+            && config.gt_auto_track(None)?
+        {
+            let parent = base_branch.as_deref().unwrap_or("main");
+            debug!(
+                "Running: gt track --parent {} in {}",
+                parent,
+                worktree.path().display()
+            );
+            match std::process::Command::new("gt")
+                .arg("track")
+                .arg("--parent")
+                .arg(parent)
+                .current_dir(worktree.path())
+                .output()
+            {
+                Ok(out) if out.status.success() => {
+                    debug!("gt track succeeded");
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    output::warn(&format!("gt track failed: {}", stderr.trim()));
+                }
+                Err(e) => {
+                    output::warn(&format!("gt track unavailable: {}", e));
+                }
+            }
+        }
 
         // Copy local files if enabled
         let copy_override = if self.copy {
@@ -262,6 +312,23 @@ impl Run for New {
         }
 
         Ok(Some(worktree))
+    }
+}
+
+/// Return the HEAD branch of the current stack-worktree under `model`, or None if cwd
+/// is not inside any worktree or the worktree's branch is not part of a tracked stack.
+fn current_stack_branch(repo: &git2::Repository, model: StackModel) -> Result<Option<String>> {
+    let wt = match current_worktree(repo) {
+        Ok(wt) => wt,
+        Err(_) => return Ok(None),
+    };
+    let branch = match wt.branch()? {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    match current_stack(repo, &branch, model)? {
+        Some(_) => Ok(Some(branch)),
+        None => Ok(None),
     }
 }
 

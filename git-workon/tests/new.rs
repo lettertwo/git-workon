@@ -723,3 +723,192 @@ fn new_interactive_prompts_for_base_branch() -> Result<(), Box<dyn std::error::E
 
     Ok(())
 }
+
+// ── stack-aware base selection and gt track ───────────────────────────────────
+
+fn path_without_gt_new() -> String {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|dir| !std::path::Path::new(dir).join("gt").exists())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+#[test]
+fn new_defaults_base_to_cwd_head_when_in_stacked_worktree() -> Result<(), Box<dyn std::error::Error>>
+{
+    // feat-1 is last worktree so CWD = feat-1; it has an extra commit to distinguish from main.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .config("workon.gtAutoTrack", "false")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    let feat1_oid = fixture
+        .commit("feat-1")
+        .file("stack.txt", "stack content")
+        .create("commit on feat-1")?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feat-2")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::branch_points_to("feat-2", feat1_oid));
+
+    Ok(())
+}
+
+#[test]
+fn new_explicit_base_overrides_smart_default() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .config("workon.gtAutoTrack", "false")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    fixture
+        .commit("feat-1")
+        .file("stack.txt", "content")
+        .create("commit on feat-1")?;
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    let main_oid = bare_repo
+        .find_branch("main", git2::BranchType::Local)?
+        .get()
+        .target()
+        .unwrap();
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feat-2")
+        .arg("--base")
+        .arg("main")
+        .assert()
+        .success();
+
+    bare_repo.assert(predicate::repo::branch_points_to("feat-2", main_oid));
+
+    Ok(())
+}
+
+#[test]
+fn new_no_stack_flag_disables_smart_base() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .config("workon.gtAutoTrack", "false")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    fixture
+        .commit("feat-1")
+        .file("stack.txt", "content")
+        .create("commit on feat-1")?;
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    let main_oid = bare_repo
+        .find_branch("main", git2::BranchType::Local)?
+        .get()
+        .target()
+        .unwrap();
+
+    let feat1_path = fixture.root()?.join("feat-1");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&feat1_path)
+        .arg("new")
+        .arg("--no-stack")
+        .arg("feat-2")
+        .assert()
+        .success();
+
+    bare_repo.assert(predicate::repo::branch_points_to("feat-2", main_oid));
+
+    Ok(())
+}
+
+#[test]
+fn new_gt_track_failure_is_non_fatal() -> Result<(), Box<dyn std::error::Error>> {
+    // When stackModel=graphite but gt is absent, worktree is still created + warning printed.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .env("PATH", path_without_gt_new())
+        .arg("new")
+        .arg("feat-2")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "new must succeed even when gt track fails; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+
+    let bare_path = fixture.root()?.join(".bare");
+    git2::Repository::open_bare(&bare_path)?.assert(predicate::repo::has_branch("feat-2"));
+
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("gt track"),
+        "expected gt track warning in stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_skips_gt_track_when_gt_auto_track_false() -> Result<(), Box<dyn std::error::Error>> {
+    // gtAutoTrack=false suppresses gt track entirely — no warning emitted.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .config("workon.gtAutoTrack", "false")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .env("PATH", path_without_gt_new())
+        .arg("new")
+        .arg("feat-2")
+        .output()?;
+
+    assert!(output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        !stderr.contains("gt track"),
+        "gt track must not be invoked when gtAutoTrack=false: {stderr}"
+    );
+
+    Ok(())
+}
