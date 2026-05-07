@@ -38,7 +38,7 @@ use dialoguer::theme::ColorfulTheme;
 use dialoguer::FuzzySelect;
 use log::debug;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
-use workon::{get_repo, get_worktrees, WorktreeDescriptor};
+use workon::{current_stack, get_repo, get_worktrees, WorkonConfig, WorktreeDescriptor};
 
 use crate::cli::Find;
 use crate::display::{format_aligned_rows, worktree_display_row};
@@ -49,6 +49,13 @@ impl Run for Find {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let repo = get_repo(None).wrap_err("Failed to find git repository")?;
         let mut worktrees = get_worktrees(&repo).wrap_err("Failed to list worktrees")?;
+
+        // Effective stack model (for the third match path below)
+        let effective_model = if self.no_stack {
+            workon::StackModel::None
+        } else {
+            WorkonConfig::new(&repo)?.stack_model(None)?
+        };
 
         // Apply status filters
         worktrees.retain(|wt| matches_filters(self, wt));
@@ -89,7 +96,52 @@ impl Run for Find {
                 debug!("Found {} fuzzy match(es)", fuzzy_matches.len());
 
                 match fuzzy_matches.len() {
-                    0 => bail!("No matching worktree found for '{}'", name),
+                    0 => {
+                        // Third path (stack-active): fuzzy match on branch names in stacks
+                        if effective_model != workon::StackModel::None {
+                            debug!("No fuzzy match, searching stacks for '{}'", name);
+                            let name_lower = name.to_lowercase();
+                            let all = get_worktrees(&repo)?;
+                            let stack_matches: Vec<WorktreeDescriptor> = all
+                                .into_iter()
+                                .filter(|wt| {
+                                    let head = match wt.branch().ok().flatten() {
+                                        Some(b) => b,
+                                        None => return false,
+                                    };
+                                    matches!(
+                                        current_stack(&repo, &head, effective_model),
+                                        Ok(Some(ref s)) if s.branches.iter().any(|b| {
+                                            b.to_lowercase().contains(&name_lower)
+                                        })
+                                    )
+                                })
+                                .collect();
+
+                            match stack_matches.len() {
+                                0 => {}
+                                1 => {
+                                    let wt = stack_matches.into_iter().next().unwrap();
+                                    debug!(
+                                        "Found '{}' in stack of '{}'",
+                                        name,
+                                        wt.name().unwrap_or("?")
+                                    );
+                                    return Ok(Some(wt));
+                                }
+                                _ => {
+                                    if self.no_interactive {
+                                        bail!(
+                                            "Multiple stacks contain branches matching '{}'. Use full branch name or remove --no-interactive.",
+                                            name
+                                        );
+                                    }
+                                    return select_from_list(stack_matches);
+                                }
+                            }
+                        }
+                        bail!("No matching worktree found for '{}'", name)
+                    }
                     1 => {
                         let (_, worktree) = fuzzy_matches.into_iter().next().unwrap();
                         Ok(Some(worktree))

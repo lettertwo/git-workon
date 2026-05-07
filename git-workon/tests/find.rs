@@ -315,3 +315,152 @@ fn find_interactive_arrow_key_navigation() -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+
+// ── stack-member fallback ─────────────────────────────────────────────────────
+
+#[test]
+fn find_falls_back_to_stack_branch_when_no_worktree_match() -> Result<(), Box<dyn std::error::Error>>
+{
+    // "feat-1" is a worktree. "step-2" is only a branch in feat-1's stack.
+    // Searching for "step-2" should fall back to returning the "feat-1" worktree.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("find")
+            .arg("--no-interactive")
+            .arg("step-2")
+            .output()?
+            .stdout,
+    )?;
+
+    assert!(
+        stdout.contains("feat-1"),
+        "expected feat-1 worktree path in output: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn find_stack_fallback_zero_matches_returns_no_matching_error(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Neither "ghost" worktree nor any stack branch matches → original error.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("find")
+        .arg("--no-interactive")
+        .arg("ghost")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No matching worktree"));
+
+    Ok(())
+}
+
+#[test]
+fn find_stack_fallback_multiple_matches_bail_under_no_interactive(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // "common" appears in both feat-a's stack and feat-b's stack.
+    // With --no-interactive this must fail, not prompt.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .worktree("feat-b")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-a", "main")
+        .branch_metadata("common-a", "feat-a")
+        .branch_metadata("feat-b", "main")
+        .branch_metadata("common-b", "feat-b")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("find")
+        .arg("--no-interactive")
+        .arg("common")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Multiple stacks"));
+
+    Ok(())
+}
+
+#[test]
+fn find_no_stack_flag_disables_stack_fallback() -> Result<(), Box<dyn std::error::Error>> {
+    // "step-2" would be found via the stack fallback, but --no-stack disables it.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("--no-stack")
+        .arg("step-2")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No matching worktree"));
+
+    Ok(())
+}
+
+#[test]
+fn find_stack_fallback_is_case_insensitive() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("UPPER-step", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("find")
+            .arg("--no-interactive")
+            .arg("upper")
+            .output()?
+            .stdout,
+    )?;
+
+    assert!(
+        stdout.contains("feat-1"),
+        "case-insensitive stack fallback should return feat-1: {stdout}"
+    );
+
+    Ok(())
+}
