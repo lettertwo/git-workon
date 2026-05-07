@@ -497,3 +497,200 @@ fn list_empty_result_when_no_worktrees_match_filters() -> Result<(), Box<dyn std
 
     Ok(())
 }
+
+// ── stack rendering ───────────────────────────────────────────────────────────
+
+#[test]
+fn list_renders_stack_branches_indented_with_current_marker(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Worktree "feat-1" has branch "feat-1" in a stack with "step-2" below it.
+    // stackModel = "graphite" bypasses gt binary detection.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    // feat-1 is the current branch of the worktree → marked with *
+    assert!(
+        stdout.contains("* feat-1"),
+        "expected '* feat-1' in output: {stdout}"
+    );
+    // step-2 is in the stack but not the current branch → no *
+    assert!(
+        stdout.contains("step-2"),
+        "expected 'step-2' in stack output: {stdout}"
+    );
+    assert!(
+        !stdout.contains("* step-2"),
+        "step-2 should not be marked as current: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_json_includes_stack_object() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("list")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let worktrees = parsed.as_array().expect("list --json must be array");
+
+    let feat1 = worktrees
+        .iter()
+        .find(|w| w["name"] == "feat-1")
+        .unwrap_or_else(|| panic!("expected feat-1 entry in: {stdout}"));
+
+    let stack = feat1
+        .get("stack")
+        .unwrap_or_else(|| panic!("expected stack field on feat-1: {stdout}"));
+
+    assert_eq!(stack["trunk"], "main");
+    assert_eq!(stack["current"], "feat-1");
+    let branches = stack["branches"]
+        .as_array()
+        .expect("branches must be array");
+    assert!(
+        branches.iter().any(|b| b == "feat-1"),
+        "expected feat-1 in stack branches: {stdout}"
+    );
+    assert!(
+        branches.iter().any(|b| b == "step-2"),
+        "expected step-2 in stack branches: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_no_stack_flag_suppresses_stack_rendering() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .arg("--no-stack")
+            .output()?
+            .stdout,
+    )?;
+
+    // The worktree row should still appear, but indented stack branches must not
+    assert!(
+        stdout.contains("feat-1"),
+        "worktree row should appear: {stdout}"
+    );
+    assert!(
+        !stdout.contains("* feat-1") && !stdout.contains("  feat-1"),
+        "stack branches must not appear with --no-stack: {stdout}"
+    );
+    assert!(
+        !stdout.contains("step-2"),
+        "step-2 stack branch must not appear with --no-stack: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_no_stack_json_omits_stack_field() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("list")
+        .arg("--no-stack")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let worktrees = parsed.as_array().expect("list --json must be array");
+
+    for wt in worktrees {
+        assert!(
+            wt.get("stack").is_none(),
+            "no stack field should appear with --no-stack: {wt}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn list_gracefully_handles_worktree_with_no_stack_metadata(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Stack model is graphite but "main" worktree branch is not in any metadata.
+    // List should render the worktree row without crashing or hiding it.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .build()?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .arg("list")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "list must succeed even with no branch-metadata refs"
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        stdout.contains("main"),
+        "main worktree row must appear: {stdout}"
+    );
+
+    Ok(())
+}

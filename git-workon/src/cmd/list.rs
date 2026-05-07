@@ -29,16 +29,16 @@
 //!
 //! Conservative behavior: `has_unpushed_commits()` returns true for gone upstreams
 //! (we can't know if commits are pushed when the upstream is deleted).
-//!
-//! TODO: Optimize status checks for performance with many worktrees
 
 use log::debug;
 use miette::{IntoDiagnostic, Result};
-use workon::{get_repo, get_worktrees, WorktreeDescriptor};
+use serde_json::json;
+use workon::{current_stack, get_repo, get_worktrees, WorkonConfig, WorktreeDescriptor};
 
 use crate::cli::List;
 use crate::display::{format_aligned_rows, worktree_display_row};
 use crate::json::worktree_to_json;
+use crate::output::style;
 
 use super::Run;
 
@@ -55,6 +55,13 @@ impl Run for List {
         let worktrees = get_worktrees(&repo)?;
         debug!("Found {} worktree(s)", worktrees.len());
 
+        // Determine effective stack model
+        let effective_model = if self.no_stack {
+            workon::StackModel::None
+        } else {
+            WorkonConfig::new(&repo)?.stack_model(None)?
+        };
+
         // Apply filters (AND logic)
         let filtered: Vec<_> = worktrees
             .into_iter()
@@ -62,8 +69,33 @@ impl Run for List {
             .collect();
         debug!("{} worktree(s) after filtering", filtered.len());
 
+        // Gather stack info per worktree when stack-active
+        let stacks: Vec<Option<workon::Stack>> = filtered
+            .iter()
+            .map(|wt| {
+                let branch = wt.branch().ok().flatten()?;
+                current_stack(&repo, &branch, effective_model)
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+
         if self.json {
-            let json_array: Vec<_> = filtered.iter().map(worktree_to_json).collect();
+            let json_array: Vec<_> = filtered
+                .iter()
+                .zip(stacks.iter())
+                .map(|(wt, stack)| {
+                    let mut obj = worktree_to_json(wt);
+                    if let Some(s) = stack {
+                        obj["stack"] = json!({
+                            "trunk": s.trunk,
+                            "branches": s.branches,
+                            "current": s.current,
+                        });
+                    }
+                    obj
+                })
+                .collect();
             let output = serde_json::to_string_pretty(&json_array).into_diagnostic()?;
             println!("{}", output);
             return Ok(None);
@@ -77,8 +109,14 @@ impl Run for List {
             .filter_map(|wt| worktree_display_row(wt, root, &current_dir).ok())
             .collect();
 
-        for line in format_aligned_rows(&rows, true) {
+        for (line, stack) in format_aligned_rows(&rows, true).iter().zip(stacks.iter()) {
             println!("{}", line);
+            if let Some(s) = stack {
+                for branch in &s.branches {
+                    let marker = if *branch == s.current { "*" } else { " " };
+                    println!("    {} {}", marker, style::dim(branch));
+                }
+            }
         }
 
         Ok(None)

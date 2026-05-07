@@ -107,6 +107,7 @@ pub struct List {
     #[allow(dead_code)]
     pub json: bool,
     #[clap(skip)]
+    #[allow(dead_code)]
     pub no_stack: bool,
 
     #[arg(long, help = "Show only worktrees with uncommitted changes")]
@@ -151,6 +152,7 @@ pub struct Move {
 #[derive(Debug, Args)]
 pub struct New {
     #[clap(skip)]
+    #[allow(dead_code)]
     pub no_stack: bool,
     pub name: Option<String>,
     #[arg(short, long, help = "Base branch to branch from")]
@@ -240,6 +242,7 @@ pub struct Prune {
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Find {
     #[clap(skip)]
+    #[allow(dead_code)]
     pub no_stack: bool,
     /// A partial name of a worktree.
     pub name: Option<String>,
