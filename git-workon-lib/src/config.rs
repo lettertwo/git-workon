@@ -52,7 +52,8 @@ use std::time::Duration;
 
 use git2::Repository;
 
-use crate::error::{ConfigError, Result};
+use crate::error::{ConfigError, Result, StackError};
+use crate::stack::{Granularity, StackModel};
 
 /// Configuration reader for workon settings stored in git config.
 ///
@@ -243,6 +244,81 @@ impl<'repo> WorkonConfig<'repo> {
             Err(_) => 300,
         };
         Ok(Duration::from_secs(seconds))
+    }
+
+    /// Get the active stack model.
+    ///
+    /// Precedence: CLI override > workon.stackModel config > auto-detect.
+    ///
+    /// Auto-detection: returns `Graphite` when `gt` is on PATH and the repo has been
+    /// `gt init`-ed (`.graphite_repo_config` exists). Otherwise returns `None`.
+    ///
+    /// Accepted config values: `"graphite"`, `"none"`, `"auto"` (re-runs detection).
+    /// Anything else returns an error.
+    pub fn stack_model(&self, cli_override: Option<&str>) -> Result<StackModel> {
+        let raw = if let Some(val) = cli_override {
+            Some(val.to_string())
+        } else {
+            let config = self.repo.config()?;
+            config.get_string("workon.stackModel").ok()
+        };
+
+        match raw.as_deref() {
+            None | Some("auto") => Ok(StackModel::detect(self.repo)),
+            Some("none") => Ok(StackModel::None),
+            Some("graphite") => Ok(StackModel::Graphite),
+            Some(other) if matches!(other, "branchless" | "sapling" | "spr") => {
+                Err(StackError::UnsupportedModel {
+                    model: other.to_string(),
+                }
+                .into())
+            }
+            Some(other) => Err(StackError::UnknownModel {
+                value: other.to_string(),
+            }
+            .into()),
+        }
+    }
+
+    /// Get the worktree granularity for stacked diff workflows.
+    ///
+    /// Precedence: CLI override > workon.stackWorktreeGranularity config > `Stack`.
+    ///
+    /// Only `"stack"` is implemented in v1. `"diff"` (one worktree per branch) is planned.
+    pub fn stack_worktree_granularity(&self, cli_override: Option<&str>) -> Result<Granularity> {
+        let raw = if let Some(val) = cli_override {
+            Some(val.to_string())
+        } else {
+            let config = self.repo.config()?;
+            config.get_string("workon.stackWorktreeGranularity").ok()
+        };
+
+        match raw.as_deref() {
+            None | Some("stack") => Ok(Granularity::Stack),
+            Some("diff") => Err(StackError::UnsupportedGranularity.into()),
+            Some(other) => Err(StackError::UnknownGranularity {
+                value: other.to_string(),
+            }
+            .into()),
+        }
+    }
+
+    /// Get whether to automatically register new branches with Graphite after `workon new`.
+    ///
+    /// Precedence: CLI override > workon.gtAutoTrack config > `true`.
+    ///
+    /// When `true` and `stackModel == Graphite`, `workon new` invokes `gt track --parent <base>`
+    /// inside the new worktree so the branch appears in `gt log` / `gt sync`. Failures are
+    /// non-fatal warnings.
+    pub fn gt_auto_track(&self, cli_override: Option<bool>) -> Result<bool> {
+        if let Some(val) = cli_override {
+            return Ok(val);
+        }
+        let config = self.repo.config()?;
+        match config.get_bool("workon.gtAutoTrack") {
+            Ok(val) => Ok(val),
+            Err(_) => Ok(true),
+        }
     }
 
     /// Helper to read multi-value config entries.

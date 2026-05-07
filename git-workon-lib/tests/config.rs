@@ -1,6 +1,6 @@
 use git_workon_fixture::prelude::*;
 use std::error::Error;
-use workon::WorkonConfig;
+use workon::{Granularity, StackModel, WorkonConfig};
 
 #[test]
 fn read_default_branch_config() -> Result<(), Box<dyn Error>> {
@@ -185,5 +185,162 @@ fn read_prune_protected_branches_multi_value() -> Result<(), Box<dyn Error>> {
     assert_eq!(protected[0], "main");
     assert_eq!(protected[1], "develop");
     assert_eq!(protected[2], "release/*");
+    Ok(())
+}
+
+// ── stack_model ───────────────────────────────────────────────────────────────
+
+#[test]
+fn stack_model_none_returns_none_variant() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "none")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(cfg.stack_model(None)?, StackModel::None);
+    Ok(())
+}
+
+#[test]
+fn stack_model_graphite_returns_graphite_variant() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "graphite")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(cfg.stack_model(None)?, StackModel::Graphite);
+    Ok(())
+}
+
+#[test]
+fn stack_model_cli_override_wins_over_config() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "none")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(cfg.stack_model(Some("graphite"))?, StackModel::Graphite);
+    Ok(())
+}
+
+#[test]
+fn stack_model_unsupported_values_return_error() -> Result<(), Box<dyn Error>> {
+    for unsupported in &["branchless", "sapling", "spr"] {
+        let fixture = FixtureBuilder::new()
+            .config("workon.stackModel", unsupported)
+            .build()?;
+        let repo = fixture.repo()?;
+        let cfg = WorkonConfig::new(repo)?;
+        let err = cfg.stack_model(None).unwrap_err();
+        assert!(
+            err.to_string().contains("not yet supported"),
+            "expected 'not yet supported' for model '{unsupported}', got: {err}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stack_model_unknown_value_returns_error() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "unknown-tool")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    let err = cfg.stack_model(None).unwrap_err();
+    assert!(err.to_string().contains("Unknown stack model"));
+    Ok(())
+}
+
+// ── stack_worktree_granularity ────────────────────────────────────────────────
+
+#[test]
+fn stack_worktree_granularity_defaults_to_stack() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new().build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(cfg.stack_worktree_granularity(None)?, Granularity::Stack);
+    Ok(())
+}
+
+#[test]
+fn stack_worktree_granularity_stack_explicit() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackWorktreeGranularity", "stack")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(cfg.stack_worktree_granularity(None)?, Granularity::Stack);
+    Ok(())
+}
+
+#[test]
+fn stack_worktree_granularity_diff_is_unsupported() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackWorktreeGranularity", "diff")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    let err = cfg.stack_worktree_granularity(None).unwrap_err();
+    assert!(err.to_string().contains("not yet implemented"));
+    Ok(())
+}
+
+#[test]
+fn stack_worktree_granularity_unknown_value_returns_error() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackWorktreeGranularity", "per-commit")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    let err = cfg.stack_worktree_granularity(None).unwrap_err();
+    assert!(err.to_string().contains("Unknown worktree granularity"));
+    Ok(())
+}
+
+#[test]
+fn stack_worktree_granularity_cli_override_wins() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackWorktreeGranularity", "diff")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(
+        cfg.stack_worktree_granularity(Some("stack"))?,
+        Granularity::Stack
+    );
+    Ok(())
+}
+
+// ── gt_auto_track ─────────────────────────────────────────────────────────────
+
+#[test]
+fn gt_auto_track_defaults_to_true() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new().build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(cfg.gt_auto_track(None)?);
+    Ok(())
+}
+
+#[test]
+fn gt_auto_track_reads_false_from_config() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.gtAutoTrack", "false")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(!cfg.gt_auto_track(None)?);
+    Ok(())
+}
+
+#[test]
+fn gt_auto_track_cli_override_wins() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.gtAutoTrack", "true")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(!cfg.gt_auto_track(Some(false))?);
     Ok(())
 }
