@@ -1,7 +1,9 @@
 mod branch_points_to;
 mod has_branch;
+mod has_branch_metadata;
 mod has_config;
 mod has_config_multivar;
+mod has_graphite_config;
 mod has_remote;
 mod has_remote_branch;
 mod has_remote_url;
@@ -17,8 +19,10 @@ mod is_worktree;
 
 pub use self::branch_points_to::*;
 pub use self::has_branch::*;
+pub use self::has_branch_metadata::*;
 pub use self::has_config::*;
 pub use self::has_config_multivar::*;
+pub use self::has_graphite_config::*;
 pub use self::has_remote::*;
 pub use self::has_remote_branch::*;
 pub use self::has_remote_url::*;

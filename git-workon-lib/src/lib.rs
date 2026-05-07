@@ -58,6 +58,7 @@ mod init;
 mod r#move;
 mod pr;
 mod ssh_config;
+mod stack;
 mod workon_root;
 mod worktree;
 
@@ -73,5 +74,6 @@ pub use crate::get_repo::*;
 pub use crate::init::*;
 pub use crate::pr::*;
 pub use crate::r#move::*;
+pub use crate::stack::{current_stack, is_graphite_active, Granularity, Stack, StackModel};
 pub use crate::workon_root::*;
 pub use crate::worktree::*;

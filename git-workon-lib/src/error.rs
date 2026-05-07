@@ -48,6 +48,11 @@ pub enum WorkonError {
     #[error(transparent)]
     #[diagnostic(forward(0))]
     Copy(#[from] CopyError),
+
+    /// Stacked diff workflow errors
+    #[error(transparent)]
+    #[diagnostic(forward(0))]
+    Stack(#[from] StackError),
 }
 
 /// Repository-specific errors
@@ -192,6 +197,66 @@ pub enum DefaultBranchError {
         help("Set init.defaultBranch in your git config, or create a 'main' or 'master' branch")
     )]
     NoDefaultBranch,
+}
+
+/// Stacked diff workflow errors
+#[derive(Error, Diagnostic, Debug)]
+pub enum StackError {
+    #[error("Stack model '{model}' is not yet supported")]
+    #[diagnostic(
+        code(workon::stack::unsupported_model),
+        help(
+            "Only 'graphite' is implemented in this version. \
+             Support for branchless, sapling, and spr is planned."
+        )
+    )]
+    UnsupportedModel { model: String },
+
+    #[error("Unknown stack model '{value}'")]
+    #[diagnostic(
+        code(workon::stack::unknown_model),
+        help("Valid values: graphite, none, auto")
+    )]
+    UnknownModel { value: String },
+
+    #[error("Worktree granularity 'diff' is not yet implemented")]
+    #[diagnostic(
+        code(workon::stack::unsupported_granularity),
+        help(
+            "Only 'stack' (one worktree per stack) is supported in this version. \
+             'diff' (one worktree per branch) is planned."
+        )
+    )]
+    UnsupportedGranularity,
+
+    #[error("Unknown worktree granularity '{value}'")]
+    #[diagnostic(code(workon::stack::unknown_granularity), help("Valid values: stack"))]
+    UnknownGranularity { value: String },
+
+    #[error("Graphite CLI ('gt') is not installed or not in PATH")]
+    #[diagnostic(
+        code(workon::stack::gt_not_installed),
+        help(
+            "Install Graphite: https://graphite.dev/cli \
+             Or set workon.stackModel = none to disable stack support."
+        )
+    )]
+    GtNotInstalled,
+
+    #[error("Graphite command failed: {stderr}")]
+    #[diagnostic(code(workon::stack::gt_command_failed))]
+    GtCommandFailed { stderr: String },
+
+    #[error("Failed to parse Graphite metadata: {message}")]
+    #[diagnostic(code(workon::stack::gt_parse_failed))]
+    GtParseFailed { message: String },
+
+    #[error("Repository is not Graphite-managed (no .graphite_repo_config)")]
+    #[diagnostic(
+        code(workon::stack::not_a_graphite_repo),
+        help("Run 'gt init' in this repository, or unset workon.stackModel.")
+    )]
+    NotAGraphiteRepo,
 }
 
 /// Pull request-related errors

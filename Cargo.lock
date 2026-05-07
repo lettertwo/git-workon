@@ -610,6 +610,7 @@ dependencies = [
  "git2_credentials",
  "log",
  "predicates",
+ "serde_json",
 ]
 
 [[package]]

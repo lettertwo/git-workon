@@ -51,6 +51,9 @@ pub struct FixtureBuilder<'fixture> {
     remotes: Vec<(String, RemoteSource)>,
     upstreams: Vec<(String, String)>, // (local_branch, remote_branch)
     configs: Vec<(String, String)>,   // (key, value) for git config
+    graphite_config: Option<Vec<String>>, // trunk branch names for .graphite_repo_config
+    branch_metadata: Vec<(String, String)>, // (branch, parent) for refs/branch-metadata/*
+    raw_branch_metadata: Vec<(String, Vec<u8>)>, // (branch, raw_bytes) for malformed-blob tests
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -62,6 +65,9 @@ impl<'fixture> FixtureBuilder<'fixture> {
             remotes: Vec::new(),
             upstreams: Vec::new(),
             configs: Vec::new(),
+            graphite_config: None,
+            branch_metadata: Vec::new(),
+            raw_branch_metadata: Vec::new(),
         }
     }
 
@@ -101,6 +107,33 @@ impl<'fixture> FixtureBuilder<'fixture> {
     /// Can be called multiple times with the same key for multi-value configs
     pub fn config(mut self, key: &str, value: &str) -> Self {
         self.configs.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Write `.graphite_repo_config` marking this as a Graphite-managed repository.
+    ///
+    /// `trunks` is the list of trunk branch names (typically `["main"]`).
+    pub fn graphite_config(mut self, trunks: &[&str]) -> Self {
+        self.graphite_config = Some(trunks.iter().map(|s| s.to_string()).collect());
+        self
+    }
+
+    /// Write Graphite branch-metadata for `branch` with parent `parent`.
+    ///
+    /// Creates a blob at `refs/branch-metadata/<branch>` containing
+    /// `{"branchName": "<branch>", "parentBranchName": "<parent>"}`, mirroring
+    /// what `gt track` writes.
+    pub fn branch_metadata(mut self, branch: &str, parent: &str) -> Self {
+        self.branch_metadata
+            .push((branch.to_string(), parent.to_string()));
+        self
+    }
+
+    /// Write a raw blob at `refs/branch-metadata/<branch>`.
+    ///
+    /// Use this to simulate malformed metadata (e.g. non-JSON content) for error-path tests.
+    pub fn raw_branch_metadata(mut self, branch: &str, bytes: Vec<u8>) -> Self {
+        self.raw_branch_metadata.push((branch.to_string(), bytes));
         self
     }
 
@@ -190,6 +223,47 @@ impl<'fixture> FixtureBuilder<'fixture> {
             // Set upstream tracking
             let mut local_branch = repo.find_branch(branch, BranchType::Local)?;
             local_branch.set_upstream(Some(remote_branch))?;
+        }
+
+        // Write .graphite_repo_config
+        if let Some(trunks) = &self.graphite_config {
+            let trunk_objects: Vec<serde_json::Value> = trunks
+                .iter()
+                .map(|t| serde_json::json!({"name": t}))
+                .collect();
+            let config_json = serde_json::json!({
+                "trunk": trunks.first().map(|s| s.as_str()).unwrap_or("main"),
+                "trunks": trunk_objects,
+            });
+            let config_path = repo.path().join(".graphite_repo_config");
+            std::fs::write(&config_path, config_json.to_string())?;
+        }
+
+        // Write branch-metadata blobs for Graphite stack tracking
+        for (branch, parent) in &self.branch_metadata {
+            let content = serde_json::json!({
+                "branchName": branch,
+                "parentBranchName": parent,
+            })
+            .to_string();
+            let oid = repo.blob(content.as_bytes())?;
+            repo.reference(
+                &format!("refs/branch-metadata/{branch}"),
+                oid,
+                false,
+                "add branch metadata",
+            )?;
+        }
+
+        // Write raw branch-metadata blobs (for malformed-content tests)
+        for (branch, bytes) in &self.raw_branch_metadata {
+            let oid = repo.blob(bytes)?;
+            repo.reference(
+                &format!("refs/branch-metadata/{branch}"),
+                oid,
+                false,
+                "add raw branch metadata",
+            )?;
         }
 
         if self.worktrees.is_empty() {
