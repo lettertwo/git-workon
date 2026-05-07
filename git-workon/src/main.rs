@@ -62,6 +62,16 @@ fn main() -> Result<()> {
         }
     }
 
+    // Propagate --no-stack to commands that have stack-aware behavior
+    if cli.no_stack {
+        match &mut cmd {
+            Cmd::List(list) => list.no_stack = true,
+            Cmd::Find(find) => find.no_stack = true,
+            Cmd::New(new) => new.no_stack = true,
+            _ => {}
+        }
+    }
+
     let worktree = match cmd.run() {
         Ok(wt) => wt,
         Err(ref e) if json_mode => {
@@ -101,6 +111,7 @@ fn route_pr_ref_to_command(pr_ref: &str) -> Option<Cmd> {
     match repo.find_worktree(&pr_name) {
         Ok(_) => None, // worktree already exists
         _ => Some(Cmd::New(cli::New {
+            no_stack: false,
             name: Some(pr_name),
             base: None,
             orphan: false,

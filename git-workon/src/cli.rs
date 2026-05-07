@@ -21,6 +21,12 @@ pub struct Cli {
     pub json: bool,
     #[arg(long, global = true, help = "Disable color output")]
     pub no_color: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Disable stack-aware behavior for this invocation"
+    )]
+    pub no_stack: bool,
     #[command(subcommand)]
     pub command: Option<Cmd>,
     #[clap(flatten)]
@@ -100,6 +106,8 @@ pub struct List {
     #[clap(skip)]
     #[allow(dead_code)]
     pub json: bool,
+    #[clap(skip)]
+    pub no_stack: bool,
 
     #[arg(long, help = "Show only worktrees with uncommitted changes")]
     pub dirty: bool,
@@ -142,6 +150,8 @@ pub struct Move {
 /// Create a new worktree.
 #[derive(Debug, Args)]
 pub struct New {
+    #[clap(skip)]
+    pub no_stack: bool,
     pub name: Option<String>,
     #[arg(short, long, help = "Base branch to branch from")]
     pub base: Option<String>,
@@ -229,6 +239,8 @@ pub struct Prune {
 #[derive(Debug, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Find {
+    #[clap(skip)]
+    pub no_stack: bool,
     /// A partial name of a worktree.
     pub name: Option<String>,
 
