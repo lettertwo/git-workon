@@ -41,6 +41,18 @@ The handoff is tag-based: release-plz pushes a tag → cargo-dist's workflow tri
 - cargo-dist's workflow also runs on pull requests (in plan-only mode) to validate release configuration without publishing.
 - The `vendored` feature bundles OpenSSL and other native dependencies into the binary, ensuring the distributed artifacts work without system library requirements.
 
+## Version Coupling
+
+`git-workon` and `git-workon-lib` share a `version_group = "main"` in `release-plz.toml`. release-plz assigns both crates the highest of their independently-calculated next versions, so a breaking change in the lib automatically major-bumps the CLI even when the breaking commit only touches lib files.
+
+**Rationale:** The CLI is a thin wrapper over the lib's user-visible behavior. A `feat(lib)!:` commit is effectively a breaking CLI change from the user's perspective, so the CLI's semver should reflect it.
+
+**Trade-off:** An internal lib refactor that triggers any bump will also bump the CLI even if no CLI behavior changed. This is accepted as an over-bump is harmless; an under-bump silently exposes users to a semver-broken dependency.
+
+**Alternative considered:** A CI guard that fails the release PR when the lib major-bumps without the CLI major-bumping. Rejected in favor of the simpler automated mechanism.
+
+`git-workon-fixture` is excluded from the version group — it has `publish = false` and is versioned independently.
+
 ## References
 
 - `.github/workflows/release-plz.yml` — release-plz trigger and action

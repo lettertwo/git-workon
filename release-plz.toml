@@ -1,3 +1,11 @@
 [workspace]
 git_tag_enable = true
 git_release_enable = false
+
+[[package]]
+name = "git-workon"
+version_group = "main"
+
+[[package]]
+name = "git-workon-lib"
+version_group = "main"
