@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.3.0...git-workon-lib-v0.4.0) - 2026-05-08
+
+### Added
+
+- *(config)* add stack_model, stack_worktree_granularity, and gt_auto_track accessors
+- *(lib)* add StackModel, Stack, StackError, and Graphite detection
+
 ## [0.3.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.2.1...git-workon-lib-v0.3.0) - 2026-05-06
 
 ### Added
