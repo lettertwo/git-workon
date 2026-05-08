@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.2.1...git-workon-v0.4.0) - 2026-05-08
+
+### Added
+
+- *(cli)* smart base default and gt track in new command when stack-active
+- *(cli)* add stack-member match path to find command
+- *(cli)* render stack tree in list when stack-active
+- *(cli)* add global --no-stack flag and propagate to commands
+- *(cli)* add stack config checks and gt detection to doctor
+
 ## [0.2.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.2.0...git-workon-v0.2.1) - 2026-05-06
 
 ### Added
