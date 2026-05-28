@@ -48,6 +48,7 @@
 //! - Enables format placeholders: {number}, {title}, {author}, {branch}
 
 use dialoguer::{FuzzySelect, Input};
+use git2::BranchType as GitBranchType;
 use log::debug;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
 
@@ -119,18 +120,24 @@ impl Run for New {
             config.stack_model(None)?
         };
 
+        // --branch is incompatible with --orphan/--detach (those imply branch creation)
+        if self.branch.is_some() && (self.orphan || self.detach) {
+            bail!("--branch cannot be combined with --orphan or --detach");
+        }
+
         // Check if this is a PR reference
         // Only treat as PR if no conflicting flags are provided
-        let pr_info = if !self.orphan && !self.detach && self.base.is_none() {
-            let info = workon::parse_pr_reference(&name)?;
-            if info.is_some() {
-                debug!("Detected PR reference in '{}'", name);
-            }
-            info
-        } else {
-            debug!("Skipping PR detection (conflicting flags)");
-            None
-        };
+        let pr_info =
+            if !self.orphan && !self.detach && self.base.is_none() && self.branch.is_none() {
+                let info = workon::parse_pr_reference(&name)?;
+                if info.is_some() {
+                    debug!("Detected PR reference in '{}'", name);
+                }
+                info
+            } else {
+                debug!("Skipping PR detection (conflicting flags)");
+                None
+            };
 
         let (worktree_name, base_branch, branch_type) = if let Some(pr) = pr_info {
             // This is a PR reference - use gh CLI workflow
@@ -151,6 +158,7 @@ impl Run for New {
             let worktree = add_worktree(
                 &repo,
                 &worktree_name,
+                None,
                 BranchType::Normal,
                 Some(&remote_ref),
                 self.lock,
@@ -235,14 +243,42 @@ impl Run for New {
             (name, base_branch, branch_type)
         };
 
+        // When --branch is set, positional name is the worktree directory and
+        // the flag value is the branch to look up or create.
+        let (effective_branch, worktree_alias) = match &self.branch {
+            Some(branch) => {
+                if self.base.is_some() && repo.find_branch(branch, GitBranchType::Local).is_ok() {
+                    output::warn(&format!(
+                        "Branch '{}' already exists; --base ignored",
+                        branch
+                    ));
+                }
+                (branch.clone(), Some(worktree_name.clone()))
+            }
+            None => {
+                if self.base.is_some()
+                    && repo
+                        .find_branch(&worktree_name, GitBranchType::Local)
+                        .is_ok()
+                {
+                    output::warn(&format!(
+                        "Branch '{}' already exists; --base ignored",
+                        &worktree_name
+                    ));
+                }
+                (worktree_name.clone(), None)
+            }
+        };
+
         let worktree = add_worktree(
             &repo,
-            &worktree_name,
+            &effective_branch,
+            worktree_alias.as_deref(),
             branch_type,
             base_branch.as_deref(),
             self.lock,
         )
-        .wrap_err(format!("Failed to create worktree '{}'", worktree_name))?;
+        .wrap_err(format!("Failed to create worktree '{}'", effective_branch))?;
 
         // Register the new branch with gt when stack-active (non-fatal on failure)
         if effective_model == StackModel::Graphite
@@ -338,7 +374,7 @@ fn prompt_for_base_branch(
     config: &workon::WorkonConfig,
 ) -> Result<Option<String>> {
     let branches = repo
-        .branches(Some(git2::BranchType::Local))
+        .branches(Some(GitBranchType::Local))
         .into_diagnostic()?;
 
     let branch_names: Vec<String> = branches

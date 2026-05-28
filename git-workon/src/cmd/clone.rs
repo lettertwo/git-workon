@@ -51,12 +51,19 @@ impl Run for Clone {
         let default_branch = get_default_branch_name(&repo, repo.find_remote("origin").ok())
             .wrap_err("Failed to determine default branch")
             .inspect_err(|_| pb.finish_and_clear())?;
-        let worktree = add_worktree(&repo, &default_branch, BranchType::default(), None, false)
-            .wrap_err(format!(
-                "Failed to create worktree for default branch '{}'",
-                default_branch
-            ))
-            .inspect_err(|_| pb.finish_and_clear())?;
+        let worktree = add_worktree(
+            &repo,
+            &default_branch,
+            None,
+            BranchType::default(),
+            None,
+            false,
+        )
+        .wrap_err(format!(
+            "Failed to create worktree for default branch '{}'",
+            default_branch
+        ))
+        .inspect_err(|_| pb.finish_and_clear())?;
         pb.finish_and_clear();
 
         // Execute post-create hooks after successful worktree creation

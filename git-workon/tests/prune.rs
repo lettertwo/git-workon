@@ -616,9 +616,9 @@ fn prune_skips_protected_branch_with_glob_pattern() -> Result<(), Box<dyn std::e
 
     // Manually create worktrees with slashes using add_worktree
     use workon::{add_worktree, BranchType};
-    add_worktree(repo, "release/1.0", BranchType::Normal, None, false)?;
-    add_worktree(repo, "release/2.0", BranchType::Normal, None, false)?;
-    add_worktree(repo, "feature/test", BranchType::Normal, None, false)?;
+    add_worktree(repo, "release/1.0", None, BranchType::Normal, None, false)?;
+    add_worktree(repo, "release/2.0", None, BranchType::Normal, None, false)?;
+    add_worktree(repo, "feature/test", None, BranchType::Normal, None, false)?;
 
     // Delete all branches to make them prune candidates
     repo.find_reference("refs/heads/release/1.0")?.delete()?;
@@ -673,8 +673,8 @@ fn prune_respects_multiple_protected_patterns() -> Result<(), Box<dyn std::error
 
     // Manually create worktrees with slashes using add_worktree
     use workon::{add_worktree, BranchType};
-    add_worktree(repo, "release/1.0", BranchType::Normal, None, false)?;
-    add_worktree(repo, "feature/test", BranchType::Normal, None, false)?;
+    add_worktree(repo, "release/1.0", None, BranchType::Normal, None, false)?;
+    add_worktree(repo, "feature/test", None, BranchType::Normal, None, false)?;
 
     // Delete all branches to make them prune candidates
     repo.find_reference("refs/heads/develop")?.delete()?;

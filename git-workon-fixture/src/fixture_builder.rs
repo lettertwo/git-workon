@@ -48,6 +48,7 @@ pub struct FixtureBuilder<'fixture> {
     bare: bool,
     default_branch: &'fixture str,
     worktrees: Vec<&'fixture str>,
+    branches: Vec<&'fixture str>, // local branches without worktrees
     remotes: Vec<(String, RemoteSource)>,
     upstreams: Vec<(String, String)>, // (local_branch, remote_branch)
     configs: Vec<(String, String)>,   // (key, value) for git config
@@ -62,6 +63,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
             bare: false,
             default_branch: "main",
             worktrees: Vec::new(),
+            branches: Vec::new(),
             remotes: Vec::new(),
             upstreams: Vec::new(),
             configs: Vec::new(),
@@ -86,6 +88,15 @@ impl<'fixture> FixtureBuilder<'fixture> {
     /// The Fixture will be opened in the last worktree specified
     pub fn worktree(mut self, worktree: &'fixture str) -> Self {
         self.worktrees.push(worktree);
+        self
+    }
+
+    /// Create a local branch at HEAD without a worktree.
+    ///
+    /// Use this to set up "branch exists but no worktree" scenarios for testing
+    /// the existing-branch worktree creation flow.
+    pub fn branch(mut self, branch: &'fixture str) -> Self {
+        self.branches.push(branch);
         self
     }
 
@@ -195,6 +206,13 @@ impl<'fixture> FixtureBuilder<'fixture> {
             worktree_opts.checkout_existing(self.bare);
 
             repo.worktree(worktree, &worktree_path, Some(&worktree_opts))?;
+        }
+
+        // Create local branches without worktrees
+        for branch_name in &self.branches {
+            let head = repo.head()?;
+            let commit = head.peel_to_commit()?;
+            repo.branch(branch_name, &commit, false)?;
         }
 
         // Apply remotes

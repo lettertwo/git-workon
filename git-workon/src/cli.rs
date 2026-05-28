@@ -157,6 +157,12 @@ pub struct New {
     pub name: Option<String>,
     #[arg(short, long, help = "Base branch to branch from")]
     pub base: Option<String>,
+    #[arg(
+        short = 'B',
+        long,
+        help = "Branch to attach (uses positional name as worktree directory)"
+    )]
+    pub branch: Option<String>,
     #[arg(short, long, help = "Create an orphan branch with no parent commits")]
     pub orphan: bool,
     #[arg(short, long, help = "Detach HEAD in the new working tree")]

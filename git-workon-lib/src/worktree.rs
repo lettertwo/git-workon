@@ -628,16 +628,47 @@ pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor
         .ok_or_else(|| WorktreeError::NotFound(name.to_string()).into())
 }
 
+/// Find a remote tracking branch by its short name (without the remote prefix).
+///
+/// Given `branch_name = "feature"`, finds `refs/remotes/origin/feature` and returns
+/// `(remote_name, commit_oid)` so a local tracking branch can be created.
+/// When multiple remotes have a branch with this name, the first match is returned.
+fn find_remote_tracking_branch(
+    repo: &Repository,
+    branch_name: &str,
+) -> Option<(String, git2::Oid)> {
+    let branches = repo.branches(Some(git2::BranchType::Remote)).ok()?;
+    for branch_result in branches.flatten() {
+        let (branch, _) = branch_result;
+        if let Ok(Some(full_name)) = branch.name() {
+            // full_name is "remote/branch" (e.g., "origin/feature")
+            if let Some((remote_name, remote_branch)) = full_name.split_once('/') {
+                if remote_branch == branch_name {
+                    if let Some(oid) = branch.get().target() {
+                        return Some((remote_name.to_string(), oid));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Create a new worktree for the given branch.
 ///
 /// The worktree directory is placed under the workon root (see [`workon_root`]).
 /// Branch names containing `/` are supported; parent directories are created
 /// automatically and the worktree is named after the final path component.
 ///
+/// When `explicit_worktree_name` is `Some`, that value is used as the worktree
+/// directory name and filesystem path instead of deriving it from `branch_name`.
+/// This allows the worktree directory and the branch to have different names.
+///
 /// # Branch types
 ///
-/// - [`BranchType::Normal`] — uses an existing local/remote branch, or creates one from
-///   `base_branch` (or HEAD if `base_branch` is `None`).
+/// - [`BranchType::Normal`] — uses an existing local branch, creates a local branch
+///   from a matching remote tracking branch (setting upstream automatically), or
+///   creates a new branch from `base_branch` (or HEAD if `base_branch` is `None`).
 /// - [`BranchType::Orphan`] — creates an independent branch with no shared history,
 ///   seeded with an empty initial commit.
 /// - [`BranchType::Detached`] — creates a worktree with a detached HEAD pointing to
@@ -645,6 +676,7 @@ pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor
 pub fn add_worktree(
     repo: &Repository,
     branch_name: &str,
+    explicit_worktree_name: Option<&str>,
     branch_type: BranchType,
     base_branch: Option<&str>,
     lock: bool,
@@ -671,12 +703,25 @@ pub fn add_worktree(
                 Ok(b) => b,
                 Err(e) => {
                     debug!("local branch not found: {:?}", e);
-                    debug!("looking for remote branch {:?}", branch_name);
-                    match repo.find_branch(branch_name, git2::BranchType::Remote) {
-                        Ok(b) => b,
-                        Err(e) => {
-                            debug!("remote branch not found: {:?}", e);
-                            debug!("creating new local branch {:?}", branch_name);
+                    debug!("looking for remote tracking branch for {:?}", branch_name);
+                    match find_remote_tracking_branch(repo, branch_name) {
+                        Some((remote_name, remote_oid)) => {
+                            debug!(
+                                "found remote tracking branch {}/{}, creating local branch",
+                                remote_name, branch_name
+                            );
+                            let remote_commit = repo.find_commit(remote_oid)?;
+                            let mut local_branch =
+                                repo.branch(branch_name, &remote_commit, false)?;
+                            let upstream_name = format!("{}/{}", remote_name, branch_name);
+                            local_branch.set_upstream(Some(&upstream_name))?;
+                            local_branch
+                        }
+                        None => {
+                            debug!(
+                                "no remote tracking branch found, creating new local branch {:?}",
+                                branch_name
+                            );
 
                             // Determine which commit to branch from
                             let base_commit = if let Some(base) = base_branch {
@@ -709,14 +754,23 @@ pub fn add_worktree(
 
     let root = workon_root(repo)?;
 
-    // Git does not support worktree names with slashes in them,
-    // so take the base of the branch name as the worktree name.
-    let worktree_name = match Path::new(&branch_name).file_name() {
-        Some(basename) => basename.to_str().ok_or(WorktreeError::InvalidName)?,
-        None => branch_name,
+    // Determine worktree name and path.
+    // When an explicit name is provided, use it directly.
+    // Otherwise, derive from branch_name: git does not support worktree names with
+    // slashes, so take the basename of the branch name as the worktree name.
+    let (worktree_name, worktree_path) = if let Some(alias) = explicit_worktree_name {
+        let name = match Path::new(alias).file_name() {
+            Some(basename) => basename.to_str().ok_or(WorktreeError::InvalidName)?,
+            None => alias,
+        };
+        (name, root.join(alias))
+    } else {
+        let name = match Path::new(&branch_name).file_name() {
+            Some(basename) => basename.to_str().ok_or(WorktreeError::InvalidName)?,
+            None => branch_name,
+        };
+        (name, root.join(branch_name))
     };
-
-    let worktree_path = root.join(branch_name);
 
     // Create parent directories if the branch name contains slashes
     if let Some(parent) = worktree_path.parent() {
