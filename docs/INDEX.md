@@ -42,6 +42,12 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 - `docs/diagrams/doctor-flow.md`
 - Key source: `git-workon/src/cmd/doctor.rs`
 
+### stack / stacked-diffs / graphite
+
+- `docs/recipes/stacked-diffs.md` — user guide: setup, worktree-per-stack pattern, list/find/new stack-aware behavior, config reference
+- `docs/rfc/stacked-diffs.md` — research on stacked diff tools (Graphite, branchless, spr, Sapling, git-stack)
+- Key source: `git-workon-lib/src/stack.rs`, `git-workon-lib/src/stack/graphite.rs`, `git-workon-lib/src/config.rs` (`stack_model`, `gt_auto_track`)
+
 ### pr / pull-request
 
 - `docs/diagrams/pr-workflow.md`
@@ -94,4 +100,4 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 
 ### stacked-diffs / stacked
 
-- `docs/rfc/stacked-diffs.md`
+- `docs/rfc/stacked-diffs.md` — pre-implementation research (see `stack` subsystem above for current docs)
