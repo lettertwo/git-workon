@@ -11,9 +11,11 @@ When `git workon` is called without an explicit subcommand, `main.rs` inspects t
 1. If no argument is given → route to `find` (interactive selection).
 2. If the argument matches `is_pr_reference()` (e.g. `#123`, `pr-123`, a GitHub PR URL) AND the corresponding worktree does not already exist → route to `new` with the PR reference pre-filled.
 3. If the argument matches `is_pr_reference()` AND the worktree already exists → route to `find` with the formatted name.
-4. Otherwise → route to `find` with the name as the search term.
+4. If a worktree matching the name already exists → route to `find` (let it handle the match).
+5. If a local branch or a remote tracking branch (by short name) matches the argument AND no worktree exists yet → route to `new` (auto-attach to the existing branch).
+6. Otherwise → route to `find` with the name as the search term.
 
-This allows `git workon #123` to create a PR worktree and `git workon feature` to find an existing one, with no explicit subcommand needed.
+This allows `git workon #123` to create a PR worktree, `git workon feature` to attach or find the `feature` branch, and `git workon some-name` to find an existing worktree — with no explicit subcommand needed.
 
 ## Consequences
 
@@ -25,5 +27,5 @@ This allows `git workon #123` to create a PR worktree and `git workon feature` t
 ## References
 
 - `docs/diagrams/command-dispatch.md` — full routing flowchart
-- `git-workon/src/main.rs` — `route_pr_ref_to_command()`
+- `git-workon/src/main.rs` — `route_pr_ref_to_command()`, `route_branch_to_command()`, `branch_exists()`
 - `git-workon-lib/src/pr.rs` — `is_pr_reference()`, `parse_pr_reference()`

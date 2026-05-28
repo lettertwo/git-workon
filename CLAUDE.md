@@ -48,8 +48,8 @@ Each command struct in `cli.rs` implements the `Run` trait in `cmd/<name>.rs`. `
 See [ADR-005](docs/adr/005-run-trait-command-dispatch.md) | Key source: `git-workon/src/main.rs`, `git-workon/src/cli.rs`
 
 ### Default Command Behavior
-PR references (`#123`, `pr#123`, GitHub URLs) → `New` command. Regular names → `Find` command.
-See [ADR-004](docs/adr/004-smart-routing-default-command.md) | Key source: `git-workon/src/main.rs` (lines 20-38)
+PR references (`#123`, `pr#123`, GitHub URLs) → `New` command. Otherwise, routing checks in order: existing worktree → `Find`; local or remote tracking branch with no worktree → `New` (auto-attach); no match → `Find` (shows error).
+See [ADR-004](docs/adr/004-smart-routing-default-command.md) | Key source: `git-workon/src/main.rs` (`route_branch_to_command`, `branch_exists`)
 
 ## Build, Test, and Quality
 

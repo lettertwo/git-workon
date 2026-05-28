@@ -11,7 +11,10 @@ flowchart TD
     GET_NAME -->|no + interactive| PROMPT_NAME["dialoguer::Input\n'Branch name'"]
     PROMPT_NAME --> NAME_VAL
 
-    NAME_VAL --> IS_PR{PR ref? no branch type flags?}
+    NAME_VAL --> HAS_BRANCH{"--branch set?"}
+    HAS_BRANCH -->|yes| BRANCH_ALIAS["positional = worktree dir\n--branch value = branch to use"]
+    HAS_BRANCH -->|no| IS_PR{PR ref? no branch type flags?}
+    BRANCH_ALIAS --> BRANCH_TYPE
     IS_PR -->|yes| PR_PATH["→ PR workflow\n(05-pr-workflow.md)"]
     IS_PR -->|no| BASE_BRANCH
 
@@ -36,11 +39,12 @@ flowchart TD
     subgraph ADD_NORMAL_DETAIL["add_worktree — Normal internals"]
         N1["find local branch?"]
         N1 -->|yes| N_USE["use local branch ref"]
-        N1 -->|no| N2["find remote branch?"]
-        N2 -->|yes| N_USE
+        N1 -->|no| N2["find remote tracking branch\n(by short name)?"]
+        N2 -->|yes| N_TRACK["create local branch\n+ set_upstream to remote"]
         N2 -->|no| N3["create new branch\nfrom base_branch or HEAD"]
+        N_TRACK --> N_USE
         N3 --> N_USE
-        N_USE --> N_ADD["repo.worktree(name, path, opts)"]
+        N_USE --> N_ADD["repo.worktree(name, path, opts)\n(explicit_worktree_name decouples dir from branch)"]
     end
 
     subgraph ADD_ORPHAN_DETAIL["add_worktree — Orphan internals"]
