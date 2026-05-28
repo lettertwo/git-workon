@@ -9,6 +9,7 @@ mod output;
 use clap::{CommandFactory, Parser};
 use clap_complete::env::CompleteEnv;
 use cli::Cmd;
+use git2::BranchType as GitBranchType;
 use miette::{IntoDiagnostic, Result};
 
 use crate::cli::Cli;
@@ -42,6 +43,9 @@ fn main() -> Result<()> {
         match cli.find.name {
             Some(ref name) if workon::is_pr_reference(name) => {
                 cli.command = route_pr_ref_to_command(name).or(Some(Cmd::Find(cli.find)));
+            }
+            Some(ref name) => {
+                cli.command = route_branch_to_command(name).or(Some(Cmd::Find(cli.find)));
             }
             _ => {
                 cli.command = Some(Cmd::Find(cli.find));
@@ -100,6 +104,53 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Returns `Some(Cmd::New)` if `name` matches a local/remote branch with no existing worktree;
+/// `None` if a worktree already exists (let Find handle it) or no branch is found.
+fn route_branch_to_command(name: &str) -> Option<Cmd> {
+    let repo = workon::get_repo(None).ok()?;
+    // Worktree already exists — let Find handle it
+    if repo.find_worktree(name).is_ok() {
+        return None;
+    }
+    if !branch_exists(&repo, name) {
+        return None;
+    }
+    Some(Cmd::New(cli::New {
+        no_stack: false,
+        name: Some(name.to_string()),
+        base: None,
+        branch: None,
+        orphan: false,
+        detach: false,
+        no_hooks: false,
+        copy: false,
+        no_copy: false,
+        no_copy_ignored: false,
+        no_interactive: false,
+        lock: false,
+    }))
+}
+
+/// Returns true if `name` matches a local branch or the short name of any remote tracking branch.
+fn branch_exists(repo: &git2::Repository, name: &str) -> bool {
+    if repo.find_branch(name, GitBranchType::Local).is_ok() {
+        return true;
+    }
+    if let Ok(branches) = repo.branches(Some(GitBranchType::Remote)) {
+        for branch in branches.flatten() {
+            if let Ok(Some(full_name)) = branch.0.name() {
+                // Remote branch names are "remote/branch" — match on the part after the first "/"
+                if let Some((_, branch)) = full_name.split_once('/') {
+                    if branch == name {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// Returns `Some(Cmd::New)` if PR worktree doesn't exist yet; `None` if it exists or parsing fails.
 fn route_pr_ref_to_command(pr_ref: &str) -> Option<Cmd> {
     let repo = workon::get_repo(None).ok()?;
@@ -114,6 +165,7 @@ fn route_pr_ref_to_command(pr_ref: &str) -> Option<Cmd> {
             no_stack: false,
             name: Some(pr_name),
             base: None,
+            branch: None,
             orphan: false,
             detach: false,
             no_hooks: false,
