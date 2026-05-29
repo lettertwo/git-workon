@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.4.0...git-workon-lib-v0.5.0) - 2026-05-29
+
+### Added
+
+- *(cli)* create worktree for existing branch with --branch flag
+
+### Fixed
+
+- *(lib)* adapt to git2 0.21 Option→Result API changes
+- *(cli)* use graphite trunk instead of hardcoded main in gt track
+
+### Other
+
+- *(deps)* [**breaking**] replace git2_credentials with auth-git2 for git2 0.21
+
 ## [0.4.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.3.0...git-workon-lib-v0.4.0) - 2026-05-08
 
 ### Added
