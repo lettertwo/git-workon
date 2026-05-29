@@ -1,6 +1,6 @@
 //! Minimal `~/.ssh/config` parser for extracting `IdentityAgent`.
 //!
-//! libgit2 (and by extension `git2_credentials`) reads the SSH agent socket
+//! libgit2 (and by extension `auth-git2`) reads the SSH agent socket
 //! from `SSH_AUTH_SOCK` only — it does not honour the `IdentityAgent`
 //! directive in `~/.ssh/config`. This module bridges that gap by parsing the
 //! config file and applying `IdentityAgent` to the process environment before
