@@ -39,8 +39,8 @@ From anywhere, create a worktree for a fresh stack:
 
 ```bash
 git workon new my-feature
-# → creates my-feature/ branched off trunk (e.g. main)
-# → runs gt track --parent main inside the new worktree
+# → creates my-feature/ branched off trunk (e.g. develop, main)
+# → runs gt track --parent <trunk> inside the new worktree
 ```
 
 ### New stack forking off an existing one
@@ -58,7 +58,7 @@ git workon new login-form
 Pass `--base` to override:
 
 ```bash
-git workon new login-form --base main    # explicit base always wins
+git workon new login-form --base develop  # explicit base always wins
 git workon new login-form --no-stack     # base = trunk; no gt track
 ```
 
