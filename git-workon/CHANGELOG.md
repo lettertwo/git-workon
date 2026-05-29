@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.4.0...git-workon-v0.5.0) - 2026-05-29
+
+### Added
+
+- *(cli)* auto-route bare name matching branch to new command
+- *(cli)* create worktree for existing branch with --branch flag
+
+### Fixed
+
+- *(lib)* adapt to git2 0.21 Option→Result API changes
+- *(cli)* use graphite trunk instead of hardcoded main in gt track
+
 ## [0.4.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.2.1...git-workon-v0.4.0) - 2026-05-08
 
 ### Added
