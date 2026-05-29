@@ -30,7 +30,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -78,7 +78,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -133,7 +133,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -191,7 +191,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -249,7 +249,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -316,7 +316,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -370,7 +370,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -431,7 +431,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -481,7 +481,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -534,7 +534,7 @@ mod fixture_builder {
         // Check that the branch has the initial commit
         assert_eq!(
             commit.message(),
-            Some("Initial commit"),
+            Ok("Initial commit"),
             "Initial commit message should match"
         );
 
@@ -666,7 +666,7 @@ mod fixture_builder {
 
         // Verify commit was created
         let commit = repo.find_commit(commit_oid)?;
-        assert_eq!(commit.message(), Some("Add two files"));
+        assert_eq!(commit.message(), Ok("Add two files"));
         assert_eq!(commit.parent_count(), 1);
 
         // Verify files exist in the commit tree
@@ -722,7 +722,7 @@ mod fixture_builder {
         assert_eq!(fixture.cwd()?.file_name(), Some(OsStr::new("docs")));
 
         // Verify we can use the fixture to access the docs worktree
-        assert_eq!(fixture.head()?.name(), Some("refs/heads/docs"));
+        assert_eq!(fixture.head()?.name(), Ok("refs/heads/docs"));
 
         Ok(())
     }

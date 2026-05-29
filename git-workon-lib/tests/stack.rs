@@ -7,12 +7,12 @@ use workon::{current_stack, StackModel};
 /// Build a fixture with Graphite metadata for a linear chain:
 /// main → step-1 → step-2 → step-3
 fn linear_chain() -> Result<Fixture, Box<dyn Error>> {
-    Ok(FixtureBuilder::new()
+    FixtureBuilder::new()
         .graphite_config(&["main"])
         .branch_metadata("step-1", "main")
         .branch_metadata("step-2", "step-1")
         .branch_metadata("step-3", "step-2")
-        .build()?)
+        .build()
 }
 
 // ── read_trunks (tested indirectly via current_stack) ────────────────────────

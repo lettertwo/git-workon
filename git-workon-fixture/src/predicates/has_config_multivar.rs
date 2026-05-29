@@ -31,7 +31,7 @@ impl Predicate<Repository> for HasConfigMultivarPredicate {
         if let Ok(mut entries) = config.multivar(&self.key, None) {
             while let Some(entry) = entries.next() {
                 if let Ok(e) = entry {
-                    if let Some(v) = e.value() {
+                    if let Ok(v) = e.value() {
                         actual_values.push(v.to_string());
                     }
                 }

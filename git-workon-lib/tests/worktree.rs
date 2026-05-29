@@ -75,7 +75,7 @@ mod tests {
 
         // Verify HEAD points to the docs branch
         let head = orphan_repo.head()?;
-        assert_eq!(head.name(), Some("refs/heads/docs"));
+        assert_eq!(head.name(), Ok("refs/heads/docs"));
         assert!(head.is_branch(), "HEAD should be a branch");
 
         // Verify the branch has exactly one commit (the initial empty commit)
@@ -85,7 +85,7 @@ mod tests {
             0,
             "Orphan branch should have no parent commits"
         );
-        assert_eq!(head_commit.message(), Some("Initial commit"));
+        assert_eq!(head_commit.message(), Ok("Initial commit"));
 
         // Verify the commit tree is empty
         let tree = head_commit.tree()?;

@@ -77,7 +77,7 @@ impl WorktreeDescriptor {
 
     /// Returns the name of the worktree, or `None` if the name is invalid UTF-8.
     pub fn name(&self) -> Option<&str> {
-        self.worktree.name()
+        self.worktree.name().ok().flatten()
     }
 
     /// Returns the filesystem path to the worktree's working directory.
@@ -518,7 +518,7 @@ impl WorktreeDescriptor {
 
         // Find the remote and extract the URL immediately
         let url = match repo.find_remote(&remote_name) {
-            Ok(remote) => remote.url().map(|s| s.to_string()),
+            Ok(remote) => remote.url().ok().map(|s| s.to_string()),
             Err(_) => return Ok(None), // Remote doesn't exist
         };
 
@@ -542,7 +542,7 @@ impl WorktreeDescriptor {
 
         // Find the remote and extract the fetch URL immediately
         let url = match repo.find_remote(&remote_name) {
-            Ok(remote) => remote.url().map(|s| s.to_string()),
+            Ok(remote) => remote.url().ok().map(|s| s.to_string()),
             Err(_) => return Ok(None), // Remote doesn't exist
         };
 
@@ -568,7 +568,9 @@ impl WorktreeDescriptor {
         let url = match repo.find_remote(&remote_name) {
             Ok(remote) => remote
                 .pushurl()
-                .or_else(|| remote.url())
+                .ok()
+                .flatten()
+                .or_else(|| remote.url().ok())
                 .map(|s| s.to_string()),
             Err(_) => return Ok(None), // Remote doesn't exist
         };
@@ -594,7 +596,7 @@ pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
     repo.worktrees()?
         .into_iter()
         .map(|name| {
-            let name = name.ok_or(WorktreeError::InvalidName)?;
+            let name = name?.ok_or(WorktreeError::InvalidName)?;
             WorktreeDescriptor::new(repo, name)
         })
         .collect()
@@ -858,6 +860,7 @@ pub fn set_upstream_tracking(
     let head = repo.head()?;
     let branch_name = head
         .shorthand()
+        .ok()
         .ok_or(WorktreeError::NoCurrentBranchTarget)?;
 
     // Set branch.*.remote

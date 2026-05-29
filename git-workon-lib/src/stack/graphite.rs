@@ -77,7 +77,7 @@ fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackE
         let reference = reference.map_err(|e| StackError::GtParseFailed {
             message: format!("failed to read branch-metadata ref: {e}"),
         })?;
-        let Some(refname) = reference.name() else {
+        let Ok(refname) = reference.name() else {
             continue;
         };
         let Some(branch) = refname.strip_prefix("refs/branch-metadata/") else {
