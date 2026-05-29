@@ -435,8 +435,8 @@ fn copy_untracked_files(
     } else {
         match repo.head() {
             Ok(head) => match head.shorthand() {
-                Some(s) => s.to_string(),
-                None => return Ok(()), // detached HEAD, skip
+                Ok(s) => s.to_string(),
+                Err(_) => return Ok(()), // detached HEAD, skip
             },
             Err(_) => return Ok(()), // can't determine HEAD, skip
         }

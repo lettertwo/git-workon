@@ -332,7 +332,7 @@ impl<'repo> WorkonConfig<'repo> {
         if let Ok(mut entries) = config.multivar(key, None) {
             while let Some(entry) = entries.next() {
                 let entry = entry?;
-                if let Some(value) = entry.value() {
+                if let Ok(value) = entry.value() {
                     values.push(value.to_string());
                 }
             }

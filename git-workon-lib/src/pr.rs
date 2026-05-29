@@ -393,14 +393,14 @@ pub fn detect_pr_remote(repo: &Repository) -> Result<String> {
 
     // Priority: upstream > origin
     for name in &["upstream", "origin"] {
-        if remotes.iter().flatten().any(|r| r == *name) {
+        if remotes.iter().flatten().flatten().any(|r| r == *name) {
             debug!("Using remote: {}", name);
             return Ok(name.to_string());
         }
     }
 
     // Fall back to first remote
-    if let Some(first_remote) = remotes.get(0) {
+    if let Ok(Some(first_remote)) = remotes.get(0) {
         Ok(first_remote.to_string())
     } else {
         Err(PrError::NoRemoteConfigured.into())
@@ -472,9 +472,10 @@ pub fn fetch_branch(repo: &Repository, remote_name: &str, branch: &str) -> Resul
     let remote_url = repo
         .find_remote(remote_name)
         .ok()
-        .and_then(|r| r.url().map(str::to_string));
+        .and_then(|r| r.url().ok().map(str::to_string));
+    let auth = get_remote_callbacks(repo, remote_url.as_deref())?;
     let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(get_remote_callbacks(repo, remote_url.as_deref())?);
+    fetch_options.remote_callbacks(auth.callbacks());
 
     repo.find_remote(remote_name)?
         .fetch(

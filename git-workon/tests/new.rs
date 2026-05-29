@@ -105,7 +105,7 @@ fn new_orphan_worktree() -> Result<(), Box<dyn std::error::Error>> {
 
     // Verify HEAD points to the docs branch
     let head = fixture.head()?;
-    assert_eq!(head.name(), Some("refs/heads/docs"));
+    assert_eq!(head.name(), Ok("refs/heads/docs"));
 
     // Verify the branch has exactly one commit (the initial empty commit)
     let head_commit = head.peel_to_commit()?;

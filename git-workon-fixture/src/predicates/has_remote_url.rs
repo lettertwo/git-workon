@@ -25,7 +25,7 @@ impl Predicate<Repository> for HasRemoteUrlPredicate {
         match repo.find_remote(&self.remote_name) {
             Ok(remote) => match &self.url {
                 Some(expected_url) => remote.url().map(|u| u == expected_url).unwrap_or(false),
-                None => remote.url().is_some(),
+                None => remote.url().is_ok(),
             },
             Err(_) => false,
         }
