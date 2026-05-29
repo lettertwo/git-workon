@@ -57,7 +57,8 @@ use crate::hooks::execute_post_create_hooks;
 use crate::output;
 use workon::{
     add_worktree, copy_untracked, current_stack, current_worktree, get_repo, get_worktrees,
-    workon_root, BranchType, CopyOptions, StackModel, WorkonConfig, WorktreeDescriptor,
+    graphite_trunk, workon_root, BranchType, CopyOptions, StackModel, WorkonConfig,
+    WorktreeDescriptor,
 };
 
 use super::Run;
@@ -285,19 +286,26 @@ impl Run for New {
             && !self.no_stack
             && config.gt_auto_track(None)?
         {
-            let parent = base_branch.as_deref().unwrap_or("main");
+            // Prefer the explicit base branch, then the repo's graphite trunk.
+            // If neither is known, omit --parent so gt infers from its own config.
+            let parent = base_branch
+                .as_deref()
+                .map(String::from)
+                .or_else(|| graphite_trunk(&repo));
             debug!(
-                "Running: gt track --parent {} in {}",
-                parent,
+                "Running: gt track{} in {}",
+                parent
+                    .as_deref()
+                    .map(|p| format!(" --parent {p}"))
+                    .unwrap_or_default(),
                 worktree.path().display()
             );
-            match std::process::Command::new("gt")
-                .arg("track")
-                .arg("--parent")
-                .arg(parent)
-                .current_dir(worktree.path())
-                .output()
-            {
+            let mut cmd = std::process::Command::new("gt");
+            cmd.arg("track");
+            if let Some(p) = &parent {
+                cmd.arg("--parent").arg(p);
+            }
+            match cmd.current_dir(worktree.path()).output() {
                 Ok(out) if out.status.success() => {
                     debug!("gt track succeeded");
                 }

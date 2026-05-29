@@ -74,6 +74,8 @@ pub use crate::get_repo::*;
 pub use crate::init::*;
 pub use crate::pr::*;
 pub use crate::r#move::*;
-pub use crate::stack::{current_stack, is_graphite_active, Granularity, Stack, StackModel};
+pub use crate::stack::{
+    current_stack, graphite_trunk, is_graphite_active, Granularity, Stack, StackModel,
+};
 pub use crate::workon_root::*;
 pub use crate::worktree::*;

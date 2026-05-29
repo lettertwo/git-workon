@@ -37,6 +37,27 @@ pub fn is_graphite_repo(repo: &Repository) -> bool {
     repo.path().join(".graphite_repo_config").exists()
 }
 
+/// Return the first trunk branch name from `.graphite_repo_config`, or `None` if the
+/// file is missing, unparseable, or contains no trunk entries.
+///
+/// Unlike [`read_trunks`], this never falls back to a hardcoded `"main"` — `None`
+/// means "unknown", which callers can use to omit `--parent` and let `gt` infer.
+pub fn graphite_trunk(repo: &Repository) -> Option<String> {
+    let path = repo.path().join(".graphite_repo_config");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let json = serde_json::from_str::<Value>(&content).ok()?;
+    if let Some(trunks) = json.get("trunks").and_then(|t| t.as_array()) {
+        let first = trunks
+            .iter()
+            .find_map(|t| t.get("name").and_then(|n| n.as_str()))
+            .map(String::from);
+        if first.is_some() {
+            return first;
+        }
+    }
+    json.get("trunk").and_then(|t| t.as_str()).map(String::from)
+}
+
 /// Read trunk branch names from `.graphite_repo_config`.
 ///
 /// Falls back to `["main"]` if the file is missing or unparseable.

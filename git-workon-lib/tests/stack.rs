@@ -1,6 +1,6 @@
 use git_workon_fixture::prelude::*;
 use std::error::Error;
-use workon::{current_stack, StackModel};
+use workon::{current_stack, graphite_trunk, StackModel};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -13,6 +13,38 @@ fn linear_chain() -> Result<Fixture, Box<dyn Error>> {
         .branch_metadata("step-2", "step-1")
         .branch_metadata("step-3", "step-2")
         .build()?)
+}
+
+// ── graphite_trunk ────────────────────────────────────────────────────────────
+
+#[test]
+fn graphite_trunk_returns_none_when_config_missing() -> Result<(), Box<dyn Error>> {
+    // No .graphite_repo_config → no hardcoded "main" fallback, just None.
+    let fixture = FixtureBuilder::new().build()?;
+    let repo = fixture.repo()?;
+    assert_eq!(graphite_trunk(repo), None);
+    Ok(())
+}
+
+#[test]
+fn graphite_trunk_returns_trunk_from_config() -> Result<(), Box<dyn Error>> {
+    // The core bug: repo with trunk=develop, not main.
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["develop"])
+        .build()?;
+    let repo = fixture.repo()?;
+    assert_eq!(graphite_trunk(repo), Some("develop".to_string()));
+    Ok(())
+}
+
+#[test]
+fn graphite_trunk_returns_first_trunk_when_multiple() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main", "release"])
+        .build()?;
+    let repo = fixture.repo()?;
+    assert_eq!(graphite_trunk(repo), Some("main".to_string()));
+    Ok(())
 }
 
 // ── read_trunks (tested indirectly via current_stack) ────────────────────────

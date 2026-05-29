@@ -93,3 +93,13 @@ pub fn current_stack(
 pub fn is_graphite_active(repo: &Repository) -> bool {
     graphite::detect_gt() && graphite::is_graphite_repo(repo)
 }
+
+/// Return the first trunk branch name from `.graphite_repo_config`, or `None` if
+/// the file is missing, unparseable, or contains no trunk entries.
+///
+/// Use this when you need to pass `--parent <trunk>` to `gt track` and want to
+/// avoid hardcoding `"main"`. Returns `None` rather than a hardcoded fallback so
+/// callers can omit `--parent` entirely and let `gt` infer when the trunk is unknown.
+pub fn graphite_trunk(repo: &Repository) -> Option<String> {
+    graphite::graphite_trunk(repo)
+}
