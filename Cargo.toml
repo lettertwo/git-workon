@@ -28,7 +28,7 @@ dialoguer = { version = "0.12.0", features = ["fuzzy-select"] }
 env_logger = "0.11.10"
 git-workon-lib = { version = "0.4.0", path = "./git-workon-lib" }
 git-workon-fixture = { path = "./git-workon-fixture" }
-git2_credentials = { version = "0.15.0", features = ["ui4dialoguer"] }
+auth-git2 = "0.6"
 git2 = { version = "0.21.0", default-features = false, features = [
   "ssh",
   "https",

@@ -47,12 +47,12 @@ impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
                 }
 
                 match cxn.default_branch()?.as_str() {
-                    Some(default_branch) => Ok(default_branch
+                    Ok(default_branch) => Ok(default_branch
                         .strip_prefix("refs/heads/")
                         .unwrap_or(default_branch)
                         .to_string()),
-                    None => Err(DefaultBranchError::NoRemoteDefault {
-                        remote: cxn.remote().name().map(|s| s.to_string()),
+                    Err(_) => Err(DefaultBranchError::NoRemoteDefault {
+                        remote: cxn.remote().name().ok().flatten().map(|s| s.to_string()),
                     }
                     .into()),
                 }
@@ -71,11 +71,13 @@ impl<'repo, 'cb> DefaultBranch<'repo, 'cb> {
 /// Queries the remote for its default branch if one is provided, otherwise
 /// falls back to `init.defaultbranch` config (defaulting to `"main"`).
 pub fn get_default_branch_name(repo: &Repository, remote: Option<Remote>) -> Result<String> {
+    let auth;
     let mut default_branch = DefaultBranch::new(repo);
     if let Some(remote) = remote {
-        let url = remote.url().map(str::to_string);
+        let url = remote.url().ok().map(str::to_string);
         default_branch.remote(remote);
-        default_branch.remote_callbacks(get_remote_callbacks(repo, url.as_deref())?);
+        auth = get_remote_callbacks(repo, url.as_deref())?;
+        default_branch.remote_callbacks(auth.callbacks());
     }
     default_branch.get_name().or_else(|_| {
         debug!("Failed to read default branch from remote, trying git config");

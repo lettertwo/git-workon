@@ -14,7 +14,6 @@ assert_fs.workspace = true
 env_logger.workspace = true
 git-workon-lib.workspace = true
 git2.workspace = true
-git2_credentials.workspace = true
 log.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
