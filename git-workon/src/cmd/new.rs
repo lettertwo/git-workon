@@ -281,9 +281,13 @@ impl Run for New {
         )
         .wrap_err(format!("Failed to create worktree '{}'", effective_branch))?;
 
-        // Register the new branch with gt when stack-active (non-fatal on failure)
+        // Register the new branch with gt when stack-active (non-fatal on failure).
+        // Skip if the branch is already tracked in the stack — re-tracking an existing
+        // stacked branch would re-parent it and trigger an unwanted restack/rebase.
+        let already_tracked = current_stack(&repo, &effective_branch, effective_model)?.is_some();
         if effective_model == StackModel::Graphite
             && !self.no_stack
+            && !already_tracked
             && config.gt_auto_track(None)?
         {
             // Prefer the explicit base branch, then the repo's graphite trunk.

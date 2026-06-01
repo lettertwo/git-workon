@@ -912,3 +912,62 @@ fn new_skips_gt_track_when_gt_auto_track_false() -> Result<(), Box<dyn std::erro
 
     Ok(())
 }
+
+#[test]
+fn new_attaching_existing_tracked_branch_skips_gt_track() -> Result<(), Box<dyn std::error::Error>>
+{
+    // feat-2 already has branch-metadata (tracked in the stack) but no worktree yet.
+    // Running `workon new feat-2` should create the worktree without calling `gt track --parent`,
+    // which would otherwise re-parent the branch and trigger an unwanted restack/rebase.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("feat-2", "feat-1") // already tracked, no worktree
+        .build()?;
+
+    // Give feat-1 an extra commit so feat-2 has something to be based on
+    fixture
+        .commit("feat-1")
+        .file("stack.txt", "content")
+        .create("commit on feat-1")?;
+
+    // Create feat-2 as a local branch pointing at feat-1's HEAD
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    let feat1_oid = bare_repo
+        .find_branch("feat-1", git2::BranchType::Local)?
+        .get()
+        .target()
+        .unwrap();
+    let feat1_commit = bare_repo.find_commit(feat1_oid)?;
+    bare_repo.branch("feat-2", &feat1_commit, false)?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .env("PATH", path_without_gt_new())
+        .arg("new")
+        .arg("feat-2")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "new must succeed for already-tracked branch; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+
+    // Worktree was created
+    bare_repo.assert(predicate::repo::has_worktree("feat-2"));
+
+    // No gt track invocation (would show as a warning since gt is absent from PATH)
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        !stderr.contains("gt track"),
+        "gt track must not be invoked for an already-tracked branch: {stderr}"
+    );
+
+    Ok(())
+}
