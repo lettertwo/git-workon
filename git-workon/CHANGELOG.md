@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2](https://github.com/lettertwo/git-workon/compare/git-workon-v0.5.1...git-workon-v0.5.2) - 2026-06-01
+
+### Fixed
+
+- *(cli)* guard gt track on branch_pre_existed, not current_stack
+
 ## [0.5.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.5.0...git-workon-v0.5.1) - 2026-06-01
 
 ### Fixed
