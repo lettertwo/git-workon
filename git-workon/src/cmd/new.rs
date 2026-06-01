@@ -271,6 +271,13 @@ impl Run for New {
             }
         };
 
+        // Check before add_worktree: if the local branch already exists this is an
+        // attach (not a create), so gt track must be skipped — re-tracking an existing
+        // branch re-parents it and triggers an unwanted restack/rebase.
+        let branch_pre_existed = repo
+            .find_branch(&effective_branch, GitBranchType::Local)
+            .is_ok();
+
         let worktree = add_worktree(
             &repo,
             &effective_branch,
@@ -282,12 +289,9 @@ impl Run for New {
         .wrap_err(format!("Failed to create worktree '{}'", effective_branch))?;
 
         // Register the new branch with gt when stack-active (non-fatal on failure).
-        // Skip if the branch is already tracked in the stack — re-tracking an existing
-        // stacked branch would re-parent it and trigger an unwanted restack/rebase.
-        let already_tracked = current_stack(&repo, &effective_branch, effective_model)?.is_some();
         if effective_model == StackModel::Graphite
             && !self.no_stack
-            && !already_tracked
+            && !branch_pre_existed
             && config.gt_auto_track(None)?
         {
             // Prefer the explicit base branch, then the repo's graphite trunk.

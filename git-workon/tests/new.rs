@@ -971,3 +971,61 @@ fn new_attaching_existing_tracked_branch_skips_gt_track() -> Result<(), Box<dyn 
 
     Ok(())
 }
+
+#[test]
+fn new_attaching_existing_branch_with_slashes_skips_gt_track(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Branch names with slashes (e.g. "ee/zip-cli-aws") have refs like
+    // refs/branch-metadata/ee/zip-cli-aws. The old current_stack guard failed to
+    // detect these because fnmatch "*" doesn't cross "/". The branch_pre_existed
+    // guard must work correctly regardless of slashes in the branch name.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1") // CWD for the command; no slash so fixture creates it fine
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("ee/feat-2", "feat-1") // slashed target branch, no worktree
+        .build()?;
+
+    fixture
+        .commit("feat-1")
+        .file("stack.txt", "content")
+        .create("commit on feat-1")?;
+
+    // Create ee/feat-2 as a local branch in the bare repo (no worktree yet)
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    let feat1_oid = bare_repo
+        .find_branch("feat-1", git2::BranchType::Local)?
+        .get()
+        .target()
+        .unwrap();
+    let feat1_commit = bare_repo.find_commit(feat1_oid)?;
+    bare_repo.branch("ee/feat-2", &feat1_commit, false)?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .env("PATH", path_without_gt_new())
+        .arg("new")
+        .arg("ee/feat-2")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "new must succeed for slashed branch; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+
+    // git-workon uses the basename of the branch as the worktree name
+    bare_repo.assert(predicate::repo::has_worktree("feat-2"));
+
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        !stderr.contains("gt track"),
+        "gt track must not be invoked for a pre-existing slashed branch: {stderr}"
+    );
+
+    Ok(())
+}
