@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.5.2...git-workon-v0.6.0) - 2026-06-04
+
+### Added
+
+- *(cli)* [**breaking**] redesign list and find as unified stack-aware tree
+- *(cli)* [**breaking**] redesign list --json shape, surface metadata-only stacks
+- *(lib)* [**breaking**] rename Stack.branches to Stack.diffs
+
 ## [0.5.2](https://github.com/lettertwo/git-workon/compare/git-workon-v0.5.1...git-workon-v0.5.2) - 2026-06-01
 
 ### Fixed
