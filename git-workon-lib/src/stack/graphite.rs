@@ -123,6 +123,80 @@ fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackE
     Ok(map)
 }
 
+
+/// Return all stacks present in `refs/branch-metadata/*`, one per connected component.
+///
+/// A "connected component" is the set of all non-trunk branches reachable from a single
+/// direct child of a trunk branch. This is the same grouping key used by `group_by_stack`,
+/// so each returned `Stack` maps one-to-one to a potential `StackGroup`.
+///
+/// Used by the `list` command to surface stacks that have no checked-out worktrees yet.
+pub fn enumerate_stacks(repo: &Repository) -> Result<Vec<Stack>, StackError> {
+    let parent_map = build_parent_map(repo)?;
+    if parent_map.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let trunks: HashSet<String> = read_trunks(repo).into_iter().collect();
+
+    let mut reverse_map: HashMap<String, Vec<String>> = HashMap::new();
+    for (branch, parent) in &parent_map {
+        reverse_map
+            .entry(parent.clone())
+            .or_default()
+            .push(branch.clone());
+    }
+
+    // Root branches are direct children of a trunk.
+    let mut root_branches: Vec<String> = parent_map
+        .iter()
+        .filter(|(_, p)| trunks.contains(*p))
+        .map(|(b, _)| b.clone())
+        .collect();
+    root_branches.sort();
+
+    let mut stacks: Vec<Stack> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::new();
+
+    for root in root_branches {
+        if visited.contains(&root) {
+            continue;
+        }
+        let trunk = parent_map.get(&root).cloned().unwrap_or_default();
+
+        let mut diffs: Vec<String> = Vec::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        queue.push_back(root);
+        while let Some(branch) = queue.pop_front() {
+            if !visited.insert(branch.clone()) {
+                continue;
+            }
+            if trunks.contains(&branch) {
+                continue;
+            }
+            diffs.push(branch.clone());
+            if let Some(children) = reverse_map.get(&branch) {
+                let mut sorted = children.clone();
+                sorted.sort();
+                for child in sorted {
+                    queue.push_back(child);
+                }
+            }
+        }
+
+        if !diffs.is_empty() {
+            let current = diffs[0].clone();
+            stacks.push(Stack {
+                trunk,
+                diffs,
+                current,
+            });
+        }
+    }
+
+    Ok(stacks)
+}
+
 /// Get the stack for the worktree whose HEAD is `head_branch`.
 ///
 /// Returns `None` if the branch has no `refs/branch-metadata/` entry (not Graphite-tracked).
