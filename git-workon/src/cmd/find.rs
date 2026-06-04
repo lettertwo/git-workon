@@ -111,7 +111,7 @@ impl Run for Find {
                                     };
                                     matches!(
                                         current_stack(&repo, &head, effective_model),
-                                        Ok(Some(ref s)) if s.branches.iter().any(|b| {
+                                        Ok(Some(ref s)) if s.diffs.iter().any(|b| {
                                             b.to_lowercase().contains(&name_lower)
                                         })
                                     )

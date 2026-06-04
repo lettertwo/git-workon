@@ -112,7 +112,7 @@ fn current_stack_linear_chain_returns_bfs_branches_and_trunk() -> Result<(), Box
     assert_eq!(stack.trunk, "main");
     assert_eq!(stack.current, "step-3");
     // BFS from bottom: step-1, step-2, step-3
-    assert_eq!(stack.branches, vec!["step-1", "step-2", "step-3"]);
+    assert_eq!(stack.diffs, vec!["step-1", "step-2", "step-3"]);
     Ok(())
 }
 
@@ -123,7 +123,7 @@ fn current_stack_returns_full_stack_from_any_member() -> Result<(), Box<dyn Erro
 
     // From step-1, all three branches are still visible.
     let stack = current_stack(repo, "step-1", StackModel::Graphite)?.unwrap();
-    assert_eq!(stack.branches, vec!["step-1", "step-2", "step-3"]);
+    assert_eq!(stack.diffs, vec!["step-1", "step-2", "step-3"]);
     assert_eq!(stack.current, "step-1");
     Ok(())
 }
@@ -172,23 +172,23 @@ fn current_stack_diamond_bfs_includes_all_branches() -> Result<(), Box<dyn Error
     let stack_from_b = current_stack(repo, "feat-b", StackModel::Graphite)?.unwrap();
     assert_eq!(stack_from_b.trunk, "main");
     // feat-a, then both children (order within the same BFS level is not specified).
-    assert!(stack_from_b.branches.contains(&"feat-a".to_string()));
-    assert!(stack_from_b.branches.contains(&"feat-b".to_string()));
-    assert!(stack_from_b.branches.contains(&"feat-c".to_string()));
-    assert_eq!(stack_from_b.branches.len(), 3);
+    assert!(stack_from_b.diffs.contains(&"feat-a".to_string()));
+    assert!(stack_from_b.diffs.contains(&"feat-b".to_string()));
+    assert!(stack_from_b.diffs.contains(&"feat-c".to_string()));
+    assert_eq!(stack_from_b.diffs.len(), 3);
     // feat-a must come before its children.
     let idx_a = stack_from_b
-        .branches
+        .diffs
         .iter()
         .position(|b| b == "feat-a")
         .unwrap();
     let idx_b = stack_from_b
-        .branches
+        .diffs
         .iter()
         .position(|b| b == "feat-b")
         .unwrap();
     let idx_c = stack_from_b
-        .branches
+        .diffs
         .iter()
         .position(|b| b == "feat-c")
         .unwrap();
@@ -209,8 +209,8 @@ fn current_stack_malformed_blob_branch_is_excluded() -> Result<(), Box<dyn Error
     let repo = fixture.repo()?;
 
     let stack = current_stack(repo, "feat-a", StackModel::Graphite)?.unwrap();
-    assert_eq!(stack.branches, vec!["feat-a"]);
-    assert!(!stack.branches.contains(&"feat-b".to_string()));
+    assert_eq!(stack.diffs, vec!["feat-a"]);
+    assert!(!stack.diffs.contains(&"feat-b".to_string()));
     Ok(())
 }
 

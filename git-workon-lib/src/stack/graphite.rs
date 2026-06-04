@@ -201,7 +201,7 @@ pub fn current_stack(repo: &Repository, head_branch: &str) -> Result<Option<Stac
 
     Ok(Some(Stack {
         trunk,
-        branches: stack_branches,
+        diffs: stack_branches,
         current: head_branch.to_string(),
     }))
 }

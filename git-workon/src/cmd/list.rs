@@ -89,7 +89,7 @@ impl Run for List {
                     if let Some(s) = stack {
                         obj["stack"] = json!({
                             "trunk": s.trunk,
-                            "branches": s.branches,
+                            "diffs": s.diffs,
                             "current": s.current,
                         });
                     }
@@ -112,7 +112,7 @@ impl Run for List {
         for (line, stack) in format_aligned_rows(&rows, true).iter().zip(stacks.iter()) {
             println!("{}", line);
             if let Some(s) = stack {
-                for branch in &s.branches {
+                for branch in &s.diffs {
                     let marker = if *branch == s.current { "*" } else { " " };
                     println!("    {} {}", marker, style::dim(branch));
                 }

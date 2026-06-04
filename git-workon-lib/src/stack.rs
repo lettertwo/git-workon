@@ -67,8 +67,8 @@ pub enum Granularity {
 pub struct Stack {
     /// The trunk branch this stack is rooted on (e.g., `"main"`).
     pub trunk: String,
-    /// All non-trunk branches in the stack, in BFS order from bottom to top.
-    pub branches: Vec<String>,
+    /// All non-trunk diffs (branches) in the stack, in BFS order from bottom to top.
+    pub diffs: Vec<String>,
     /// The branch that is currently HEAD in the worktree.
     pub current: String,
 }
