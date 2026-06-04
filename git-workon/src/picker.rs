@@ -121,13 +121,14 @@ fn draw(
             .into_diagnostic()?;
     } else {
         for (i, line) in rendered.lines.iter().enumerate() {
-            let marker = if i == cursor {
-                style::green("→")
+            if i == cursor {
+                let marker = style::cyan_bold("▶");
+                let tinted = style::cursor_tint(line);
+                term.write_line(&format!("{} {}", marker, tinted))
+                    .into_diagnostic()?;
             } else {
-                " ".to_string()
-            };
-            term.write_line(&format!("{} {}", marker, line))
-                .into_diagnostic()?;
+                term.write_line(&format!("  {}", line)).into_diagnostic()?;
+            }
         }
     }
 

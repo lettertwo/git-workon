@@ -246,4 +246,28 @@ pub mod style {
             s.to_string()
         }
     }
+
+    pub fn cyan_bold(s: &str) -> String {
+        if use_color() {
+            s.cyan().bold().to_string()
+        } else {
+            s.to_string()
+        }
+    }
+
+    /// Wrap `line` in a dim cyan tint for the picker cursor row.
+    ///
+    /// Re-applies cyan after every SGR reset (`\x1b[0m`) so that coloured spans
+    /// inside the line (active-worktree green, dirty-indicator yellow, etc.) keep
+    /// their own colour while uncoloured spans pick up the tint.
+    ///
+    /// Returns the line unchanged when colour is disabled.
+    pub fn cursor_tint(line: &str) -> String {
+        if use_color() {
+            let t = line.replace("\x1b[0m", "\x1b[0m\x1b[36m");
+            format!("\x1b[36m{}\x1b[0m", t)
+        } else {
+            line.to_string()
+        }
+    }
 }

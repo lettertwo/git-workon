@@ -58,10 +58,12 @@ use workon::WorktreeDescriptor;
 
 use crate::output::style;
 
-/// Glyph for a diff/branch that has a checked-out worktree.
-pub const GLYPH_WORKTREE: &str = "◉";
-/// Glyph for a diff/branch that exists only in stack metadata (no worktree).
+/// Glyph for a diff/branch that has a checked-out worktree (but is not the active one).
+pub const GLYPH_WORKTREE: &str = "◎";
+/// Glyph for a diff/branch that exists only in stack metadata (no checked-out worktree).
 pub const GLYPH_METADATA: &str = "◯";
+/// Glyph for the active (current-directory) worktree.
+pub const GLYPH_ACTIVE: &str = "◉";
 
 // ── Flat row (shared between non-stack list and find) ────────────────────────
 
@@ -169,7 +171,11 @@ pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool
         .enumerate()
         .map(|(i, row)| {
             let prefix = style::dim("./");
-            let name = style::bold(&row.dir_name);
+            let name = if row.is_active {
+                style::green_bold(&row.dir_name)
+            } else {
+                style::bold(&row.dir_name)
+            };
             let name_pad = max_name - row.dir_name.width();
 
             let indicators_display = format_indicators(&row.indicators);
@@ -391,6 +397,37 @@ fn subtree_max(own: Option<i64>, children: &[TreeNode]) -> Option<i64> {
     }
 }
 
+/// Return the styled glyph for a tree node based on its state.
+///
+/// Three-state vocabulary:
+/// - `◉` green+bold — active (the current-directory worktree)
+/// - `◎` plain — a worktree exists but is not current
+/// - `◯` dim — metadata-only diff (no worktree)
+fn node_glyph(is_active: bool, has_worktree: bool) -> String {
+    if is_active {
+        style::green_bold(GLYPH_ACTIVE)
+    } else if has_worktree {
+        GLYPH_WORKTREE.to_string()
+    } else {
+        style::dim(GLYPH_METADATA)
+    }
+}
+
+/// Return the styled branch label for a tree node.
+///
+/// - active → green+bold
+/// - has worktree → bold
+/// - metadata-only → dim
+fn node_label(branch: &str, is_active: bool, has_worktree: bool) -> String {
+    if is_active {
+        style::green_bold(branch)
+    } else if has_worktree {
+        style::bold(branch)
+    } else {
+        style::dim(branch)
+    }
+}
+
 /// Render a forest of [`TreeNode`]s into display lines (and, optionally, selection metadata).
 ///
 /// Returns `(display_lines, selection_map)` where `selection_map[i]` maps the i-th display
@@ -429,18 +466,9 @@ pub fn format_tree_lines(
     let mut selection: Vec<String> = Vec::new();
 
     for (prefix, connector, node) in &flat {
-        let glyph: String = if node.has_worktree() {
-            GLYPH_WORKTREE.to_string()
-        } else {
-            style::dim(GLYPH_METADATA)
-        };
-
-        // Label: branch name (bold if has worktree, dim if metadata-only)
-        let label = if node.has_worktree() {
-            style::bold(&node.branch)
-        } else {
-            style::dim(&node.branch)
-        };
+        let is_active = node.row.as_ref().map(|r| r.is_active).unwrap_or(false);
+        let glyph = node_glyph(is_active, node.has_worktree());
+        let label = node_label(&node.branch, is_active, node.has_worktree());
 
         // Optional path annotation: dim `./path` only when it differs from branch name.
         let path_ann = node.row.as_ref().and_then(|r| {
@@ -581,7 +609,7 @@ fn content_width(prefix: &str, connector: &str, node: &TreeNode) -> usize {
     // prefix + connector + glyph(1) + " "(1) + branch_label + optional_path
     prefix.width()
         + connector.width()
-        + GLYPH_WORKTREE.width() // same width as GLYPH_METADATA
+        + GLYPH_WORKTREE.width() // same width as GLYPH_METADATA and GLYPH_ACTIVE
         + 1 // space after glyph
         + node.branch.width()
         + path_extra.unwrap_or(0)
@@ -661,21 +689,14 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
             }
         }
 
-        // Glyph: keep structural styling regardless of match state.
-        let glyph: String = if node.has_worktree() {
-            GLYPH_WORKTREE.to_string()
-        } else {
-            style::dim(GLYPH_METADATA)
-        };
+        // Glyph: reflect active/worktree/metadata state regardless of match state.
+        let is_active = node.row.as_ref().map(|r| r.is_active).unwrap_or(false);
+        let glyph = node_glyph(is_active, node.has_worktree());
 
         // Label: apply match decoration or fall back to normal styling.
         let label = if query.is_empty() {
-            // Same as format_tree_lines: bold if worktree, dim if metadata-only.
-            if node.has_worktree() {
-                style::bold(&node.branch)
-            } else {
-                style::dim(&node.branch)
-            }
+            // Same as format_tree_lines: active → green+bold, worktree → bold, metadata → dim.
+            node_label(&node.branch, is_active, node.has_worktree())
         } else if is_ancestor_only {
             style::dim(&node.branch)
         } else {
@@ -825,7 +846,11 @@ pub fn render_flat(
 
         let prefix = style::dim("./");
         let name = if query.is_empty() {
-            style::bold(&row.dir_name)
+            if row.is_active {
+                style::green_bold(&row.dir_name)
+            } else {
+                style::bold(&row.dir_name)
+            }
         } else {
             let indices = match_result.map(|(_, idx)| idx.as_slice()).unwrap_or(&[]);
             decorate_match(&row.dir_name, indices)

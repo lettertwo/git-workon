@@ -36,7 +36,12 @@
 //! rendered as a unified tree. Each trunk is a single root node; stacks hang underneath;
 //! untracked worktrees appear at the root level sorted by most-recent activity.
 //! Metadata-only diffs (branches tracked by Graphite with no worktree) appear as
-//! `◯` nodes in the tree.
+//! `◯` nodes in the tree. The glyph vocabulary encodes two independent axes:
+//! fill = a worktree exists on disk; halo = you are standing in it right now.
+//!
+//! - `◯` dim — metadata-only (no worktree)
+//! - `◎` bold — a worktree exists but is not the current directory
+//! - `◉` green+bold — the active (current-directory) worktree
 //!
 //! Passing `--no-stack` or using no stack model falls back to the flat list (identical
 //! to the pre-stack behavior, no glyphs or connectors).
@@ -44,11 +49,11 @@
 //! ```text
 //! ◉ main             ↑   2m ago  ← here
 //! ├─◯ api-1
-//! │ ◉ api-2          ↑   2h ago
+//! │ ◎ api-2          ↑   2h ago
 //! └─◯ shared  ./base     5d ago
 //!   ├─◯ branch-x
 //!   └─◯ branch-y
-//! ◉ ee/testing           1mo ago
+//! ◎ ee/testing           1mo ago
 //! ```
 
 use log::debug;

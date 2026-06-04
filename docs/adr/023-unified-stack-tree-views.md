@@ -17,13 +17,22 @@ section headers; instead each trunk is a single root node with stacks hanging un
 untracked worktrees appear at the root level. All roots are sorted by most-recent activity in
 their subtree.
 
-### `◉` / `◯` glyphs + connector lines
+### `◉` / `◎` / `◯` glyphs + connector lines
 
-- `◉` — diff/branch that **has a checked-out worktree**
-- `◯` — diff/branch that exists only in Graphite metadata (no worktree)
+The glyph vocabulary encodes two independent axes — *fill* = a worktree exists on disk;
+*halo* = you are standing in it right now:
+
+- `◉` green+bold — the **active** (current-directory) worktree
+- `◎` bold — a worktree exists but is not the current directory
+- `◯` dim — diff/branch that exists only in Graphite metadata (no worktree)
+
+`◉` / `◎` degrade to plain glyphs under `NO_COLOR`, remaining distinguishable from
+the hollow `◯`.
+
 - `├─` / `└─` at fork points; linear (single-child) chains use `│` continuation without
   increasing visual indentation.
-- `← here` on the active worktree's row (list only; the cursor serves that role in find).
+- `← here` on the active worktree's row in `list` output (the cyan picker cursor serves
+  that role in `find`).
 - Row label is the branch/diff name; a dim `./path` annotation appears only when the worktree
   directory differs from the branch name.
 
@@ -43,10 +52,11 @@ into a single `format_indicators` helper.
 ### `find` selects from the full tree; worktree-less diffs route to `New`
 
 The `select_from_list` picker is replaced by `select_from_tree`, which uses `format_tree_lines` to
-show the same tree as `list`. Selecting a `◉` node returns its worktree directly. Selecting a `◯`
-node whose stack already has a worktree returns that worktree (granularity=Stack semantics).
-Selecting a `◯` node whose stack has **no** worktree constructs a `New` command for that branch
-name and delegates to it — `find` now mutates in this case.
+show the same tree as `list`. The picker uses a cyan `▶` cursor so it is visually distinct from the
+green `◉` active-worktree marker. Selecting a `◉` or `◎` node returns its worktree directly.
+Selecting a `◯` node whose stack already has a worktree returns that worktree (granularity=Stack
+semantics). Selecting a `◯` node whose stack has **no** worktree constructs a `New` command for
+that branch name and delegates to it — `find` now mutates in this case.
 
 ## Why `find` mutates here
 
@@ -54,8 +64,9 @@ The alternatives were: (a) error "no worktree for this diff", (b) route to `New`
 require the user to leave the picker, run `workon new <branch>`, and then re-run find — poor UX
 when the tree already surfaced the branch. Smart-routing (ADR-004) already auto-attaches branches
 that exist with no worktree; routing `find` to `New` is the natural extension of that principle.
-The cost — `find` is no longer read-only — is real but bounded: it only fires for `◯` nodes in
-stacks with no worktree, and is subject to all of `New`'s normal guards (hooks, copy, etc.).
+The cost — `find` is no longer read-only — is real but bounded: it only fires for metadata-only
+`◯` nodes in stacks with no worktree, and is subject to all of `New`'s normal guards (hooks,
+copy, etc.).
 
 ## Non-stack degradation
 
@@ -68,4 +79,4 @@ with no glyphs or connector lines.
   crate as a library will need to add the field to any struct literals.
 - `list --json` gains `parents` in each stack object. `diffs` and `checkouts` are unchanged.
 - The old `Stack (trunk:)` / `Ungrouped` section headers are gone.
-- `find` may now create worktrees (for `◯` diffs with no worktree in their stack).
+- `find` may now create worktrees (for metadata-only `◯` diffs with no worktree in their stack).

@@ -79,11 +79,14 @@ job.
 git workon list
 ```
 
-Stack-active output shows a graphite-style tree — `◉` for branches with a checked-out
-worktree, `◯` for metadata-only diffs (stack branches with no worktree):
+Stack-active output shows a graphite-style tree with three glyphs:
+
+- `◉` green — the active worktree (your current directory)
+- `◎` plain — a worktree exists but is not current
+- `◯` dim — metadata-only diff (stack branch with no worktree)
 
 ```
-◉ main                        1 day ago
+◎ main                        1 day ago
 ◯ auth-step-1
 ◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
 ◯ auth-step-3

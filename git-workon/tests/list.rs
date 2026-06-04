@@ -524,10 +524,16 @@ fn list_renders_stack_branches_indented_with_current_marker(
             .stdout,
     )?;
 
-    // feat-1 has a checked-out worktree → rendered with ◉ glyph
+    // main is the active worktree (current dir) → rendered with ◉ glyph
     assert!(
-        stdout.contains("◉") && stdout.contains("feat-1"),
-        "expected '◉ feat-1' in output: {stdout}"
+        stdout.contains("◉") && stdout.contains("main"),
+        "expected '◉ main' (active) in output: {stdout}"
+    );
+    // feat-1 has a checked-out worktree but is not active → rendered with ◎ glyph
+    let feat1_line = stdout.lines().find(|l| l.contains("feat-1")).unwrap_or("");
+    assert!(
+        feat1_line.contains("◎"),
+        "feat-1 (non-active worktree) must show ◎ glyph: {feat1_line}"
     );
     // step-2 is in the stack but has no worktree → rendered with ◯ (metadata-only)
     assert!(

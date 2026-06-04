@@ -34,8 +34,14 @@
 //! - The cursor jumps to the best-scoring match; arrow keys navigate freely.
 //! - Matched characters are underlined; non-matched characters are dimmed.
 //!
-//! When stack-active, uses the graphite-style tree view (`◉`/`◯`). Selecting a
-//! `◯` diff that belongs to a stack with no worktree routes to `New` to create/attach one.
+//! When stack-active, uses the graphite-style tree view (`◉`/`◎`/`◯`):
+//! - `◉` green+bold — the active (current-directory) worktree
+//! - `◎` bold — a worktree exists but is not current
+//! - `◯` dim — metadata-only diff (no worktree)
+//!
+//! The picker cursor uses a cyan `▶` pointer so it is visually distinct from the
+//! green active-worktree marker. Selecting a `◯` diff with no worktree routes to
+//! `New` to create/attach one.
 //!
 //! Pass `--no-interactive` to bypass interactive selection for scripting/testing.
 
@@ -213,7 +219,7 @@ fn matches_filters(find: &Find, wt: &WorktreeDescriptor) -> bool {
 /// tree view) and jumps the cursor to the best-scoring match.
 ///
 /// When stack-active, displays the unified tree view (same as `list`). Selecting a
-/// `◯` diff with no worktree in its stack routes to `New` to create/attach one.
+/// metadata-only `◯` diff with no worktree routes to `New` to create/attach one.
 /// Falls back to the flat picker when `--no-stack` is set.
 fn select_from_tree(
     find: &Find,
