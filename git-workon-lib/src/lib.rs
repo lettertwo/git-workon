@@ -75,7 +75,8 @@ pub use crate::init::*;
 pub use crate::pr::*;
 pub use crate::r#move::*;
 pub use crate::stack::{
-    current_stack, graphite_trunk, is_graphite_active, Granularity, Stack, StackModel,
+    current_stack, enumerate_stacks, graphite_trunk, group_by_stack, is_graphite_active,
+    Granularity, Stack, StackGroup, StackGrouping, StackModel,
 };
 pub use crate::workon_root::*;
 pub use crate::worktree::*;

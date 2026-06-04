@@ -564,29 +564,54 @@ fn list_json_includes_stack_object() -> Result<(), Box<dyn std::error::Error>> {
     assert!(output.status.success());
     let stdout = std::str::from_utf8(&output.stdout)?;
     let parsed: serde_json::Value = serde_json::from_str(stdout)?;
-    let worktrees = parsed.as_array().expect("list --json must be array");
 
-    let feat1 = worktrees
-        .iter()
-        .find(|w| w["name"] == "feat-1")
-        .unwrap_or_else(|| panic!("expected feat-1 entry in: {stdout}"));
-
-    let stack = feat1
-        .get("stack")
-        .unwrap_or_else(|| panic!("expected stack field on feat-1: {stdout}"));
-
-    assert_eq!(stack["trunk"], "main");
-    assert_eq!(stack["current"], "feat-1");
-    let branches = stack["branches"]
+    // New shape: { "worktrees": [...], "stacks": [...] }
+    let worktrees = parsed["worktrees"]
         .as_array()
-        .expect("branches must be array");
+        .unwrap_or_else(|| panic!("expected worktrees array in: {stdout}"));
     assert!(
-        branches.iter().any(|b| b == "feat-1"),
-        "expected feat-1 in stack branches: {stdout}"
+        worktrees.iter().any(|w| w["name"] == "feat-1"),
+        "expected feat-1 in worktrees: {stdout}"
     );
     assert!(
-        branches.iter().any(|b| b == "step-2"),
-        "expected step-2 in stack branches: {stdout}"
+        worktrees.iter().any(|w| w["name"] == "main"),
+        "expected main in worktrees: {stdout}"
+    );
+
+    let stacks = parsed["stacks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected stacks array in: {stdout}"));
+    assert_eq!(
+        stacks.len(),
+        1,
+        "expected exactly one stack group: {stdout}"
+    );
+
+    let group = &stacks[0];
+    assert_eq!(group["trunk"], "main", "stack trunk must be main: {stdout}");
+
+    let diffs = group["diffs"].as_array().expect("diffs must be array");
+    assert!(
+        diffs.iter().any(|b| b == "feat-1"),
+        "expected feat-1 in stack diffs: {stdout}"
+    );
+    assert!(
+        diffs.iter().any(|b| b == "step-2"),
+        "expected step-2 in stack diffs: {stdout}"
+    );
+
+    let checkouts = group["checkouts"]
+        .as_object()
+        .expect("checkouts must be object");
+    assert_eq!(
+        checkouts.get("feat-1").and_then(|v| v.as_str()),
+        Some("feat-1"),
+        "feat-1 diff must map to feat-1 worktree: {stdout}"
+    );
+
+    assert!(
+        parsed.get("ungrouped").is_none(),
+        "ungrouped field must not be present: {stdout}"
     );
 
     Ok(())
@@ -653,14 +678,29 @@ fn list_no_stack_json_omits_stack_field() -> Result<(), Box<dyn std::error::Erro
     assert!(output.status.success());
     let stdout = std::str::from_utf8(&output.stdout)?;
     let parsed: serde_json::Value = serde_json::from_str(stdout)?;
-    let worktrees = parsed.as_array().expect("list --json must be array");
 
-    for wt in worktrees {
-        assert!(
-            wt.get("stack").is_none(),
-            "no stack field should appear with --no-stack: {wt}"
-        );
-    }
+    // With --no-stack, stacks array must be empty and worktrees has all entries
+    let stacks = parsed["stacks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected stacks array in: {stdout}"));
+    assert!(
+        stacks.is_empty(),
+        "stacks must be empty with --no-stack: {stdout}"
+    );
+
+    let worktrees = parsed["worktrees"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected worktrees array in: {stdout}"));
+    assert_eq!(
+        worktrees.len(),
+        2,
+        "both worktrees should appear in worktrees with --no-stack: {stdout}"
+    );
+
+    assert!(
+        parsed.get("ungrouped").is_none(),
+        "ungrouped field must not be present: {stdout}"
+    );
 
     Ok(())
 }
@@ -690,6 +730,96 @@ fn list_gracefully_handles_worktree_with_no_stack_metadata(
     assert!(
         stdout.contains("main"),
         "main worktree row must appear: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_shows_stack_when_no_worktree_on_stack_branch() -> Result<(), Box<dyn std::error::Error>> {
+    // Scenario: trunk worktree "main" is checked out, but the stacked branch "feat-1" has no
+    // worktree. The stack should still be visible in the output.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    assert!(
+        stdout.contains("Stack (trunk: main)"),
+        "stack header must appear even without a worktree on the stack branches: {stdout}"
+    );
+    assert!(
+        stdout.contains("feat-1"),
+        "feat-1 must appear in the stack even without a worktree: {stdout}"
+    );
+    assert!(
+        !stdout.contains("* feat-1"),
+        "feat-1 must not be marked as checked out: {stdout}"
+    );
+    assert!(
+        stdout.contains("main"),
+        "main worktree must still appear in output: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_json_shows_stack_when_no_worktree_on_stack_branch() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("list")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+
+    let stacks = parsed["stacks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected stacks array in: {stdout}"));
+    assert_eq!(stacks.len(), 1, "expected one stack: {stdout}");
+
+    let group = &stacks[0];
+    assert_eq!(group["trunk"], "main");
+    assert!(
+        group["diffs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b == "feat-1"),
+        "feat-1 must be in diffs: {stdout}"
+    );
+    let checkouts = group["checkouts"]
+        .as_object()
+        .expect("checkouts must be object");
+    assert!(
+        checkouts.is_empty(),
+        "checkouts must be empty when no worktrees are on stack branches: {stdout}"
     );
 
     Ok(())
