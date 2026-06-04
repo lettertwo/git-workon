@@ -524,19 +524,19 @@ fn list_renders_stack_branches_indented_with_current_marker(
             .stdout,
     )?;
 
-    // feat-1 is the current branch of the worktree → marked with *
+    // feat-1 has a checked-out worktree → rendered with ◉ glyph
     assert!(
-        stdout.contains("* feat-1"),
-        "expected '* feat-1' in output: {stdout}"
+        stdout.contains("◉") && stdout.contains("feat-1"),
+        "expected '◉ feat-1' in output: {stdout}"
     );
-    // step-2 is in the stack but not the current branch → no *
+    // step-2 is in the stack but has no worktree → rendered with ◯ (metadata-only)
     assert!(
         stdout.contains("step-2"),
         "expected 'step-2' in stack output: {stdout}"
     );
     assert!(
-        !stdout.contains("* step-2"),
-        "step-2 should not be marked as current: {stdout}"
+        stdout.contains("◯") && stdout.contains("step-2"),
+        "step-2 should appear as a metadata-only ◯ node: {stdout}"
     );
 
     Ok(())
@@ -757,21 +757,23 @@ fn list_shows_stack_when_no_worktree_on_stack_branch() -> Result<(), Box<dyn std
             .stdout,
     )?;
 
+    // In the new tree format there is no "Stack (trunk: …)" header; instead, the
+    // trunk itself is the root node and stacks hang underneath it.
     assert!(
-        stdout.contains("Stack (trunk: main)"),
-        "stack header must appear even without a worktree on the stack branches: {stdout}"
+        stdout.contains("main"),
+        "main must appear as the tree root: {stdout}"
     );
     assert!(
         stdout.contains("feat-1"),
-        "feat-1 must appear in the stack even without a worktree: {stdout}"
+        "feat-1 must appear in the tree even without a worktree: {stdout}"
+    );
+    assert!(
+        stdout.contains("◯") && stdout.contains("feat-1"),
+        "feat-1 must be shown as a metadata-only ◯ node: {stdout}"
     );
     assert!(
         !stdout.contains("* feat-1"),
-        "feat-1 must not be marked as checked out: {stdout}"
-    );
-    assert!(
-        stdout.contains("main"),
-        "main worktree must still appear in output: {stdout}"
+        "feat-1 must not carry the old stack '* ' prefix: {stdout}"
     );
 
     Ok(())
@@ -820,6 +822,170 @@ fn list_json_shows_stack_when_no_worktree_on_stack_branch() -> Result<(), Box<dy
     assert!(
         checkouts.is_empty(),
         "checkouts must be empty when no worktrees are on stack branches: {stdout}"
+    );
+
+    Ok(())
+}
+
+// ── tree rendering: connectors, ← here, parents in JSON ──────────────────────
+
+#[test]
+fn list_tree_shows_here_marker_on_active_worktree() -> Result<(), Box<dyn std::error::Error>> {
+    // Two worktrees: main (current dir) and feat-1 (stacked).
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    // The active worktree (main) should be marked with ← here.
+    assert!(
+        stdout.contains("← here"),
+        "active worktree must show ← here marker: {stdout}"
+    );
+    // feat-1 is not active so it must NOT carry the ← here marker on its own line.
+    // (We check the line containing feat-1 doesn't also contain ← here.)
+    let feat1_line = stdout.lines().find(|l| l.contains("feat-1")).unwrap_or("");
+    assert!(
+        !feat1_line.contains("← here"),
+        "non-active worktree must not show ← here: {feat1_line}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_tree_renders_connector_lines_for_forking_stack() -> Result<(), Box<dyn std::error::Error>> {
+    // main → shared → branch-x (fork)
+    //              → branch-y
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("shared", "main")
+        .branch_metadata("branch-x", "shared")
+        .branch_metadata("branch-y", "shared")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    // At the fork, both ├─ and └─ should appear.
+    assert!(
+        stdout.contains("├─") && stdout.contains("└─"),
+        "fork connectors ├─ and └─ must appear for branching stacks: {stdout}"
+    );
+    // All four branches should be present.
+    for name in ["main", "shared", "branch-x", "branch-y"] {
+        assert!(
+            stdout.contains(name),
+            "{name} must appear in output: {stdout}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn list_json_stack_includes_parents_map() -> Result<(), Box<dyn std::error::Error>> {
+    // main → api-1 → api-2
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("api-1", "main")
+        .branch_metadata("api-2", "api-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("list")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+
+    let stacks = parsed["stacks"].as_array().expect("stacks must be array");
+    assert_eq!(stacks.len(), 1);
+    let group = &stacks[0];
+
+    let parents = group["parents"]
+        .as_object()
+        .unwrap_or_else(|| panic!("parents must be an object in: {stdout}"));
+    assert_eq!(
+        parents.get("api-1").and_then(|v| v.as_str()),
+        Some("main"),
+        "api-1 parent must be main: {stdout}"
+    );
+    assert_eq!(
+        parents.get("api-2").and_then(|v| v.as_str()),
+        Some("api-1"),
+        "api-2 parent must be api-1: {stdout}"
+    );
+    // Trunk itself must not appear as a key.
+    assert!(
+        !parents.contains_key("main"),
+        "trunk must not be a key in parents: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_tree_linear_chain_uses_pipe_continuation_not_fork_chars(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // main → step-1 → step-2 → step-3  (no forks)
+    // Linear chains must show │ continuation but NOT ├─ or └─.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("step-1", "main")
+        .branch_metadata("step-2", "step-1")
+        .branch_metadata("step-3", "step-2")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    // All steps must appear.
+    for name in ["step-1", "step-2", "step-3"] {
+        assert!(stdout.contains(name), "{name} must appear: {stdout}");
+    }
+    // No fork connectors in a purely linear chain.
+    assert!(
+        !stdout.contains("├─") && !stdout.contains("└─"),
+        "linear chain must not use fork connectors: {stdout}"
     );
 
     Ok(())

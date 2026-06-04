@@ -238,4 +238,12 @@ pub mod style {
             s.to_string()
         }
     }
+
+    pub fn underline(s: &str) -> String {
+        if use_color() {
+            s.underline().to_string()
+        } else {
+            s.to_string()
+        }
+    }
 }

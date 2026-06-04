@@ -539,6 +539,7 @@ dependencies = [
  "dialoguer",
  "env_logger",
  "expectrl",
+ "fuzzy-matcher",
  "git-workon-fixture",
  "git-workon-lib",
  "git2",

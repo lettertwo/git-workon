@@ -238,10 +238,15 @@ pub fn enumerate_stacks(repo: &Repository) -> Result<Vec<Stack>, StackError> {
 
         if !diffs.is_empty() {
             let current = diffs[0].clone();
+            let parents: std::collections::HashMap<String, String> = diffs
+                .iter()
+                .filter_map(|b| parent_map.get(b).map(|p| (b.clone(), p.clone())))
+                .collect();
             stacks.push(Stack {
                 trunk,
                 diffs,
                 current,
+                parents,
             });
         }
     }
@@ -325,9 +330,14 @@ pub fn current_stack(repo: &Repository, head_branch: &str) -> Result<Option<Stac
         }
     }
 
+    let parents: std::collections::HashMap<String, String> = stack_branches
+        .iter()
+        .filter_map(|b| parent_map.get(b).map(|p| (b.clone(), p.clone())))
+        .collect();
     Ok(Some(Stack {
         trunk,
         diffs: stack_branches,
         current: head_branch.to_string(),
+        parents,
     }))
 }
