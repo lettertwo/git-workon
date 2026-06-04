@@ -1,19 +1,24 @@
-//! Graphite (`gt`) stack detection via `refs/branch-metadata/*` git refs.
+//! Graphite (`gt`) stack detection.
 //!
-//! Stack metadata is read directly from git refs written by `gt` — no `gt` process
-//! is required for detection or visualization. The storage format is:
+//! Stack metadata is read without invoking `gt`. Two storage formats are supported:
 //!
-//! - `refs/branch-metadata/<branch>` — a blob containing JSON:
-//!   `{ "parentBranchName": "step-1", "parentBranchRevision": "<sha>" }`
-//! - `.git/.graphite_repo_config` — JSON with `{ "trunk": "main", "trunks": [{ "name": "main" }] }`
+//! - **gt ≥ 1.8** — SQLite database at `.graphite_metadata.db` in the git common dir.
+//!   Table `branch_metadata(branch_name, parent_branch_name, ...)`.
+//! - **gt < 1.8** — `refs/branch-metadata/<branch>` git refs: blobs containing JSON
+//!   `{ "parentBranchName": "step-1", "parentBranchRevision": "<sha>" }`.
+//!
+//! The database format is tried first; refs are the fallback for older installations.
+//! Trunk names come from `.graphite_repo_config` in both cases.
 //!
 //! `gt track` is invoked only when registering a new branch after `workon new` creates a
 //! worktree forked off an existing stack-worktree branch.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use git2::Repository;
+use rusqlite::OpenFlags;
 use serde_json::Value;
 
 use super::Stack;
@@ -30,11 +35,13 @@ pub fn detect_gt() -> bool {
         .unwrap_or(false)
 }
 
-/// Returns `true` if `.graphite_repo_config` exists in the repository's git directory.
+/// Returns `true` if the repository has been Graphite-initialized.
 ///
+/// Checks for either the SQLite metadata DB (gt ≥ 1.8) or the legacy config file (gt < 1.8).
 /// Uses `repo.path()`, which returns the shared git dir for both bare repos and worktrees.
 pub fn is_graphite_repo(repo: &Repository) -> bool {
-    repo.path().join(".graphite_repo_config").exists()
+    let git_dir = repo.path();
+    git_dir.join(".graphite_metadata.db").exists() || git_dir.join(".graphite_repo_config").exists()
 }
 
 /// Return the first trunk branch name from `.graphite_repo_config`, or `None` if the
@@ -86,8 +93,55 @@ fn read_trunks(repo: &Repository) -> Vec<String> {
     vec!["main".to_string()]
 }
 
-/// Build a `branch → parent_branch` map from all `refs/branch-metadata/*` refs.
+/// Build a `branch → parent_branch` map.
+///
+/// Tries the SQLite database (gt ≥ 1.8) first; falls back to git refs (gt < 1.8).
 fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
+    let db_path = repo.path().join(".graphite_metadata.db");
+    if db_path.exists() {
+        if let Ok(map) = build_parent_map_from_sqlite(&db_path) {
+            return Ok(map);
+        }
+    }
+    build_parent_map_from_refs(repo)
+}
+
+/// Read `branch → parent_branch` from the gt ≥ 1.8 SQLite database.
+fn build_parent_map_from_sqlite(db_path: &Path) -> Result<HashMap<String, String>, StackError> {
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| StackError::GtParseFailed {
+        message: format!("failed to open .graphite_metadata.db: {e}"),
+    })?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT branch_name, parent_branch_name \
+             FROM branch_metadata \
+             WHERE parent_branch_name IS NOT NULL AND parent_branch_name != ''",
+        )
+        .map_err(|e| StackError::GtParseFailed {
+            message: format!("failed to query .graphite_metadata.db: {e}"),
+        })?;
+
+    let mut map = HashMap::new();
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| StackError::GtParseFailed {
+            message: format!("failed to read .graphite_metadata.db rows: {e}"),
+        })?;
+    for row in rows.flatten() {
+        map.insert(row.0, row.1);
+    }
+    Ok(map)
+}
+
+/// Read `branch → parent_branch` from gt < 1.8 `refs/branch-metadata/*` git refs.
+fn build_parent_map_from_refs(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
     let mut map = HashMap::new();
     let references = repo
         .references_glob("refs/branch-metadata/*")
@@ -122,7 +176,6 @@ fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackE
     }
     Ok(map)
 }
-
 
 /// Return all stacks present in `refs/branch-metadata/*`, one per connected component.
 ///

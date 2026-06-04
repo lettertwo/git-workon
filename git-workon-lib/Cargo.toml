@@ -33,6 +33,7 @@ ignore.workspace = true
 libc.workspace = true
 log.workspace = true
 miette.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
