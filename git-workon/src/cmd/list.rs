@@ -32,36 +32,36 @@
 //!
 //! ## Stack-aware output
 //!
-//! When a stack model is active (e.g. Graphite), worktrees are grouped by their
-//! connected stack and rendered as a tree rather than a flat list. Each stack is
-//! rendered once, with a branch per line and an inline worktree reference on the
-//! line of the branch checked out there. Trunk/untracked worktrees appear in a
-//! trailing "Ungrouped" section. Passing `--no-stack` or using no stack model falls
-//! back to the flat list (no headers, identical to the pre-stack behavior).
+//! When a stack model is active (e.g. Graphite), worktrees and stack metadata are
+//! rendered as a unified tree. Each trunk is a single root node; stacks hang underneath;
+//! untracked worktrees appear at the root level sorted by most-recent activity.
+//! Metadata-only diffs (branches tracked by Graphite with no worktree) appear as
+//! `◯` nodes in the tree.
+//!
+//! Passing `--no-stack` or using no stack model falls back to the flat list (identical
+//! to the pre-stack behavior, no glyphs or connectors).
 //!
 //! ```text
-//! Stack (trunk: main)
-//!   feat-a-base
-//! * feat-a-top      → ./user/feat-a   1h ago
-//!
-//! Ungrouped
-//!   ./main                         2h ago
+//! ◉ main             ↑   2m ago  ← here
+//! ├─◯ api-1
+//! │ ◉ api-2          ↑   2h ago
+//! └─◯ shared  ./base     5d ago
+//!   ├─◯ branch-x
+//!   └─◯ branch-y
+//! ◉ ee/testing           1mo ago
 //! ```
-
-use std::collections::HashMap;
 
 use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
-use unicode_width::UnicodeWidthStr;
 use workon::{
-    current_stack, get_repo, get_worktrees, group_by_stack, WorkonConfig, WorktreeDescriptor,
+    current_stack, enumerate_stacks, get_repo, get_worktrees, group_by_stack, WorkonConfig,
+    WorktreeDescriptor,
 };
 
 use crate::cli::List;
-use crate::display::{format_aligned_rows, worktree_display_row, WorktreeDisplayRow};
+use crate::display::{build_tree, format_aligned_rows, format_tree_lines, worktree_display_row};
 use crate::json::worktree_to_json;
-use crate::output::style;
 
 use super::Run;
 
@@ -118,7 +118,7 @@ impl Run for List {
                     (g.stack.trunk.clone(), sorted)
                 })
                 .collect();
-            if let Ok(meta_stacks) = workon::enumerate_stacks(&repo, effective_model) {
+            if let Ok(meta_stacks) = enumerate_stacks(&repo, effective_model) {
                 for meta_stack in meta_stacks {
                     let mut sorted_diffs = meta_stack.diffs.clone();
                     sorted_diffs.sort();
@@ -150,9 +150,16 @@ impl Run for List {
                             Some((diff, json!(wt_name(idx))))
                         })
                         .collect();
+                    let parents: serde_json::Map<_, _> = group
+                        .stack
+                        .parents
+                        .iter()
+                        .map(|(child, parent)| (child.clone(), json!(parent)))
+                        .collect();
                     json!({
                         "trunk": group.stack.trunk,
                         "diffs": group.stack.diffs,
+                        "parents": parents,
                         "checkouts": checkouts,
                     })
                 })
@@ -170,110 +177,32 @@ impl Run for List {
         let root = workon::workon_root(&repo)?;
         let current_dir = std::env::current_dir().into_diagnostic()?;
 
-        let mut need_blank = false;
-
-        // Render each stack group as a branch tree with inline worktree references
-        for group in &grouping.groups {
-            if need_blank {
-                println!();
-            }
-            need_blank = true;
-
-            println!(
-                "{}",
-                style::dim(&format!("Stack (trunk: {})", group.stack.trunk))
+        if effective_model != workon::StackModel::None {
+            // Stack-active: render as unified tree
+            let forest = build_tree(
+                &filtered,
+                &grouping.groups,
+                &grouping.ungrouped,
+                root,
+                &current_dir,
             );
-
-            // Map branch name → worktree index for members of this group
-            let branch_to_idx: HashMap<&str, usize> = group
-                .members
+            let (lines, _) = format_tree_lines(&forest, true);
+            for line in lines {
+                println!("{}", line);
+            }
+        } else {
+            // Non-stack: flat aligned list (pre-stack behavior, no headers)
+            let rows: Vec<_> = filtered
                 .iter()
-                .filter_map(|&idx| stacks[idx].as_ref().map(|s| (s.current.as_str(), idx)))
+                .filter_map(|wt| worktree_display_row(wt, root, &current_dir).ok())
                 .collect();
-
-            // Compute per-group column widths for branch and dir columns
-            let max_branch_width = group
-                .stack
-                .diffs
-                .iter()
-                .filter_map(|b| branch_to_idx.contains_key(b.as_str()).then(|| b.width()))
-                .max()
-                .unwrap_or(0);
-
-            for branch in &group.stack.diffs {
-                match branch_to_idx.get(branch.as_str()) {
-                    None => {
-                        // Branch exists in stack metadata but has no worktree
-                        println!("  {}", style::dim(branch));
-                    }
-                    Some(&idx) => {
-                        if let Ok(row) = worktree_display_row(&filtered[idx], root, &current_dir) {
-                            let branch_pad = max_branch_width - branch.width();
-                            let active_marker = if row.is_active {
-                                style::green("→")
-                            } else {
-                                " ".to_string()
-                            };
-                            let indicators = format_indicators(&row);
-                            let time = style::dim(&row.last_activity);
-                            let suffix = if indicators.is_empty() {
-                                format!("  {}", time)
-                            } else {
-                                format!("  {}  {}", indicators, time)
-                            };
-                            println!(
-                                "* {}{}  {} {}{}{}",
-                                style::bold(branch),
-                                " ".repeat(branch_pad),
-                                active_marker,
-                                style::dim("./"),
-                                row.dir_name,
-                                suffix,
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // Render ungrouped worktrees (trunk / untracked) as a flat aligned list
-        if !grouping.ungrouped.is_empty() {
-            if need_blank {
-                println!();
-            }
-
-            // Only show the "Ungrouped" header when there are also stack groups above
-            if !grouping.groups.is_empty() {
-                println!("{}", style::dim("Ungrouped"));
-            }
-
-            let ungrouped_rows: Vec<WorktreeDisplayRow> = grouping
-                .ungrouped
-                .iter()
-                .filter_map(|&idx| worktree_display_row(&filtered[idx], root, &current_dir).ok())
-                .collect();
-            for line in format_aligned_rows(&ungrouped_rows, true) {
+            for line in format_aligned_rows(&rows, true) {
                 println!("{}", line);
             }
         }
 
         Ok(None)
     }
-}
-
-/// Format the status indicator symbols for a display row with appropriate colors.
-fn format_indicators(row: &WorktreeDisplayRow) -> String {
-    row.indicators
-        .iter()
-        .map(|ind| match ind.as_str() {
-            "*" => style::yellow(ind),
-            "↑" => style::green(ind),
-            "↓" => style::red(ind),
-            "✗" => style::red_bold(ind),
-            _ => ind.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 impl List {

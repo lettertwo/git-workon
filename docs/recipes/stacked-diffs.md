@@ -79,17 +79,19 @@ job.
 git workon list
 ```
 
-Stack-active output shows the branch hierarchy under each worktree:
+Stack-active output shows a graphite-style tree — `◉` for branches with a checked-out
+worktree, `◯` for metadata-only diffs (stack branches with no worktree):
 
 ```
-→ ./auth          * ↑   2 hours ago
-    auth-step-1
-  * auth-step-2
-    auth-step-3
-  ./main                 1 day ago
+◉ main                        1 day ago
+◯ auth-step-1
+◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
+◯ auth-step-3
 ```
 
-`*` marks the branch that is currently HEAD in the worktree. Fall back to flat list:
+`← here` marks the worktree that contains the current directory. When the worktree
+directory name differs from the branch (e.g. the `./auth` worktree with HEAD on
+`auth-step-2`), the path is shown as a dim annotation. Fall back to flat list:
 
 ```bash
 git workon list --no-stack

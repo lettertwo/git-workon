@@ -464,3 +464,66 @@ fn find_stack_fallback_is_case_insensitive() -> Result<(), Box<dyn std::error::E
 
     Ok(())
 }
+
+// ── New hybrid picker behavior ─────────────────────────────────────────────────
+
+/// Typing a query jumps the cursor to the best-matching item even when a
+/// different item was the initial default (is_active).
+#[test]
+fn find_picker_typing_jumps_cursor_to_best_match() -> Result<(), Box<dyn std::error::Error>> {
+    // "docs" is the last worktree added, so it's current_dir (is_active).
+    // Typing "feat" matches only "feature"; cursor should jump there.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .worktree("docs")
+        .build()?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["find"]);
+
+    session.expect("Select a worktree")?;
+    // Type "feat" — only "feature" matches; cursor jumps to it.
+    session.send(b"feat")?;
+    session.send(ENTER)?;
+
+    let output = session.expect(expectrl::Eof)?;
+    let selected = last_line(output.get(0).unwrap());
+
+    assert!(
+        selected.contains("feature") && !selected.contains("docs"),
+        "Expected typing 'feat' to jump cursor to 'feature', got: {selected}"
+    );
+
+    Ok(())
+}
+
+/// Pressing Esc cancels the picker without selecting any worktree.
+#[test]
+fn find_picker_esc_cancels_selection() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("alpha")
+        .worktree("bravo")
+        .build()?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["find"]);
+
+    session.expect("Select a worktree")?;
+    // ESC: lone \x1b with no follow-up sequence → Key::Escape.
+    session.send(b"\x1b")?;
+
+    let output = session.expect(expectrl::Eof)?;
+    let selected = last_line(output.get(0).unwrap());
+
+    // After Esc the picker exits without printing a worktree path.
+    // The last non-empty output is a display line (starts with space/→),
+    // not an absolute path (which would start with '/').
+    assert!(
+        !selected.starts_with('/'),
+        "Expected no path after Esc, got: {selected}"
+    );
+
+    Ok(())
+}

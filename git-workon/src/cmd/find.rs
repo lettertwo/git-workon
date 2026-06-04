@@ -27,21 +27,29 @@
 //!
 //! ## Interactive Mode
 //!
-//! Uses dialoguer's FuzzySelect widget with:
-//! - Status indicators from display.rs (`*`, `↑`, `↓`, `✗`)
-//! - Fuzzy searchable selection
-//! - `--no-interactive` bypass for testing and scripting
+//! Uses a custom hybrid picker that keeps items in stable tree order while still
+//! filtering as you type. When a query is active:
+//! - Non-matching items are hidden, except ancestors of a match (so connectors
+//!   always point to a real visible parent — no orphaned `├─`/`└─` glyphs).
+//! - The cursor jumps to the best-scoring match; arrow keys navigate freely.
+//! - Matched characters are underlined; non-matched characters are dimmed.
 //!
+//! When stack-active, uses the graphite-style tree view (`◉`/`◯`). Selecting a
+//! `◯` diff that belongs to a stack with no worktree routes to `New` to create/attach one.
+//!
+//! Pass `--no-interactive` to bypass interactive selection for scripting/testing.
 
-use dialoguer::console::{style, Style};
-use dialoguer::theme::ColorfulTheme;
-use dialoguer::FuzzySelect;
+use fuzzy_matcher::skim::SkimMatcherV2;
 use log::debug;
 use miette::{bail, IntoDiagnostic, Result, WrapErr};
-use workon::{current_stack, get_repo, get_worktrees, WorkonConfig, WorktreeDescriptor};
+use workon::{
+    current_stack, enumerate_stacks, get_repo, get_worktrees, group_by_stack, WorkonConfig,
+    WorktreeDescriptor,
+};
 
-use crate::cli::Find;
-use crate::display::{format_aligned_rows, worktree_display_row};
+use crate::cli::{Find, New};
+use crate::display::{build_tree, render_flat, render_tree, worktree_display_row};
+use crate::picker;
 
 use super::Run;
 
@@ -73,7 +81,6 @@ impl Run for Find {
                     if let Some(wt_name) = worktree.name() {
                         if wt_name == name {
                             debug!("Found exact match: {}", wt_name);
-                            // Return the worktree by consuming the vec
                             return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
                         }
                     }
@@ -136,7 +143,12 @@ impl Run for Find {
                                             name
                                         );
                                     }
-                                    return select_from_list(stack_matches);
+                                    return select_from_tree(
+                                        self,
+                                        stack_matches,
+                                        effective_model,
+                                        &repo,
+                                    );
                                 }
                             }
                         }
@@ -153,10 +165,9 @@ impl Run for Find {
                                 name
                             );
                         }
-                        // Extract just the worktrees from the (index, worktree) tuples
                         let matched_worktrees: Vec<WorktreeDescriptor> =
                             fuzzy_matches.into_iter().map(|(_, wt)| wt).collect();
-                        select_from_list(matched_worktrees)
+                        select_from_tree(self, matched_worktrees, effective_model, &repo)
                     }
                 }
             }
@@ -164,13 +175,13 @@ impl Run for Find {
                 if self.no_interactive {
                     bail!("No worktree name provided. Specify a name or remove --no-interactive.");
                 }
-                select_from_list(worktrees)
+                select_from_tree(self, worktrees, effective_model, &repo)
             }
         }
     }
 }
 
-/// Returns true if the worktree matches all active filters
+/// Returns true if the worktree matches all active filters.
 fn matches_filters(find: &Find, wt: &WorktreeDescriptor) -> bool {
     if !find.dirty && !find.clean && !find.ahead && !find.behind && !find.gone {
         return true;
@@ -195,35 +206,131 @@ fn matches_filters(find: &Find, wt: &WorktreeDescriptor) -> bool {
     true
 }
 
-/// Show interactive fuzzy selection list
-fn select_from_list(worktrees: Vec<WorktreeDescriptor>) -> Result<Option<WorktreeDescriptor>> {
-    let repo = get_repo(None)?;
-    let root = workon::workon_root(&repo)?;
+/// Show interactive selection.
+///
+/// Uses the hybrid picker: items stay in stable order; typing filters to
+/// matching items (keeping ancestors of matches so connectors stay valid in the
+/// tree view) and jumps the cursor to the best-scoring match.
+///
+/// When stack-active, displays the unified tree view (same as `list`). Selecting a
+/// `◯` diff with no worktree in its stack routes to `New` to create/attach one.
+/// Falls back to the flat picker when `--no-stack` is set.
+fn select_from_tree(
+    find: &Find,
+    worktrees: Vec<WorktreeDescriptor>,
+    effective_model: workon::StackModel,
+    repo: &git2::Repository,
+) -> Result<Option<WorktreeDescriptor>> {
+    let root = workon::workon_root(repo)?;
     let current_dir = std::env::current_dir().into_diagnostic()?;
+    let matcher = SkimMatcherV2::default();
 
+    if effective_model != workon::StackModel::None {
+        // ── Stack-active: unified tree picker ────────────────────────────────
+        let stacks: Vec<Option<workon::Stack>> = worktrees
+            .iter()
+            .map(|wt| {
+                let branch = wt.branch().ok().flatten()?;
+                current_stack(repo, &branch, effective_model).ok().flatten()
+            })
+            .collect();
+
+        let mut grouping = group_by_stack(&stacks);
+
+        // Surface metadata-only stacks (same logic as list).
+        let covered: std::collections::HashSet<(String, Vec<String>)> = grouping
+            .groups
+            .iter()
+            .map(|g| {
+                let mut sorted = g.stack.diffs.clone();
+                sorted.sort();
+                (g.stack.trunk.clone(), sorted)
+            })
+            .collect();
+        if let Ok(meta_stacks) = enumerate_stacks(repo, effective_model) {
+            for meta_stack in meta_stacks {
+                let mut sorted_diffs = meta_stack.diffs.clone();
+                sorted_diffs.sort();
+                if !covered.contains(&(meta_stack.trunk.clone(), sorted_diffs)) {
+                    grouping.groups.push(workon::StackGroup {
+                        stack: meta_stack,
+                        members: vec![],
+                    });
+                }
+            }
+        }
+
+        let forest = build_tree(
+            &worktrees,
+            &grouping.groups,
+            &grouping.ungrouped,
+            root,
+            &current_dir,
+        );
+
+        let selected_branch =
+            match picker::select("Select a worktree", |q| render_tree(&forest, q, &matcher))
+                .wrap_err("Failed to show interactive selection")?
+            {
+                Some(key) => key,
+                None => return Ok(None),
+            };
+
+        // Resolve: find the worktree whose HEAD matches the selected branch.
+        if let Some(idx) = worktrees
+            .iter()
+            .position(|wt| wt.branch().ok().flatten().as_deref() == Some(&selected_branch))
+        {
+            return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
+        }
+
+        // No direct match — selected_branch is a ◯ metadata-only diff.
+        // If another worktree's stack contains it, return that worktree (granularity=Stack).
+        for (idx, stack_opt) in stacks.iter().enumerate() {
+            if let Some(stack) = stack_opt {
+                if stack.diffs.contains(&selected_branch) {
+                    return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
+                }
+            }
+        }
+
+        // Stack has no worktree — route to New to create/attach one.
+        debug!("No worktree for diff '{}'; routing to new", selected_branch);
+        let new_cmd = New {
+            no_stack: find.no_stack,
+            name: Some(selected_branch),
+            base: None,
+            branch: None,
+            orphan: false,
+            detach: false,
+            no_hooks: false,
+            copy: false,
+            no_copy: false,
+            no_copy_ignored: false,
+            no_interactive: find.no_interactive,
+            lock: false,
+        };
+        return new_cmd.run();
+    }
+
+    // ── Non-stack: flat picker ────────────────────────────────────────────────
     let rows: Vec<_> = worktrees
         .iter()
         .filter_map(|wt| worktree_display_row(wt, root, &current_dir).ok())
         .collect();
-    let active_index = rows.iter().position(|r| r.is_active).unwrap_or(0);
-    let items = format_aligned_rows(&rows, false);
 
-    let theme = ColorfulTheme {
-        active_item_prefix: style("→".to_string()).for_stderr().green(),
-        active_item_style: Style::new().for_stderr(),
-        inactive_item_style: Style::new().for_stderr(),
-        fuzzy_match_highlight_style: Style::new().for_stderr().underlined(),
-        ..ColorfulTheme::default()
-    };
+    let selected_key =
+        match picker::select("Select a worktree", |q| render_flat(&rows, q, &matcher))
+            .wrap_err("Failed to show interactive selection")?
+        {
+            Some(key) => key,
+            None => return Ok(None),
+        };
 
-    let selection = FuzzySelect::with_theme(&theme)
-        .with_prompt("Select a worktree")
-        .items(&items)
-        .default(active_index)
-        .interact()
-        .into_diagnostic()
-        .wrap_err("Failed to show interactive selection")?;
-
-    // Consume the vec and return the selected worktree
-    Ok(Some(worktrees.into_iter().nth(selection).unwrap()))
+    // Map the selected dir_name key back to a worktree.
+    let idx = rows
+        .iter()
+        .position(|r| r.dir_name == selected_key)
+        .unwrap_or(0);
+    Ok(Some(worktrees.into_iter().nth(idx).unwrap()))
 }

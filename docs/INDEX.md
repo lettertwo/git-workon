@@ -23,6 +23,7 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 
 - `docs/diagrams/find-flow.md`
 - `docs/adr/013-find-three-mode-strategy.md`
+- `docs/adr/023-unified-stack-tree-views.md`
 - Key source: `git-workon/src/cmd/find.rs`, `git-workon-lib/src/worktree.rs`
 
 ### prune
@@ -46,6 +47,7 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 
 - `docs/recipes/stacked-diffs.md` — user guide: setup, worktree-per-stack pattern, list/find/new stack-aware behavior, config reference
 - `docs/rfc/stacked-diffs.md` — research on stacked diff tools (Graphite, branchless, spr, Sapling, git-stack)
+- `docs/adr/023-unified-stack-tree-views.md` — unified tree rendering for list and find
 - Key source: `git-workon-lib/src/stack.rs`, `git-workon-lib/src/stack/graphite.rs`, `git-workon-lib/src/config.rs` (`stack_model`, `gt_auto_track`)
 
 ### pr / pull-request

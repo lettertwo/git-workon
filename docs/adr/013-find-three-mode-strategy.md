@@ -10,7 +10,12 @@ Users switch between worktrees frequently. They may know the exact name, a parti
 
 1. **Exact match**: if a name argument is given and a worktree's `name()` equals it exactly, return immediately.
 2. **Fuzzy match**: if no exact match, search for worktrees whose lowercased name contains the lowercased argument as a substring. If exactly one match is found, return it. If multiple matches are found and `--no-interactive` is set, return an error; otherwise fall through to interactive selection.
-3. **Interactive selection**: `dialoguer::FuzzySelect` displays all candidate worktrees with status indicators (`*` dirty, `↑` ahead, `↓` behind, `✗` upstream gone, `→` current). The user selects one.
+3. **Stack-member match** (stack-active only): if fuzzy matching finds zero worktrees, search all stacks' `diffs` lists for branches matching the argument. A single matching stack's worktree is returned directly; multiple matches go to interactive selection.
+4. **Interactive selection**: `dialoguer::FuzzySelect` displays candidate worktrees as a graphite-style tree (same rendering as `list`) when stack-active, or as a flat aligned list otherwise. The user selects one.
+
+When a `◯` (metadata-only) diff is selected from the tree and its stack has no checked-out
+worktree, `find` delegates to `New` for that branch — creating or attaching the worktree rather
+than returning an error. See [ADR-023](023-unified-stack-tree-views.md) for the rationale.
 
 Status filters (`--dirty`, `--clean`, `--ahead`, `--behind`, `--gone`) are applied before any name matching. All active filters are ANDed together.
 
@@ -18,9 +23,10 @@ Status filters (`--dirty`, `--clean`, `--ahead`, `--behind`, `--gone`) are appli
 
 ## Consequences
 
-- Exact names are zero-overhead; fuzzy names work for most cases; interactive mode is a fallback for exploration.
+- Exact names are zero-overhead; fuzzy names work for most cases; stack-member matching resolves branch names not yet checked out; interactive mode is a fallback for exploration.
 - The fuzzy match is a simple substring check, not a fuzzy-scoring algorithm — fast and predictable, but not tolerant of typos.
 - Filter + fuzzy combining allows power queries like `git workon find feat --ahead` (ahead worktrees whose name contains "feat").
+- `find` is not purely read-only when stack-active: selecting a `◯` diff with no worktree creates one.
 
 ## References
 

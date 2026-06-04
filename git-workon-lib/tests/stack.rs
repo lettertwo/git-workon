@@ -1,6 +1,6 @@
 use git_workon_fixture::prelude::*;
 use std::error::Error;
-use workon::{current_stack, graphite_trunk, StackModel};
+use workon::{current_stack, enumerate_stacks, graphite_trunk, StackModel};
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -223,6 +223,90 @@ fn current_stack_malformed_blob_for_head_returns_none() -> Result<(), Box<dyn Er
     let repo = fixture.repo()?;
 
     assert!(current_stack(repo, "feat-a", StackModel::Graphite)?.is_none());
+    Ok(())
+}
+
+// ── Stack.parents — tree structure ────────────────────────────────────────────
+
+#[test]
+fn current_stack_linear_chain_parents_map_is_populated() -> Result<(), Box<dyn Error>> {
+    // main → step-1 → step-2 → step-3
+    let fixture = linear_chain()?;
+    let repo = fixture.repo()?;
+
+    let stack = current_stack(repo, "step-3", StackModel::Graphite)?.unwrap();
+    // Each diff maps to its immediate parent.
+    assert_eq!(
+        stack.parents.get("step-1").map(String::as_str),
+        Some("main"),
+        "step-1's parent must be main"
+    );
+    assert_eq!(
+        stack.parents.get("step-2").map(String::as_str),
+        Some("step-1"),
+        "step-2's parent must be step-1"
+    );
+    assert_eq!(
+        stack.parents.get("step-3").map(String::as_str),
+        Some("step-2"),
+        "step-3's parent must be step-2"
+    );
+    // Trunk itself is not a key in parents.
+    assert!(
+        !stack.parents.contains_key("main"),
+        "trunk must not be a key in parents"
+    );
+    Ok(())
+}
+
+#[test]
+fn current_stack_branching_stack_parents_map_covers_all_diffs() -> Result<(), Box<dyn Error>> {
+    // main → feat-a → feat-b (linear), and also main → feat-a → feat-c (fork at feat-a)
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .branch_metadata("feat-b", "feat-a")
+        .branch_metadata("feat-c", "feat-a")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let stack = current_stack(repo, "feat-b", StackModel::Graphite)?.unwrap();
+
+    assert_eq!(
+        stack.parents.get("feat-a").map(String::as_str),
+        Some("main")
+    );
+    assert_eq!(
+        stack.parents.get("feat-b").map(String::as_str),
+        Some("feat-a")
+    );
+    assert_eq!(
+        stack.parents.get("feat-c").map(String::as_str),
+        Some("feat-a")
+    );
+    // All three diffs should have entries.
+    assert_eq!(stack.parents.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn enumerate_stacks_parents_map_is_populated() -> Result<(), Box<dyn Error>> {
+    // Verify that the parents map is also populated via enumerate_stacks (metadata-only path).
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .branch_metadata("api-1", "main")
+        .branch_metadata("api-2", "api-1")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let stacks = enumerate_stacks(repo, StackModel::Graphite)?;
+    assert_eq!(stacks.len(), 1);
+    let stack = &stacks[0];
+    assert_eq!(stack.parents.get("api-1").map(String::as_str), Some("main"));
+    assert_eq!(
+        stack.parents.get("api-2").map(String::as_str),
+        Some("api-1")
+    );
     Ok(())
 }
 

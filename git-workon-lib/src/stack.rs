@@ -34,7 +34,7 @@
 
 mod graphite;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use git2::Repository;
 
@@ -81,6 +81,12 @@ pub struct Stack {
     pub diffs: Vec<String>,
     /// The branch that is currently HEAD in the worktree.
     pub current: String,
+    /// Parent map for the diffs in this stack: `diff → parent_branch`.
+    ///
+    /// The parent may be another diff or the trunk itself. Only covers diffs in
+    /// [`Stack::diffs`]; the trunk's own parent is not recorded. Used to reconstruct
+    /// the branching tree structure (a flat [`diffs`] list cannot represent forks).
+    pub parents: HashMap<String, String>,
 }
 
 /// Return all stacks present in metadata, one per connected component.
@@ -211,6 +217,7 @@ mod tests {
             trunk: trunk.to_string(),
             diffs: diffs.iter().map(|s| s.to_string()).collect(),
             current: current.to_string(),
+            parents: HashMap::new(),
         }
     }
 

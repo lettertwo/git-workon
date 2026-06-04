@@ -5,6 +5,7 @@ mod display;
 mod hooks;
 mod json;
 mod output;
+mod picker;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::env::CompleteEnv;
