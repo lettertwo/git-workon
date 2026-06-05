@@ -1393,6 +1393,133 @@ fn prune_include_locked_removes_locked_worktrees() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+// --- Orphaned stash tests ---
+
+fn create_labeled_stash(
+    fixture: &Fixture,
+    worktree: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let wt_path = fixture.root()?.child(worktree).path().to_path_buf();
+    fixture
+        .commit(worktree)
+        .file("f.txt", "v1")
+        .create("init")?;
+    std::fs::write(wt_path.join("f.txt"), "local-edit")?;
+    let mut wt_repo = git2::Repository::open(&wt_path)?;
+    let sig = git2::Signature::now("test", "test@test.com")?;
+    wt_repo.stash_save2(
+        &sig,
+        Some(&format!("workon-autostash: {} @ {}", worktree, worktree)),
+        Some(git2::StashFlags::INCLUDE_UNTRACKED),
+    )?;
+    Ok(())
+}
+
+#[test]
+fn prune_warns_about_orphaned_stashes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    create_labeled_stash(&fixture, "feature")?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--allow-unmerged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("orphans shelved changes"))
+        .stderr(predicate::str::contains(
+            "workon-autostash: feature @ feature",
+        ))
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_json_includes_orphaned_stashes() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    create_labeled_stash(&fixture, "feature")?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    let output = prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--json")
+        .arg("feature")
+        .arg("--allow-unmerged")
+        .arg("--yes")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
+    let pruned = json["pruned"].as_array().expect("pruned should be array");
+    assert_eq!(pruned.len(), 1);
+    let stashes = pruned[0]["orphaned_stashes"]
+        .as_array()
+        .expect("orphaned_stashes should be array");
+    assert!(!stashes.is_empty(), "expected at least one orphaned stash");
+    assert!(
+        stashes[0]
+            .as_str()
+            .unwrap_or("")
+            .contains("workon-autostash: feature @ feature"),
+        "stash label should match"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn prune_no_orphan_warning_when_no_stash() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("orphans shelved").not())
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
 // --- Interactive PTY tests ---
 
 fn cargo_bin_path() -> PathBuf {

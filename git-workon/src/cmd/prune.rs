@@ -271,27 +271,30 @@ impl Run for Prune {
         if self.json {
             // JSON mode: skip confirmation, output structured result
             let delete_branch = !self.keep_branch;
-            let mut pruned_with_status: Vec<(&PruneCandidate, bool)> = Vec::new();
+            let mut pruned_with_status: Vec<(&PruneCandidate, bool, Vec<String>)> = Vec::new();
             let force_locked = self.force || self.include_locked;
             if !self.dry_run {
                 for candidate in &to_prune {
+                    let orphaned = collect_orphaned_stashes(candidate);
                     let branch_deleted =
                         prune_worktree(&repo, candidate, delete_branch, force_locked)?;
-                    pruned_with_status.push((candidate, branch_deleted));
+                    pruned_with_status.push((candidate, branch_deleted, orphaned));
                 }
             } else {
                 for candidate in &to_prune {
-                    pruned_with_status.push((candidate, false));
+                    let orphaned = collect_orphaned_stashes(candidate);
+                    pruned_with_status.push((candidate, false, orphaned));
                 }
             }
 
             let result = json!({
-                "pruned": pruned_with_status.iter().map(|(c, branch_deleted)| json!({
+                "pruned": pruned_with_status.iter().map(|(c, branch_deleted, orphaned)| json!({
                     "name": c.worktree_name,
                     "path": c.worktree_path.to_str(),
                     "branch": c.branch_name,
                     "reason": c.reason.to_string(),
                     "branch_deleted": branch_deleted,
+                    "orphaned_stashes": orphaned,
                 })).collect::<Vec<_>>(),
                 "skipped": skipped.iter().map(|(c, reason)| json!({
                     "name": c.worktree_name,
@@ -367,6 +370,12 @@ impl Run for Prune {
         let delete_branch = !self.keep_branch;
         let force_locked = self.force || self.include_locked;
         for candidate in &to_prune {
+            for label in collect_orphaned_stashes(candidate) {
+                output::warn(&format!(
+                    "pruning '{}' orphans shelved changes: {} (not restorable)",
+                    candidate.worktree_name, label
+                ));
+            }
             prune_worktree(&repo, candidate, delete_branch, force_locked)?;
         }
 
@@ -499,6 +508,13 @@ fn is_protected(branch_name: &str, patterns: &[String]) -> bool {
         }
     }
     false
+}
+
+fn collect_orphaned_stashes(candidate: &PruneCandidate) -> Vec<String> {
+    let Ok(mut wt_repo) = git2::Repository::open(&candidate.worktree_path) else {
+        return vec![];
+    };
+    workon::list_labeled_for_worktree(&mut wt_repo, &candidate.worktree_name).unwrap_or_default()
 }
 
 /// Simple glob pattern matching supporting * and ? wildcards
