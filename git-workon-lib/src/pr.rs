@@ -384,27 +384,41 @@ pub fn is_pr_reference(input: &str) -> bool {
     parse_pr_reference(input).ok().flatten().is_some()
 }
 
+/// Returns remotes in preferred order: upstream first, then origin, then all others.
+pub fn preferred_remote_order(repo: &Repository) -> Vec<String> {
+    let Ok(remotes) = repo.remotes() else {
+        return vec![];
+    };
+    let all: Vec<String> = remotes
+        .iter()
+        .flatten()
+        .flatten()
+        .map(str::to_string)
+        .collect();
+
+    let mut ordered = Vec::with_capacity(all.len());
+    for preferred in &["upstream", "origin"] {
+        if all.iter().any(|r| r == preferred) {
+            ordered.push(preferred.to_string());
+        }
+    }
+    for r in &all {
+        if !ordered.contains(r) {
+            ordered.push(r.clone());
+        }
+    }
+    ordered
+}
+
 /// Select which remote to use for fetching PR refs.
 ///
 /// Priority: `upstream` → `origin` → first available remote.
 /// Returns [`PrError::NoRemoteConfigured`] if the repository has no remotes.
 pub fn detect_pr_remote(repo: &Repository) -> Result<String> {
-    let remotes = repo.remotes()?;
-
-    // Priority: upstream > origin
-    for name in &["upstream", "origin"] {
-        if remotes.iter().flatten().flatten().any(|r| r == *name) {
-            debug!("Using remote: {}", name);
-            return Ok(name.to_string());
-        }
-    }
-
-    // Fall back to first remote
-    if let Ok(Some(first_remote)) = remotes.get(0) {
-        Ok(first_remote.to_string())
-    } else {
-        Err(PrError::NoRemoteConfigured.into())
-    }
+    preferred_remote_order(repo)
+        .into_iter()
+        .next()
+        .ok_or_else(|| PrError::NoRemoteConfigured.into())
 }
 
 /// Ensure a remote for a fork PR exists, then return its name.

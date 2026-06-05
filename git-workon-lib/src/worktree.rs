@@ -630,30 +630,56 @@ pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor
         .ok_or_else(|| WorktreeError::NotFound(name.to_string()).into())
 }
 
-/// Find a remote tracking branch by its short name (without the remote prefix).
+/// Result of looking up which remote carries a branch.
+pub enum RemoteResolution {
+    /// Exactly one remote (or a clear winner by priority) found.
+    Single { remote: String, oid: git2::Oid },
+    /// Two or more equally-preferred remotes carry the branch — user must choose.
+    Ambiguous(Vec<String>),
+    /// No remote has the branch.
+    None,
+}
+
+/// Find which remote(s) carry a branch, ranked by preferred remote order.
 ///
-/// Given `branch_name = "feature"`, finds `refs/remotes/origin/feature` and returns
-/// `(remote_name, commit_oid)` so a local tracking branch can be created.
-/// When multiple remotes have a branch with this name, the first match is returned.
-fn find_remote_tracking_branch(
-    repo: &Repository,
-    branch_name: &str,
-) -> Option<(String, git2::Oid)> {
-    let branches = repo.branches(Some(git2::BranchType::Remote)).ok()?;
-    for branch_result in branches.flatten() {
-        let (branch, _) = branch_result;
-        if let Ok(Some(full_name)) = branch.name() {
-            // full_name is "remote/branch" (e.g., "origin/feature")
-            if let Some((remote_name, remote_branch)) = full_name.split_once('/') {
-                if remote_branch == branch_name {
-                    if let Some(oid) = branch.get().target() {
-                        return Some((remote_name.to_string(), oid));
-                    }
-                }
+/// Priority: `upstream` (tier 0) → `origin` (tier 1) → all others (tier 2).
+/// Returns `Ambiguous` when two or more tier-2 remotes both carry the branch.
+pub fn resolve_remote_tracking(repo: &Repository, branch_name: &str) -> RemoteResolution {
+    let branches = match repo.branches(Some(git2::BranchType::Remote)) {
+        Ok(b) => b,
+        Err(_) => return RemoteResolution::None,
+    };
+
+    let mut candidates: Vec<(String, git2::Oid)> = branches
+        .flatten()
+        .filter_map(|(branch, _)| {
+            let name = branch.name().ok()??;
+            let (remote, br) = name.split_once('/')?;
+            if br != branch_name {
+                return None;
             }
-        }
+            Some((remote.to_string(), branch.get().target()?))
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return RemoteResolution::None;
     }
-    None
+
+    let tier = |r: &str| match r {
+        "upstream" => 0usize,
+        "origin" => 1,
+        _ => 2,
+    };
+
+    candidates.sort_by_key(|(r, _)| tier(r));
+
+    if candidates.len() >= 2 && tier(&candidates[0].0) == tier(&candidates[1].0) {
+        return RemoteResolution::Ambiguous(candidates.into_iter().map(|(r, _)| r).collect());
+    }
+
+    let (remote, oid) = candidates.remove(0);
+    RemoteResolution::Single { remote, oid }
 }
 
 /// Create a new worktree for the given branch.
@@ -706,8 +732,11 @@ pub fn add_worktree(
                 Err(e) => {
                     debug!("local branch not found: {:?}", e);
                     debug!("looking for remote tracking branch for {:?}", branch_name);
-                    match find_remote_tracking_branch(repo, branch_name) {
-                        Some((remote_name, remote_oid)) => {
+                    match resolve_remote_tracking(repo, branch_name) {
+                        RemoteResolution::Single {
+                            remote: remote_name,
+                            oid: remote_oid,
+                        } => {
                             debug!(
                                 "found remote tracking branch {}/{}, creating local branch",
                                 remote_name, branch_name
@@ -719,7 +748,7 @@ pub fn add_worktree(
                             local_branch.set_upstream(Some(&upstream_name))?;
                             local_branch
                         }
-                        None => {
+                        RemoteResolution::Ambiguous(_) | RemoteResolution::None => {
                             debug!(
                                 "no remote tracking branch found, creating new local branch {:?}",
                                 branch_name

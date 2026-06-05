@@ -57,8 +57,8 @@ use crate::hooks::execute_post_create_hooks;
 use crate::output;
 use workon::{
     add_worktree, copy_untracked, current_stack, current_worktree, get_repo, get_worktrees,
-    graphite_trunk, workon_root, BranchType, CopyOptions, StackModel, WorkonConfig,
-    WorktreeDescriptor,
+    graphite_trunk, resolve_remote_tracking, workon_root, BranchType, CopyOptions,
+    RemoteResolution, StackModel, WorkonConfig, WorktreeDescriptor,
 };
 
 use super::Run;
@@ -277,6 +277,38 @@ impl Run for New {
         let branch_pre_existed = repo
             .find_branch(&effective_branch, GitBranchType::Local)
             .is_ok();
+
+        // For Normal branches that don't exist locally yet, resolve which remote to use.
+        // On ambiguity (two equally-ranked remotes), prompt interactively.
+        // Pre-create the local branch so add_worktree takes the "attach" path.
+        if branch_type == BranchType::Normal && !branch_pre_existed {
+            let chosen_remote = match resolve_remote_tracking(&repo, &effective_branch) {
+                RemoteResolution::Single { remote, .. } => Some(remote),
+                RemoteResolution::Ambiguous(remotes) if !self.no_interactive => {
+                    let idx = dialoguer::Select::new()
+                        .with_prompt(format!(
+                            "Branch '{}' exists on multiple remotes; choose one",
+                            effective_branch
+                        ))
+                        .items(&remotes)
+                        .default(0)
+                        .interact()
+                        .into_diagnostic()?;
+                    Some(remotes.into_iter().nth(idx).unwrap())
+                }
+                RemoteResolution::Ambiguous(mut remotes) => Some(remotes.remove(0)),
+                RemoteResolution::None => None,
+            };
+
+            if let Some(remote) = chosen_remote {
+                let remote_ref = format!("refs/remotes/{}/{}", remote, effective_branch);
+                if let Ok(reference) = repo.find_reference(&remote_ref) {
+                    if let Ok(commit) = reference.peel_to_commit() {
+                        let _ = repo.branch(&effective_branch, &commit, false);
+                    }
+                }
+            }
+        }
 
         let worktree = add_worktree(
             &repo,

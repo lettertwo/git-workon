@@ -1139,4 +1139,120 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn resolve_remote_tracking_prefers_upstream_over_origin(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .branch("feature")
+            .remote("upstream", "https://example.com/upstream.git")
+            .remote("origin", "https://example.com/origin.git")
+            .upstream("feature", "upstream/feature")
+            .upstream("feature", "origin/feature")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        match workon::resolve_remote_tracking(repo, "feature") {
+            workon::RemoteResolution::Single { remote, .. } => {
+                assert_eq!(remote, "upstream");
+            }
+            other => panic!(
+                "expected Single(upstream), got {:?}",
+                match other {
+                    workon::RemoteResolution::Ambiguous(v) => format!("Ambiguous({:?})", v),
+                    workon::RemoteResolution::None => "None".to_string(),
+                    _ => unreachable!(),
+                }
+            ),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_remote_tracking_prefers_origin_over_other() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .branch("feature")
+            .remote("origin", "https://example.com/origin.git")
+            .remote("myfork", "https://example.com/myfork.git")
+            .upstream("feature", "origin/feature")
+            .upstream("feature", "myfork/feature")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        match workon::resolve_remote_tracking(repo, "feature") {
+            workon::RemoteResolution::Single { remote, .. } => {
+                assert_eq!(remote, "origin");
+            }
+            other => panic!(
+                "expected Single(origin), got {:?}",
+                match other {
+                    workon::RemoteResolution::Ambiguous(v) => format!("Ambiguous({:?})", v),
+                    workon::RemoteResolution::None => "None".to_string(),
+                    _ => unreachable!(),
+                }
+            ),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_remote_tracking_ambiguous_for_two_unpreferred(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .branch("feature")
+            .remote("teamA", "https://example.com/teamA.git")
+            .remote("teamB", "https://example.com/teamB.git")
+            .upstream("feature", "teamA/feature")
+            .upstream("feature", "teamB/feature")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        match workon::resolve_remote_tracking(repo, "feature") {
+            workon::RemoteResolution::Ambiguous(remotes) => {
+                assert!(remotes.contains(&"teamA".to_string()));
+                assert!(remotes.contains(&"teamB".to_string()));
+            }
+            other => panic!(
+                "expected Ambiguous, got {:?}",
+                match other {
+                    workon::RemoteResolution::Single { remote, .. } => {
+                        format!("Single({})", remote)
+                    }
+                    workon::RemoteResolution::None => "None".to_string(),
+                    _ => unreachable!(),
+                }
+            ),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_remote_tracking_none_when_no_remotes() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        assert!(matches!(
+            workon::resolve_remote_tracking(repo, "feature"),
+            workon::RemoteResolution::None
+        ));
+
+        Ok(())
+    }
 }
