@@ -10,7 +10,6 @@ mod picker;
 use clap::{CommandFactory, Parser};
 use clap_complete::env::CompleteEnv;
 use cli::Cmd;
-use git2::BranchType as GitBranchType;
 use miette::{IntoDiagnostic, Result};
 
 use crate::cli::Cli;
@@ -40,15 +39,30 @@ fn main() -> Result<()> {
         output::set_no_color(true);
     }
 
+    // Resolve the stack model once up front so the routing functions can consult it
+    // without re-opening the repository or re-reading config.
+    let routing_repo = workon::get_repo(None).ok();
+    let routing_model = match (&routing_repo, cli.no_stack) {
+        (Some(repo), false) => workon::WorkonConfig::new(repo)
+            .ok()
+            .and_then(|c| c.stack_model(None).ok())
+            .unwrap_or(workon::StackModel::None),
+        _ => workon::StackModel::None,
+    };
+
     if cli.command.is_none() {
-        match cli.find.name {
-            Some(ref name) if workon::is_pr_reference(name) => {
-                cli.command = route_pr_ref_to_command(name).or(Some(Cmd::Find(cli.find)));
+        // Clone the name so cli.find can be moved freely into Cmd::Find below.
+        let name_opt = cli.find.name.clone();
+        match name_opt {
+            Some(name) if workon::is_pr_reference(&name) => {
+                cli.command = route_pr_ref_to_command(&name, routing_repo.as_ref())
+                    .or(Some(Cmd::Find(cli.find)));
             }
-            Some(ref name) => {
-                cli.command = route_branch_to_command(name).or(Some(Cmd::Find(cli.find)));
+            Some(name) => {
+                cli.command = route_branch_to_command(routing_repo.as_ref(), &name, routing_model)
+                    .or(Some(Cmd::Find(cli.find)));
             }
-            _ => {
+            None => {
                 cli.command = Some(Cmd::Find(cli.find));
             }
         }
@@ -105,76 +119,43 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Returns `Some(Cmd::New)` if `name` matches a local/remote branch with no existing worktree;
-/// `None` if a worktree already exists (let Find handle it) or no branch is found.
-fn route_branch_to_command(name: &str) -> Option<Cmd> {
-    let repo = workon::get_repo(None).ok()?;
-    // Worktree already exists — let Find handle it
-    if repo.find_worktree(name).is_ok() {
-        return None;
+/// Route a bare `workon <name>` to the appropriate `Cmd`.
+///
+/// Maps [`workon::resolve_action`] output to a `Cmd`:
+/// - [`Navigate`] / [`NotFound`] / [`DeletedNode`] → `None` (falls through to `Cmd::Find`)
+/// - [`Materialize`] → `Some(Cmd::New)`
+/// - [`Checkout`] → `Some(Cmd::Checkout)` *(added in PR-2)*
+///
+/// [`Navigate`]: workon::Resolution::Navigate
+/// [`NotFound`]: workon::Resolution::NotFound
+/// [`DeletedNode`]: workon::Resolution::DeletedNode
+/// [`Materialize`]: workon::Resolution::Materialize
+/// [`Checkout`]: workon::Resolution::Checkout
+fn route_branch_to_command(
+    repo: Option<&git2::Repository>,
+    name: &str,
+    model: workon::StackModel,
+) -> Option<Cmd> {
+    let repo = repo?;
+    match workon::resolve_action(repo, name, model) {
+        workon::Resolution::Materialize => Some(Cmd::New(cli::New::attach(name))),
+        // Navigate → Find handles the cd; NotFound → Find shows the error.
+        // DeletedNode → treated as NotFound until PR-7 adds the structured error.
+        // Checkout → added in PR-2.
+        _ => None,
     }
-    if !branch_exists(&repo, name) {
-        return None;
-    }
-    Some(Cmd::New(cli::New {
-        no_stack: false,
-        name: Some(name.to_string()),
-        base: None,
-        branch: None,
-        orphan: false,
-        detach: false,
-        no_hooks: false,
-        copy: false,
-        no_copy: false,
-        no_copy_ignored: false,
-        no_interactive: false,
-        lock: false,
-    }))
 }
 
-/// Returns true if `name` matches a local branch or the short name of any remote tracking branch.
-fn branch_exists(repo: &git2::Repository, name: &str) -> bool {
-    if repo.find_branch(name, GitBranchType::Local).is_ok() {
-        return true;
-    }
-    if let Ok(branches) = repo.branches(Some(GitBranchType::Remote)) {
-        for branch in branches.flatten() {
-            if let Ok(Some(full_name)) = branch.0.name() {
-                // Remote branch names are "remote/branch" — match on the part after the first "/"
-                if let Some((_, branch)) = full_name.split_once('/') {
-                    if branch == name {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Returns `Some(Cmd::New)` if PR worktree doesn't exist yet; `None` if it exists or parsing fails.
-fn route_pr_ref_to_command(pr_ref: &str) -> Option<Cmd> {
-    let repo = workon::get_repo(None).ok()?;
-    let config = workon::WorkonConfig::new(&repo).ok()?;
+/// Returns `Some(Cmd::New)` if the PR worktree doesn't exist yet; `None` otherwise.
+fn route_pr_ref_to_command(pr_ref: &str, repo: Option<&git2::Repository>) -> Option<Cmd> {
+    let repo = repo?;
+    let config = workon::WorkonConfig::new(repo).ok()?;
     let pr_format = config.pr_format(None).ok()?;
     let pr_info = workon::parse_pr_reference(pr_ref).ok()??;
     let pr_name = workon::format_pr_name(&pr_format, pr_info.number);
 
     match repo.find_worktree(&pr_name) {
         Ok(_) => None, // worktree already exists
-        _ => Some(Cmd::New(cli::New {
-            no_stack: false,
-            name: Some(pr_name),
-            base: None,
-            branch: None,
-            orphan: false,
-            detach: false,
-            no_hooks: false,
-            copy: false,
-            no_copy: false,
-            no_copy_ignored: false,
-            no_interactive: false,
-            lock: false,
-        })),
+        _ => Some(Cmd::New(cli::New::attach(pr_name))),
     }
 }

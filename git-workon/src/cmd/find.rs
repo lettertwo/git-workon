@@ -302,20 +302,9 @@ fn select_from_tree(
 
         // Stack has no worktree — route to New to create/attach one.
         debug!("No worktree for diff '{}'; routing to new", selected_branch);
-        let new_cmd = New {
-            no_stack: find.no_stack,
-            name: Some(selected_branch),
-            base: None,
-            branch: None,
-            orphan: false,
-            detach: false,
-            no_hooks: false,
-            copy: false,
-            no_copy: false,
-            no_copy_ignored: false,
-            no_interactive: find.no_interactive,
-            lock: false,
-        };
+        let mut new_cmd = New::attach(selected_branch);
+        new_cmd.no_stack = find.no_stack;
+        new_cmd.no_interactive = find.no_interactive;
         return new_cmd.run();
     }
 

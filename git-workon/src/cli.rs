@@ -189,6 +189,31 @@ pub struct New {
     pub lock: bool,
 }
 
+impl New {
+    /// Construct a minimal `New` for auto-attach or branch creation.
+    ///
+    /// Used by the resolver when routing a bare `workon <name>` to `Cmd::New`.
+    /// All flags default to off; callers can override individual fields after
+    /// construction (e.g. `new.no_stack = true`).
+    #[allow(dead_code)] // used by the main binary; build.rs imports cli.rs for completions
+    pub fn attach(name: impl Into<String>) -> Self {
+        Self {
+            no_stack: false,
+            name: Some(name.into()),
+            base: None,
+            branch: None,
+            orphan: false,
+            detach: false,
+            no_hooks: false,
+            copy: false,
+            no_copy: false,
+            no_copy_ignored: false,
+            no_interactive: false,
+            lock: false,
+        }
+    }
+}
+
 /// Prune stale worktrees.
 #[derive(Debug, Args)]
 pub struct Prune {
@@ -244,7 +269,7 @@ pub struct Prune {
 }
 
 /// Find a worktree to work on.
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct Find {
     #[clap(skip)]

@@ -57,6 +57,7 @@ mod get_repo;
 mod init;
 mod r#move;
 mod pr;
+mod resolve;
 mod ssh_config;
 mod stack;
 mod workon_root;
@@ -74,6 +75,7 @@ pub use crate::get_repo::*;
 pub use crate::init::*;
 pub use crate::pr::*;
 pub use crate::r#move::*;
+pub use crate::resolve::*;
 pub use crate::stack::{
     current_stack, enumerate_stacks, graphite_trunk, group_by_stack, is_graphite_active,
     Granularity, Stack, StackGroup, StackGrouping, StackModel,
