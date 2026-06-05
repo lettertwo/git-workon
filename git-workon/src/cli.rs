@@ -318,6 +318,13 @@ pub struct Find {
     #[arg(long, help = "Show only worktrees whose upstream branch is deleted")]
     pub gone: bool,
 
+    #[arg(
+        short = 'n',
+        long,
+        help = "Force a fresh worktree instead of reusing a stack home"
+    )]
+    pub new: bool,
+
     #[arg(long, help = "Disable interactive mode (for testing/scripting)")]
     pub no_interactive: bool,
 }

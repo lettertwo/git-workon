@@ -11,7 +11,8 @@
 //!   keystroke and may filter/highlight the list however it likes.
 //! - `Backspace` removes the last query character.
 //! - `↑`/`↓` move the cursor through the current visible list.
-//! - `Enter` confirms the selection (returns the key at the current cursor).
+//! - `Enter` confirms the selection with [`PickerAction::Resolve`].
+//! - `Tab` confirms the selection with [`PickerAction::Materialize`] (force create).
 //! - `Esc` / `Ctrl-C` cancel (returns `None`).
 //!
 //! ## Terminal safety
@@ -26,6 +27,15 @@ use miette::{IntoDiagnostic, Result};
 use crate::display::PickerRender;
 use crate::output::style;
 
+/// How the user confirmed their selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickerAction {
+    /// `Enter` — use the normal resolution path.
+    Resolve,
+    /// `Tab` — bypass the resolver and force-materialize a fresh worktree.
+    Materialize,
+}
+
 /// Run an interactive picker.
 ///
 /// `prompt` is shown above the list (e.g. `"Select a worktree"`).
@@ -33,8 +43,11 @@ use crate::output::style;
 /// returns the full set of visible lines, their selection keys, and the index
 /// the cursor should jump to (best fuzzy match, or the active item).
 ///
-/// Returns the selected key on `Enter`, or `None` on `Esc`/`Ctrl-C`.
-pub fn select(prompt: &str, render: impl Fn(&str) -> PickerRender) -> Result<Option<String>> {
+/// Returns `(selected_key, action)` on `Enter`/`Tab`, or `None` on `Esc`/`Ctrl-C`.
+pub fn select(
+    prompt: &str,
+    render: impl Fn(&str) -> PickerRender,
+) -> Result<Option<(String, PickerAction)>> {
     let term = Term::stderr();
     term.hide_cursor().into_diagnostic()?;
     let _guard = CursorGuard(&term);
@@ -80,11 +93,17 @@ pub fn select(prompt: &str, render: impl Fn(&str) -> PickerRender) -> Result<Opt
                 draw(&term, prompt, &query, &rendered, cursor, prev_line_count)?;
             }
             Key::Enter if !rendered.keys.is_empty() => {
-                // Clear the picker UI before returning.
                 term.clear_last_lines(prev_line_count).into_diagnostic()?;
-                return Ok(Some(rendered.keys[cursor].clone()));
+                return Ok(Some((rendered.keys[cursor].clone(), PickerAction::Resolve)));
             }
-            // Empty list: ignore Enter.
+            Key::Tab if !rendered.keys.is_empty() => {
+                term.clear_last_lines(prev_line_count).into_diagnostic()?;
+                return Ok(Some((
+                    rendered.keys[cursor].clone(),
+                    PickerAction::Materialize,
+                )));
+            }
+            // Empty list: ignore Enter/Tab.
             Key::Escape | Key::CtrlC => {
                 term.clear_last_lines(prev_line_count).into_diagnostic()?;
                 return Ok(None);

@@ -187,6 +187,7 @@ fn find_case_insensitive_fuzzy_match() -> Result<(), Box<dyn std::error::Error>>
 
 const ARROW_DOWN: &[u8] = b"\x1b[B";
 const ENTER: &[u8] = b"\r";
+const TAB: &[u8] = b"\t";
 
 fn cargo_bin_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_git-workon"))
@@ -523,6 +524,118 @@ fn find_picker_esc_cancels_selection() -> Result<(), Box<dyn std::error::Error>>
     assert!(
         !selected.starts_with('/'),
         "Expected no path after Esc, got: {selected}"
+    );
+
+    Ok(())
+}
+
+/// `--new` / `-n` bypasses the stack-aware resolver and creates a fresh worktree.
+///
+/// Without `--new`, the resolver applies Rule 3: `step-2` is in `feat-1`'s stack
+/// and `feat-1` has a worktree, so it picks `Checkout { host: "feat-1" }`.
+/// With `--new`, we skip the resolver entirely and materialize a new worktree.
+#[test]
+fn find_new_flag_forces_fresh_worktree() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .branch("step-2")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("step-2")
+        .arg("--new")
+        .output()?;
+
+    let stdout = String::from_utf8(output.stdout)?;
+    assert!(
+        output.status.success(),
+        "Expected success, got: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("step-2"),
+        "Expected step-2 worktree path in output: {stdout}"
+    );
+
+    let repo = fixture.repo()?;
+    repo.assert(predicate::repo::has_worktree("step-2"));
+
+    Ok(())
+}
+
+/// `Tab` in the stack tree picker force-materializes a fresh worktree instead of
+/// navigating to the containing stack-home.
+///
+/// Without Tab (Enter), selecting `step-2` (a ◯ diff in `feat-1`'s stack) returns
+/// the `feat-1` worktree (granularity=Stack). With Tab, a new worktree for `step-2`
+/// is created and its path is returned.
+#[test]
+fn find_tab_forces_materialize_in_tree_picker() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .branch("step-2")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    // Run from feat-1 so it is the active (◉) worktree; cursor starts there.
+    // step-2 is the next tree item (one ArrowDown away).
+    let feat1_path = fixture.root()?.join("feat-1");
+    let mut session = spawn_interactive(&feat1_path, &["find"]);
+
+    session.expect("Select a worktree")?;
+    session.send(ARROW_DOWN)?; // move cursor from feat-1 to step-2
+    session.send(TAB)?; // force-materialize step-2
+
+    let output = session.expect(expectrl::Eof)?;
+    let selected = last_line(output.get(0).unwrap());
+
+    assert!(
+        selected.contains("step-2"),
+        "Expected step-2 worktree path after Tab, got: {selected}"
+    );
+    assert!(
+        !selected.contains("feat-1"),
+        "Tab should create step-2 worktree, not return feat-1 path: {selected}"
+    );
+
+    Ok(())
+}
+
+/// `Tab` in the flat (non-stack) picker behaves identically to `Enter` — it
+/// navigates to the selected worktree without any force-materialize side-effect.
+#[test]
+fn find_flat_picker_tab_acts_as_enter() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("alpha")
+        .worktree("bravo")
+        .build()?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["find"]);
+
+    session.expect("Select a worktree")?;
+    session.send(TAB)?; // confirm with Tab; should resolve like Enter
+
+    let output = session.expect(expectrl::Eof)?;
+    let selected = last_line(output.get(0).unwrap());
+
+    assert!(
+        selected.contains("alpha") || selected.contains("bravo"),
+        "Expected a worktree path after Tab in flat picker, got: {selected}"
     );
 
     Ok(())

@@ -59,8 +59,13 @@ fn main() -> Result<()> {
                     .or(Some(Cmd::Find(cli.find)));
             }
             Some(name) => {
-                cli.command = route_branch_to_command(routing_repo.as_ref(), &name, routing_model)
-                    .or(Some(Cmd::Find(cli.find)));
+                if cli.find.new {
+                    cli.command = Some(Cmd::New(cli::New::attach(name)));
+                } else {
+                    cli.command =
+                        route_branch_to_command(routing_repo.as_ref(), &name, routing_model)
+                            .or(Some(Cmd::Find(cli.find)));
+                }
             }
             None => {
                 cli.command = Some(Cmd::Find(cli.find));

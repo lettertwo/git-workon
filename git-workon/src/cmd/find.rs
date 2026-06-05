@@ -55,7 +55,7 @@ use workon::{
 
 use crate::cli::{Find, New};
 use crate::display::{build_tree, render_flat, render_tree, worktree_display_row};
-use crate::picker;
+use crate::picker::{self, PickerAction};
 
 use super::Run;
 
@@ -291,13 +291,22 @@ fn select_from_tree(
             &current_dir,
         );
 
-        let selected_branch =
-            match picker::select("Select a worktree", |q| render_tree(&forest, q, &matcher))
-                .wrap_err("Failed to show interactive selection")?
-            {
-                Some(key) => key,
-                None => return Ok(None),
-            };
+        let pick = picker::select("Select a worktree", |q| render_tree(&forest, q, &matcher))
+            .wrap_err("Failed to show interactive selection")?;
+
+        let (selected_branch, action) = match pick {
+            None => return Ok(None),
+            Some((branch, PickerAction::Materialize)) => {
+                // Tab: bypass resolution, force a fresh worktree.
+                debug!("Tab: force-materializing '{}'", branch);
+                let mut new_cmd = New::attach(branch);
+                new_cmd.no_stack = find.no_stack;
+                new_cmd.no_interactive = find.no_interactive;
+                return new_cmd.run();
+            }
+            Some((branch, action)) => (branch, action),
+        };
+        let _ = action; // Resolve is the only remaining variant; no extra branching needed.
 
         // Resolve: find the worktree whose HEAD matches the selected branch.
         if let Some(idx) = worktrees
@@ -335,7 +344,7 @@ fn select_from_tree(
         match picker::select("Select a worktree", |q| render_flat(&rows, q, &matcher))
             .wrap_err("Failed to show interactive selection")?
         {
-            Some(key) => key,
+            Some((key, _action)) => key, // Tab and Enter are equivalent in the flat picker
             None => return Ok(None),
         };
 
