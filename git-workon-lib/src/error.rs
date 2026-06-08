@@ -262,6 +262,17 @@ pub enum StackError {
         help("Run 'gt init' in this repository, or unset workon.stackModel.")
     )]
     NotAGraphiteRepo,
+
+    #[error("Branch '{branch}' exists in stack metadata but its local ref was deleted")]
+    #[diagnostic(
+        code(workon::stack::deleted_branch_node),
+        help(
+            "The branch was tracked by Graphite but its local ref no longer exists. \
+             Run 'gt branch checkout {branch}' to restore it, or \
+             'gt branch delete {branch}' to remove it from the stack."
+        )
+    )]
+    DeletedBranchNode { branch: String },
 }
 
 /// Pull request-related errors

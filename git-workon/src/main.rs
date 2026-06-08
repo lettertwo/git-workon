@@ -63,7 +63,7 @@ fn main() -> Result<()> {
                     cli.command = Some(Cmd::New(cli::New::attach(name)));
                 } else {
                     cli.command =
-                        route_branch_to_command(routing_repo.as_ref(), &name, routing_model)
+                        route_branch_to_command(routing_repo.as_ref(), &name, routing_model)?
                             .or(Some(Cmd::Find(cli.find)));
                 }
             }
@@ -130,9 +130,10 @@ fn main() -> Result<()> {
 /// Route a bare `workon <name>` to the appropriate `Cmd`.
 ///
 /// Maps [`workon::resolve_action`] output to a `Cmd`:
-/// - [`Navigate`] / [`NotFound`] / [`DeletedNode`] → `None` (falls through to `Cmd::Find`)
+/// - [`Navigate`] / [`NotFound`] → `None` (falls through to `Cmd::Find`)
 /// - [`Materialize`] → `Some(Cmd::New)`
 /// - [`Checkout`] → `Some(Cmd::Checkout)` *(added in PR-2)*
+/// - [`DeletedNode`] → structured error (`StackError::DeletedBranchNode`)
 ///
 /// [`Navigate`]: workon::Resolution::Navigate
 /// [`NotFound`]: workon::Resolution::NotFound
@@ -143,19 +144,24 @@ fn route_branch_to_command(
     repo: Option<&git2::Repository>,
     name: &str,
     model: workon::StackModel,
-) -> Option<Cmd> {
-    let repo = repo?;
+) -> miette::Result<Option<Cmd>> {
+    let repo = match repo {
+        Some(r) => r,
+        None => return Ok(None),
+    };
     match workon::resolve_action(repo, name, model) {
-        workon::Resolution::Materialize => Some(Cmd::New(cli::New::attach(name))),
-        workon::Resolution::Checkout { host } => Some(Cmd::Checkout(cli::Checkout {
+        workon::Resolution::Materialize => Ok(Some(Cmd::New(cli::New::attach(name)))),
+        workon::Resolution::Checkout { host } => Ok(Some(Cmd::Checkout(cli::Checkout {
             branch: name.to_string(),
             host_worktree: host,
             no_stack: false,
             no_interactive: false,
-        })),
+        }))),
+        workon::Resolution::DeletedNode { branch } => {
+            miette::bail!(workon::StackError::DeletedBranchNode { branch })
+        }
         // Navigate → Find handles the cd; NotFound → Find shows the error.
-        // DeletedNode → treated as NotFound until PR-7 adds the structured error.
-        _ => None,
+        _ => Ok(None),
     }
 }
 

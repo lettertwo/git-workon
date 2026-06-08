@@ -22,7 +22,9 @@ flowchart TD
     WT_EXISTS -->|yes| ROUTE_FIND2["route → Find(name)"]
     WT_EXISTS -->|no| BRANCH_EXISTS["local or remote\nbranch exists?"]
     BRANCH_EXISTS -->|yes| ROUTE_NEW_BR["route → New\n(auto-attach branch)"]
-    BRANCH_EXISTS -->|no| ROUTE_FIND4["route → Find(name)\n(will error: not found)"]
+    BRANCH_EXISTS -->|no| DELETED_NODE_CHECK["stack metadata\nexists for name?"]
+    DELETED_NODE_CHECK -->|yes| ERROR_DELETED["error: DeletedBranchNode\n(points at gt)"]
+    DELETED_NODE_CHECK -->|no| ROUTE_FIND4["route → Find(name)\n(will error: not found)"]
 
     DIRECT --> JSON_PROP
     ROUTE_FIND --> JSON_PROP
@@ -31,6 +33,7 @@ flowchart TD
     ROUTE_FIND4 --> JSON_PROP
     ROUTE_NEW_PR --> JSON_PROP
     ROUTE_NEW_BR --> JSON_PROP
+    ERROR_DELETED --> MIETTE
 
     JSON_PROP{"--json\nflag?"}
     JSON_PROP -->|yes| SET_JSON["set json_mode\npropagate to commands:\n• List: json=true\n• Prune: json=true\n• Doctor: json=true\n• Find: no_interactive=true"]
@@ -59,12 +62,12 @@ flowchart TD
 
 ## Branch detection
 
-`route_branch_to_command()` and `branch_exists()` in `main.rs`:
+`route_branch_to_command()` in `main.rs` calls `workon::resolve_action()`:
 
-1. Check if a worktree already exists for the name — if so, return `None` (let `Find` handle it)
-2. Check for a local branch via `repo.find_branch(name, Local)`
-3. Check remote tracking branches by short name: `"origin/feature"` matches `"feature"`
-4. If any branch found → `New` (auto-attach, no `--branch` flag needed); otherwise → `None` → `Find`
+1. Check if a worktree already exists for the name — `Navigate` → `None` (let `Find` handle it)
+2. Check for a local or remote tracking branch — `Materialize` → `New` (auto-attach)
+3. Check if the name exists in stack metadata with no local branch — `DeletedNode` → structured error (`StackError::DeletedBranchNode`, points at `gt`)
+4. Otherwise `NotFound` → `None` → `Find` (will error: not found)
 
 ## JSON propagation details
 

@@ -614,6 +614,41 @@ fn find_tab_forces_materialize_in_tree_picker() -> Result<(), Box<dyn std::error
     Ok(())
 }
 
+// ── DeletedNode routing ───────────────────────────────────────────────────────
+
+/// `git workon ghost-branch` where `ghost-branch` exists in graphite stack metadata
+/// but has no local branch ref should exit non-zero with a `DeletedBranchNode` error
+/// that names the branch and points at `gt`.
+///
+/// Run from `other-work` (not in ghost-branch's stack) so rules 2/3 don't fire first.
+#[test]
+fn route_deleted_stack_node_errors_with_gt_guidance() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("other-work")
+        .graphite_config(&["main"])
+        .branch_metadata("ghost-branch", "main")
+        // Deliberately no .branch("ghost-branch") — simulates a deleted local ref.
+        // No branch_metadata for other-work, so other-work is not in ghost-branch's stack.
+        .config("workon.stackModel", "graphite")
+        .build()?;
+
+    // Run from other-work: its branch is not in ghost-branch's stack, so
+    // rules 2/3 don't fire and resolve_action reaches the DeletedNode check.
+    let other_work_path = fixture.root()?.join("other-work");
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&other_work_path)
+        .args(["ghost-branch", "--no-interactive"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("stack metadata"));
+
+    Ok(())
+}
+
 /// `Tab` in the flat (non-stack) picker behaves identically to `Enter` — it
 /// navigates to the selected worktree without any force-materialize side-effect.
 #[test]

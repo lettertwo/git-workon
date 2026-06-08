@@ -1,7 +1,5 @@
 # 024 — Stack-Aware Checkout vs Worktree Resolution
 
-**Status:** Proposed (design capture; not yet implemented).
-
 ## Context
 
 `git workon <name>` (no subcommand) currently resolves to either *navigate* (an existing
@@ -135,5 +133,5 @@ behavior with no behavior change.
 - ADR-004 — smart routing when no subcommand is given (extended here)
 - ADR-023 — unified stack-tree views; `find` materializes `◯` nodes
 - `git-workon/src/main.rs` — `route_branch_to_command`, `branch_exists`
-- `git-workon-lib/src/graphite.rs` — `current_stack`, `enumerate_stacks` (stack/parent data)
+- `git-workon-lib/src/stack.rs` / `git-workon-lib/src/stack/graphite.rs` — `current_stack`, `enumerate_stacks` (stack/parent data)
 - `docs/diagrams/command-dispatch.md` — routing flowchart (update when implemented)
