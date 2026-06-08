@@ -61,6 +61,7 @@ mod pr;
 mod resolve;
 mod ssh_config;
 mod stack;
+mod stash;
 mod workon_root;
 mod worktree;
 
@@ -82,5 +83,6 @@ pub use crate::stack::{
     current_stack, enumerate_stacks, graphite_trunk, group_by_stack, is_graphite_active,
     Granularity, Stack, StackGroup, StackGrouping, StackModel,
 };
+pub use crate::stash::*;
 pub use crate::workon_root::*;
 pub use crate::worktree::*;
