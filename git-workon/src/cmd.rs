@@ -1,3 +1,4 @@
+mod checkout;
 mod clone;
 mod complete;
 mod copy;
@@ -23,6 +24,7 @@ pub trait Run {
 impl Run for Cmd {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         match self {
+            Cmd::Checkout(cmd) => cmd.run(),
             Cmd::Clone(cmd) => cmd.run(),
             Cmd::Complete(cmd) => cmd.run(),
             Cmd::Copy(cmd) => cmd.run(),

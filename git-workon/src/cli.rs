@@ -54,6 +54,9 @@ pub enum Cmd {
     /// Output the man page to stdout (hidden).
     #[command(name = "generate-man", hide = true)]
     GenerateMan(GenerateMan),
+    /// Check out a branch inside an existing stack home worktree (hidden, resolver-produced).
+    #[command(hide = true)]
+    Checkout(Checkout),
 }
 
 /// Perform a bare clone of a repository and create an initial worktree.
@@ -212,6 +215,24 @@ impl New {
             lock: false,
         }
     }
+}
+
+/// In-place checkout — move HEAD within a stack home worktree to `branch`.
+///
+/// Hidden; produced by the resolver when `workon <T>` resolves to
+/// [`Resolution::Checkout`]. Never typed directly by users.
+#[derive(Debug, Clone, Args)]
+#[command(hide = true)]
+pub struct Checkout {
+    /// The target branch to check out.
+    pub branch: String,
+    /// The host worktree name (not path) where the checkout will happen.
+    pub host_worktree: String,
+    /// Propagated from the global `--no-stack` flag; suppresses stack-aware
+    /// restore-on-return behavior added in PR-3.
+    #[clap(skip)]
+    #[allow(dead_code)]
+    pub no_stack: bool,
 }
 
 /// Prune stale worktrees.

@@ -87,6 +87,7 @@ fn main() -> Result<()> {
             Cmd::List(list) => list.no_stack = true,
             Cmd::Find(find) => find.no_stack = true,
             Cmd::New(new) => new.no_stack = true,
+            Cmd::Checkout(checkout) => checkout.no_stack = true,
             _ => {}
         }
     }
@@ -139,9 +140,13 @@ fn route_branch_to_command(
     let repo = repo?;
     match workon::resolve_action(repo, name, model) {
         workon::Resolution::Materialize => Some(Cmd::New(cli::New::attach(name))),
+        workon::Resolution::Checkout { host } => Some(Cmd::Checkout(cli::Checkout {
+            branch: name.to_string(),
+            host_worktree: host,
+            no_stack: false,
+        })),
         // Navigate → Find handles the cd; NotFound → Find shows the error.
         // DeletedNode → treated as NotFound until PR-7 adds the structured error.
-        // Checkout → added in PR-2.
         _ => None,
     }
 }
