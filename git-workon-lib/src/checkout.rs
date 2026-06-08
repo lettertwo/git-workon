@@ -64,8 +64,8 @@ pub fn checkout_branch_in_worktree(
     let target_commit = branch_ref
         .get()
         .peel_to_commit()
-        .map_err(|e| CheckoutError::Git(e))?;
-    let target_tree = target_commit.tree().map_err(|e| CheckoutError::Git(e))?;
+        .map_err(CheckoutError::Git)?;
+    let target_tree = target_commit.tree().map_err(CheckoutError::Git)?;
 
     // Collect conflicting paths via a notify callback. Use Arc<Mutex<_>> so the
     // closure and this function can both own a handle — the closure borrows through
@@ -99,7 +99,7 @@ pub fn checkout_branch_in_worktree(
 
     wt_repo
         .set_head(&format!("refs/heads/{}", branch))
-        .map_err(|e| CheckoutError::Git(e))?;
+        .map_err(CheckoutError::Git)?;
 
     Ok(CheckoutOutcome::Clean)
 }
