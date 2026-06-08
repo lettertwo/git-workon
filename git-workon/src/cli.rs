@@ -233,6 +233,10 @@ pub struct Checkout {
     #[clap(skip)]
     #[allow(dead_code)]
     pub no_stack: bool,
+    /// Bail on conflict instead of prompting (propagated from `--json`; also
+    /// accepted directly for scripting and testing).
+    #[arg(long)]
+    pub no_interactive: bool,
 }
 
 /// Prune stale worktrees.

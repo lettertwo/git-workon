@@ -77,6 +77,8 @@ fn main() -> Result<()> {
             Cmd::Prune(prune) => prune.json = true,
             Cmd::Doctor(doctor) => doctor.json = true,
             Cmd::Find(find) => find.no_interactive = true,
+            Cmd::New(new) => new.no_interactive = true,
+            Cmd::Checkout(c) => c.no_interactive = true,
             _ => {}
         }
     }
@@ -144,6 +146,7 @@ fn route_branch_to_command(
             branch: name.to_string(),
             host_worktree: host,
             no_stack: false,
+            no_interactive: false,
         })),
         // Navigate → Find handles the cd; NotFound → Find shows the error.
         // DeletedNode → treated as NotFound until PR-7 adds the structured error.
