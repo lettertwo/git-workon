@@ -45,6 +45,7 @@
 //! # }
 //! ```
 
+mod checkout;
 mod clone;
 mod config;
 mod convert_to_bare;
@@ -63,6 +64,7 @@ mod stack;
 mod workon_root;
 mod worktree;
 
+pub use crate::checkout::*;
 pub use crate::clone::*;
 pub use crate::config::*;
 pub use crate::convert_to_bare::*;

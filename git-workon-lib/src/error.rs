@@ -53,6 +53,11 @@ pub enum WorkonError {
     #[error(transparent)]
     #[diagnostic(forward(0))]
     Stack(#[from] StackError),
+
+    /// In-place checkout errors
+    #[error(transparent)]
+    #[diagnostic(forward(0))]
+    Checkout(#[from] CheckoutError),
 }
 
 /// Repository-specific errors
@@ -317,6 +322,45 @@ pub enum PrError {
         help("This PR may be from a deleted fork")
     )]
     MissingForkOwner,
+}
+
+/// In-place checkout errors
+#[derive(Error, Diagnostic, Debug)]
+pub enum CheckoutError {
+    /// A git2 error during checkout
+    #[error(transparent)]
+    #[diagnostic(code(workon::checkout::git_error))]
+    Git(#[from] git2::Error),
+
+    /// Branch not found in the host worktree
+    #[error("Branch '{branch}' not found in the worktree")]
+    #[diagnostic(
+        code(workon::checkout::branch_not_found),
+        help("Ensure the branch exists locally before checking it out in place")
+    )]
+    BranchNotFound { branch: String },
+
+    /// Could not open the worktree repository
+    #[error("Could not open worktree repository at '{}'", path.display())]
+    #[diagnostic(code(workon::checkout::repo_open))]
+    RepoOpen {
+        path: std::path::PathBuf,
+        #[source]
+        source: git2::Error,
+    },
+
+    /// Checkout conflicts with uncommitted changes in the working tree
+    #[error("Checkout of '{branch}' conflicts with uncommitted changes in {path}")]
+    #[diagnostic(
+        code(workon::checkout::conflict),
+        help("Stash or commit changes first, or use the interactive prompt to shelve them")
+    )]
+    Conflict { branch: String, path: String },
+
+    /// User aborted an interactive checkout
+    #[error("Checkout aborted")]
+    #[diagnostic(code(workon::checkout::aborted))]
+    Aborted,
 }
 
 /// File copy errors

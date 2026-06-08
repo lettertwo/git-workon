@@ -41,3 +41,4 @@ thiserror.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true
 git-workon-fixture.workspace = true
+serial_test.workspace = true

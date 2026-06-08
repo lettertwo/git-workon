@@ -14,7 +14,7 @@
 use git2::{BranchType, Repository};
 
 use crate::stack::{current_stack, StackModel};
-use crate::worktree::find_worktree;
+use crate::worktree::{current_worktree, find_worktree};
 
 /// The resolved action for `workon <T>`.
 ///
@@ -51,9 +51,7 @@ pub enum Resolution {
 
 /// Resolve the action for `workon <name>` under the given stack model.
 ///
-/// Implements the four-rule cascade from ADR-024. Rules 2 and 3 (in-place checkout)
-/// are wired up alongside `Cmd::Checkout` in PR-2; this function currently never
-/// returns [`Resolution::Checkout`].
+/// Implements the four-rule cascade from ADR-024.
 ///
 /// # Rule summary
 ///
@@ -95,7 +93,39 @@ pub fn resolve_action(repo: &Repository, name: &str, model: StackModel) -> Resol
 
     // ── Rules 2 and 3 ────────────────────────────────────────────────────────
     // In-place checkout (move HEAD within an existing worktree, no new directory).
-    // Implemented in PR-2 alongside Cmd::Checkout. For now, fall through to rule 4.
+    let t_stack = current_stack(repo, name, model).ok().flatten();
+
+    // Rule 2: current worktree's branch shares T's stack → checkout T in place.
+    if let (Ok(cur), Some(ts)) = (current_worktree(repo), &t_stack) {
+        if let Ok(Some(b)) = cur.branch() {
+            if b == ts.trunk || ts.diffs.contains(&b) {
+                if let Some(n) = cur.name() {
+                    return Resolution::Checkout {
+                        host: n.to_string(),
+                    };
+                }
+            }
+        }
+    }
+
+    // Rule 3: deepest non-trunk ancestor of T with a worktree → checkout T there.
+    // Walk the parent chain nearest-first; first ancestor that has a worktree wins.
+    if let Some(ts) = &t_stack {
+        let mut node = name.to_string();
+        while let Some(parent) = ts.parents.get(&node) {
+            if *parent == ts.trunk {
+                break; // never host on the trunk worktree
+            }
+            if let Ok(wt) = find_worktree(repo, parent) {
+                if let Some(n) = wt.name() {
+                    return Resolution::Checkout {
+                        host: n.to_string(),
+                    };
+                }
+            }
+            node = parent.clone();
+        }
+    }
 
     // ── Rule 4 ───────────────────────────────────────────────────────────────
     // Materialize if a branch ref exists (auto-attach); otherwise distinguish a
