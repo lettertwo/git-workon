@@ -37,6 +37,82 @@ fn new_creates_worktree() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Auto-attaching a branch that exists only on a remote must set upstream
+/// tracking on the created local branch.
+#[test]
+fn new_remote_branch_attach_sets_upstream() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("feature")
+        .remote("origin", "https://example.com/origin.git")
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    // Make "feature" remote-only so `new` takes the attach-from-remote path.
+    fixture
+        .repo()?
+        .find_branch("feature", git2::BranchType::Local)?
+        .delete()?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .args(["new", "feature", "--no-interactive"])
+        .assert()
+        .success();
+
+    fixture.assert(predicate::repo::has_worktree("feature"));
+    fixture.assert(predicate::repo::has_branch("feature"));
+
+    // Fresh handle: the cached fixture repo's config snapshot predates the
+    // subprocess's upstream write.
+    let repo = git2::Repository::open(fixture.repo()?.path())?;
+    repo.assert(predicate::repo::has_upstream(
+        "feature",
+        Some("origin/feature"),
+    ));
+
+    Ok(())
+}
+
+/// Ambiguous remotes with --no-interactive: the first candidate is used and
+/// upstream tracking is still set.
+#[test]
+fn new_ambiguous_remote_no_interactive_sets_upstream() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("feature")
+        .remote("teamA", "https://example.com/teamA.git")
+        .remote("teamB", "https://example.com/teamB.git")
+        .upstream("feature", "teamA/feature")
+        .upstream("feature", "teamB/feature")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_branch("feature", git2::BranchType::Local)?
+        .delete()?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .args(["new", "feature", "--no-interactive"])
+        .assert()
+        .success();
+
+    fixture.assert(predicate::repo::has_worktree("feature"));
+
+    // Fresh handle: the cached fixture repo's config snapshot predates the
+    // subprocess's upstream write.
+    let repo = git2::Repository::open(fixture.repo()?.path())?;
+    repo.assert(predicate::repo::has_upstream(
+        "feature",
+        Some("teamA/feature"),
+    ));
+
+    Ok(())
+}
+
 #[test]
 fn new_with_slashes_in_name() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
