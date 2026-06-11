@@ -682,6 +682,20 @@ pub fn resolve_remote_tracking(repo: &Repository, branch_name: &str) -> RemoteRe
     RemoteResolution::Single { remote, oid }
 }
 
+/// Create local branch `branch` from `remote`'s tracking ref and set its upstream.
+///
+/// The single place where a local branch is materialized from a remote tracking
+/// branch — keeping creation and upstream wiring together so no caller can get
+/// one without the other. Used by [`add_worktree`] when it resolves the remote
+/// itself, and by callers that resolved an ambiguous remote (e.g. by prompting).
+pub fn create_branch_from_remote(repo: &Repository, branch: &str, remote: &str) -> Result<()> {
+    let remote_ref = repo.find_reference(&format!("refs/remotes/{}/{}", remote, branch))?;
+    let commit = remote_ref.peel_to_commit()?;
+    let mut local_branch = repo.branch(branch, &commit, false)?;
+    local_branch.set_upstream(Some(&format!("{}/{}", remote, branch)))?;
+    Ok(())
+}
+
 /// Create a new worktree for the given branch.
 ///
 /// The worktree directory is placed under the workon root (see [`workon_root`]).
@@ -735,18 +749,14 @@ pub fn add_worktree(
                     match resolve_remote_tracking(repo, branch_name) {
                         RemoteResolution::Single {
                             remote: remote_name,
-                            oid: remote_oid,
+                            ..
                         } => {
                             debug!(
                                 "found remote tracking branch {}/{}, creating local branch",
                                 remote_name, branch_name
                             );
-                            let remote_commit = repo.find_commit(remote_oid)?;
-                            let mut local_branch =
-                                repo.branch(branch_name, &remote_commit, false)?;
-                            let upstream_name = format!("{}/{}", remote_name, branch_name);
-                            local_branch.set_upstream(Some(&upstream_name))?;
-                            local_branch
+                            create_branch_from_remote(repo, branch_name, &remote_name)?;
+                            repo.find_branch(branch_name, git2::BranchType::Local)?
                         }
                         RemoteResolution::Ambiguous(_) | RemoteResolution::None => {
                             debug!(

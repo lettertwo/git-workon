@@ -1205,6 +1205,35 @@ mod tests {
     }
 
     #[test]
+    fn create_branch_from_remote_sets_upstream() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .branch("feature")
+            .remote("teamA", "https://example.com/teamA.git")
+            .remote("teamB", "https://example.com/teamB.git")
+            .upstream("feature", "teamA/feature")
+            .upstream("feature", "teamB/feature")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        // Make "feature" remote-only: the helper materializes the local branch.
+        repo.find_branch("feature", git2::BranchType::Local)?
+            .delete()?;
+
+        workon::create_branch_from_remote(repo, "feature", "teamB")?;
+
+        repo.assert(predicate::repo::has_branch("feature"));
+        repo.assert(predicate::repo::has_upstream(
+            "feature",
+            Some("teamB/feature"),
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn resolve_remote_tracking_ambiguous_for_two_unpreferred(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new()
