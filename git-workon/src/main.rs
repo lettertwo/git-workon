@@ -39,22 +39,15 @@ fn main() -> Result<()> {
         output::set_no_color(true);
     }
 
-    // Resolve the stack model once up front so the routing functions can consult it
-    // without re-opening the repository or re-reading config.
-    let routing_repo = workon::get_repo(None).ok();
-    let routing_model = match (&routing_repo, cli.no_stack) {
-        (Some(repo), false) => workon::WorkonConfig::new(repo)
-            .ok()
-            .and_then(|c| c.stack_model(None).ok())
-            .unwrap_or(workon::StackModel::None),
-        _ => workon::StackModel::None,
-    };
-
     // Captured before cli.find is moved into Cmd::Find: when routing constructs
     // a different command (New/Checkout), the flag must follow it.
     let no_interactive = cli.find.no_interactive;
 
     if cli.command.is_none() {
+        // Opened here rather than at startup: explicit subcommands manage their
+        // own repository access, and the stack-model probe can spawn a `gt`
+        // subprocess — neither belongs on every invocation.
+        let routing_repo = workon::get_repo(None).ok();
         // Clone the name so cli.find can be moved freely into Cmd::Find below.
         let name_opt = cli.find.name.clone();
         match name_opt {
@@ -66,6 +59,13 @@ fn main() -> Result<()> {
                 if cli.find.new {
                     cli.command = Some(Cmd::New(cli::New::attach(name)));
                 } else {
+                    let routing_model = match (&routing_repo, cli.no_stack) {
+                        (Some(repo), false) => workon::WorkonConfig::new(repo)
+                            .ok()
+                            .and_then(|c| c.stack_model(None).ok())
+                            .unwrap_or(workon::StackModel::None),
+                        _ => workon::StackModel::None,
+                    };
                     // Routing errors (e.g. a deleted stack node) must honor the
                     // structured-error contract the same way run errors do.
                     let routed = match route_branch_to_command(
