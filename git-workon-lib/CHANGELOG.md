@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.6.1...git-workon-lib-v0.7.0) - 2026-06-11
+
+### Added
+
+- *(lib)* add create_branch_from_remote with upstream wiring
+- *(cli)* [**breaking**] route deleted stack nodes to structured error
+- *(lib)* add preferred-remote resolution and ambiguity prompt
+- *(lib)* add labeled stash create/apply
+- *(lib)* [**breaking**] add checkout primitive and CheckoutError
+
+### Fixed
+
+- *(lib)* [**breaking**] resolve rule 1 by branch and never host on trunk
+- *(lib)* [**breaking**] fix stash label matching and conflict handling
+
+### Other
+
+- [**breaking**] pass one repository handle through checkout flow
+- *(lib)* collect checkout conflicts with RefCell
+- *(lib)* share remote precedence via remote_priority
+- *(lib)* remove redundant closures in checkout
+- [**breaking**] add resolve_action + Resolution enum
+
 ## [0.6.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.5.2...git-workon-lib-v0.6.0) - 2026-06-04
 
 ### Added
