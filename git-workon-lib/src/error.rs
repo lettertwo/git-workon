@@ -351,15 +351,6 @@ pub enum CheckoutError {
     )]
     BranchNotFound { branch: String },
 
-    /// Could not open the worktree repository
-    #[error("Could not open worktree repository at '{}'", path.display())]
-    #[diagnostic(code(workon::checkout::repo_open))]
-    RepoOpen {
-        path: std::path::PathBuf,
-        #[source]
-        source: git2::Error,
-    },
-
     /// Checkout conflicts with uncommitted changes in the working tree
     #[error("Checkout of '{branch}' conflicts with uncommitted changes in {path}")]
     #[diagnostic(

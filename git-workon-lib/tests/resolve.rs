@@ -279,8 +279,9 @@ fn rule1_does_not_navigate_to_stale_worktree_name() -> Result<(), Box<dyn Error>
 
     let repo = fixture.repo()?;
     let wt = workon::find_worktree(repo, "feat-a")?;
+    let wt_repo = git2::Repository::open(wt.path())?;
     assert_eq!(
-        workon::checkout_branch_in_worktree(&wt, "feat-b")?,
+        workon::checkout_branch_in_worktree(&wt_repo, "feat-b")?,
         workon::CheckoutOutcome::Clean
     );
 

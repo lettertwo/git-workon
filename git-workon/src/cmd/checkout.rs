@@ -17,7 +17,7 @@
 //! 6. Returns `Ok(Some(host_wt))` so `main` prints `W`'s path and the shell `cd`s there.
 
 use dialoguer::Confirm;
-use miette::{bail, IntoDiagnostic, Report, Result};
+use miette::{bail, IntoDiagnostic, Report, Result, WrapErr};
 use workon::WorktreeDescriptor;
 
 use crate::cli::Checkout;
@@ -29,7 +29,15 @@ impl Run for Checkout {
         let repo = workon::get_repo(None).into_diagnostic()?;
         let host_wt = workon::find_worktree(&repo, &self.host_worktree).into_diagnostic()?;
 
-        match workon::checkout_branch_in_worktree(&host_wt, &self.branch).into_diagnostic()? {
+        // One handle serves the whole flow: checkout, shelve, retry, restore.
+        let mut wt_repo = git2::Repository::open(host_wt.path())
+            .into_diagnostic()
+            .wrap_err(format!(
+                "Failed to open worktree at {}",
+                host_wt.path().display()
+            ))?;
+
+        match workon::checkout_branch_in_worktree(&wt_repo, &self.branch).into_diagnostic()? {
             workon::CheckoutOutcome::Clean => {}
             workon::CheckoutOutcome::Conflict { paths } => {
                 if self.no_interactive {
@@ -59,12 +67,11 @@ impl Run for Checkout {
                     .branch()
                     .into_diagnostic()?
                     .unwrap_or_else(|| self.host_worktree.clone());
-                let mut wt_repo = git2::Repository::open(host_wt.path()).into_diagnostic()?;
                 workon::create_labeled_stash(&mut wt_repo, &host_branch, &self.host_worktree)
                     .into_diagnostic()?;
 
                 // Retry now that the working tree is clean.
-                match workon::checkout_branch_in_worktree(&host_wt, &self.branch)
+                match workon::checkout_branch_in_worktree(&wt_repo, &self.branch)
                     .into_diagnostic()?
                 {
                     workon::CheckoutOutcome::Clean => {}
@@ -81,7 +88,6 @@ impl Run for Checkout {
         // Restore-on-return: if T had shelved changes in W from a previous visit,
         // apply them now. Gated on stack mode being active.
         if !self.no_stack {
-            let mut wt_repo = git2::Repository::open(host_wt.path()).into_diagnostic()?;
             match workon::apply_labeled_stash(&mut wt_repo, &self.branch, &self.host_worktree)
                 .into_diagnostic()?
             {

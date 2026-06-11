@@ -25,7 +25,6 @@ use std::cell::RefCell;
 use git2::{build::CheckoutBuilder, Repository};
 
 use crate::error::{CheckoutError, Result};
-use crate::worktree::WorktreeDescriptor;
 
 /// The outcome of a successful [`checkout_branch_in_worktree`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,25 +35,19 @@ pub enum CheckoutOutcome {
     Conflict { paths: Vec<String> },
 }
 
-/// Move HEAD inside `wt`'s working directory to `branch`.
+/// Move HEAD in the worktree opened as `wt_repo` to `branch`.
 ///
-/// Opens the worktree as its own [`Repository`] (so HEAD/index target `wt`'s
-/// working dir), resolves `refs/heads/<branch>`, performs a safe checkout
+/// `wt_repo` must be a [`Repository`] opened on the worktree's path (not the
+/// bare root) so HEAD/index target that worktree's working directory — the
+/// same handle the stash operations take, so one open serves the whole
+/// checkout flow. Resolves `refs/heads/<branch>`, performs a safe checkout
 /// (`CheckoutBuilder::safe()`), then updates HEAD with `set_head`. On conflict
 /// HEAD is left unmoved and [`CheckoutOutcome::Conflict`] is returned rather than
 /// `Err`, so the caller can prompt before deciding to stash-and-retry (PR-3) or
 /// abort.
 ///
 /// Returns `Err` only for genuine git errors (branch not found, I/O, etc.).
-pub fn checkout_branch_in_worktree(
-    wt: &WorktreeDescriptor,
-    branch: &str,
-) -> Result<CheckoutOutcome> {
-    let wt_repo = Repository::open(wt.path()).map_err(|e| CheckoutError::RepoOpen {
-        path: wt.path().to_owned(),
-        source: e,
-    })?;
-
+pub fn checkout_branch_in_worktree(wt_repo: &Repository, branch: &str) -> Result<CheckoutOutcome> {
     let branch_ref = wt_repo
         .find_branch(branch, git2::BranchType::Local)
         .map_err(|_| CheckoutError::BranchNotFound {
