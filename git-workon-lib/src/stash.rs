@@ -1,8 +1,9 @@
 //! Labeled autostash for stack-aware checkout.
 //!
-//! `refs/stash` is per-worktree (stored under `.git/worktrees/<name>/refs/stash`),
-//! so entries are scoped to the worktree that created them. Entries are identified
-//! by a label embedded in the stash message:
+//! `refs/stash` is shared across all worktrees (it lives in the common git dir),
+//! so entries from every worktree appear in the same list. Entries are scoped by
+//! a label embedded in the stash message and matched on the exact
+//! `(branch, worktree)` pair:
 //!
 //! ```text
 //! workon-autostash: <branch> @ <worktree>
@@ -13,8 +14,9 @@
 //! the **host worktree's path** (not the bare root), so that HEAD/index target
 //! that worktree's working directory.
 //!
-//! **Apply, never pop** — on conflict the entry is kept intact so the user can
-//! recover manually. No work is ever silently discarded.
+//! A clean apply drops the entry (the work now lives in the working tree); on
+//! conflict the entry is kept intact so the user can recover manually. No work
+//! is ever silently discarded.
 
 use git2::{Repository, Signature, StashFlags};
 
@@ -22,6 +24,17 @@ use crate::error::{CheckoutError, Result};
 
 fn label(branch: &str, worktree: &str) -> String {
     format!("workon-autostash: {} @ {}", branch, worktree)
+}
+
+/// Parse a stash message into its `(branch, worktree)` label pair.
+///
+/// Stash messages carry a git-generated `On <branch>: ` prefix before the
+/// label, so the label is located by marker rather than by position. The
+/// worktree is the part after the *last* ` @ `, tolerating branch names that
+/// contain the separator. Returns `None` for non-workon stash entries.
+fn parse_label(message: &str) -> Option<(&str, &str)> {
+    let (_, rest) = message.split_once("workon-autostash: ")?;
+    rest.rsplit_once(" @ ")
 }
 
 /// Create a labeled stash in `wt_repo` (a worktree-specific `&mut Repository`).
@@ -52,10 +65,9 @@ pub fn find_labeled_stash(
     branch: &str,
     worktree: &str,
 ) -> Result<Option<usize>> {
-    let want = label(branch, worktree);
     let mut found: Option<usize> = None;
     repo.stash_foreach(|index, message, _oid| {
-        if found.is_none() && message.contains(&want) {
+        if found.is_none() && parse_label(message) == Some((branch, worktree)) {
             found = Some(index);
         }
         true
@@ -67,20 +79,22 @@ pub fn find_labeled_stash(
 /// Outcome of [`apply_labeled_stash`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StashRestore {
-    /// The stash was applied. The entry is **not** dropped — it remains in the
-    /// stash list until the user or a future tool drops it explicitly.
+    /// The stash was applied cleanly and the entry dropped — the work now
+    /// lives in the working tree, so keeping the entry would re-apply it on
+    /// every subsequent restore.
     Applied,
-    /// The apply conflicted; the stash entry is kept intact for manual recovery.
+    /// The apply conflicted; the stash entry is kept intact for manual
+    /// recovery. Conflict markers may be present in the working tree (same
+    /// behavior as `git stash apply`).
     Conflict,
     /// No stash entry matched the label.
     NotFound,
 }
 
-/// Apply (but never pop) the stash labeled for `(branch, worktree)`.
+/// Apply the stash labeled for `(branch, worktree)`, dropping it on a clean apply.
 ///
-/// On `Applied` the entry stays in the stash list. On `Conflict` it is also
-/// kept so the user can recover manually. The caller is responsible for
-/// user-facing messaging.
+/// On `Conflict` the entry is kept so the user can recover manually. The
+/// caller is responsible for user-facing messaging.
 pub fn apply_labeled_stash(
     repo: &mut Repository,
     branch: &str,
@@ -90,8 +104,26 @@ pub fn apply_labeled_stash(
         return Ok(StashRestore::NotFound);
     };
     match repo.stash_apply(index, None) {
-        Ok(()) => Ok(StashRestore::Applied),
-        Err(e) if e.code() == git2::ErrorCode::Conflict => Ok(StashRestore::Conflict),
+        Ok(()) => {
+            // A merge conflict is NOT an error: stash_apply writes conflict
+            // markers, leaves a conflicted index, and returns success. Check
+            // the index before dropping, or the only recovery copy is lost.
+            if repo.index().map_err(CheckoutError::Git)?.has_conflicts() {
+                return Ok(StashRestore::Conflict);
+            }
+            repo.stash_drop(index).map_err(CheckoutError::Git)?;
+            Ok(StashRestore::Applied)
+        }
+        // GIT_ECONFLICT: dirty local files block the apply; GIT_EMERGECONFLICT:
+        // the merge itself cannot proceed. Both keep the entry intact.
+        Err(e)
+            if matches!(
+                e.code(),
+                git2::ErrorCode::Conflict | git2::ErrorCode::MergeConflict
+            ) =>
+        {
+            Ok(StashRestore::Conflict)
+        }
         Err(e) => Err(CheckoutError::Git(e).into()),
     }
 }
@@ -101,10 +133,9 @@ pub fn apply_labeled_stash(
 /// Used by the prune command (PR-4) to warn about orphaned stashes before a
 /// worktree is removed.
 pub fn list_labeled_for_worktree(repo: &mut Repository, worktree: &str) -> Result<Vec<String>> {
-    let suffix = format!("@ {}", worktree);
     let mut entries = Vec::new();
     repo.stash_foreach(|_index, message, _oid| {
-        if message.contains("workon-autostash:") && message.contains(&suffix) {
+        if parse_label(message).is_some_and(|(_, wt)| wt == worktree) {
             entries.push(message.to_string());
         }
         true
