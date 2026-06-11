@@ -232,11 +232,10 @@ fn rule2_current_worktree_in_same_stack_checks_out_in_place() -> Result<(), Box<
 
 #[test]
 #[serial]
-fn rule2_fires_when_cwd_is_trunk_worktree_and_target_is_in_its_stack() -> Result<(), Box<dyn Error>>
-{
+fn rule2_never_hosts_on_the_trunk_worktree() -> Result<(), Box<dyn Error>> {
     // Stack: main → feat-a. CWD = main worktree.
-    // Even though main is the trunk, if the user is sitting in main and the target
-    // shares main's stack, rule 2 fires (host = main worktree).
+    // ADR-024: the trunk worktree is never a checkout host. Sitting on trunk
+    // falls through to rule 4 (materialize) instead of moving main's HEAD.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -257,10 +256,49 @@ fn rule2_fires_when_cwd_is_trunk_worktree_and_target_is_in_its_stack() -> Result
 
     std::env::set_current_dir(saved_cwd)?;
 
+    assert_eq!(result?, Resolution::Materialize);
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn rule1_does_not_navigate_to_stale_worktree_name() -> Result<(), Box<dyn Error>> {
+    // Worktree "feat-a" had its HEAD moved to feat-b by an in-place checkout.
+    // `workon feat-a` must not name-match the stale worktree and Navigate —
+    // feat-a is no longer checked out anywhere, so it resolves to a checkout
+    // in its stack home (rule 2 via the cwd) rather than Navigate.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feat-a")
+        .branch("feat-b")
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .branch_metadata("feat-b", "feat-a")
+        .build()?;
+
+    let repo = fixture.repo()?;
+    let wt = workon::find_worktree(repo, "feat-a")?;
+    assert_eq!(
+        workon::checkout_branch_in_worktree(&wt, "feat-b")?,
+        workon::CheckoutOutcome::Clean
+    );
+
+    let worktree_path = fixture.root()?.path().join("feat-a");
+    let saved_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(&worktree_path)?;
+
+    let result = (|| -> Result<Resolution, Box<dyn Error>> {
+        let repo = fixture.repo()?;
+        Ok(resolve_action(repo, "feat-a", StackModel::Graphite))
+    })();
+
+    std::env::set_current_dir(saved_cwd)?;
+
     assert_eq!(
         result?,
         Resolution::Checkout {
-            host: "main".to_string()
+            host: "feat-a".to_string()
         }
     );
     Ok(())

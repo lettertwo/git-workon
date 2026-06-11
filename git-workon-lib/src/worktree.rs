@@ -630,6 +630,22 @@ pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor
         .ok_or_else(|| WorktreeError::NotFound(name.to_string()).into())
 }
 
+/// Find the worktree whose checked-out branch is `branch`.
+///
+/// Unlike [`find_worktree`] this never matches by worktree name: after an
+/// in-place checkout a stack-home worktree's name routinely diverges from its
+/// branch, and a name match would treat "a worktree once created for T" as
+/// "T is checked out" — wrong for resolution decisions.
+///
+/// Returns [`WorktreeError::NotFound`] if no worktree has `branch` checked out.
+pub fn find_worktree_by_branch(repo: &Repository, branch: &str) -> Result<WorktreeDescriptor> {
+    let worktrees = get_worktrees(repo)?;
+    worktrees
+        .into_iter()
+        .find(|wt| wt.branch().ok().flatten().as_deref() == Some(branch))
+        .ok_or_else(|| WorktreeError::NotFound(branch.to_string()).into())
+}
+
 /// Result of looking up which remote carries a branch.
 pub enum RemoteResolution {
     /// Exactly one remote (or a clear winner by priority) found.

@@ -14,7 +14,7 @@
 use git2::{BranchType, Repository};
 
 use crate::stack::{current_stack, StackModel};
-use crate::worktree::{current_worktree, find_worktree};
+use crate::worktree::{current_worktree, find_worktree, find_worktree_by_branch};
 
 /// The resolved action for `workon <T>`.
 ///
@@ -71,12 +71,14 @@ pub enum Resolution {
 pub fn resolve_action(repo: &Repository, name: &str, model: StackModel) -> Resolution {
     // ── Rule 1 ───────────────────────────────────────────────────────────────
     // T has its own worktree → navigate.
-    // `find_worktree` matches by worktree name OR branch name, so a worktree named
-    // "wt-feat" checked out on branch "feat" is found by either identifier.
+    // Matched by *branch* only: after an in-place checkout a stack home keeps its
+    // name but moves to another branch, and navigating to the stale name would
+    // land the user on the wrong branch (and skip T's checkout + stash restore).
+    // Name-based navigation still works via Find's NotFound fallthrough.
     // Subsumes the trunk case: `main` lives in the `main` worktree, so `workon main`
     // always navigates there. git's lock (it forbids checkout of a branch that is
     // live in another worktree) makes this check correctly first.
-    if find_worktree(repo, name).is_ok() {
+    if find_worktree_by_branch(repo, name).is_ok() {
         return Resolution::Navigate;
     }
 
@@ -96,9 +98,12 @@ pub fn resolve_action(repo: &Repository, name: &str, model: StackModel) -> Resol
     let t_stack = current_stack(repo, name, model).ok().flatten();
 
     // Rule 2: current worktree's branch shares T's stack → checkout T in place.
+    // The trunk does not count as "sharing the stack": ADR-024's invariant is
+    // that the trunk worktree is never a checkout host, so sitting on trunk
+    // falls through to rules 3–4 instead of hijacking the trunk worktree.
     if let (Ok(cur), Some(ts)) = (current_worktree(repo), &t_stack) {
         if let Ok(Some(b)) = cur.branch() {
-            if b == ts.trunk || ts.diffs.contains(&b) {
+            if ts.diffs.contains(&b) {
                 if let Some(n) = cur.name() {
                     return Resolution::Checkout {
                         host: n.to_string(),
@@ -110,10 +115,13 @@ pub fn resolve_action(repo: &Repository, name: &str, model: StackModel) -> Resol
 
     // Rule 3: deepest non-trunk ancestor of T with a worktree → checkout T there.
     // Walk the parent chain nearest-first; first ancestor that has a worktree wins.
+    // The visited set bounds the walk even if the metadata's parent graph is
+    // cyclic — termination must not depend on how the map was built.
     if let Some(ts) = &t_stack {
+        let mut visited = std::collections::HashSet::new();
         let mut node = name.to_string();
         while let Some(parent) = ts.parents.get(&node) {
-            if *parent == ts.trunk {
+            if *parent == ts.trunk || !visited.insert(parent.clone()) {
                 break; // never host on the trunk worktree
             }
             if let Ok(wt) = find_worktree(repo, parent) {
@@ -137,7 +145,7 @@ pub fn resolve_action(repo: &Repository, name: &str, model: StackModel) -> Resol
     // A branch can appear in stack metadata (it was `gt track`-ed) but have its
     // local ref deleted. ADR-024 says this should error pointing at gt rather than
     // silently trying to recreate the branch.
-    if current_stack(repo, name, model).ok().flatten().is_some() {
+    if t_stack.is_some() {
         return Resolution::DeletedNode {
             branch: name.to_string(),
         };
