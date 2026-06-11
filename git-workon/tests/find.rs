@@ -688,6 +688,47 @@ fn route_deleted_stack_node_json_emits_structured_error() -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// The explicit subcommand form `git workon find <name> --new` must honor the
+/// flag the same way bare-name routing does: force a fresh worktree.
+#[test]
+fn find_new_flag_forces_materialize() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .branch("feature")
+        .build()?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .args(["find", "feature", "--new", "--no-interactive"])
+        .assert()
+        .success();
+
+    fixture.assert(predicate::repo::has_worktree("feature"));
+
+    Ok(())
+}
+
+/// `git workon find --new` without a name is an error, not a silent no-op.
+#[test]
+fn find_new_flag_without_name_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .build()?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .args(["find", "--new", "--no-interactive"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--new requires"));
+
+    Ok(())
+}
+
 /// `git workon <name> --no-interactive` routed to `New` must not open the
 /// ambiguous-remote prompt — the flag has to follow the constructed command.
 #[test]

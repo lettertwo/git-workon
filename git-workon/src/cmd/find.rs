@@ -61,6 +61,18 @@ use super::Run;
 
 impl Run for Find {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
+        // --new bypasses resolution entirely: force a fresh worktree, the same
+        // escape hatch the bare-name routing and the picker's Tab action use.
+        if self.new {
+            let Some(name) = &self.name else {
+                bail!("--new requires a worktree name");
+            };
+            let mut new_cmd = New::attach(name.clone());
+            new_cmd.no_stack = self.no_stack;
+            new_cmd.no_interactive = self.no_interactive;
+            return new_cmd.run();
+        }
+
         let repo = get_repo(None).wrap_err("Failed to find git repository")?;
         let mut worktrees = get_worktrees(&repo).wrap_err("Failed to list worktrees")?;
 
