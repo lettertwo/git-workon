@@ -20,7 +20,7 @@
 //! On conflict HEAD is never moved, so an `Err(CheckoutError::Conflict { .. })` is
 //! a clean no-op — the caller can either abort or stash-and-retry (PR-3).
 
-use std::sync::{Arc, Mutex};
+use std::cell::RefCell;
 
 use git2::{build::CheckoutBuilder, Repository};
 
@@ -67,19 +67,18 @@ pub fn checkout_branch_in_worktree(
         .map_err(CheckoutError::Git)?;
     let target_tree = target_commit.tree().map_err(CheckoutError::Git)?;
 
-    // Collect conflicting paths via a notify callback. Use Arc<Mutex<_>> so the
-    // closure and this function can both own a handle — the closure borrows through
-    // the Arc while builder is live, and we read the collected paths afterward.
-    let conflicts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let conflicts_cb = Arc::clone(&conflicts);
+    // Collect conflicting paths via a notify callback. The callback runs
+    // synchronously on this thread while checkout_tree executes, so a local
+    // RefCell borrowed by the closure is all the sharing needed.
+    let conflicts: RefCell<Vec<String>> = RefCell::new(Vec::new());
 
     let mut builder = CheckoutBuilder::new();
     builder.safe();
     builder.notify_on(git2::CheckoutNotificationType::CONFLICT);
-    builder.notify(move |_kind, path, _baseline, _target, _workdir| {
+    builder.notify(|_kind, path, _baseline, _target, _workdir| {
         if let Some(p) = path {
             if let Some(s) = p.to_str() {
-                conflicts_cb.lock().unwrap().push(s.to_string());
+                conflicts.borrow_mut().push(s.to_string());
             }
         }
         true // continue collecting
@@ -88,11 +87,9 @@ pub fn checkout_branch_in_worktree(
     match wt_repo.checkout_tree(target_tree.as_object(), Some(&mut builder)) {
         Ok(()) => {}
         Err(e) if e.code() == git2::ErrorCode::Conflict => {
-            let paths = Arc::try_unwrap(conflicts)
-                .unwrap_or_else(|a| Mutex::new(a.lock().unwrap().clone()))
-                .into_inner()
-                .unwrap();
-            return Ok(CheckoutOutcome::Conflict { paths });
+            return Ok(CheckoutOutcome::Conflict {
+                paths: conflicts.take(),
+            });
         }
         Err(e) => return Err(CheckoutError::Git(e).into()),
     }
