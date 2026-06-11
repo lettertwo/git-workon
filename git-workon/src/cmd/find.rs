@@ -87,9 +87,7 @@ impl Run for Find {
                     if let Some(wt_name) = worktree.name() {
                         if wt_name == name {
                             debug!("Found exact match: {}", wt_name);
-                            let wt = worktrees.into_iter().nth(idx).unwrap();
-                            restore_stash_if_active(&wt, effective_model);
-                            return Ok(Some(wt));
+                            return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
                         }
                     }
                 }
@@ -142,7 +140,6 @@ impl Run for Find {
                                         name,
                                         wt.name().unwrap_or("?")
                                     );
-                                    restore_stash_if_active(&wt, effective_model);
                                     return Ok(Some(wt));
                                 }
                                 _ => {
@@ -152,16 +149,12 @@ impl Run for Find {
                                             name
                                         );
                                     }
-                                    let result = select_from_tree(
+                                    return select_from_tree(
                                         self,
                                         stack_matches,
                                         effective_model,
                                         &repo,
-                                    )?;
-                                    if let Some(ref wt) = result {
-                                        restore_stash_if_active(wt, effective_model);
-                                    }
-                                    return Ok(result);
+                                    );
                                 }
                             }
                         }
@@ -169,7 +162,6 @@ impl Run for Find {
                     }
                     1 => {
                         let (_, worktree) = fuzzy_matches.into_iter().next().unwrap();
-                        restore_stash_if_active(&worktree, effective_model);
                         Ok(Some(worktree))
                     }
                     _ => {
@@ -181,12 +173,7 @@ impl Run for Find {
                         }
                         let matched_worktrees: Vec<WorktreeDescriptor> =
                             fuzzy_matches.into_iter().map(|(_, wt)| wt).collect();
-                        let result =
-                            select_from_tree(self, matched_worktrees, effective_model, &repo)?;
-                        if let Some(ref wt) = result {
-                            restore_stash_if_active(wt, effective_model);
-                        }
-                        Ok(result)
+                        select_from_tree(self, matched_worktrees, effective_model, &repo)
                     }
                 }
             }
@@ -194,11 +181,7 @@ impl Run for Find {
                 if self.no_interactive {
                     bail!("No worktree name provided. Specify a name or remove --no-interactive.");
                 }
-                let result = select_from_tree(self, worktrees, effective_model, &repo)?;
-                if let Some(ref wt) = result {
-                    restore_stash_if_active(wt, effective_model);
-                }
-                Ok(result)
+                select_from_tree(self, worktrees, effective_model, &repo)
             }
         }
     }
@@ -354,35 +337,4 @@ fn select_from_tree(
         .position(|r| r.dir_name == selected_key)
         .unwrap_or(0);
     Ok(Some(worktrees.into_iter().nth(idx).unwrap()))
-}
-
-/// Apply any labeled stash previously shelved for `wt`'s branch.
-///
-/// Best-effort: any error is silently swallowed so Find never fails due to a
-/// stash-restore problem. Skipped when `model == StackModel::None`.
-fn restore_stash_if_active(wt: &WorktreeDescriptor, model: workon::StackModel) {
-    if model == workon::StackModel::None {
-        return;
-    }
-    let Some(branch) = wt.branch().ok().flatten() else {
-        return;
-    };
-    let Some(name) = wt.name() else {
-        return;
-    };
-    let Ok(mut wt_repo) = git2::Repository::open(wt.path()) else {
-        return;
-    };
-    match workon::apply_labeled_stash(&mut wt_repo, &branch, name) {
-        Ok(workon::StashRestore::Applied) => {
-            crate::output::info(&format!("restored shelved changes for '{}'", branch));
-        }
-        Ok(workon::StashRestore::Conflict) => {
-            crate::output::warn(&format!(
-                "shelved changes for '{}' could not be restored (kept in stash)",
-                branch
-            ));
-        }
-        _ => {}
-    }
 }
