@@ -50,6 +50,10 @@ fn main() -> Result<()> {
         _ => workon::StackModel::None,
     };
 
+    // Captured before cli.find is moved into Cmd::Find: when routing constructs
+    // a different command (New/Checkout), the flag must follow it.
+    let no_interactive = cli.find.no_interactive;
+
     if cli.command.is_none() {
         // Clone the name so cli.find can be moved freely into Cmd::Find below.
         let name_opt = cli.find.name.clone();
@@ -62,9 +66,18 @@ fn main() -> Result<()> {
                 if cli.find.new {
                     cli.command = Some(Cmd::New(cli::New::attach(name)));
                 } else {
-                    cli.command =
-                        route_branch_to_command(routing_repo.as_ref(), &name, routing_model)?
-                            .or(Some(Cmd::Find(cli.find)));
+                    // Routing errors (e.g. a deleted stack node) must honor the
+                    // structured-error contract the same way run errors do.
+                    let routed = match route_branch_to_command(
+                        routing_repo.as_ref(),
+                        &name,
+                        routing_model,
+                    ) {
+                        Ok(routed) => routed,
+                        Err(ref e) if json_mode => emit_json_error(e),
+                        Err(e) => return Err(e),
+                    };
+                    cli.command = routed.or(Some(Cmd::Find(cli.find)));
                 }
             }
             None => {
@@ -74,6 +87,16 @@ fn main() -> Result<()> {
     }
 
     let mut cmd = cli.command.unwrap();
+
+    // Propagate --no-interactive to commands constructed by routing
+    if no_interactive {
+        match &mut cmd {
+            Cmd::Find(find) => find.no_interactive = true,
+            Cmd::New(new) => new.no_interactive = true,
+            Cmd::Checkout(checkout) => checkout.no_interactive = true,
+            _ => {}
+        }
+    }
 
     // Propagate --json to commands that handle it internally
     if json_mode {
@@ -101,13 +124,7 @@ fn main() -> Result<()> {
 
     let worktree = match cmd.run() {
         Ok(wt) => wt,
-        Err(ref e) if json_mode => {
-            let code = e.code().map(|c| c.to_string());
-            let msg = e.to_string();
-            let json = serde_json::json!({"error": {"code": code, "message": msg}});
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
-            std::process::exit(1);
-        }
+        Err(ref e) if json_mode => emit_json_error(e),
         Err(e) => return Err(e),
     };
 
@@ -125,6 +142,18 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Print a structured `{"error": ...}` envelope to stdout and exit non-zero.
+///
+/// The single JSON error path for `--json` mode, used for both routing and
+/// command-run failures so scripts always get the envelope.
+fn emit_json_error(e: &miette::Report) -> ! {
+    let code = e.code().map(|c| c.to_string());
+    let msg = e.to_string();
+    let json = serde_json::json!({"error": {"code": code, "message": msg}});
+    println!("{}", serde_json::to_string_pretty(&json).unwrap());
+    std::process::exit(1);
 }
 
 /// Route a bare `workon <name>` to the appropriate `Cmd`.

@@ -649,6 +649,78 @@ fn route_deleted_stack_node_errors_with_gt_guidance() -> Result<(), Box<dyn std:
     Ok(())
 }
 
+/// `git workon --json ghost-branch` for a deleted stack node must emit the
+/// structured `{"error": ...}` envelope on stdout — routing errors honor the
+/// JSON contract the same way run errors do.
+#[test]
+fn route_deleted_stack_node_json_emits_structured_error() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("other-work")
+        .graphite_config(&["main"])
+        .branch_metadata("ghost-branch", "main")
+        .config("workon.stackModel", "graphite")
+        .build()?;
+
+    let other_work_path = fixture.root()?.join("other-work");
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&other_work_path)
+        .args(["--json", "ghost-branch"])
+        .output()?;
+
+    assert!(!output.status.success(), "should fail on deleted node");
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&stdout).expect("--json output should be valid JSON");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("ghost-branch"),
+        "error.message should name the branch, got: {json}"
+    );
+
+    Ok(())
+}
+
+/// `git workon <name> --no-interactive` routed to `New` must not open the
+/// ambiguous-remote prompt — the flag has to follow the constructed command.
+#[test]
+fn route_to_new_propagates_no_interactive() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .branch("feature")
+        .remote("teamA", "https://example.com/teamA.git")
+        .remote("teamB", "https://example.com/teamB.git")
+        .upstream("feature", "teamA/feature")
+        .upstream("feature", "teamB/feature")
+        .build()?;
+
+    // Remote-only branch on two equal-tier remotes: interactive mode would
+    // prompt; --no-interactive must pick the first candidate instead.
+    fixture
+        .repo()?
+        .find_branch("feature", git2::BranchType::Local)?
+        .delete()?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .args(["feature", "--no-interactive"])
+        .assert()
+        .success();
+
+    fixture.assert(predicate::repo::has_worktree("feature"));
+
+    Ok(())
+}
+
 /// `Tab` in the flat (non-stack) picker behaves identically to `Enter` — it
 /// navigates to the selected worktree without any force-materialize side-effect.
 #[test]
