@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.6.1...git-workon-v0.7.0) - 2026-06-11
+
+### Added
+
+- *(cli)* [**breaking**] route deleted stack nodes to structured error
+- *(lib)* add preferred-remote resolution and ambiguity prompt
+- *(cli)* [**breaking**] add --new flag and keybind to force new from find
+- *(cli)* [**breaking**] add orphan-stash warning to prune command
+- *(cli)* [**breaking**] add stash shelve/restore to checkout and find
+- *(cli)* add hidden checkout command
+
+### Fixed
+
+- *(cli)* honor --new flag in explicit find subcommand
+- *(cli)* emit json envelope and propagate no-interactive in routing
+- *(cli)* set upstream when attaching remote branches in new
+- *(cli)* make find read-only by removing stash restore from navigation
+- *(cli)* assert stash drop and clarify restore conflict warning
+
+### Other
+
+- [**breaking**] pass one repository handle through checkout flow
+- *(cli)* defer repo and stack-model probe to bare-name routing
+- [**breaking**] add resolve_action + Resolution enum
+
 ## [0.6.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.6.0...git-workon-v0.6.1) - 2026-06-05
 
 ### Added
