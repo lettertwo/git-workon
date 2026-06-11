@@ -90,7 +90,7 @@ impl Run for Checkout {
                 }
                 workon::StashRestore::Conflict => {
                     output::warn(&format!(
-                        "shelved changes for '{}' could not be restored (kept in stash)",
+                        "conflicts while restoring shelved changes for '{}' (entry kept in stash)",
                         self.branch
                     ));
                 }

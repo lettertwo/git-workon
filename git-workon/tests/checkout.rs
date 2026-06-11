@@ -207,7 +207,8 @@ fn checkout_conflict_interactive_leave_creates_stash() -> Result<(), Box<dyn std
 }
 
 /// Restore-on-return: checking out a branch that has a labeled stash restores it.
-/// The stash entry is applied (but not dropped).
+/// The stash entry is dropped after the clean apply so it is not re-applied on
+/// a later visit.
 #[test]
 fn checkout_restore_on_return() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
@@ -255,6 +256,10 @@ fn checkout_restore_on_return() -> Result<(), Box<dyn std::error::Error>> {
         restored, "local-edit",
         "restore-on-return should apply the labeled stash"
     );
+
+    // The entry was dropped — a second visit must not re-apply it.
+    let wt_repo = git2::Repository::open(&*stack_home_path)?;
+    wt_repo.assert(predicate::repo::has_no_stash());
 
     Ok(())
 }
