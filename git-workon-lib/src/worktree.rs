@@ -656,10 +656,12 @@ pub enum RemoteResolution {
     None,
 }
 
-/// Find which remote(s) carry a branch, ranked by preferred remote order.
+/// Find which remote(s) carry a branch, ranked by the shared
+/// [`remote_priority`](crate::pr::remote_priority) precedence
+/// (`upstream → origin → others`).
 ///
-/// Priority: `upstream` (tier 0) → `origin` (tier 1) → all others (tier 2).
-/// Returns `Ambiguous` when two or more tier-2 remotes both carry the branch.
+/// Returns `Ambiguous` when two or more equally-preferred remotes both carry
+/// the branch.
 pub fn resolve_remote_tracking(repo: &Repository, branch_name: &str) -> RemoteResolution {
     let branches = match repo.branches(Some(git2::BranchType::Remote)) {
         Ok(b) => b,
@@ -682,15 +684,12 @@ pub fn resolve_remote_tracking(repo: &Repository, branch_name: &str) -> RemoteRe
         return RemoteResolution::None;
     }
 
-    let tier = |r: &str| match r {
-        "upstream" => 0usize,
-        "origin" => 1,
-        _ => 2,
-    };
+    candidates.sort_by_key(|(r, _)| crate::pr::remote_priority(r));
 
-    candidates.sort_by_key(|(r, _)| tier(r));
-
-    if candidates.len() >= 2 && tier(&candidates[0].0) == tier(&candidates[1].0) {
+    if candidates.len() >= 2
+        && crate::pr::remote_priority(&candidates[0].0)
+            == crate::pr::remote_priority(&candidates[1].0)
+    {
         return RemoteResolution::Ambiguous(candidates.into_iter().map(|(r, _)| r).collect());
     }
 

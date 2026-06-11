@@ -384,30 +384,34 @@ pub fn is_pr_reference(input: &str) -> bool {
     parse_pr_reference(input).ok().flatten().is_some()
 }
 
-/// Returns remotes in preferred order: upstream first, then origin, then all others.
+/// Priority tier for the shared `upstream → origin → others` remote precedence.
+///
+/// The single encoding of the precedence ADR-024 prescribes for every remote
+/// decision: [`preferred_remote_order`] sorts by it, and
+/// `resolve_remote_tracking` (worktree.rs) uses equal tiers to detect
+/// ambiguity. Lower is more preferred; all non-special remotes share a tier.
+pub fn remote_priority(remote: &str) -> usize {
+    match remote {
+        "upstream" => 0,
+        "origin" => 1,
+        _ => 2,
+    }
+}
+
+/// Returns remotes in preferred order: upstream first, then origin, then all
+/// others in configuration order (the sort is stable).
 pub fn preferred_remote_order(repo: &Repository) -> Vec<String> {
     let Ok(remotes) = repo.remotes() else {
         return vec![];
     };
-    let all: Vec<String> = remotes
+    let mut all: Vec<String> = remotes
         .iter()
         .flatten()
         .flatten()
         .map(str::to_string)
         .collect();
-
-    let mut ordered = Vec::with_capacity(all.len());
-    for preferred in &["upstream", "origin"] {
-        if all.iter().any(|r| r == preferred) {
-            ordered.push(preferred.to_string());
-        }
-    }
-    for r in &all {
-        if !ordered.contains(r) {
-            ordered.push(r.clone());
-        }
-    }
-    ordered
+    all.sort_by_key(|r| remote_priority(r));
+    all
 }
 
 /// Select which remote to use for fetching PR refs.
