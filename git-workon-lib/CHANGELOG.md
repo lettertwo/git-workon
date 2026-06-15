@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.7.0...git-workon-lib-v0.7.1) - 2026-06-15
+
+### Fixed
+
+- *(lib)* filter ghost branches without git refs from enumerate_stacks
+
 ## [0.7.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.6.1...git-workon-lib-v0.7.0) - 2026-06-11
 
 ### Added
