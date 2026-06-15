@@ -996,3 +996,42 @@ fn list_tree_linear_chain_uses_pipe_continuation_not_fork_chars(
 
     Ok(())
 }
+
+// ── Ghost branch filtering ────────────────────────────────────────────────────
+
+/// A branch that exists only in Graphite metadata (no git ref — simulating a branch
+/// that was merged and deleted while the metadata lingered) must NOT appear in list output.
+/// A branch with a git ref but no worktree MUST still appear as a ◯ metadata-only node.
+#[test]
+fn list_omits_ghost_branches_with_no_git_ref() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        // live-diff: real branch ref + metadata → shows as ◯ metadata-only node
+        .branch_metadata("live-diff", "main")
+        // ghost: metadata only (simulates a deleted branch) → must NOT appear
+        .ghost_branch_metadata("ghost-diff", "main")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    assert!(
+        stdout.contains("live-diff"),
+        "live-diff (real branch, no worktree) must still appear as ◯ node: {stdout}"
+    );
+    assert!(
+        !stdout.contains("ghost-diff"),
+        "ghost-diff (no git ref) must be filtered out: {stdout}"
+    );
+
+    Ok(())
+}

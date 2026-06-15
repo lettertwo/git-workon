@@ -183,9 +183,22 @@ fn build_parent_map_from_refs(repo: &Repository) -> Result<HashMap<String, Strin
 /// direct child of a trunk branch. This is the same grouping key used by `group_by_stack`,
 /// so each returned `Stack` maps one-to-one to a potential `StackGroup`.
 ///
+/// Ghost branches — those present in Graphite metadata but whose branch ref no longer exists
+/// (merged/deleted while Graphite's records linger) — are dropped before the BFS so they
+/// do not surface as `◯` metadata nodes in `list`/`find`.
+///
 /// Used by the `list` command to surface stacks that have no checked-out worktrees yet.
 pub fn enumerate_stacks(repo: &Repository) -> Result<Vec<Stack>, StackError> {
-    let parent_map = build_parent_map(repo)?;
+    let mut parent_map = build_parent_map(repo)?;
+    if parent_map.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Drop ghost branches: Graphite leaves metadata rows behind after a branch is merged or
+    // deleted. Filter before the BFS so orphaned subtrees are pruned consistently. Trunks are
+    // not in the parent map (they are values, not keys), so they are always preserved.
+    parent_map.retain(|branch, _| crate::resolve::branch_exists(repo, branch));
+
     if parent_map.is_empty() {
         return Ok(vec![]);
     }
