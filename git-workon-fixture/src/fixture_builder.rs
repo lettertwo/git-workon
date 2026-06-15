@@ -140,6 +140,28 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Write Graphite branch-metadata for a **deleted** branch (ghost entry).
+    ///
+    /// Same as [`branch_metadata`] but intentionally does NOT create a local git branch ref.
+    /// Use this to simulate a branch that was merged/deleted after being tracked by Graphite —
+    /// metadata lingers in `refs/branch-metadata/<branch>` but the branch ref is gone.
+    /// This is the precondition for the `DeletedNode` resolution and ghost-branch filtering tests.
+    ///
+    /// [`branch_metadata`]: Self::branch_metadata
+    pub fn ghost_branch_metadata(mut self, branch: &str, parent: &str) -> Self {
+        // Store the same way as branch_metadata but mark it by NOT creating a git branch.
+        // We reuse `raw_branch_metadata` storage with valid JSON so the parser succeeds
+        // while bypassing the auto-branch-creation in the build step.
+        let content = serde_json::json!({
+            "branchName": branch,
+            "parentBranchName": parent,
+        })
+        .to_string();
+        self.raw_branch_metadata
+            .push((branch.to_string(), content.into_bytes()));
+        self
+    }
+
     /// Write a raw blob at `refs/branch-metadata/<branch>`.
     ///
     /// Use this to simulate malformed metadata (e.g. non-JSON content) for error-path tests.
@@ -257,7 +279,10 @@ impl<'fixture> FixtureBuilder<'fixture> {
             std::fs::write(&config_path, config_json.to_string())?;
         }
 
-        // Write branch-metadata blobs for Graphite stack tracking
+        // Write branch-metadata blobs for Graphite stack tracking.
+        // Also create a local branch ref when one does not already exist: in real Graphite
+        // repos every tracked branch has a corresponding git ref. Creating it here lets
+        // branch_exists() correctly identify live branches vs ghost entries in tests.
         for (branch, parent) in &self.branch_metadata {
             let content = serde_json::json!({
                 "branchName": branch,
@@ -271,6 +296,13 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 false,
                 "add branch metadata",
             )?;
+            // Trunk and worktree branches already have refs; metadata-only stack
+            // diffs do not — create a local branch pointing to HEAD for them.
+            if repo.find_branch(branch, BranchType::Local).is_err() {
+                let head = repo.head()?;
+                let commit = head.peel_to_commit()?;
+                repo.branch(branch, &commit, false)?;
+            }
         }
 
         // Write raw branch-metadata blobs (for malformed-content tests)

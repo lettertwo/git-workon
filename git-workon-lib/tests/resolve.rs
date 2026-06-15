@@ -150,15 +150,15 @@ fn stack_active_existing_branch_no_worktree_materializes() -> Result<(), Box<dyn
 
 #[test]
 fn deleted_branch_node_returns_deleted_node() -> Result<(), Box<dyn Error>> {
-    // ghost-branch has graphite metadata (was `gt track`-ed) but NO local branch ref.
+    // ghost-branch has graphite metadata (was `gt track`-ed) but NO local branch ref —
+    // simulating a branch that was merged and deleted while Graphite's record lingered.
     // resolve_action should recognise it as a deleted ◯ node, not a plain typo.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
         .worktree("main")
         .graphite_config(&["main"])
-        .branch_metadata("ghost-branch", "main")
-        // Deliberately NOT calling .branch("ghost-branch")
+        .ghost_branch_metadata("ghost-branch", "main") // metadata only, no git ref
         .build()?;
     let repo = fixture.repo()?;
     assert_eq!(
@@ -172,14 +172,14 @@ fn deleted_branch_node_returns_deleted_node() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn deleted_branch_node_not_triggered_under_no_stack() -> Result<(), Box<dyn Error>> {
-    // Same metadata, but StackModel::None → rules 2-3 skip, falls to rule 4 branch check →
-    // NotFound (not DeletedNode). Degradation invariant.
+    // Same ghost metadata (no git ref), but StackModel::None → rules 2-3 skip, falls to
+    // rule 4 branch check → NotFound (not DeletedNode). Degradation invariant.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
         .worktree("main")
         .graphite_config(&["main"])
-        .branch_metadata("ghost-branch", "main")
+        .ghost_branch_metadata("ghost-branch", "main") // metadata only, no git ref
         .build()?;
     let repo = fixture.repo()?;
     assert_eq!(

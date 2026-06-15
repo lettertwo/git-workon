@@ -1011,7 +1011,8 @@ fn new_attaching_existing_tracked_branch_skips_gt_track() -> Result<(), Box<dyn 
         .file("stack.txt", "content")
         .create("commit on feat-1")?;
 
-    // Create feat-2 as a local branch pointing at feat-1's HEAD
+    // Advance feat-2 to feat-1's current HEAD (fixture builder created it at the initial
+    // commit; now we want it at feat-1's tip after the extra commit above).
     let bare_path = fixture.root()?.join(".bare");
     let bare_repo = git2::Repository::open_bare(&bare_path)?;
     let feat1_oid = bare_repo
@@ -1020,7 +1021,7 @@ fn new_attaching_existing_tracked_branch_skips_gt_track() -> Result<(), Box<dyn 
         .target()
         .unwrap();
     let feat1_commit = bare_repo.find_commit(feat1_oid)?;
-    bare_repo.branch("feat-2", &feat1_commit, false)?;
+    bare_repo.branch("feat-2", &feat1_commit, true)?; // force=true: update existing branch
 
     let output = cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
@@ -1070,7 +1071,8 @@ fn new_attaching_existing_branch_with_slashes_skips_gt_track(
         .file("stack.txt", "content")
         .create("commit on feat-1")?;
 
-    // Create ee/feat-2 as a local branch in the bare repo (no worktree yet)
+    // Advance ee/feat-2 to feat-1's current HEAD (fixture builder created it at the initial
+    // commit; now we want it at feat-1's tip after the extra commit above).
     let bare_path = fixture.root()?.join(".bare");
     let bare_repo = git2::Repository::open_bare(&bare_path)?;
     let feat1_oid = bare_repo
@@ -1079,7 +1081,7 @@ fn new_attaching_existing_branch_with_slashes_skips_gt_track(
         .target()
         .unwrap();
     let feat1_commit = bare_repo.find_commit(feat1_oid)?;
-    bare_repo.branch("ee/feat-2", &feat1_commit, false)?;
+    bare_repo.branch("ee/feat-2", &feat1_commit, true)?; // force=true: update existing branch
 
     let output = cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
