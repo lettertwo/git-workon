@@ -58,6 +58,8 @@ use workon::WorktreeDescriptor;
 
 use crate::output::style;
 
+type MatchMap = HashMap<String, Option<(i64, Vec<usize>, Option<Vec<usize>>)>>;
+
 /// Glyph for a diff/branch that has a checked-out worktree (but is not the active one).
 pub const GLYPH_WORKTREE: &str = "◎";
 /// Glyph for a diff/branch that exists only in stack metadata (no checked-out worktree).
@@ -645,8 +647,8 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
         };
     }
 
-    // Collect fuzzy match results for every node's branch name.
-    let mut match_map: HashMap<String, Option<(i64, Vec<usize>)>> = HashMap::new();
+    // Collect fuzzy match results for every node (branch name + dir name when different).
+    let mut match_map: MatchMap = HashMap::new();
     collect_match_results_tree(forest, query, matcher, &mut match_map);
 
     // Build a filtered flat list; connectors are recomputed over the visible subset.
@@ -674,17 +676,17 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
 
     let mut lines = Vec::with_capacity(flat.len());
     let mut keys = Vec::with_capacity(flat.len());
-    let mut best_score: Option<i64> = None;
+    let mut top_score: Option<i64> = None;
     let mut cursor = 0usize;
 
     for (i, (prefix, connector, node)) in flat.iter().enumerate() {
         let direct_match = match_map.get(&node.branch).and_then(|v| v.as_ref());
         let is_ancestor_only = !query.is_empty() && direct_match.is_none();
 
-        // Track best-match cursor.
-        if let Some((score, _)) = direct_match {
-            if best_score.map(|b| *score > b).unwrap_or(true) {
-                best_score = Some(*score);
+        // Track best-match cursor by combined score.
+        if let Some((score, _, _)) = direct_match {
+            if top_score.map(|b| *score > b).unwrap_or(true) {
+                top_score = Some(*score);
                 cursor = i;
             }
         }
@@ -694,21 +696,36 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
         let glyph = node_glyph(is_active, node.has_worktree());
 
         // Label: apply match decoration or fall back to normal styling.
+        let branch_indices = direct_match
+            .map(|(_, idx, _)| idx.as_slice())
+            .unwrap_or(&[]);
         let label = if query.is_empty() {
             // Same as format_tree_lines: active → green+bold, worktree → bold, metadata → dim.
             node_label(&node.branch, is_active, node.has_worktree())
         } else if is_ancestor_only {
             style::dim(&node.branch)
         } else {
-            // Direct match: underline matched chars, dim the rest.
-            let indices = direct_match.map(|(_, idx)| idx.as_slice()).unwrap_or(&[]);
-            decorate_match(&node.branch, indices)
+            // Direct match: underline matched chars in the branch name, dim the rest.
+            decorate_match(&node.branch, branch_indices)
         };
 
-        // Optional path annotation (same logic as format_tree_lines).
+        // Optional path annotation; decorate with dir-name match indices when present.
         let path_ann = node.row.as_ref().and_then(|r| {
             if r.dir_name != node.branch {
-                Some(format!("  {}{}", style::dim("./"), r.dir_name.clone()))
+                let ann = if query.is_empty() || is_ancestor_only {
+                    // Match original list format: dim "./" only, dir name in default styling.
+                    format!("  {}{}", style::dim("./"), r.dir_name.clone())
+                } else {
+                    let dir_indices = direct_match
+                        .and_then(|(_, _, d)| d.as_deref())
+                        .unwrap_or(&[]);
+                    format!(
+                        "  {}{}",
+                        style::dim("./"),
+                        decorate_match(&r.dir_name, dir_indices)
+                    )
+                };
+                Some(ann)
             } else {
                 None
             }
@@ -772,9 +789,11 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
 
 /// Render flat (non-stack) rows for the interactive picker with optional fuzzy filtering.
 ///
-/// Matches on `dir_name`. Non-matching rows are hidden entirely (no ancestor relationships
-/// in the flat list). Keys are `dir_name` values. Matched characters are underlined;
-/// non-matched characters are dimmed.
+/// Matches against both `dir_name` and `branch_annotation` (when present); a row is visible
+/// if either field matches. Ranking and cursor position use the best score across both fields.
+/// Each field is decorated with its own match indices so underlines appear at correct positions.
+/// Non-matching rows are hidden entirely (no ancestor relationships in the flat list).
+/// Keys are `dir_name` values.
 pub fn render_flat(
     rows: &[WorktreeDisplayRow],
     query: &str,
@@ -788,21 +807,38 @@ pub fn render_flat(
         };
     }
 
-    // Compute match data for every row.
-    let match_data: Vec<Option<(i64, Vec<usize>)>> = rows
+    // Match data per row: (combined_score, dir_indices, branch_indices).
+    // A row is visible when this is Some (at least one field matched).
+    #[allow(clippy::type_complexity)]
+    let match_data: Vec<Option<(i64, Option<Vec<usize>>, Option<Vec<usize>>)>> = rows
         .iter()
         .map(|r| {
             if query.is_empty() {
-                None
-            } else {
-                matcher.fuzzy_indices(&r.dir_name, query)
+                return None;
             }
+            let dir = matcher.fuzzy_indices(&r.dir_name, query);
+            let branch = r
+                .branch_annotation
+                .as_deref()
+                .and_then(|ann| matcher.fuzzy_indices(ann, query));
+            let score = [
+                dir.as_ref().map(|(s, _)| *s),
+                branch.as_ref().map(|(s, _)| *s),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
+            score.map(|s| (s, dir.map(|(_, idx)| idx), branch.map(|(_, idx)| idx)))
         })
         .collect();
 
     // Filter to visible rows.
     #[allow(clippy::type_complexity)]
-    let visible: Vec<(usize, &WorktreeDisplayRow, Option<&(i64, Vec<usize>)>)> = rows
+    let visible: Vec<(
+        usize,
+        &WorktreeDisplayRow,
+        Option<&(i64, Option<Vec<usize>>, Option<Vec<usize>>)>,
+    )> = rows
         .iter()
         .zip(match_data.iter())
         .enumerate()
@@ -832,19 +868,22 @@ pub fn render_flat(
 
     let mut lines = Vec::with_capacity(visible.len());
     let mut keys = Vec::with_capacity(visible.len());
-    let mut best_score: Option<i64> = None;
+    let mut top_score: Option<i64> = None;
     let mut cursor = 0usize;
 
     for (vis_i, (_, row, match_result)) in visible.iter().enumerate() {
-        // Track best-match cursor.
-        if let Some((score, _)) = match_result {
-            if best_score.map(|b| *score > b).unwrap_or(true) {
-                best_score = Some(*score);
+        // Track best-match cursor by combined score.
+        if let Some((score, _, _)) = match_result {
+            if top_score.map(|b| *score > b).unwrap_or(true) {
+                top_score = Some(*score);
                 cursor = vis_i;
             }
         }
 
         let prefix = style::dim("./");
+        let dir_indices = match_result
+            .and_then(|(_, d, _)| d.as_deref())
+            .unwrap_or(&[]);
         let name = if query.is_empty() {
             if row.is_active {
                 style::green_bold(&row.dir_name)
@@ -852,8 +891,7 @@ pub fn render_flat(
                 style::bold(&row.dir_name)
             }
         } else {
-            let indices = match_result.map(|(_, idx)| idx.as_slice()).unwrap_or(&[]);
-            decorate_match(&row.dir_name, indices)
+            decorate_match(&row.dir_name, dir_indices)
         };
         let name_pad = max_name - row.dir_name.width();
 
@@ -861,11 +899,21 @@ pub fn render_flat(
         let indicators_pad = max_indicators - indicator_widths[vis_i];
 
         let activity = style::dim(&row.last_activity);
-        let branch = row
-            .branch_annotation
-            .as_deref()
-            .map(|ann| format!("  {}", style::dim(ann)))
-            .unwrap_or_default();
+        // Decorate the branch annotation with its own match indices when present.
+        let branch = if query.is_empty() {
+            row.branch_annotation
+                .as_deref()
+                .map(|ann| format!("  {}", style::dim(ann)))
+                .unwrap_or_default()
+        } else {
+            let branch_indices = match_result
+                .and_then(|(_, _, b)| b.as_deref())
+                .unwrap_or(&[]);
+            row.branch_annotation
+                .as_deref()
+                .map(|ann| format!("  {}", decorate_match(ann, branch_indices)))
+                .unwrap_or_default()
+        };
 
         lines.push(format!(
             "{}{}{} {}{}  {}{}",
@@ -895,18 +943,47 @@ pub fn render_flat(
     }
 }
 
-/// Collect fuzzy match results for every branch name in a forest.
+/// Collect fuzzy match results for every node in a forest, matching against both the branch
+/// name and the directory name (when the node has a worktree with a different dir name).
+///
+/// Map value: `(combined_score, branch_indices, dir_indices)`.
+/// - `combined_score` — best score across both fields; drives cursor ranking and visibility.
+/// - `branch_indices` — Skim match positions within `node.branch` (empty when no branch match).
+/// - `dir_indices` — Skim match positions within `node.row.dir_name` when present (None when
+///   the node has no worktree, the dir name equals the branch name, or the dir name didn't match).
 fn collect_match_results_tree(
     nodes: &[TreeNode],
     query: &str,
     matcher: &SkimMatcherV2,
-    map: &mut HashMap<String, Option<(i64, Vec<usize>)>>,
+    map: &mut MatchMap,
 ) {
     for node in nodes {
         let result = if query.is_empty() {
             None
         } else {
-            matcher.fuzzy_indices(&node.branch, query)
+            let branch_match = matcher.fuzzy_indices(&node.branch, query);
+            // Match against the dir name only when it differs from the branch name.
+            let dir_match = node.row.as_ref().and_then(|r| {
+                if r.dir_name != node.branch {
+                    matcher.fuzzy_indices(&r.dir_name, query)
+                } else {
+                    None
+                }
+            });
+            let score = [
+                branch_match.as_ref().map(|(s, _)| *s),
+                dir_match.as_ref().map(|(s, _)| *s),
+            ]
+            .into_iter()
+            .flatten()
+            .max();
+            score.map(|s| {
+                (
+                    s,
+                    branch_match.map(|(_, idx)| idx).unwrap_or_default(),
+                    dir_match.map(|(_, idx)| idx),
+                )
+            })
         };
         map.insert(node.branch.clone(), result);
         collect_match_results_tree(&node.children, query, matcher, map);
@@ -917,11 +994,7 @@ fn collect_match_results_tree(
 ///
 /// A node is visible if it directly matches the query, or if any descendant matches.
 /// When the query is empty, all nodes are visible.
-fn is_node_visible(
-    node: &TreeNode,
-    query: &str,
-    match_map: &HashMap<String, Option<(i64, Vec<usize>)>>,
-) -> bool {
+fn is_node_visible(node: &TreeNode, query: &str, match_map: &MatchMap) -> bool {
     if query.is_empty() {
         return true;
     }
@@ -944,7 +1017,7 @@ fn is_node_visible(
 fn flatten_tree_filtered<'a>(
     forest: &'a [TreeNode],
     query: &str,
-    match_map: &HashMap<String, Option<(i64, Vec<usize>)>>,
+    match_map: &MatchMap,
 ) -> Vec<(String, String, &'a TreeNode)> {
     let mut result = Vec::new();
     for node in forest {
@@ -960,7 +1033,7 @@ fn flatten_node_filtered<'a>(
     parent_prefix: &str,
     connector: &str,
     query: &str,
-    match_map: &HashMap<String, Option<(i64, Vec<usize>)>>,
+    match_map: &MatchMap,
     result: &mut Vec<(String, String, &'a TreeNode)>,
 ) {
     result.push((parent_prefix.to_string(), connector.to_string(), node));

@@ -11,10 +11,11 @@
 //!
 //! ## Fuzzy Matching Algorithm
 //!
-//! Simple case-insensitive substring matching:
-//! - `feat` matches `feature`, `feat-branch`, `new-feature`
-//! - `user/` matches `user/feature`, `user/bugfix`
-//! - Exact matches take priority over fuzzy matches
+//! Skim fuzzy scoring on both the worktree directory name and the checked-out branch name.
+//! The best score across both fields determines visibility and ranking.
+//! - `feat` matches `feature`, `feat-branch`, `new-feature` (dir or branch)
+//! - `shared` matches a branch named `shared` even when the dir is named `base`
+//! - Exact dir-name matches take priority over fuzzy matches
 //!
 //! ## Status Filter Integration
 //!
@@ -94,98 +95,103 @@ impl Run for Find {
             Some(name) => {
                 debug!("Searching for worktree '{}'", name);
 
-                // Try exact match first
-                for (idx, worktree) in worktrees.iter().enumerate() {
-                    if let Some(wt_name) = worktree.name() {
-                        if wt_name == name {
-                            debug!("Found exact match: {}", wt_name);
-                            return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
-                        }
-                    }
-                }
+                use fuzzy_matcher::FuzzyMatcher;
+                let matcher = SkimMatcherV2::default();
 
-                // No exact match - try fuzzy matching (case-insensitive substring)
-                debug!("No exact match, trying fuzzy match");
-                let fuzzy_matches: Vec<_> = worktrees
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(_, wt)| {
-                        if let Some(wt_name) = wt.name() {
-                            wt_name.to_lowercase().contains(&name.to_lowercase())
-                        } else {
-                            false
-                        }
-                    })
+                // Pre-collect (dir_name, branch_name) for all worktrees once.
+                // branch() reads HEAD from disk on every call, so we gather it up front.
+                let fields: Vec<(Option<String>, Option<String>)> = worktrees
+                    .iter()
+                    .map(|wt| (wt.name().map(|n| n.to_string()), wt.branch().ok().flatten()))
                     .collect();
 
-                debug!("Found {} fuzzy match(es)", fuzzy_matches.len());
+                // 1. Exact match on directory name (highest priority, unchanged).
+                if let Some(idx) = fields
+                    .iter()
+                    .position(|(dir, _)| dir.as_deref() == Some(name.as_str()))
+                {
+                    debug!("Found exact match: {}", name);
+                    return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
+                }
 
-                match fuzzy_matches.len() {
-                    0 => {
-                        // Third path (stack-active): fuzzy match on branch names in stacks
-                        if effective_model != workon::StackModel::None {
-                            debug!("No fuzzy match, searching stacks for '{}'", name);
-                            let name_lower = name.to_lowercase();
-                            let all = get_worktrees(&repo)?;
-                            let stack_matches: Vec<WorktreeDescriptor> = all
-                                .into_iter()
-                                .filter(|wt| {
-                                    let head = match wt.branch().ok().flatten() {
-                                        Some(b) => b,
-                                        None => return false,
-                                    };
-                                    matches!(
-                                        current_stack(&repo, &head, effective_model),
-                                        Ok(Some(ref s)) if s.diffs.iter().any(|b| {
-                                            b.to_lowercase().contains(&name_lower)
-                                        })
-                                    )
+                // 2. Skim fuzzy match on both dir name and branch name; rank by best score.
+                debug!("No exact match, trying Skim fuzzy match on dir + branch");
+                let mut scored: Vec<(i64, usize)> = fields
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, (dir, branch))| {
+                        let dir_score = dir.as_deref().and_then(|d| matcher.fuzzy_match(d, name));
+                        let branch_score =
+                            branch.as_deref().and_then(|b| matcher.fuzzy_match(b, name));
+                        [dir_score, branch_score]
+                            .into_iter()
+                            .flatten()
+                            .max()
+                            .map(|s| (s, i))
+                    })
+                    .collect();
+                scored.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
+                debug!("Found {} Skim fuzzy match(es)", scored.len());
+
+                // 3. Stack-member fallback (stack-active only, when paths 1+2 find nothing).
+                //
+                // When a branch exists only in stack metadata (no worktree), navigating to
+                // the worktree that owns the containing stack is the expected behavior.
+                // Uses Skim fuzzy (same as path 2) so case-sensitivity and scoring are uniform.
+                let is_stack_fallback =
+                    scored.is_empty() && effective_model != workon::StackModel::None;
+                let stack_indices: Vec<usize> = if is_stack_fallback {
+                    debug!("No Skim match, searching stack members for '{}'", name);
+                    fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, branch))| {
+                            let Some(head) = branch.as_deref() else {
+                                return false;
+                            };
+                            matches!(
+                                current_stack(&repo, head, effective_model),
+                                Ok(Some(ref s)) if s.diffs.iter().any(|b| {
+                                    matcher.fuzzy_match(b, name).is_some()
                                 })
-                                .collect();
+                            )
+                        })
+                        .map(|(i, _)| i)
+                        .collect()
+                } else {
+                    vec![]
+                };
 
-                            match stack_matches.len() {
-                                0 => {}
-                                1 => {
-                                    let wt = stack_matches.into_iter().next().unwrap();
-                                    debug!(
-                                        "Found '{}' in stack of '{}'",
-                                        name,
-                                        wt.name().unwrap_or("?")
-                                    );
-                                    return Ok(Some(wt));
-                                }
-                                _ => {
-                                    if self.no_interactive {
-                                        bail!(
-                                            "Multiple stacks contain branches matching '{}'. Use full branch name or remove --no-interactive.",
-                                            name
-                                        );
-                                    }
-                                    return select_from_tree(
-                                        self,
-                                        stack_matches,
-                                        effective_model,
-                                        &repo,
-                                    );
-                                }
-                            }
-                        }
-                        bail!("No matching worktree found for '{}'", name)
-                    }
-                    1 => {
-                        let (_, worktree) = fuzzy_matches.into_iter().next().unwrap();
-                        Ok(Some(worktree))
-                    }
+                let match_indices: Vec<usize> = if is_stack_fallback {
+                    stack_indices
+                } else {
+                    scored.into_iter().map(|(_, i)| i).collect()
+                };
+
+                match match_indices.len() {
+                    0 => bail!("No matching worktree found for '{}'", name),
+                    1 => Ok(Some(worktrees.into_iter().nth(match_indices[0]).unwrap())),
                     _ => {
                         if self.no_interactive {
-                            bail!(
-                                "Multiple worktrees match '{}'. Use full name or remove --no-interactive.",
-                                name
-                            );
+                            if is_stack_fallback {
+                                bail!(
+                                    "Multiple stacks contain branches matching '{}'. Use full branch name or remove --no-interactive.",
+                                    name
+                                );
+                            } else {
+                                bail!(
+                                    "Multiple worktrees match '{}'. Use full name or remove --no-interactive.",
+                                    name
+                                );
+                            }
                         }
-                        let matched_worktrees: Vec<WorktreeDescriptor> =
-                            fuzzy_matches.into_iter().map(|(_, wt)| wt).collect();
-                        select_from_tree(self, matched_worktrees, effective_model, &repo)
+                        let matched: Vec<WorktreeDescriptor> = worktrees
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(i, _)| match_indices.contains(i))
+                            .map(|(_, wt)| wt)
+                            .collect();
+                        select_from_tree(self, matched, effective_model, &repo)
                     }
                 }
             }
