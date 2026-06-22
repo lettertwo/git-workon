@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4](https://github.com/lettertwo/git-workon/compare/git-workon-v0.7.3...git-workon-v0.7.4) - 2026-06-22
+
+### Fixed
+
+- *(cli)* suppress stack tree and metadata diffs under status filters
+
+### Other
+
+- fill in missing flags and nuances across command docs
+
 ## [0.7.3](https://github.com/lettertwo/git-workon/compare/git-workon-v0.7.2...git-workon-v0.7.3) - 2026-06-22
 
 ### Other
