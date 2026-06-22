@@ -258,9 +258,28 @@ pub struct Prune {
     pub yes: bool,
     #[arg(
         long,
-        help = "Also prune worktrees where the remote tracking branch is gone"
+        conflicts_with = "no_gone",
+        help = "Prune worktrees where the remote tracking branch is gone (see also workon.pruneGone)"
     )]
     pub gone: bool,
+    #[arg(
+        long,
+        conflicts_with = "gone",
+        help = "Do not prune gone-upstream worktrees, even if workon.pruneGone is true"
+    )]
+    pub no_gone: bool,
+    #[arg(
+        long,
+        conflicts_with = "no_fetch",
+        help = "Prune-fetch from tracked remotes before checking gone status (see also workon.pruneFetch)"
+    )]
+    pub fetch: bool,
+    #[arg(
+        long,
+        conflicts_with = "fetch",
+        help = "Skip the prune-fetch step, even if workon.pruneFetch is true"
+    )]
+    pub no_fetch: bool,
     #[arg(
         long,
         value_name = "BRANCH",
@@ -291,6 +310,37 @@ pub struct Prune {
     pub keep_branch: bool,
     #[arg(long, help = "Include locked worktrees when pruning")]
     pub include_locked: bool,
+}
+
+#[allow(dead_code)] // methods are used by the main binary; build.rs imports cli.rs for completions
+impl Prune {
+    /// Returns the CLI override for gone-upstream pruning.
+    ///
+    /// `Some(true)` if `--gone` was passed, `Some(false)` if `--no-gone` was passed,
+    /// `None` to fall back to the `workon.pruneGone` config (default false).
+    pub fn gone_override(&self) -> Option<bool> {
+        if self.gone {
+            Some(true)
+        } else if self.no_gone {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the CLI override for the prune-fetch step.
+    ///
+    /// `Some(true)` if `--fetch` was passed, `Some(false)` if `--no-fetch` was passed,
+    /// `None` to fall back to the `workon.pruneFetch` config (default false).
+    pub fn fetch_override(&self) -> Option<bool> {
+        if self.fetch {
+            Some(true)
+        } else if self.no_fetch {
+            Some(false)
+        } else {
+            None
+        }
+    }
 }
 
 /// Find a worktree to work on.

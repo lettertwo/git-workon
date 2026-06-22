@@ -208,6 +208,43 @@ impl<'repo> WorkonConfig<'repo> {
         self.read_multivar("workon.pruneProtectedBranches")
     }
 
+    /// Get whether to include gone-upstream worktrees as prune candidates by default.
+    ///
+    /// Precedence: CLI override > workon.pruneGone config > false
+    ///
+    /// When true, `prune` treats worktrees with a gone upstream tracking branch as
+    /// eligible for removal without requiring `--gone`. Equivalent to always passing
+    /// `--gone`.
+    pub fn prune_gone(&self, cli_override: Option<bool>) -> Result<bool> {
+        if let Some(override_val) = cli_override {
+            return Ok(override_val);
+        }
+        let config = self.repo.config()?;
+        match config.get_bool("workon.pruneGone") {
+            Ok(val) => Ok(val),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// Get whether to run a prune-fetch before evaluating gone-upstream status.
+    ///
+    /// Precedence: CLI override > workon.pruneFetch config > false
+    ///
+    /// When true, `prune` fetches from all remotes tracked by worktree branches
+    /// (with `--prune`, deleting stale remote-tracking refs) before evaluating
+    /// gone-upstream status. This makes `--gone` accurate even when local refs
+    /// are stale. Equivalent to always passing `--fetch`.
+    pub fn prune_fetch(&self, cli_override: Option<bool>) -> Result<bool> {
+        if let Some(override_val) = cli_override {
+            return Ok(override_val);
+        }
+        let config = self.repo.config()?;
+        match config.get_bool("workon.pruneFetch") {
+            Ok(val) => Ok(val),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Check if a given branch name is protected from pruning.
     ///
     /// Returns true if the branch name matches any of the protected patterns.

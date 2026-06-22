@@ -7,11 +7,26 @@
 //!
 //! - **Targeted pruning**: `git workon prune <name>...` - prune specific worktrees
 //! - **Bulk pruning**: `--gone` and `--merged` flags for automatic discovery
+//! - **Gone hint**: bare `prune` surfaces worktrees with gone upstreams as a non-destructive notice
+//! - **Optional fetch**: `--fetch` (or `workon.pruneFetch = true`) prune-fetches from tracked
+//!   remotes before evaluating gone status, so `--gone` decisions use fresh refs
 //! - **Protected branches**: Respects `workon.pruneProtectedBranches` glob patterns
 //! - **Safety checks**: `--allow-dirty` and `--allow-unmerged` to override warnings
 //! - **Dry run**: `--dry-run` to preview without deleting
 //! - **Branch cleanup**: Local branch refs are deleted after pruning by default; use `--keep-branch` to preserve them
 //! - **Force mode**: `--force` overrides all safety checks (protected, default-branch, dirty, unmerged)
+//!
+//! ## Gone Pruning and Fetch
+//!
+//! A branch is "gone" when its upstream tracking ref has been deleted on the remote.
+//! Detection relies on cached local refs, so it is only accurate after a prune-fetch.
+//!
+//! - `--gone` / `workon.pruneGone = true` — include gone-upstream worktrees as candidates
+//! - `--fetch` / `workon.pruneFetch = true` — run `git fetch --prune` on all tracked
+//!   remotes before candidate collection; makes gone status trustworthy
+//! - `--no-gone` / `--no-fetch` — suppress the config-enabled behaviour for one run
+//! - `--gone` and `--fetch` are independent: `--gone` alone uses cached refs; add
+//!   `--fetch` to refresh first
 //!
 //! ## Protected Branch Matching
 //!
@@ -29,11 +44,13 @@
 //! unmerged check is also skipped for `RemoteGone` candidates.
 
 use dialoguer::Confirm;
-use git2::BranchType;
 use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
-use workon::{get_default_branch, get_repo, get_worktrees, WorktreeDescriptor};
+use workon::{
+    get_default_branch, get_repo, get_worktrees, prune_fetch as remote_prune_fetch,
+    remotes_tracked_by_worktrees, WorktreeDescriptor,
+};
 
 use crate::cli::Prune;
 use crate::output;
@@ -45,7 +62,32 @@ impl Run for Prune {
         let repo = get_repo(None)?;
         let config = workon::WorkonConfig::new(&repo)?;
         let protected_patterns = config.prune_protected_branches()?;
+        let effective_gone = config.prune_gone(self.gone_override()).into_diagnostic()?;
+        let effective_fetch = config
+            .prune_fetch(self.fetch_override())
+            .into_diagnostic()?;
         let worktrees = get_worktrees(&repo)?;
+
+        let pb = output::create_spinner();
+
+        // Phase 0 (optional): prune-fetch from all tracked remotes so that gone-upstream
+        // detection reflects the actual current state of the remote, not a stale local view.
+        // Failure is non-fatal: warn and continue on cached refs (a failed fetch can only
+        // cause under-pruning, never a false prune).
+        if effective_fetch {
+            let remotes = remotes_tracked_by_worktrees(&repo, &worktrees).into_diagnostic()?;
+            for remote_name in &remotes {
+                pb.set_message(format!("Fetching {}...", remote_name));
+                if let Err(e) = remote_prune_fetch(&repo, remote_name) {
+                    pb.suspend(|| {
+                        output::warn(&format!(
+                            "could not fetch {}: {}; gone status may be based on stale refs",
+                            remote_name, e
+                        ));
+                    });
+                }
+            }
+        }
 
         let mut candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = Vec::new();
 
@@ -90,7 +132,6 @@ impl Run for Prune {
         }
 
         // Then, add filter-based worktrees (if any filters are specified)
-        let pb = output::create_spinner();
         pb.set_message("Checking worktree status...");
         let filter_candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = worktrees
             .iter()
@@ -123,9 +164,9 @@ impl Run for Prune {
                             reason: PruneReason::BranchDeleted,
                         },
                     ))
-                } else if self.gone {
-                    // Branch exists - check if upstream is gone (only if --gone flag is set)
-                    match is_upstream_gone(&repo, &branch_name) {
+                } else if effective_gone {
+                    // Branch exists - check if upstream is gone
+                    match wt.has_gone_upstream() {
                         Ok(true) => {
                             debug!("'{}': upstream gone, candidate for pruning", branch_name);
                             Some((
@@ -310,6 +351,27 @@ impl Run for Prune {
             return Ok(None);
         }
 
+        // Gone hint: when not actively pruning gone worktrees, check for any that exist
+        // and surface them as a non-destructive notice. Computed before to_prune/skipped
+        // are consumed so we can filter them out of the hint.
+        let gone_hint: Vec<&WorktreeDescriptor> = if !effective_gone {
+            worktrees
+                .iter()
+                .filter(|wt| {
+                    let name = wt.name();
+                    !to_prune
+                        .iter()
+                        .any(|c| Some(c.worktree_name.as_str()) == name)
+                        && !skipped
+                            .iter()
+                            .any(|(c, _)| Some(c.worktree_name.as_str()) == name)
+                })
+                .filter(|wt| wt.has_gone_upstream().unwrap_or(false))
+                .collect()
+        } else {
+            vec![]
+        };
+
         // Display skipped worktrees
         if !skipped.is_empty() {
             output::notice("Skipped worktrees (unsafe to prune):");
@@ -325,6 +387,7 @@ impl Run for Prune {
 
         if to_prune.is_empty() {
             output::status("No worktrees to prune");
+            print_gone_hint(&gone_hint, effective_fetch);
             return Ok(None);
         }
 
@@ -341,6 +404,7 @@ impl Run for Prune {
 
         if self.dry_run {
             output::notice("\nDry run - no changes made");
+            print_gone_hint(&gone_hint, effective_fetch);
             return Ok(None);
         }
 
@@ -380,8 +444,31 @@ impl Run for Prune {
         }
 
         output::success(&format!("Pruned {} worktree(s)", to_prune.len()));
+        print_gone_hint(&gone_hint, effective_fetch);
         Ok(None)
     }
+}
+
+/// Print a non-destructive notice listing worktrees with gone upstreams.
+///
+/// Called at exit points when `effective_gone` is false, so the user knows
+/// to rerun with `--gone` (and optionally `--fetch`) to clean them up.
+fn print_gone_hint(gone: &[&WorktreeDescriptor], effective_fetch: bool) {
+    if gone.is_empty() {
+        return;
+    }
+    eprintln!();
+    output::notice(&format!("{} worktree(s) have gone upstreams:", gone.len()));
+    for wt in gone {
+        let branch = wt.branch().ok().flatten().unwrap_or_default();
+        output::detail(&format!("  {} (branch: {})", wt.path().display(), branch));
+    }
+    let suffix = if effective_fetch {
+        String::new()
+    } else {
+        " (add --fetch to refresh remote refs first)".to_string()
+    };
+    output::detail(&format!("  Rerun with --gone to prune them.{}", suffix));
 }
 
 #[derive(Debug)]
@@ -408,38 +495,6 @@ struct PruneCandidate {
     worktree_path: std::path::PathBuf,
     branch_name: String,
     reason: PruneReason,
-}
-
-/// Check if a branch has an upstream that no longer exists (is "gone")
-fn is_upstream_gone(repo: &git2::Repository, branch_name: &str) -> Result<bool> {
-    // Find the local branch
-    let branch = match repo.find_branch(branch_name, BranchType::Local) {
-        Ok(b) => b,
-        Err(_) => return Ok(false), // Branch doesn't exist, not our concern here
-    };
-
-    // Check if upstream is configured by looking at the branch config
-    // Format: branch.<name>.remote and branch.<name>.merge
-    let config = repo.config().into_diagnostic()?;
-    let remote_key = format!("branch.{}.remote", branch_name);
-    let merge_key = format!("branch.{}.merge", branch_name);
-
-    // If no upstream is configured, not "gone"
-    let _remote = match config.get_string(&remote_key) {
-        Ok(r) => r,
-        Err(_) => return Ok(false), // No remote configured
-    };
-
-    let _merge = match config.get_string(&merge_key) {
-        Ok(m) => m,
-        Err(_) => return Ok(false), // No merge ref configured
-    };
-
-    // Try to get the upstream branch - if it fails, upstream is gone
-    match branch.upstream() {
-        Ok(_) => Ok(false), // Upstream exists
-        Err(_) => Ok(true), // Upstream configured but reference is gone
-    }
 }
 
 fn prune_worktree(
@@ -470,7 +525,7 @@ fn prune_worktree(
         && !matches!(candidate.reason, PruneReason::BranchDeleted)
         && !candidate.branch_name.starts_with('(')
     {
-        match repo.find_branch(&candidate.branch_name, BranchType::Local) {
+        match repo.find_branch(&candidate.branch_name, git2::BranchType::Local) {
             Ok(mut branch) => match branch.delete() {
                 Ok(()) => true,
                 Err(e) => {

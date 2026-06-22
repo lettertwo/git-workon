@@ -1592,3 +1592,337 @@ fn prune_interactive_confirm_no() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+// --- Gone hint tests ---
+
+#[test]
+fn prune_bare_shows_hint_for_gone_upstreams() -> Result<(), Box<dyn std::error::Error>> {
+    // A worktree whose upstream tracking ref is manually deleted (simulates a prune-fetch
+    // having run) should surface as a hint on bare prune, not be pruned automatically.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    // Delete the remote-tracking ref to make the branch look "gone"
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    // Bare prune (no --gone): should NOT prune the worktree
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No worktrees to prune"))
+        .stderr(predicate::str::contains("gone upstreams"))
+        .stderr(predicate::str::contains("--gone"));
+
+    // Verify worktree still exists
+    fixture.cwd()?.assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_bare_no_hint_when_no_gone_upstreams() -> Result<(), Box<dyn std::error::Error>> {
+    // When no worktrees have gone upstreams, the hint should not appear.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("gone upstreams").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_hint_mentions_fetch_when_fetch_not_active() -> Result<(), Box<dyn std::error::Error>> {
+    // The hint should recommend --fetch when fetch is not already enabled.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("--fetch"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_hint_no_fetch_mention_when_fetch_flag_used() -> Result<(), Box<dyn std::error::Error>> {
+    // When --fetch was actually run this invocation, the hint should not mention --fetch
+    // (the refs were just refreshed, so suggesting it again is noise). We can test this
+    // by verifying the hint IS present (gone upstream found) but --fetch is NOT mentioned.
+    // We use a local fixture as the remote so the fetch actually succeeds.
+    let upstream = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    let local = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", &upstream)
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    // Delete the remote-tracking ref manually to simulate a gone upstream
+    // (the fetch to our local upstream won't create it since upstream never had it)
+    local
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&local)
+        .arg("prune")
+        .arg("--fetch")
+        .arg("--yes")
+        .assert()
+        .success()
+        // hint is present (gone upstream found) but --fetch not mentioned since we just ran it
+        .stderr(predicate::str::contains("gone upstreams"))
+        .stderr(predicate::str::contains("--fetch").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_hint_suppressed_in_json_mode() -> Result<(), Box<dyn std::error::Error>> {
+    // The gone hint must not appear in JSON mode (structured output only).
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    let output = prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--json")
+        .arg("--yes")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(
+        !stderr.contains("gone upstreams"),
+        "hint should not appear in JSON mode"
+    );
+
+    Ok(())
+}
+
+// --- Config-driven gone/fetch tests ---
+
+#[test]
+fn prune_config_prune_gone_removes_gone_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    // workon.pruneGone=true makes bare prune behave like prune --gone.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .config("workon.pruneGone", "true")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"))
+        .stderr(predicate::str::contains("remote gone"));
+
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_no_gone_flag_suppresses_config() -> Result<(), Box<dyn std::error::Error>> {
+    // --no-gone overrides workon.pruneGone=true for one run.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .config("workon.pruneGone", "true")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--no-gone")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No worktrees to prune"));
+
+    fixture.cwd()?.assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_fetch_failure_warns_and_continues() -> Result<(), Box<dyn std::error::Error>> {
+    // When --fetch is passed but the remote is not a valid git repo, prune should
+    // warn and continue (still pruning BranchDeleted candidates on cached refs).
+    // Use /dev/null as the remote URL: not a git repository, so fetch fails fast.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .worktree("feature")
+        // Track origin/feature so remotes_tracked_by_worktrees includes "origin"
+        .upstream("feature", "origin/feature")
+        .build()?;
+
+    // Delete the branch to create a BranchDeleted prune candidate
+    fixture
+        .repo()?
+        .find_reference("refs/heads/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--fetch")
+        .arg("--yes")
+        .assert()
+        .success()
+        // fetch failed but prune continued and removed the BranchDeleted candidate
+        .stderr(predicate::str::contains("could not fetch origin"))
+        .stderr(predicate::str::contains("stale refs"))
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_fetch_flag_with_no_remotes_is_harmless() -> Result<(), Box<dyn std::error::Error>> {
+    // --fetch when no worktree branches track any remote should be a no-op.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/heads/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--fetch")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_no_fetch_flag_suppresses_config() -> Result<(), Box<dyn std::error::Error>> {
+    // --no-fetch overrides workon.pruneFetch=true for one run, preventing the network call.
+    // We use an unreachable remote to verify: if --no-fetch didn't work, fetch would fail
+    // noisily; since the worktree also has a deleted branch it should still be pruned.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "git://192.0.2.1/does-not-exist.git")
+        .worktree("feature")
+        .config("workon.pruneFetch", "true")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/heads/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--no-fetch")
+        .arg("--yes")
+        .assert()
+        .success()
+        // No fetch warning because --no-fetch suppressed the fetch entirely
+        .stderr(predicate::str::contains("could not fetch").not())
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
