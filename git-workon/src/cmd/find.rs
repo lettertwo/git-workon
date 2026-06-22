@@ -55,6 +55,7 @@ use workon::{
 };
 
 use crate::cli::{Find, New};
+use crate::cmd::filter::StatusFilter;
 use crate::display::{build_tree, render_flat, render_tree, worktree_display_row};
 use crate::picker::{self, PickerAction};
 
@@ -62,6 +63,11 @@ use super::Run;
 
 impl Run for Find {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
+        // Validate filter combination before anything else (even --new) so the
+        // conflict error is always visible.
+        let filter = StatusFilter::from(self);
+        filter.validate()?;
+
         // --new bypasses resolution entirely: force a fresh worktree, the same
         // escape hatch the bare-name routing and the picker's Tab action use.
         if self.new {
@@ -84,8 +90,18 @@ impl Run for Find {
             WorkonConfig::new(&repo)?.stack_model(None)?
         };
 
+        // When any status filter is active, suppress the stack tree and use the flat
+        // picker. Metadata-only ◯ diffs have no working tree and can never satisfy a
+        // worktree-status filter — showing them in the picker would be misleading.
+        // See ADR-025.
+        let picker_model = if filter.any_active() {
+            workon::StackModel::None
+        } else {
+            effective_model
+        };
+
         // Apply status filters
-        worktrees.retain(|wt| matches_filters(self, wt));
+        worktrees.retain(|wt| filter.matches(wt));
 
         if worktrees.is_empty() {
             bail!("No worktrees match the specified filters");
@@ -191,7 +207,7 @@ impl Run for Find {
                             .filter(|(i, _)| match_indices.contains(i))
                             .map(|(_, wt)| wt)
                             .collect();
-                        select_from_tree(self, matched, effective_model, &repo)
+                        select_from_tree(self, matched, picker_model, &repo)
                     }
                 }
             }
@@ -199,35 +215,10 @@ impl Run for Find {
                 if self.no_interactive {
                     bail!("No worktree name provided. Specify a name or remove --no-interactive.");
                 }
-                select_from_tree(self, worktrees, effective_model, &repo)
+                select_from_tree(self, worktrees, picker_model, &repo)
             }
         }
     }
-}
-
-/// Returns true if the worktree matches all active filters.
-fn matches_filters(find: &Find, wt: &WorktreeDescriptor) -> bool {
-    if !find.dirty && !find.clean && !find.ahead && !find.behind && !find.gone {
-        return true;
-    }
-
-    if find.dirty && !wt.is_dirty().unwrap_or(false) {
-        return false;
-    }
-    if find.clean && wt.is_dirty().unwrap_or(true) {
-        return false;
-    }
-    if find.ahead && !wt.has_unpushed_commits().unwrap_or(false) {
-        return false;
-    }
-    if find.behind && !wt.is_behind_upstream().unwrap_or(false) {
-        return false;
-    }
-    if find.gone && !wt.has_gone_upstream().unwrap_or(false) {
-        return false;
-    }
-
-    true
 }
 
 /// Show interactive selection.

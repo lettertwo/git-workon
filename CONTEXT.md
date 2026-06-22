@@ -8,6 +8,10 @@ Terms used throughout the `git-workon` codebase. Implementation details do not b
 
 **Prune-fetch** — a fetch that also deletes (prunes) stale local remote-tracking refs for branches that no longer exist on the remote. Equivalent to `git fetch --prune <remote>`. Makes "gone upstream" detection trustworthy.
 
+## Status Filters
+
+**Status filter** — a flag (`--dirty`, `--clean`, `--ahead`, `--behind`, `--gone`) that narrows a `list` or `find` result to worktrees in a specific state. Filters select **worktrees**: each check queries the working tree or branch-tracking state of a checked-out worktree. A metadata-only stack diff (`◯`) has no working tree and can never satisfy a status filter; it is excluded from any filtered result. See also: `StatusFilter`, `WorktreeDescriptor::is_dirty()`.
+
 ## Prune Candidate Reasons
 
 **BranchDeleted** — the local branch ref for the worktree no longer exists in the repository. Always a prune candidate regardless of flags.

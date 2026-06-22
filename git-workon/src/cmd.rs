@@ -3,6 +3,7 @@ mod clone;
 mod complete;
 mod copy;
 mod doctor;
+pub mod filter;
 mod find;
 mod generate_man;
 mod init;

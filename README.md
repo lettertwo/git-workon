@@ -75,6 +75,7 @@ git workon list                  # all worktrees
 git workon list --dirty          # only worktrees with uncommitted changes
 git workon list --ahead          # worktrees with unpushed commits
 git workon list --gone           # worktrees whose upstream branch was deleted
+# Note: filters produce a flat list in stack-enabled repos (the tree is suppressed).
 ```
 
 ### Prune stale worktrees

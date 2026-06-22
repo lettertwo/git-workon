@@ -1035,3 +1035,179 @@ fn list_omits_ghost_branches_with_no_git_ref() -> Result<(), Box<dyn std::error:
 
     Ok(())
 }
+
+// ── Filter × stack interaction ────────────────────────────────────────────────
+
+/// `list --dirty` in a stack-enabled repo must show a flat list of only the dirty
+/// worktrees. Metadata-only ◯ stack branches must not appear (they have no working
+/// tree and can never be dirty). The tree glyphs and connectors must not appear.
+#[test]
+fn list_dirty_in_stack_repo_shows_flat_no_metadata_nodes() -> Result<(), Box<dyn std::error::Error>>
+{
+    // feat-1 is a worktree. step-2 is a metadata-only diff below feat-1.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    // Make feat-1 dirty
+    std::fs::write(
+        fixture.root()?.child("feat-1").join("test.txt"),
+        "uncommitted",
+    )?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .arg("--dirty")
+            .output()?
+            .stdout,
+    )?;
+
+    assert!(
+        stdout.contains("feat-1"),
+        "dirty worktree must appear: {stdout}"
+    );
+    // Clean worktrees must not appear
+    assert!(
+        !stdout.contains("main"),
+        "clean worktree 'main' must not appear under --dirty: {stdout}"
+    );
+    // Metadata-only stack diff must not appear
+    assert!(
+        !stdout.contains("step-2"),
+        "metadata-only diff 'step-2' must not appear under --dirty: {stdout}"
+    );
+    // Output must be flat (no tree glyphs or connectors)
+    assert!(
+        !stdout.contains("◯") && !stdout.contains("◎") && !stdout.contains("◉"),
+        "tree glyphs must not appear under --dirty: {stdout}"
+    );
+    assert!(
+        !stdout.contains("├─") && !stdout.contains("└─"),
+        "tree connectors must not appear under --dirty: {stdout}"
+    );
+
+    Ok(())
+}
+
+/// `list --clean` in a stack-enabled repo must show only clean worktrees, flat.
+#[test]
+fn list_clean_in_stack_repo_shows_flat_matching_only() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    // Make feat-1 dirty
+    std::fs::write(
+        fixture.root()?.child("feat-1").join("test.txt"),
+        "uncommitted",
+    )?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .arg("--clean")
+            .output()?
+            .stdout,
+    )?;
+
+    assert!(
+        stdout.contains("main"),
+        "clean worktree 'main' must appear under --clean: {stdout}"
+    );
+    assert!(
+        !stdout.contains("feat-1"),
+        "dirty worktree 'feat-1' must not appear under --clean: {stdout}"
+    );
+    assert!(
+        !stdout.contains("step-2"),
+        "metadata-only diff 'step-2' must not appear under --clean: {stdout}"
+    );
+    // Flat output: no tree glyphs or connectors
+    assert!(
+        !stdout.contains("◯") && !stdout.contains("◎") && !stdout.contains("◉"),
+        "tree glyphs must not appear under --clean: {stdout}"
+    );
+
+    Ok(())
+}
+
+/// `list --dirty --json` in a stack-enabled repo must not inject metadata-only
+/// stacks into the `stacks` array.
+#[test]
+fn list_json_dirty_filter_excludes_metadata_only_stacks() -> Result<(), Box<dyn std::error::Error>>
+{
+    // feat-1 is a dirty worktree. step-2 is metadata-only.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    std::fs::write(
+        fixture.root()?.child("feat-1").join("test.txt"),
+        "uncommitted",
+    )?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("list")
+        .arg("--dirty")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+
+    // Only the dirty worktree should appear
+    let worktrees = parsed["worktrees"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected worktrees array in: {stdout}"));
+    assert_eq!(
+        worktrees.len(),
+        1,
+        "only feat-1 should be in worktrees: {stdout}"
+    );
+    assert_eq!(
+        worktrees[0]["name"], "feat-1",
+        "worktree must be feat-1: {stdout}"
+    );
+
+    // No metadata-only stacks should be injected
+    let stacks = parsed["stacks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected stacks array in: {stdout}"));
+    for group in stacks {
+        let checkouts = group["checkouts"]
+            .as_object()
+            .expect("checkouts must be obj");
+        assert!(
+            !checkouts.is_empty(),
+            "no member-less (metadata-only) stack groups should appear under a filter: {stdout}"
+        );
+    }
+
+    Ok(())
+}

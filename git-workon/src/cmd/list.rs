@@ -32,11 +32,18 @@
 //!
 //! ## Stack-aware output
 //!
-//! When a stack model is active (e.g. Graphite), worktrees and stack metadata are
-//! rendered as a unified tree. Each trunk is a single root node; stacks hang underneath;
-//! untracked worktrees appear at the root level sorted by most-recent activity.
-//! Metadata-only diffs (branches tracked by Graphite with no worktree) appear as
-//! `◯` nodes in the tree. The glyph vocabulary encodes two independent axes:
+//! When a stack model is active (e.g. Graphite) **and no filter is active**, worktrees
+//! and stack metadata are rendered as a unified tree. Each trunk is a single root node;
+//! stacks hang underneath; untracked worktrees appear at the root level sorted by
+//! most-recent activity. Metadata-only diffs (branches tracked by Graphite with no
+//! worktree) appear as `◯` nodes in the tree.
+//!
+//! When any status filter is active the tree is suppressed: only matching worktrees are
+//! listed in the plain flat format (same as `--no-stack`). Metadata-only diffs have no
+//! working tree and can never satisfy a worktree-status filter, so they are excluded.
+//! See ADR-025.
+//!
+//! The glyph vocabulary encodes two independent axes:
 //! fill = a worktree exists on disk; halo = you are standing in it right now.
 //!
 //! - `◯` dim — metadata-only (no worktree)
@@ -65,6 +72,7 @@ use workon::{
 };
 
 use crate::cli::List;
+use crate::cmd::filter::StatusFilter;
 use crate::display::{build_tree, format_aligned_rows, format_tree_lines, worktree_display_row};
 use crate::json::worktree_to_json;
 
@@ -72,12 +80,8 @@ use super::Run;
 
 impl Run for List {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
-        // Error if --dirty and --clean both specified
-        if self.dirty && self.clean {
-            return Err(miette::miette!(
-                "Cannot specify both --dirty and --clean filters"
-            ));
-        }
+        let filter = StatusFilter::from(self);
+        filter.validate()?;
 
         let repo = get_repo(None)?;
         let worktrees = get_worktrees(&repo)?;
@@ -93,7 +97,7 @@ impl Run for List {
         // Apply filters (AND logic)
         let filtered: Vec<_> = worktrees
             .into_iter()
-            .filter(|wt| self.matches_filters(wt))
+            .filter(|wt| filter.matches(wt))
             .collect();
         debug!("{} worktree(s) after filtering", filtered.len());
 
@@ -113,7 +117,10 @@ impl Run for List {
 
         // Add synthetic (member-less) groups for stacks present in metadata but not yet
         // represented by any worktree (e.g. stack branches with no checked-out worktree).
-        if effective_model != workon::StackModel::None {
+        // Skipped when any filter is active: metadata-only diffs have no worktree and can
+        // never satisfy a worktree-status filter, so injecting them under a filter would
+        // surface irrelevant stacks. See ADR-025.
+        if effective_model != workon::StackModel::None && !filter.any_active() {
             let covered: std::collections::HashSet<(String, Vec<String>)> = grouping
                 .groups
                 .iter()
@@ -182,8 +189,8 @@ impl Run for List {
         let root = workon::workon_root(&repo)?;
         let current_dir = std::env::current_dir().into_diagnostic()?;
 
-        if effective_model != workon::StackModel::None {
-            // Stack-active: render as unified tree
+        if effective_model != workon::StackModel::None && !filter.any_active() {
+            // Stack-active with no filter: render as unified tree
             let forest = build_tree(
                 &filtered,
                 &grouping.groups,
@@ -196,7 +203,7 @@ impl Run for List {
                 println!("{}", line);
             }
         } else {
-            // Non-stack: flat aligned list (pre-stack behavior, no headers)
+            // Non-stack, or any filter active: flat aligned list (pre-stack behavior, no headers)
             let rows: Vec<_> = filtered
                 .iter()
                 .filter_map(|wt| worktree_display_row(wt, root, &current_dir).ok())
@@ -207,38 +214,5 @@ impl Run for List {
         }
 
         Ok(None)
-    }
-}
-
-impl List {
-    /// Returns true if the worktree matches all active filters
-    fn matches_filters(&self, wt: &WorktreeDescriptor) -> bool {
-        // No filters = show all
-        if !self.dirty && !self.clean && !self.ahead && !self.behind && !self.gone {
-            return true;
-        }
-
-        // Check each filter - all must pass (AND logic)
-        if self.dirty && !wt.is_dirty().unwrap_or(false) {
-            return false;
-        }
-
-        if self.clean && wt.is_dirty().unwrap_or(true) {
-            return false;
-        }
-
-        if self.ahead && !wt.has_unpushed_commits().unwrap_or(false) {
-            return false;
-        }
-
-        if self.behind && !wt.is_behind_upstream().unwrap_or(false) {
-            return false;
-        }
-
-        if self.gone && !wt.has_gone_upstream().unwrap_or(false) {
-            return false;
-        }
-
-        true
     }
 }

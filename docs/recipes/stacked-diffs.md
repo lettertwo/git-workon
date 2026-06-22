@@ -94,10 +94,15 @@ Stack-active output shows a graphite-style tree with three glyphs:
 
 `← here` marks the worktree that contains the current directory. When the worktree
 directory name differs from the branch (e.g. the `./auth` worktree with HEAD on
-`auth-step-2`), the path is shown as a dim annotation. Fall back to flat list:
+`auth-step-2`), the path is shown as a dim annotation.
+
+Status filters (`--dirty`, `--clean`, `--ahead`, `--behind`, `--gone`) suppress the tree
+and produce a flat list of matching worktrees only. Metadata-only `◯` diffs have no working
+tree and can never satisfy a worktree-status filter, so they are excluded.
 
 ```bash
-git workon list --no-stack
+git workon list --dirty          # flat: only worktrees with uncommitted changes
+git workon list --no-stack       # flat: all worktrees, tree suppressed permanently
 ```
 
 ## Finding worktrees by stack-member branch

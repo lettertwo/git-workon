@@ -857,3 +857,100 @@ fn find_branch_name_match_is_case_insensitive() -> Result<(), Box<dyn std::error
 
     Ok(())
 }
+
+// ── Filter × stack interaction ─────────────────────────────────────────────────
+
+/// `find --dirty --clean` must error immediately, matching the behaviour of `list`.
+#[test]
+fn find_dirty_and_clean_conflict_errors() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .build()?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .arg("find")
+        .arg("--dirty")
+        .arg("--clean")
+        .arg("--no-interactive")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "Cannot specify both --dirty and --clean filters",
+        ));
+
+    Ok(())
+}
+
+/// `find --dirty` in a stack-enabled repo must return only matching worktrees and
+/// must NOT surface metadata-only ◯ stack diffs.
+///
+/// Under a filter the flat non-interactive code path is used. The stack-member fallback
+/// still works (it searches within the already-filtered worktree set) so the result must
+/// be the dirty worktree, not a metadata-only branch.
+#[test]
+fn find_dirty_filter_in_stack_repo_excludes_metadata_diffs(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // feat-1 is a dirty worktree. step-2 is a metadata-only diff below it.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    std::fs::write(
+        fixture.root()?.child("feat-1").join("test.txt"),
+        "uncommitted",
+    )?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("find")
+            .arg("feat-1")
+            .arg("--dirty")
+            .output()?
+            .stdout,
+    )?;
+
+    assert!(
+        stdout.contains("feat-1"),
+        "dirty worktree must be found: {stdout}"
+    );
+
+    Ok(())
+}
+
+/// `find --dirty` with only clean worktrees must bail, not open a picker showing
+/// metadata-only ◯ diffs.
+#[test]
+fn find_dirty_filter_in_stack_repo_bails_when_nothing_matches(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("find")
+        .arg("--dirty")
+        .arg("--no-interactive")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("No worktrees match"));
+
+    Ok(())
+}
