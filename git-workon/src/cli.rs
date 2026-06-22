@@ -62,7 +62,9 @@ pub enum Cmd {
 /// Perform a bare clone of a repository and create an initial worktree.
 #[derive(Debug, Args)]
 pub struct Clone {
+    #[arg(help = "URL of the repository to clone")]
     pub url: String,
+    #[arg(help = "Local path for the cloned repository (derived from URL if omitted)")]
     pub path: Option<PathBuf>,
     #[arg(long, help = "Skip post-create hooks")]
     pub no_hooks: bool,
@@ -78,6 +80,7 @@ pub struct Clone {
 /// which is a copy-on-write optimization over a potentially much slower copy operation.
 #[derive(Debug, Args)]
 pub struct Copy {
+    #[arg(help = "Source worktree name")]
     pub from: String,
     /// Destination worktree name. Defaults to the current worktree when omitted.
     pub to: Option<String>,
@@ -98,6 +101,7 @@ pub struct Copy {
 /// Create a new bare repository and an initial worktree.
 #[derive(Debug, Args)]
 pub struct Init {
+    #[arg(help = "Directory to initialize (defaults to current directory)")]
     pub path: Option<PathBuf>,
     #[arg(long, help = "Skip post-create hooks")]
     pub no_hooks: bool,
@@ -140,7 +144,7 @@ pub struct Move {
     #[arg(num_args = 1..=2, required = true)]
     pub names: Vec<String>,
 
-    #[arg(short = 'n', long, help = "Preview changes without executing")]
+    #[arg(short = 'n', long, help = "Preview renames without applying them")]
     pub dry_run: bool,
 
     #[arg(
@@ -248,11 +252,7 @@ pub struct Prune {
 
     /// Specific worktree names to prune
     pub names: Vec<String>,
-    #[arg(
-        short = 'n',
-        long,
-        help = "Show what would be pruned without actually removing anything"
-    )]
+    #[arg(short = 'n', long, help = "Preview removals without applying them")]
     pub dry_run: bool,
     #[arg(short, long, help = "Skip confirmation prompts")]
     pub yes: bool,
@@ -382,12 +382,10 @@ pub struct Find {
 /// Detect and repair workspace issues.
 #[derive(Debug, Args)]
 pub struct Doctor {
-    /// Automatically fix detected issues
-    #[arg(long)]
+    #[arg(long, help = "Automatically fix detected issues")]
     pub fix: bool,
 
-    /// Preview fixes without applying them
-    #[arg(long)]
+    #[arg(long, help = "Preview fixes without applying them")]
     pub dry_run: bool,
 
     #[clap(skip)]

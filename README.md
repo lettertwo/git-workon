@@ -109,7 +109,7 @@ git workon doctor --dry-run      # preview fixes without applying
 ### Copy untracked files between worktrees
 
 ```sh
-git workon copy-untracked main my-feature --pattern '.env*'
+git workon copy main my-feature --pattern '.env*'
 ```
 
 ## Shell integration
@@ -153,13 +153,30 @@ man git-workon
 
 ```gitconfig
 [workon]
-    defaultBranch = main
-    postCreateHook = npm install
-    copyPattern = .env.local
-    autoCopyUntracked = true
-    pruneProtectedBranches = main
+    # New worktrees
+    defaultBranch = main         # base branch when none is specified
+    prFormat = pr-{number}       # worktree name pattern for PR checkouts
+
+    # File copying
+    autoCopy = false             # copy local files automatically on 'new'
+    copyPattern = .env.local     # glob patterns to copy (multi-value)
+    copyExclude = .env.prod      # patterns to exclude (multi-value)
+    copyIncludeIgnored = true    # include git-ignored files when copying
+
+    # Hooks
+    postCreateHook = npm install # commands run after worktree creation (multi-value)
+    hookTimeout = 300            # hook timeout in seconds (0 = no timeout)
+
+    # Pruning
+    pruneProtectedBranches = main       # branches protected from pruning (multi-value)
     pruneProtectedBranches = release/*
-    prFormat = pr-{number}
+    pruneGone = false            # prune gone-upstream worktrees by default
+    pruneFetch = false           # fetch from remotes before evaluating gone status
+
+    # Stacked diffs (Graphite)
+    stackModel = auto            # "auto", "graphite", or "none"
+    stackWorktreeGranularity = stack  # "stack" (one worktree per stack)
+    gtAutoTrack = true           # auto-run 'gt track' after 'workon new'
 ```
 
 See `man git-workon` or `git workon --help` for full documentation.

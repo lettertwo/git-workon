@@ -19,13 +19,19 @@
 //! This module supports the following configuration keys:
 //!
 //! - **workon.defaultBranch** - Default base branch for new worktrees (string, default: None)
+//! - **workon.prFormat** - Format string for PR-based worktree names (string, default: "pr-{number}")
 //! - **workon.postCreateHook** - Commands to run after worktree creation (multi-value, default: [])
+//! - **workon.hookTimeout** - Timeout in seconds for hook execution (integer, default: 300, 0 = no timeout)
 //! - **workon.copyPattern** - Glob patterns for automatic file copying (multi-value, default: [])
 //! - **workon.copyExclude** - Patterns to exclude from copying (multi-value, default: [])
+//! - **workon.copyIncludeIgnored** - Include git-ignored files when copying (bool, default: true)
 //! - **workon.autoCopy** - Enable automatic file copying in new command (bool, default: false)
 //! - **workon.pruneProtectedBranches** - Branches protected from pruning (multi-value, default: [])
-//! - **workon.prFormat** - Format string for PR-based worktree names (string, default: "pr-{number}")
-//! - **workon.hookTimeout** - Timeout in seconds for hook execution (integer, default: 300, 0 = no timeout)
+//! - **workon.pruneGone** - Treat gone-upstream worktrees as prune candidates by default (bool, default: false)
+//! - **workon.pruneFetch** - Fetch from tracked remotes before evaluating gone status (bool, default: false)
+//! - **workon.stackModel** - Active stack model: "auto", "graphite", or "none" (string, default: "auto")
+//! - **workon.stackWorktreeGranularity** - Worktree granularity for stacked diffs: "stack" (string, default: "stack")
+//! - **workon.gtAutoTrack** - Auto-run `gt track` after `workon new` (bool, default: true)
 //!
 //! ## Example Configuration
 //!

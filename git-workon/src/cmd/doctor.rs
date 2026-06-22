@@ -11,9 +11,18 @@
 //! ### Dependency Checks (once):
 //! - Hook commands not found in PATH (from workon.postCreateHook config)
 //! - gh CLI not available (required for PR workflow features)
+//! - gh CLI not authenticated (PR features require `gh auth login`)
+//! - No git remote configured (PR features require at least one remote)
+//!
+//! ### Configuration Checks (once):
+//! - Renamed config keys (e.g. workon.autoCopyUntracked → workon.autoCopy) — fixable with --fix
+//! - Invalid workon.stackModel or workon.stackWorktreeGranularity values
+//! - Invalid workon.prFormat (missing required `{number}` placeholder)
+//! - workon.defaultBranch set to a branch that does not exist locally
+//! - stackModel=graphite but repo not initialized with `gt init`
 //!
 //! ## Flags:
-//! - `--fix` - Automatically repair fixable issues (missing directory entries)
+//! - `--fix` - Automatically repair fixable issues (missing directory entries, renamed keys)
 //! - `--dry-run` - Preview fixes without applying
 
 use std::path::{Path, PathBuf};
@@ -21,7 +30,10 @@ use std::path::{Path, PathBuf};
 use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
-use workon::{get_repo, get_worktrees, Granularity, StackModel, WorkonConfig, WorktreeDescriptor};
+use workon::{
+    get_repo, get_worktrees, is_graphite_active, preferred_remote_order, Granularity, StackModel,
+    WorkonConfig, WorktreeDescriptor,
+};
 
 use crate::cli::Doctor;
 use crate::output;
@@ -51,11 +63,22 @@ enum IssueKind {
         new_already_set: bool,
     },
     GtNotFound,
+    GhNotAuthenticated,
+    NoRemote,
     InvalidStackConfig {
         key: String,
         value: String,
         reason: String,
     },
+    InvalidConfig {
+        key: String,
+        value: String,
+        reason: String,
+    },
+    DefaultBranchMissing {
+        branch: String,
+    },
+    GraphiteNotInitialized,
 }
 
 struct Issue {
@@ -110,8 +133,21 @@ impl Issue {
             }
             IssueKind::GhNotFound => "gh CLI not found (PR features unavailable)".to_string(),
             IssueKind::GtNotFound => "gt CLI not found (stack features unavailable)".to_string(),
+            IssueKind::GhNotAuthenticated => {
+                "gh is not authenticated — run: gh auth login".to_string()
+            }
+            IssueKind::NoRemote => "no git remote configured (PR features unavailable)".to_string(),
             IssueKind::InvalidStackConfig { key, value, reason } => {
                 format!("'{key} = {value}': {reason}")
+            }
+            IssueKind::InvalidConfig { key, value, reason } => {
+                format!("'{key} = {value}': {reason}")
+            }
+            IssueKind::DefaultBranchMissing { branch } => {
+                format!("configured branch '{branch}' not found in repo")
+            }
+            IssueKind::GraphiteNotInitialized => {
+                "stackModel=graphite but repo not gt-initialized — run: gt init".to_string()
             }
             IssueKind::RenamedConfigKey {
                 old_key,
@@ -143,7 +179,12 @@ impl Issue {
             IssueKind::GhNotFound => "gh_not_found",
             IssueKind::RenamedConfigKey { .. } => "renamed_config_key",
             IssueKind::GtNotFound => "gt_not_found",
+            IssueKind::GhNotAuthenticated => "gh_not_authenticated",
+            IssueKind::NoRemote => "no_remote",
             IssueKind::InvalidStackConfig { .. } => "invalid_stack_config",
+            IssueKind::InvalidConfig { .. } => "invalid_config",
+            IssueKind::DefaultBranchMissing { .. } => "default_branch_missing",
+            IssueKind::GraphiteNotInitialized => "graphite_not_initialized",
         }
     }
 }
@@ -198,11 +239,32 @@ impl Run for Doctor {
         if gh_available() {
             debug!("gh CLI: ok");
             output::check_pass("gh");
+            debug!("checking gh auth status");
+            if gh_authenticated() {
+                debug!("gh auth: ok");
+                output::check_pass("gh auth");
+            } else {
+                debug!("gh not authenticated");
+                let issue = Issue::dependency(IssueKind::GhNotAuthenticated);
+                output::check_warn("gh auth", &issue.message());
+                issues.push(issue);
+            }
         } else {
             debug!("gh CLI not found in PATH");
             let issue = Issue::dependency(IssueKind::GhNotFound);
             output::check_fail("gh", "not found in PATH");
             issues.push(issue);
+        }
+
+        debug!("checking remote configuration");
+        if preferred_remote_order(&repo).is_empty() {
+            debug!("no remotes configured");
+            let issue = Issue::dependency(IssueKind::NoRemote);
+            output::check_warn("remote", &issue.message());
+            issues.push(issue);
+        } else {
+            debug!("remote: ok");
+            output::check_pass("remote");
         }
 
         debug!("checking gt CLI availability");
@@ -314,6 +376,51 @@ impl Run for Doctor {
             issues.push(issue);
         }
 
+        // prFormat validation — flag invalid value as an issue (parity with stackModel)
+        if let Err(e) = config.pr_format(None) {
+            let value = repo
+                .config()
+                .ok()
+                .and_then(|c| c.get_string("workon.prFormat").ok())
+                .unwrap_or_default();
+            let issue = Issue::config(IssueKind::InvalidConfig {
+                key: "workon.prFormat".to_string(),
+                value,
+                reason: e.to_string(),
+            });
+            output::check_fail("workon.prFormat", &issue.message());
+            issues.push(issue);
+        }
+
+        // defaultBranch existence check
+        if let Some(branch) = config.default_branch(None)? {
+            debug!("checking defaultBranch '{branch}' exists");
+            let exists = repo.find_branch(&branch, git2::BranchType::Local).is_ok();
+            if !exists {
+                debug!("defaultBranch '{branch}' not found in repo");
+                let issue = Issue::config(IssueKind::DefaultBranchMissing {
+                    branch: branch.clone(),
+                });
+                output::check_fail("workon.defaultBranch", &issue.message());
+                issues.push(issue);
+            }
+        }
+
+        // Graphite-init mismatch: stackModel=graphite but repo not gt-initialized.
+        // Only emit when gt is on PATH to avoid double-warning with GtNotFound.
+        // is_graphite_active = detect_gt() && is_graphite_repo(), so when gt is available
+        // it reduces to is_graphite_repo() — false means repo hasn't been `gt init`-ed.
+        if gt_available() {
+            if let Ok(StackModel::Graphite) = config.stack_model(None) {
+                if !is_graphite_active(&repo) {
+                    debug!("stackModel=graphite but repo not gt-initialized");
+                    let issue = Issue::config(IssueKind::GraphiteNotInitialized);
+                    output::check_warn("graphite", &issue.message());
+                    issues.push(issue);
+                }
+            }
+        }
+
         debug!("found {} issue(s) total", issues.len());
 
         // JSON output: serialize all collected issues
@@ -342,10 +449,15 @@ impl Run for Doctor {
                         obj["hook"] = json!(hook);
                         obj["command"] = json!(command);
                     }
-                    if let IssueKind::InvalidStackConfig { key, value, reason } = &issue.kind {
+                    if let IssueKind::InvalidStackConfig { key, value, reason }
+                    | IssueKind::InvalidConfig { key, value, reason } = &issue.kind
+                    {
                         obj["key"] = json!(key);
                         obj["value"] = json!(value);
                         obj["reason"] = json!(reason);
+                    }
+                    if let IssueKind::DefaultBranchMissing { branch } = &issue.kind {
+                        obj["branch"] = json!(branch);
                     }
                     if let IssueKind::RenamedConfigKey {
                         old_key,
@@ -549,6 +661,14 @@ fn read_config_entries(
     };
     entries.push(("workon.copyExclude".to_string(), val, src));
 
+    let copy_include_ignored = config.copy_include_ignored(None)?;
+    let src = scalar_source(repo, &git_config, "workon.copyIncludeIgnored");
+    entries.push((
+        "workon.copyIncludeIgnored".to_string(),
+        copy_include_ignored.to_string(),
+        src,
+    ));
+
     let protected = config.prune_protected_branches()?;
     let src = multivar_source(repo, &git_config, "workon.pruneProtectedBranches");
     let val = if protected.is_empty() {
@@ -604,6 +724,18 @@ fn read_config_entries(
     entries.push((
         "workon.gtAutoTrack".to_string(),
         gt_auto_track.to_string(),
+        src,
+    ));
+
+    let prune_gone = config.prune_gone(None)?;
+    let src = scalar_source(repo, &git_config, "workon.pruneGone");
+    entries.push(("workon.pruneGone".to_string(), prune_gone.to_string(), src));
+
+    let prune_fetch = config.prune_fetch(None)?;
+    let src = scalar_source(repo, &git_config, "workon.pruneFetch");
+    entries.push((
+        "workon.pruneFetch".to_string(),
+        prune_fetch.to_string(),
         src,
     ));
 
@@ -671,6 +803,17 @@ fn command_in_path(cmd: &str) -> bool {
 /// Check if the gh CLI is available.
 fn gh_available() -> bool {
     command_in_path("gh")
+}
+
+/// Check if the gh CLI is authenticated (exit 0 from `gh auth status`).
+fn gh_authenticated() -> bool {
+    std::process::Command::new("gh")
+        .args(["auth", "status"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Check if the gt CLI (Graphite) is available.
