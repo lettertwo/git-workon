@@ -1,3 +1,31 @@
+//! Copy command — copy git-untracked files between worktrees.
+//!
+//! Copies files that git doesn't track: git-ignored files (build artifacts, local
+//! config, secrets) and untracked-but-not-staged files. Ignored files are included
+//! by default since they are the primary use case.
+//!
+//! ## Argument resolution
+//!
+//! - `from` and `to` are worktree names resolved as `<root>/<name>`.
+//! - `to` defaults to `"."`, which resolves to the current worktree by stripping
+//!   the worktree-root prefix from CWD and taking the first path component.
+//!
+//! ## Pattern and exclude priority
+//!
+//! - `--pattern` overrides all config patterns for a one-off copy.
+//! - Without `--pattern`, config `workon.copyPattern` values are used (empty = copy everything).
+//! - `--exclude` values are additive with config `workon.copyExclude`.
+//!
+//! ## Copy-on-write optimization
+//!
+//! When the platform supports `clonefile(2)` (macOS APFS), files are copied using
+//! CoW reflinks instead of a full data copy. See ADR-010.
+//!
+//! ## Skipped-file tracing
+//!
+//! Skipped files (excluded, exists-without-`--force`, etc.) are only logged at
+//! `TRACE` level (`-vvv` or `RUST_LOG=trace`).
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use workon::{
     copy_untracked, get_repo, workon_root, CopyOptions, WorkonConfig, WorktreeDescriptor,

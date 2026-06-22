@@ -36,7 +36,7 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 
 - `docs/diagrams/move-flow.md`
 - `docs/adr/015-atomic-move-with-rollback.md`
-- Key source: `git-workon/src/cmd/mv.rs`
+- Key source: `git-workon/src/cmd/move.rs`
 
 ### doctor
 

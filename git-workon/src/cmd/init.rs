@@ -1,3 +1,13 @@
+//! Init command — create a bare repository with an initial worktree in place.
+//!
+//! Initializes a bare repo at the given path (or the current directory), then
+//! creates a worktree for the default branch name detected via `get_default_branch_name`.
+//!
+//! Unlike `clone`, there is no remote: the default branch falls back to the
+//! system or repository-level `init.defaultBranch` config (typically `main`).
+//!
+//! Post-create hooks run after the worktree is created unless `--no-hooks` is passed.
+
 use std::path::PathBuf;
 
 use miette::{Result, WrapErr};

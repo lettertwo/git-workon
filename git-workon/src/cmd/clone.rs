@@ -1,3 +1,23 @@
+//! Clone command — bare-clone a repository and create an initial worktree.
+//!
+//! Clones the repository as a bare repo (worktrees-first layout), then creates a
+//! worktree for the default branch (detected from the remote's HEAD).
+//!
+//! ## Path derivation
+//!
+//! When `path` is omitted, the local directory name is derived from the URL by
+//! taking the last path component and stripping a trailing `.git`.
+//!
+//! ## Post-create hooks
+//!
+//! After the initial worktree is created, `workon.postCreateHook` commands run
+//! inside it. Pass `--no-hooks` to skip.
+//!
+//! ## Error handling
+//!
+//! Both clone and worktree-creation phases clear the progress spinner on failure
+//! so the error is readable, but the partial clone directory is not removed.
+
 use std::path::PathBuf;
 
 use miette::{Result, WrapErr};

@@ -39,6 +39,7 @@ make install-man PREFIX=~/.local
 ```sh
 git workon clone https://github.com/owner/repo
 cd repo/main        # jumps into the default branch worktree
+git workon clone https://github.com/owner/repo --no-hooks   # skip post-create hooks
 ```
 
 ### Initialize a new repository
@@ -46,6 +47,7 @@ cd repo/main        # jumps into the default branch worktree
 ```sh
 git workon init                  # bare init in current directory with initial worktree
 git workon init my-project       # bare init in my-project/ with initial worktree
+git workon init --no-hooks       # skip post-create hooks
 ```
 
 ### Create a new worktree
@@ -54,42 +56,75 @@ git workon init my-project       # bare init in my-project/ with initial worktre
 git workon new                   # interactive: prompts for name, then base branch
 git workon new my-feature        # creates branch + worktree
 git workon new my-feature --base main   # branch from main
+git workon new my-feature -B existing   # attach to existing branch, name dir 'my-feature'
 git workon new my-feature --orphan      # create branch with no parent commits
 git workon new my-feature --detach      # detach HEAD in the new worktree
+git workon new my-feature --copy        # copy local files from base worktree (overrides config)
+git workon new my-feature --no-copy     # skip file copy even if workon.autoCopy=true
+git workon new my-feature --lock        # lock worktree after creation
 git workon #123                  # create worktree from PR #123 (auto-fetches)
 ```
+
+When in a stack worktree, `new` defaults the base branch to the current HEAD branch (so the new branch stacks on top). Pass `--base` to override, or `--no-stack` to disable stack-aware behavior.
+
+When a branch name exists on multiple remotes, `new` prompts you to choose one (suppressed to first-remote by `--no-interactive`).
 
 ### Find an existing worktree
 
 ```sh
 git workon find                  # interactive: fuzzy picker across all worktrees
 git workon find main             # prints path to the 'main' worktree
-git workon my-feature            # shorthand for find (prints path)
-                                 # note: multiple fuzzy matches also trigger the picker
+git workon find feat --dirty     # find a worktree matching 'feat' that has uncommitted changes
+git workon find --clean          # interactive: only clean worktrees
+git workon find --ahead          # interactive: only worktrees with unpushed commits
+git workon find --behind         # interactive: only worktrees behind upstream
+git workon find --gone           # interactive: only worktrees with deleted upstreams
+git workon find --new my-feature # bypass resolution and force a new worktree
+git workon my-feature            # smart-route: find worktree, or create one if branch exists
 ```
+
+The bare `workon <name>` routing: PR reference → `new` (auto-fetch); existing worktree → `find` (navigate); local or remote tracking branch with no worktree → `new` (auto-attach); stack-home + branch in current stack → `checkout` (in-place HEAD switch); no match → `find` (error).
+
+`find` match priority: exact name > fuzzy dir/branch name > interactive picker. Multiple fuzzy matches trigger the picker. When stack-active, the picker shows a tree with `◉` (current), `◎` (exists), `◯` (metadata-only, no worktree). Pressing `Tab` on any item forces creation of a new worktree instead of navigating to an existing one. Selecting a `◯` item automatically routes to `new` to create/attach it.
+
+Status filters suppress the stack tree and use a flat list (metadata-only diffs cannot satisfy worktree-status filters).
 
 ### List worktrees
 
 ```sh
 git workon list                  # all worktrees
 git workon list --dirty          # only worktrees with uncommitted changes
+git workon list --clean          # only worktrees without uncommitted changes
 git workon list --ahead          # worktrees with unpushed commits
+git workon list --behind         # worktrees behind their upstream
 git workon list --gone           # worktrees whose upstream branch was deleted
+git workon list --dirty --ahead  # filters combine with AND logic
 # Note: filters produce a flat list in stack-enabled repos (the tree is suppressed).
 ```
 
 ### Prune stale worktrees
 
+By default, pruning deletes the local branch ref along with the worktree. Use `--keep-branch` to preserve it.
+
 ```sh
 git workon prune                 # interactive: shows candidates, prompts for confirmation
 git workon prune --yes           # skip confirmation prompt (for scripting)
 git workon prune --dry-run       # preview without deleting
-git workon prune my-feature      # prune a specific worktree
+git workon prune my-feature      # prune a specific worktree by name
 git workon prune --gone          # also prune worktrees whose upstream branch is gone
+git workon prune --gone --fetch  # fetch --prune from remotes first so gone status is fresh
 git workon prune --merged        # also prune worktrees merged into the default branch
+git workon prune --merged=release/v2  # merge target other than the default branch
 git workon prune --keep-branch   # prune worktrees but keep local branch refs
-git workon prune --force         # override all safety checks
+git workon prune --allow-dirty   # prune even with uncommitted changes
+git workon prune --allow-unmerged # prune even with unmerged commits
+git workon prune --include-locked # include locked worktrees
+git workon prune --force         # override all safety checks (protection, dirty, unmerged, locked)
 ```
+
+A bare `git workon prune` (no `--gone`) shows a hint if any worktrees have gone upstreams.
+
+Safety checks (skipped with `--force`): protected branches (`workon.pruneProtectedBranches`), default branch, uncommitted changes (tracked files only for `--gone` candidates), unmerged commits, locked worktrees.
 
 ### Rename a worktree
 
@@ -97,6 +132,7 @@ git workon prune --force         # override all safety checks
 git workon move new-name                # rename the current worktree
 git workon move old-name new-name       # rename a specific worktree
 git workon move new-name --dry-run      # preview without renaming
+git workon move new-name --force        # override safety checks (dirty, unpushed, protected)
 ```
 
 ### Diagnose workspace issues
@@ -107,10 +143,22 @@ git workon doctor --fix          # automatically repair fixable issues
 git workon doctor --dry-run      # preview fixes without applying
 ```
 
+Checks performed:
+- **Worktrees**: missing directories, broken git links, gone upstreams
+- **Dependencies**: `gh` CLI (PR features), `gh` auth status, git remote, `gt` CLI (stack features), hook commands in PATH
+- **Configuration**: renamed config keys (auto-fixable), invalid `stackModel`/`stackWorktreeGranularity`, invalid `prFormat`, `defaultBranch` not found in repo, `stackModel=graphite` without `gt init`
+
 ### Copy untracked files between worktrees
 
+Copies git-untracked files (ignored files and untracked-but-not-staged files). The `to` argument defaults to the current worktree when omitted.
+
 ```sh
-git workon copy main my-feature --pattern '.env*'
+git workon copy main                         # copy from 'main' into current worktree
+git workon copy main my-feature              # copy from 'main' into 'my-feature'
+git workon copy main my-feature --pattern '.env*'   # copy only files matching pattern
+git workon copy main my-feature --exclude '.env.prod'  # exclude specific files (additive with config)
+git workon copy main my-feature --force      # overwrite existing files in destination
+git workon copy main my-feature --no-include-ignored   # skip git-ignored files
 ```
 
 ## Shell integration
@@ -138,9 +186,28 @@ eval "$(git workon shell-init zsh)"
 git workon shell-init fish | source
 ```
 
+The shell is auto-detected from `$SHELL` if not specified. Use `--cmd` to change the wrapper function name (default: `workon`):
+
+```sh
+eval "$(git workon shell-init --cmd wt)"   # installs a 'wt' function instead
+```
+
 After setup, `workon <name>` changes your current directory to the worktree, and `workon new <name>` drops you directly into the newly created worktree.
 
-> **Scripting**: pass `--no-interactive` to `find` and `new`, and `--yes` to `prune`, to suppress all prompts.
+> **Scripting**: pass `--no-interactive` to `find` and `new`, and `--yes` to `prune`, to suppress all prompts. Pass `--json` globally to get machine-readable output on success and a `{"error": {...}}` envelope on failure.
+
+## Global flags
+
+These flags are accepted before any subcommand:
+
+| Flag | Effect |
+|------|--------|
+| `--json` | Output results as JSON; errors are `{"error":{"code":…,"message":…}}` |
+| `--no-color` | Disable ANSI color output |
+| `--no-stack` | Disable stack-aware behavior for this invocation |
+| `-v / -q` | Increase/decrease log verbosity (can repeat, e.g. `-vv`) |
+
+`--json` also sets `--no-interactive` for commands that prompt.
 
 ## Man page
 
