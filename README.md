@@ -8,6 +8,12 @@ An opinionated [git worktree][git-worktree] workflow for managing multiple branc
 
 ## Installation
 
+### Homebrew (macOS / Linux)
+
+```sh
+brew install lettertwo/tap/git-workon
+```
+
 ### From crates.io
 
 ```sh
