@@ -9,7 +9,7 @@ license.workspace = true
 name = "git-workon"
 readme = "README.md"
 repository.workspace = true
-version = "0.7.2"
+version = "0.7.3"
 include = [
   "build.rs",
   "src/**/*",

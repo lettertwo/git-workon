@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.7.2...git-workon-lib-v0.7.3) - 2026-06-22
+
+### Other
+
+- *(cli)* update help text, man docs, and doctor coverage
+
 ## [0.7.2](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.7.1...git-workon-lib-v0.7.2) - 2026-06-22
 
 ### Added
