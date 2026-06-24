@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.7.4...git-workon-v0.8.0) - 2026-06-24
+
+### Added
+
+- *(cli)* [**breaking**] replace indented tree with graphite-style lane graph
+
+### Fixed
+
+- *(cli)* checkout branch in host worktree for stack-member find
+
 ## [0.7.4](https://github.com/lettertwo/git-workon/compare/git-workon-v0.7.3...git-workon-v0.7.4) - 2026-06-22
 
 ### Fixed
