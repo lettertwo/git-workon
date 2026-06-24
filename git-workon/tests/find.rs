@@ -185,6 +185,7 @@ fn find_case_insensitive_fuzzy_match() -> Result<(), Box<dyn std::error::Error>>
 
 // --- Interactive PTY tests ---
 
+const ARROW_UP: &[u8] = b"\x1b[A";
 const ARROW_DOWN: &[u8] = b"\x1b[B";
 const ENTER: &[u8] = b"\r";
 const TAB: &[u8] = b"\t";
@@ -597,7 +598,7 @@ fn find_tab_forces_materialize_in_tree_picker() -> Result<(), Box<dyn std::error
     let mut session = spawn_interactive(&feat1_path, &["find"]);
 
     session.expect("Select a worktree")?;
-    session.send(ARROW_DOWN)?; // move cursor from feat-1 to step-2
+    session.send(ARROW_UP)?; // move cursor from feat-1 up to step-2 (tip-on-top: step-2 is above feat-1)
     session.send(TAB)?; // force-materialize step-2
 
     let output = session.expect(expectrl::Eof)?;

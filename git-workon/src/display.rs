@@ -30,19 +30,20 @@
 //!
 //! ### Tree (stack-active) format
 //!
-//! Graphite-style connector tree: `◉` for diffs with a checked-out worktree, `◯` for
-//! metadata-only diffs. `├─` / `└─` at fork points; linear chains use `│` continuation
-//! without extra indent. `← here` marks the current worktree.
+//! Graphite-style lane graph: each stack is one straight vertical lane; the graph grows
+//! horizontally by one column per concurrent sibling stack. `◉`/`◎`/`◯` glyphs encode
+//! worktree state; converging lanes close on the fork node's own row (no connector-only rows).
+//! Display order is tip-on-top, trunk at the bottom. `← here` marks the current worktree.
 //!
 //! ```text
-//! ◉ main             ↑   2m ago  ← here
-//! ├─◯ api-1
-//! │ ◉ api-2          ↑   2h ago
-//! │ ◯ api-3
-//! └─◯ shared  ./base     5d ago
-//!   ├─◯ branch-x
-//!   └─◯ branch-y
-//! ◉ ee/testing           1mo ago
+//! ◯ api-3
+//! ◎ api-2          ↑   2h ago
+//! ◯ api-1
+//! │ ◯ branch-x
+//! │ │ ◯ branch-y
+//! │ ◎─╯ shared  ./base     5d ago
+//! ◉─╯ main             ↑   2m ago  ← here
+//! ◎ ee/testing           1mo ago
 //! ```
 //!
 //! Used by `list` for output and `find` for interactive selection.
@@ -399,6 +400,191 @@ fn subtree_max(own: Option<i64>, children: &[TreeNode]) -> Option<i64> {
     }
 }
 
+// ── Lane graph layout ─────────────────────────────────────────────────────────
+
+/// One row in the tip-on-top lane-graph layout.
+///
+/// Every row corresponds to exactly one [`TreeNode`] — there are no connector-only rows.
+/// The gutter is constructed from `own_lane`, `passthrough_lanes`, and `closing_count`.
+struct LaneRow<'a> {
+    node: &'a TreeNode,
+    /// The lane index this node occupies (0 = leftmost).
+    own_lane: usize,
+    /// Lane indices open at this row that are not this node's lane (rendered as `│ `).
+    passthrough_lanes: Vec<usize>,
+    /// Number of sibling lanes that converge onto this node's row, closing to its right
+    /// (rendered as `─╯`, `─┴─╯`, etc. immediately after the glyph).
+    closing_count: usize,
+}
+
+/// Visual display width of the gutter portion of a lane row.
+///
+/// = passthrough columns (`own_lane × 2`) + glyph width (1) + closing connector (`closing_count × 2`).
+fn lane_gutter_width(own_lane: usize, closing_count: usize) -> usize {
+    own_lane * 2 + GLYPH_WORKTREE.width() + closing_count * 2
+}
+
+/// Visual display width of the full content portion of a lane row
+/// (gutter + space + branch label + optional path annotation).
+fn lane_content_width(own_lane: usize, closing_count: usize, node: &TreeNode) -> usize {
+    let path_extra = node.row.as_ref().and_then(|r| {
+        if r.dir_name != node.branch {
+            Some(2 + 2 + r.dir_name.width()) // "  ./" + dir_name
+        } else {
+            None
+        }
+    });
+    lane_gutter_width(own_lane, closing_count)
+        + 1 // space after glyph/connector
+        + node.branch.width()
+        + path_extra.unwrap_or(0)
+}
+
+/// Render the gutter string for a lane row.
+///
+/// Produces: `(│ | )* glyph [─╯ | ─┴─╯ | …]`
+/// - Each column before `own_lane` renders as `│ ` (passthrough) or `  ` (empty/closed).
+/// - `own_lane` renders as `glyph`.
+/// - If `closing_count > 0`, appends `─`, then `(closing_count − 1) × ┴─`, then `╯`.
+fn render_gutter(
+    own_lane: usize,
+    passthrough_lanes: &[usize],
+    closing_count: usize,
+    glyph: &str,
+) -> String {
+    let pass_set: std::collections::HashSet<usize> = passthrough_lanes.iter().copied().collect();
+    let mut gutter = String::new();
+    for col in 0..own_lane {
+        if pass_set.contains(&col) {
+            gutter.push_str("│ ");
+        } else {
+            gutter.push_str("  ");
+        }
+    }
+    gutter.push_str(glyph);
+    if closing_count > 0 {
+        gutter.push('─');
+        for _ in 0..closing_count - 1 {
+            gutter.push_str("┴─");
+        }
+        gutter.push('╯');
+    }
+    gutter
+}
+
+/// Build lane rows for a forest (tip-on-top; each root is an independent lane block).
+fn build_lane_rows(forest: &[TreeNode]) -> Vec<LaneRow<'_>> {
+    build_lane_rows_impl(forest, &|_: &TreeNode| true)
+}
+
+/// Build lane rows for the visible subset of a forest (fuzzy-filtered picker).
+fn build_lane_rows_filtered<'a>(
+    forest: &'a [TreeNode],
+    query: &str,
+    match_map: &MatchMap,
+) -> Vec<LaneRow<'a>> {
+    let include = |node: &TreeNode| is_node_visible(node, query, match_map);
+    build_lane_rows_impl(forest, &include)
+}
+
+fn build_lane_rows_impl<'a, F>(forest: &'a [TreeNode], include: &F) -> Vec<LaneRow<'a>>
+where
+    F: Fn(&TreeNode) -> bool,
+{
+    let mut rows = Vec::new();
+    for node in forest {
+        if include(node) {
+            let mut next_lane = 1usize; // root occupies lane 0; siblings start at 1
+            emit_lane_rows(node, 0, &[], &mut next_lane, include, &mut rows);
+        }
+    }
+    rows
+}
+
+/// Recursively emit `LaneRow`s for `node` and its subtree (tip-on-top: children first, then node).
+///
+/// - `own_lane`: lane assigned to this node.
+/// - `passthrough_lanes`: lanes open above that pass through this subtree unchanged.
+/// - `next_lane`: shared counter; each new sibling lane claims the next value.
+/// - `include`: returns true when a node (or its subtree) should appear in output.
+fn emit_lane_rows<'a, F>(
+    node: &'a TreeNode,
+    own_lane: usize,
+    passthrough_lanes: &[usize],
+    next_lane: &mut usize,
+    include: &F,
+    rows: &mut Vec<LaneRow<'a>>,
+) where
+    F: Fn(&TreeNode) -> bool,
+{
+    // Visible children only.
+    let visible: Vec<&TreeNode> = node.children.iter().filter(|c| include(c)).collect();
+
+    if visible.is_empty() {
+        rows.push(LaneRow {
+            node,
+            own_lane,
+            passthrough_lanes: passthrough_lanes.to_vec(),
+            closing_count: 0,
+        });
+        return;
+    }
+
+    // Primary child = highest subtree_activity; earlier index wins ties.
+    let primary_idx: Option<usize> = visible
+        .iter()
+        .enumerate()
+        .max_by_key(|(i, c)| (c.subtree_activity, std::cmp::Reverse(*i)))
+        .map(|(i, _)| i);
+
+    // Non-primary children (siblings) each claim a new lane.
+    let siblings: Vec<(&TreeNode, usize)> = visible
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &c)| {
+            if Some(i) == primary_idx {
+                None
+            } else {
+                let lane = *next_lane;
+                *next_lane += 1;
+                Some((c, lane))
+            }
+        })
+        .collect();
+
+    // 1. Emit primary subtree (same lane, same passthrough).
+    if let Some(pi) = primary_idx {
+        emit_lane_rows(
+            visible[pi],
+            own_lane,
+            passthrough_lanes,
+            next_lane,
+            include,
+            rows,
+        );
+    }
+
+    // 2. Emit each sibling's subtree.
+    //    Passthrough for sibling i = passthrough_lanes ∪ {own_lane} ∪ {earlier siblings' lanes}.
+    for (si, &(sib, sib_lane)) in siblings.iter().enumerate() {
+        let mut sib_pass: Vec<usize> = passthrough_lanes.to_vec();
+        sib_pass.push(own_lane);
+        for &(_, lane) in siblings.iter().take(si) {
+            sib_pass.push(lane);
+        }
+        sib_pass.sort_unstable();
+        emit_lane_rows(sib, sib_lane, &sib_pass, next_lane, include, rows);
+    }
+
+    // 3. Emit this node — sibling lanes converge here.
+    rows.push(LaneRow {
+        node,
+        own_lane,
+        passthrough_lanes: passthrough_lanes.to_vec(),
+        closing_count: siblings.len(),
+    });
+}
+
 /// Return the styled glyph for a tree node based on its state.
 ///
 /// Three-state vocabulary:
@@ -446,31 +632,37 @@ pub fn format_tree_lines(
         return (Vec::new(), Vec::new());
     }
 
-    // First pass: collect all (prefix, connector, node) tuples in display order.
-    // This lets us compute the max content width for column alignment.
-    let flat = flatten_tree(forest);
+    // Build lane rows (tip-on-top; each root is an independent block).
+    let flat = build_lane_rows(forest);
 
-    // Compute max width of the "prefix+connector+glyph+label[+path]" portion.
+    // Compute max content width for column alignment.
     let max_content_w = flat
         .iter()
-        .map(|(prefix, connector, node)| content_width(prefix, connector, node))
+        .map(|r| lane_content_width(r.own_lane, r.closing_count, r.node))
         .max()
         .unwrap_or(0);
 
     // Max indicator width across all rows that have worktrees.
     let max_ind_w = flat
         .iter()
-        .filter_map(|(_, _, node)| node.row.as_ref().map(|r| r.indicators.join(" ").width()))
+        .filter_map(|r| {
+            r.node
+                .row
+                .as_ref()
+                .map(|row| row.indicators.join(" ").width())
+        })
         .max()
         .unwrap_or(0);
 
     let mut lines: Vec<String> = Vec::new();
     let mut selection: Vec<String> = Vec::new();
 
-    for (prefix, connector, node) in &flat {
+    for lr in &flat {
+        let node = lr.node;
         let is_active = node.row.as_ref().map(|r| r.is_active).unwrap_or(false);
         let glyph = node_glyph(is_active, node.has_worktree());
         let label = node_label(&node.branch, is_active, node.has_worktree());
+        let gutter = render_gutter(lr.own_lane, &lr.passthrough_lanes, lr.closing_count, &glyph);
 
         // Optional path annotation: dim `./path` only when it differs from branch name.
         let path_ann = node.row.as_ref().and_then(|r| {
@@ -481,8 +673,8 @@ pub fn format_tree_lines(
             }
         });
 
-        // Content column (label + optional path) with padding to align indicators.
-        let this_content_w = content_width(prefix, connector, node);
+        // Padding to align the indicator column.
+        let this_content_w = lane_content_width(lr.own_lane, lr.closing_count, node);
         let content_pad = max_content_w.saturating_sub(this_content_w);
 
         // Indicators column.
@@ -513,14 +705,12 @@ pub fn format_tree_lines(
             String::new()
         };
 
-        // Assemble line: [prefix][connector][glyph] [label][path][pad]  [indicators][ind_pad]  [activity][here]
+        // Assemble line: [gutter] [label][path][pad]  [indicators][ind_pad]  [activity][here]
         let path_str = path_ann.unwrap_or_default();
         let line = if node.row.is_some() {
             format!(
-                "{}{}{} {}{}{}  {}{}  {}{}",
-                prefix,
-                connector,
-                glyph,
+                "{} {}{}{}  {}{}  {}{}",
+                gutter,
                 label,
                 path_str,
                 " ".repeat(content_pad),
@@ -530,8 +720,8 @@ pub fn format_tree_lines(
                 here,
             )
         } else {
-            // Metadata-only: just prefix+connector+glyph+label, no indicator/time columns.
-            format!("{}{}{} {}", prefix, connector, glyph, label,)
+            // Metadata-only: gutter + label, no indicator/time columns.
+            format!("{} {}", gutter, label)
         };
 
         lines.push(line);
@@ -539,82 +729,6 @@ pub fn format_tree_lines(
     }
 
     (lines, selection)
-}
-
-/// Flatten the forest into (prefix_str, connector_str, &TreeNode) tuples in depth-first order.
-///
-/// The connector-line algorithm:
-/// - Root nodes: prefix="", connector=""
-/// - A parent with multiple children uses "├─" (not-last) / "└─" (last) for each child.
-/// - A parent with exactly one child uses "" (no fork char); the child's visual column doesn't
-///   increase — linear chains stay aligned, showing only the ancestor's continuation bar.
-/// - After "├─", the child's `child_prefix = parent_prefix + "│ "`
-/// - After "└─", the child's `child_prefix = parent_prefix + "  "`
-/// - After "" (single child), the child's `child_prefix = parent_prefix + connector_col`
-///   where connector_col is "" (since we're just inheriting the same prefix).
-fn flatten_tree(forest: &[TreeNode]) -> Vec<(String, String, &TreeNode)> {
-    let mut result = Vec::new();
-    for node in forest {
-        flatten_node(node, "", "", &mut result);
-    }
-    result
-}
-
-fn flatten_node<'a>(
-    node: &'a TreeNode,
-    parent_prefix: &str,
-    connector: &str,
-    result: &mut Vec<(String, String, &'a TreeNode)>,
-) {
-    result.push((parent_prefix.to_string(), connector.to_string(), node));
-
-    // Column continuation contributed by this node for its children.
-    // Depends on the connector used to arrive at this node:
-    //   "├─" → "│ "   (continuation bar; another sibling follows)
-    //   "└─" → "  "   (spaces; this was the last sibling)
-    //   ""   → ""     (single child or root; pass through unchanged)
-    let my_col = match connector {
-        "├─" => "│ ",
-        "└─" => "  ",
-        _ => "",
-    };
-    let child_prefix = format!("{}{}", parent_prefix, my_col);
-
-    let n = node.children.len();
-    for (i, child) in node.children.iter().enumerate() {
-        let child_connector = if n > 1 {
-            if i < n - 1 {
-                "├─"
-            } else {
-                "└─"
-            }
-        } else {
-            ""
-        };
-        flatten_node(child, &child_prefix, child_connector, result);
-    }
-}
-
-/// Compute the visual width of the content portion of a tree row
-/// (prefix + connector + glyph + " " + label + optional_path).
-///
-/// Used for column alignment across all rows.
-fn content_width(prefix: &str, connector: &str, node: &TreeNode) -> usize {
-    let path_extra = node.row.as_ref().and_then(|r| {
-        if r.dir_name != node.branch {
-            // "  ./" + dir_name
-            Some(2 + 2 + r.dir_name.width())
-        } else {
-            None
-        }
-    });
-    // prefix + connector + glyph(1) + " "(1) + branch_label + optional_path
-    prefix.width()
-        + connector.width()
-        + GLYPH_WORKTREE.width() // same width as GLYPH_METADATA and GLYPH_ACTIVE
-        + 1 // space after glyph
-        + node.branch.width()
-        + path_extra.unwrap_or(0)
 }
 
 // ── Picker rendering (interactive selection) ─────────────────────────────────
@@ -634,7 +748,7 @@ pub struct PickerRender {
 /// When `query` is empty, all nodes are visible and the cursor is placed on the
 /// active node (current-directory worktree). When `query` is non-empty:
 /// - Non-matching nodes are removed unless they are ancestors of a match.
-/// - Connectors are recomputed over the visible subset (no orphaned `├─`/`└─`).
+/// - Lanes are recomputed over the visible subset (no orphaned gutter segments).
 /// - Matched characters in a label are underlined; non-matched characters in a
 ///   matching label are dimmed; ancestor-only labels are fully dimmed.
 /// - The cursor is placed on the highest-scoring matching node.
@@ -651,8 +765,8 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
     let mut match_map: MatchMap = HashMap::new();
     collect_match_results_tree(forest, query, matcher, &mut match_map);
 
-    // Build a filtered flat list; connectors are recomputed over the visible subset.
-    let flat = flatten_tree_filtered(forest, query, &match_map);
+    // Build lane rows over the visible subset; lanes recomputed for the filtered tree.
+    let flat = build_lane_rows_filtered(forest, query, &match_map);
 
     if flat.is_empty() {
         return PickerRender {
@@ -662,15 +776,20 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
         };
     }
 
-    // Column widths — same approach as format_tree_lines.
+    // Column widths.
     let max_content_w = flat
         .iter()
-        .map(|(prefix, connector, node)| content_width(prefix, connector, node))
+        .map(|r| lane_content_width(r.own_lane, r.closing_count, r.node))
         .max()
         .unwrap_or(0);
     let max_ind_w = flat
         .iter()
-        .filter_map(|(_, _, node)| node.row.as_ref().map(|r| r.indicators.join(" ").width()))
+        .filter_map(|r| {
+            r.node
+                .row
+                .as_ref()
+                .map(|row| row.indicators.join(" ").width())
+        })
         .max()
         .unwrap_or(0);
 
@@ -679,7 +798,8 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
     let mut top_score: Option<i64> = None;
     let mut cursor = 0usize;
 
-    for (i, (prefix, connector, node)) in flat.iter().enumerate() {
+    for (i, lr) in flat.iter().enumerate() {
+        let node = lr.node;
         let direct_match = match_map.get(&node.branch).and_then(|v| v.as_ref());
         let is_ancestor_only = !query.is_empty() && direct_match.is_none();
 
@@ -694,18 +814,17 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
         // Glyph: reflect active/worktree/metadata state regardless of match state.
         let is_active = node.row.as_ref().map(|r| r.is_active).unwrap_or(false);
         let glyph = node_glyph(is_active, node.has_worktree());
+        let gutter = render_gutter(lr.own_lane, &lr.passthrough_lanes, lr.closing_count, &glyph);
 
         // Label: apply match decoration or fall back to normal styling.
         let branch_indices = direct_match
             .map(|(_, idx, _)| idx.as_slice())
             .unwrap_or(&[]);
         let label = if query.is_empty() {
-            // Same as format_tree_lines: active → green+bold, worktree → bold, metadata → dim.
             node_label(&node.branch, is_active, node.has_worktree())
         } else if is_ancestor_only {
             style::dim(&node.branch)
         } else {
-            // Direct match: underline matched chars in the branch name, dim the rest.
             decorate_match(&node.branch, branch_indices)
         };
 
@@ -713,7 +832,6 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
         let path_ann = node.row.as_ref().and_then(|r| {
             if r.dir_name != node.branch {
                 let ann = if query.is_empty() || is_ancestor_only {
-                    // Match original list format: dim "./" only, dir name in default styling.
                     format!("  {}{}", style::dim("./"), r.dir_name.clone())
                 } else {
                     let dir_indices = direct_match
@@ -731,7 +849,7 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
             }
         });
 
-        let this_content_w = content_width(prefix, connector, node);
+        let this_content_w = lane_content_width(lr.own_lane, lr.closing_count, node);
         let content_pad = max_content_w.saturating_sub(this_content_w);
 
         let (ind_str, ind_w) = if let Some(r) = &node.row {
@@ -753,10 +871,8 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
         let path_str = path_ann.unwrap_or_default();
         let line = if node.row.is_some() {
             format!(
-                "{}{}{} {}{}{}  {}{}  {}",
-                prefix,
-                connector,
-                glyph,
+                "{} {}{}{}  {}{}  {}",
+                gutter,
                 label,
                 path_str,
                 " ".repeat(content_pad),
@@ -765,7 +881,7 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
                 activity,
             )
         } else {
-            format!("{}{}{} {}", prefix, connector, glyph, label)
+            format!("{} {}", gutter, label)
         };
 
         lines.push(line);
@@ -776,7 +892,13 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
     if query.is_empty() {
         cursor = flat
             .iter()
-            .position(|(_, _, n)| n.row.as_ref().map(|r| r.is_active).unwrap_or(false))
+            .position(|r| {
+                r.node
+                    .row
+                    .as_ref()
+                    .map(|row| row.is_active)
+                    .unwrap_or(false)
+            })
             .unwrap_or(0);
     }
 
@@ -1010,71 +1132,6 @@ fn is_node_visible(node: &TreeNode, query: &str, match_map: &MatchMap) -> bool {
         .any(|c| is_node_visible(c, query, match_map))
 }
 
-/// Flatten a forest into `(prefix, connector, node)` tuples, skipping non-visible nodes.
-///
-/// Connectors are recomputed over the visible subset so `├─`/`└─` always refer to
-/// real visible siblings — no orphaned connector glyphs.
-fn flatten_tree_filtered<'a>(
-    forest: &'a [TreeNode],
-    query: &str,
-    match_map: &MatchMap,
-) -> Vec<(String, String, &'a TreeNode)> {
-    let mut result = Vec::new();
-    for node in forest {
-        if is_node_visible(node, query, match_map) {
-            flatten_node_filtered(node, "", "", query, match_map, &mut result);
-        }
-    }
-    result
-}
-
-fn flatten_node_filtered<'a>(
-    node: &'a TreeNode,
-    parent_prefix: &str,
-    connector: &str,
-    query: &str,
-    match_map: &MatchMap,
-    result: &mut Vec<(String, String, &'a TreeNode)>,
-) {
-    result.push((parent_prefix.to_string(), connector.to_string(), node));
-
-    // Column continuation — same rules as flatten_node.
-    let my_col = match connector {
-        "├─" => "│ ",
-        "└─" => "  ",
-        _ => "",
-    };
-    let child_prefix = format!("{}{}", parent_prefix, my_col);
-
-    // Only consider visible children; recompute connectors for the visible subset.
-    let visible_children: Vec<&TreeNode> = node
-        .children
-        .iter()
-        .filter(|c| is_node_visible(c, query, match_map))
-        .collect();
-
-    let n = visible_children.len();
-    for (i, child) in visible_children.iter().enumerate() {
-        let child_connector = if n > 1 {
-            if i < n - 1 {
-                "├─"
-            } else {
-                "└─"
-            }
-        } else {
-            ""
-        };
-        flatten_node_filtered(
-            child,
-            &child_prefix,
-            child_connector,
-            query,
-            match_map,
-            result,
-        );
-    }
-}
-
 /// Decorate a label by underlining matched characters and dimming the rest.
 ///
 /// `match_indices` are character (not byte) positions that matched the query.
@@ -1222,22 +1279,22 @@ mod tests {
 
     #[test]
     fn render_tree_empty_query_shows_all_nodes() {
+        // Tip-on-top: child emitted before parent.
         let mut root = leaf("main", false);
         root.children = vec![leaf("feature", false)];
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
-        assert_eq!(result.keys, vec!["main", "feature"]);
+        assert_eq!(result.keys, vec!["feature", "main"]);
     }
 
     #[test]
     fn render_tree_empty_query_cursor_on_active_node() {
-        // Active node is "feature" at depth 1; cursor should point to it.
+        // Active node is "feature"; tip-on-top puts it at index 0.
         let mut root = leaf("main", false);
         root.children = vec![leaf("feature", true)];
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
-        // flat order: main=0, feature=1
-        assert_eq!(result.cursor, 1);
+        assert_eq!(result.cursor, 0);
     }
 
     // ── render_tree: filtered query ───────────────────────────────────────────
@@ -1252,7 +1309,7 @@ mod tests {
     #[test]
     fn render_tree_query_keeps_ancestor_of_matching_descendant() {
         // "main" doesn't match "feat", but "feature" (its child) does.
-        // Both should appear; cursor on the match (feature), not the ancestor.
+        // Both appear; tip-on-top puts feature first, then main (ancestor).
         let mut root = leaf("main", false);
         root.children = vec![leaf("feature", false)];
         let forest = vec![root];
@@ -1285,10 +1342,11 @@ mod tests {
     }
 
     #[test]
-    fn render_tree_connectors_recomputed_for_visible_subset() {
-        // Forest: root → [child-a, child-b, child-c]
-        // Query matches only child-a and child-c; child-b is hidden.
-        // Connectors should be ├─ (child-a) and └─ (child-c), skipping child-b.
+    fn render_tree_lanes_recomputed_for_visible_subset() {
+        // trunk → [child-a, child-b, child-c]; all match "child-".
+        // child-a is primary (index 0), child-b=lane1, child-c=lane2.
+        // Emission order: child-a, child-b, child-c, trunk (trunk last, tip-on-top).
+        // Trunk closes 2 sibling lanes → its line contains "─┴─╯".
         let mut root = meta("trunk");
         root.children = vec![
             leaf("child-a", false),
@@ -1298,21 +1356,19 @@ mod tests {
         let forest = vec![root];
         let result = render_tree(&forest, "child-", &matcher());
 
-        // child-a, child-b, child-c all match "child-" — all visible.
-        // Connector for the last child should be └─.
-        assert_eq!(result.keys.len(), 4); // trunk + 3 children
-        let last_child_line = &result.lines[3];
+        assert_eq!(result.keys, vec!["child-a", "child-b", "child-c", "trunk"]);
+        let trunk_line = result.lines.last().unwrap();
         assert!(
-            last_child_line.contains("└─"),
-            "last visible child should get └─, got: {last_child_line}"
+            trunk_line.contains("─┴─╯"),
+            "trunk with 2 closing sibling lanes should contain ─┴─╯, got: {trunk_line}"
         );
     }
 
     #[test]
-    fn render_tree_connector_correct_when_middle_child_filtered() {
-        // Forest: trunk → [child-a, child-b, child-c]
-        // Query matches only child-a and child-c; child-b is hidden.
-        // After filtering: trunk has 2 visible children → ├─ / └─.
+    fn render_tree_lanes_correct_when_middle_child_filtered() {
+        // trunk → [child-a, unrelated, child-c]; "child" matches child-a and child-c.
+        // After filtering: primary=child-a (lane 0), sibling=child-c (lane 1).
+        // Emission: child-a, child-c, trunk; trunk closes 1 lane → "─╯".
         let mut root = meta("trunk");
         root.children = vec![
             leaf("child-a", false),
@@ -1322,18 +1378,186 @@ mod tests {
         let forest = vec![root];
         let result = render_tree(&forest, "child", &matcher());
 
-        // trunk (ancestor of matches) + child-a + child-c (unrelated filtered out)
-        assert_eq!(result.keys, vec!["trunk", "child-a", "child-c"]);
-        // Two visible children → first gets ├─, last gets └─
+        assert_eq!(result.keys, vec!["child-a", "child-c", "trunk"]);
+        let trunk_line = result.lines.last().unwrap();
         assert!(
-            result.lines[1].contains("├─"),
-            "first of two visible children should get ├─, got: {}",
+            trunk_line.contains("─╯"),
+            "trunk closing 1 sibling lane should contain ─╯, got: {trunk_line}"
+        );
+        // child-c is the sibling lane — its line has passthrough "│ " for trunk's lane.
+        assert!(
+            result.lines[1].contains("│ "),
+            "child-c (sibling lane) should show │ passthrough, got: {}",
             result.lines[1]
         );
+    }
+
+    // ── render_tree: lane graph layout ───────────────────────────────────────
+
+    #[test]
+    fn render_tree_linear_stack_is_single_pillar() {
+        // main → s1 → s2: no siblings, so one straight lane (no │, no ─╯).
+        let mut s1 = leaf("s1", false);
+        s1.children = vec![leaf("s2", false)];
+        let mut root = leaf("main", false);
+        root.children = vec![s1];
+        let forest = vec![root];
+        let result = render_tree(&forest, "", &matcher());
+
+        // Tip-on-top: s2, s1, main
+        assert_eq!(result.keys, vec!["s2", "s1", "main"]);
+        // No passthrough or closing connectors (single lane throughout).
+        for line in &result.lines {
+            assert!(
+                !line.contains("│ "),
+                "linear stack should have no passthrough │, got: {line}"
+            );
+            assert!(
+                !line.contains("─╯"),
+                "linear stack should have no closing ─╯, got: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_tree_sibling_stack_closes_on_trunk_row() {
+        // main → [s1 (primary), shared (sibling lane 1)].
+        // Emission: s1, shared, main.  main's line closes lane 1 → "─╯".
+        let mut root = leaf("main", false);
+        root.children = vec![leaf("s1", false), leaf("shared", false)];
+        let forest = vec![root];
+        let result = render_tree(&forest, "", &matcher());
+
+        assert_eq!(result.keys, vec!["s1", "shared", "main"]);
+        // shared is in lane 1 — its line has "│ " passthrough for lane 0.
         assert!(
-            result.lines[2].contains("└─"),
-            "last of two visible children should get └─, got: {}",
-            result.lines[2]
+            result.lines[1].contains("│ "),
+            "shared (sibling lane) should show │ passthrough, got: {}",
+            result.lines[1]
+        );
+        // main closes lane 1 on its own row.
+        let main_line = result.lines.last().unwrap();
+        assert!(
+            main_line.contains("─╯"),
+            "main should close sibling lane with ─╯, got: {main_line}"
+        );
+    }
+
+    #[test]
+    fn render_tree_mid_stack_fork_closes_on_fork_node() {
+        // main → a1 → a2 → [b1 (primary), c1 (sibling)].
+        // Emission: b1, c1, a2, a1, main.  a2 closes lane 1 → "─╯".
+        let mut a2 = leaf("a2", false);
+        a2.children = vec![leaf("b1", false), leaf("c1", false)];
+        let mut a1 = leaf("a1", false);
+        a1.children = vec![a2];
+        let mut root = leaf("main", false);
+        root.children = vec![a1];
+        let forest = vec![root];
+        let result = render_tree(&forest, "", &matcher());
+
+        assert_eq!(result.keys, vec!["b1", "c1", "a2", "a1", "main"]);
+        let a2_line = &result.lines[2];
+        assert!(
+            a2_line.contains("─╯"),
+            "a2 (fork node) should close sibling lane with ─╯, got: {a2_line}"
+        );
+        // a1 and main are back to a single lane — no passthrough or closing.
+        assert!(
+            !result.lines[3].contains("│ "),
+            "a1 after fork should have no passthrough, got: {}",
+            result.lines[3]
+        );
+    }
+
+    // ── column alignment ─────────────────────────────────────────────────────
+
+    /// Build a leaf with indicators and activity set (for alignment tests).
+    fn leaf_with_data(
+        branch: &str,
+        is_active: bool,
+        indicators: &[&str],
+        activity: &str,
+    ) -> TreeNode {
+        TreeNode {
+            branch: branch.to_string(),
+            row: Some(WorktreeDisplayRow {
+                is_active,
+                dir_name: branch.to_string(),
+                branch_annotation: None,
+                indicators: indicators.iter().map(|s| s.to_string()).collect(),
+                last_activity: activity.to_string(),
+                activity_epoch: Some(0),
+            }),
+            subtree_activity: Some(0),
+            children: vec![],
+        }
+    }
+
+    /// Return the display-column position of `needle` in `haystack`.
+    /// Uses Unicode display widths so multi-byte glyphs (◉, ─, ╯…) count as 1 column.
+    fn display_col_of(haystack: &str, needle: &str, context: &str) -> usize {
+        let byte_pos = haystack
+            .find(needle)
+            .unwrap_or_else(|| panic!("{context}: '{needle}' not found in: {haystack:?}"));
+        haystack[..byte_pos].width()
+    }
+
+    #[test]
+    fn format_tree_lines_indicator_column_aligned_across_lanes() {
+        // Forest: main → [s1 (primary, lane 0), shared (sibling, lane 1)]
+        // Emission order (tip-on-top): s1, shared, main
+        //
+        // s1 gutter  = "◎"     (width 1) → narrow
+        // main gutter = "◉─╯"  (width 3) → wide (closes sibling lane)
+        // shared has no indicators; s1 has "*", main has "↑".
+        //
+        // Despite the different gutter widths, the indicator column must start at
+        // the same byte offset in every row that has indicators.
+        let s1 = leaf_with_data("s1", false, &["*"], "2h ago");
+        let shared = leaf_with_data("shared", false, &[], "3d ago");
+        let mut root = leaf_with_data("main", true, &["↑"], "1d ago");
+        root.children = vec![s1, shared];
+        let forest = vec![root];
+
+        let (lines, _) = format_tree_lines(&forest, true);
+        // lines[0]=s1 (tip), lines[1]=shared (sibling lane), lines[2]=main (trunk)
+        assert_eq!(lines.len(), 3, "expected 3 rows");
+
+        let s1_ind_col = display_col_of(&lines[0], "*", "s1");
+        let main_ind_col = display_col_of(&lines[2], "↑", "main");
+        assert_eq!(
+            s1_ind_col, main_ind_col,
+            "indicator column must be aligned:\ns1:   {:?}\nmain: {:?}",
+            lines[0], lines[2]
+        );
+    }
+
+    #[test]
+    fn format_tree_lines_activity_column_aligned_across_lanes() {
+        // Same setup as above; also verify the activity strings start at the same offset.
+        let s1 = leaf_with_data("s1", false, &["*"], "2h ago");
+        let shared = leaf_with_data("shared", false, &[], "3d ago");
+        let mut root = leaf_with_data("main", true, &["↑"], "1d ago");
+        root.children = vec![s1, shared];
+        let forest = vec![root];
+
+        let (lines, _) = format_tree_lines(&forest, true);
+        assert_eq!(lines.len(), 3);
+
+        // Activity strings are unique enough to find directly.
+        let s1_act_col = display_col_of(&lines[0], "2h ago", "s1");
+        let shared_act_col = display_col_of(&lines[1], "3d ago", "shared");
+        let main_act_col = display_col_of(&lines[2], "1d ago", "main");
+        assert_eq!(
+            s1_act_col, shared_act_col,
+            "activity column must align between s1 and shared:\ns1:     {:?}\nshared: {:?}",
+            lines[0], lines[1]
+        );
+        assert_eq!(
+            s1_act_col, main_act_col,
+            "activity column must align between s1 and main:\ns1:   {:?}\nmain: {:?}",
+            lines[0], lines[2]
         );
     }
 

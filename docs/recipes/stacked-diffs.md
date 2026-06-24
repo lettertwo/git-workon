@@ -79,17 +79,32 @@ job.
 git workon list
 ```
 
-Stack-active output shows a graphite-style tree with three glyphs:
+Stack-active output shows a Graphite-style lane graph with three glyphs:
 
 - `◉` green — the active worktree (your current directory)
 - `◎` plain — a worktree exists but is not current
 - `◯` dim — metadata-only diff (stack branch with no worktree)
 
+Display order is **tip-on-top**: the tip of each stack appears at the top, the
+trunk at the bottom. Each stack is one straight vertical lane; sibling stacks fan
+out to the right and converge back on the fork node's own row (no extra connector
+lines).
+
 ```
-◎ main                        1 day ago
-◯ auth-step-1
-◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
 ◯ auth-step-3
+◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
+◯ auth-step-1
+◎ main                        1 day ago
+```
+
+With a sibling stack branching off `main`:
+
+```
+◯ auth-step-3
+◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
+◯ auth-step-1
+│ ◎ other-feature              3 days ago
+◎─╯ main                       1 day ago
 ```
 
 `← here` marks the worktree that contains the current directory. When the worktree

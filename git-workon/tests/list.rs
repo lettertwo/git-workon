@@ -895,10 +895,16 @@ fn list_tree_renders_connector_lines_for_forking_stack() -> Result<(), Box<dyn s
             .stdout,
     )?;
 
-    // At the fork, both ├─ and └─ should appear.
+    // shared has two children (branch-x primary lane, branch-y sibling lane).
+    // shared closes the sibling lane on its own row: expect "─╯".
     assert!(
-        stdout.contains("├─") && stdout.contains("└─"),
-        "fork connectors ├─ and └─ must appear for branching stacks: {stdout}"
+        stdout.contains("─╯"),
+        "fork-node row must close sibling lane with ─╯: {stdout}"
+    );
+    // branch-y is in the sibling lane — its row should have a │ passthrough.
+    assert!(
+        stdout.contains("│ "),
+        "sibling-lane row must show │ passthrough: {stdout}"
     );
     // All four branches should be present.
     for name in ["main", "shared", "branch-x", "branch-y"] {
