@@ -323,8 +323,9 @@ fn find_interactive_arrow_key_navigation() -> Result<(), Box<dyn std::error::Err
 #[test]
 fn find_falls_back_to_stack_branch_when_no_worktree_match() -> Result<(), Box<dyn std::error::Error>>
 {
-    // "feat-1" is a worktree. "step-2" is only a branch in feat-1's stack.
-    // Searching for "step-2" should fall back to returning the "feat-1" worktree.
+    // "feat-1" is a worktree. "step-2" is only a branch in feat-1's stack (no worktree).
+    // Searching for "step-2" should navigate to the feat-1 worktree *and* check out
+    // step-2 in place, so the user lands on the correct branch.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -350,6 +351,56 @@ fn find_falls_back_to_stack_branch_when_no_worktree_match() -> Result<(), Box<dy
         stdout.contains("feat-1"),
         "expected feat-1 worktree path in output: {stdout}"
     );
+
+    // The host worktree must now be on step-2, not still on feat-1.
+    let feat1_path = fixture.root()?.join("feat-1");
+    let feat1_repo = git2::Repository::open(&feat1_path)?;
+    feat1_repo.assert(predicate::repo::head_matches("step-2"));
+
+    Ok(())
+}
+
+/// Selecting a ◯ metadata-only diff in the interactive picker checks out that
+/// branch inside its stack-home worktree instead of just navigating there.
+///
+/// Stack: main → feat-1 (worktree) → step-2 (◯, no worktree).
+/// Running find from `feat-1` (◉ active), the cursor starts at feat-1; one
+/// ArrowUp moves to step-2 (tip-on-top: step-2 is above feat-1). Enter should
+/// print feat-1's path *and* leave feat-1's HEAD on step-2.
+#[test]
+fn find_picker_enter_on_metadata_diff_checks_out_branch() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-1")
+        .config("workon.stackModel", "graphite")
+        .branch_metadata("feat-1", "main")
+        .branch_metadata("step-2", "feat-1")
+        .build()?;
+
+    // Run from feat-1 so it is the active (◉) worktree; cursor starts there.
+    // step-2 is the next tree item (one ArrowUp away, tip-on-top order).
+    let feat1_path = fixture.root()?.join("feat-1");
+    let mut session = spawn_interactive(&feat1_path, &["find"]);
+
+    session.expect("Select a worktree")?;
+    session.send(ARROW_UP)?; // move to step-2 (above feat-1 in tip-on-top order)
+    session.send(ENTER)?;
+
+    let output = session.expect(expectrl::Eof)?;
+    let selected = last_line(output.get(0).unwrap());
+
+    assert!(
+        selected.contains("feat-1"),
+        "Expected feat-1 worktree path in output, got: {selected}"
+    );
+
+    // feat-1's HEAD must now be step-2.
+    let feat1_path = fixture.root()?.join("feat-1");
+    let feat1_repo = git2::Repository::open(&feat1_path)?;
+    feat1_repo.assert(predicate::repo::head_matches("step-2"));
 
     Ok(())
 }

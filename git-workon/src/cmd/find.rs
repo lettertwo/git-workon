@@ -54,12 +54,34 @@ use workon::{
     WorktreeDescriptor,
 };
 
-use crate::cli::{Find, New};
+use crate::cli::{Checkout, Find, New};
 use crate::cmd::filter::StatusFilter;
 use crate::display::{build_tree, render_flat, render_tree, worktree_display_row};
 use crate::picker::{self, PickerAction};
 
 use super::Run;
+
+/// Move into `host_wt` and check out `branch` in place.
+///
+/// Delegates to [`Checkout::run`] so conflict-shelving and restore-on-return
+/// are included — identical to the `Resolution::Checkout` path in routing.
+fn checkout_in_host(
+    find: &Find,
+    host_wt: &WorktreeDescriptor,
+    branch: &str,
+) -> Result<Option<WorktreeDescriptor>> {
+    let host = host_wt
+        .name()
+        .ok_or_else(|| miette::miette!("host worktree has no name"))?
+        .to_string();
+    Checkout {
+        branch: branch.to_string(),
+        host_worktree: host,
+        no_stack: find.no_stack,
+        no_interactive: find.no_interactive,
+    }
+    .run()
+}
 
 impl Run for Find {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
@@ -151,55 +173,75 @@ impl Run for Find {
 
                 // 3. Stack-member fallback (stack-active only, when paths 1+2 find nothing).
                 //
-                // When a branch exists only in stack metadata (no worktree), navigating to
-                // the worktree that owns the containing stack is the expected behavior.
-                // Uses Skim fuzzy (same as path 2) so case-sensitivity and scoring are uniform.
+                // When a branch exists only in stack metadata (no worktree), we must both
+                // navigate to the worktree that owns the containing stack *and* check out
+                // the target branch in place. Uses Skim fuzzy (same as path 2) so
+                // case-sensitivity and scoring are uniform.
+                //
+                // Each entry is (worktree_index, best_matched_diff, best_score).
                 let is_stack_fallback =
                     scored.is_empty() && effective_model != workon::StackModel::None;
-                let stack_indices: Vec<usize> = if is_stack_fallback {
+                let stack_matches: Vec<(usize, String, i64)> = if is_stack_fallback {
                     debug!("No Skim match, searching stack members for '{}'", name);
                     fields
                         .iter()
                         .enumerate()
-                        .filter(|(_, (_, branch))| {
-                            let Some(head) = branch.as_deref() else {
-                                return false;
-                            };
-                            matches!(
-                                current_stack(&repo, head, effective_model),
-                                Ok(Some(ref s)) if s.diffs.iter().any(|b| {
-                                    matcher.fuzzy_match(b, name).is_some()
+                        .filter_map(|(i, (_, branch))| {
+                            let head = branch.as_deref()?;
+                            let stack =
+                                current_stack(&repo, head, effective_model).ok().flatten()?;
+                            // Find the highest-scoring diff in this worktree's stack.
+                            stack
+                                .diffs
+                                .iter()
+                                .filter_map(|b| {
+                                    matcher.fuzzy_match(b, name).map(|s| (i, b.clone(), s))
                                 })
-                            )
+                                .max_by_key(|(_, _, s)| *s)
                         })
-                        .map(|(i, _)| i)
                         .collect()
                 } else {
                     vec![]
                 };
 
-                let match_indices: Vec<usize> = if is_stack_fallback {
-                    stack_indices
-                } else {
-                    scored.into_iter().map(|(_, i)| i).collect()
-                };
+                if is_stack_fallback {
+                    match stack_matches.len() {
+                        0 => bail!("No matching worktree found for '{}'", name),
+                        1 => {
+                            let (idx, branch, _) = stack_matches.into_iter().next().unwrap();
+                            return checkout_in_host(self, worktrees.get(idx).unwrap(), &branch);
+                        }
+                        _ => {
+                            if self.no_interactive {
+                                bail!(
+                                    "Multiple stacks contain branches matching '{}'. Use full branch name or remove --no-interactive.",
+                                    name
+                                );
+                            }
+                            let match_indices: Vec<usize> =
+                                stack_matches.into_iter().map(|(i, _, _)| i).collect();
+                            let matched: Vec<WorktreeDescriptor> = worktrees
+                                .into_iter()
+                                .enumerate()
+                                .filter(|(i, _)| match_indices.contains(i))
+                                .map(|(_, wt)| wt)
+                                .collect();
+                            return select_from_tree(self, matched, picker_model, &repo);
+                        }
+                    }
+                }
+
+                let match_indices: Vec<usize> = scored.into_iter().map(|(_, i)| i).collect();
 
                 match match_indices.len() {
                     0 => bail!("No matching worktree found for '{}'", name),
                     1 => Ok(Some(worktrees.into_iter().nth(match_indices[0]).unwrap())),
                     _ => {
                         if self.no_interactive {
-                            if is_stack_fallback {
-                                bail!(
-                                    "Multiple stacks contain branches matching '{}'. Use full branch name or remove --no-interactive.",
-                                    name
-                                );
-                            } else {
-                                bail!(
-                                    "Multiple worktrees match '{}'. Use full name or remove --no-interactive.",
-                                    name
-                                );
-                            }
+                            bail!(
+                                "Multiple worktrees match '{}'. Use full name or remove --no-interactive.",
+                                name
+                            );
                         }
                         let matched: Vec<WorktreeDescriptor> = worktrees
                             .into_iter()
@@ -309,11 +351,11 @@ fn select_from_tree(
         }
 
         // No direct match — selected_branch is a ◯ metadata-only diff.
-        // If another worktree's stack contains it, return that worktree (granularity=Stack).
+        // Navigate to its stack home worktree and check out the branch in place.
         for (idx, stack_opt) in stacks.iter().enumerate() {
             if let Some(stack) = stack_opt {
                 if stack.diffs.contains(&selected_branch) {
-                    return Ok(Some(worktrees.into_iter().nth(idx).unwrap()));
+                    return checkout_in_host(find, &worktrees[idx], &selected_branch);
                 }
             }
         }
