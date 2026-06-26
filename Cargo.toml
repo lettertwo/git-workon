@@ -45,7 +45,7 @@ supports-color = "3"
 expectrl = "0.9"
 fuzzy-matcher = "0.3"
 pathdiff = "0.2.3"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde_json = "1.0"
 serial_test = "3"
 thiserror = "2.0.18"
