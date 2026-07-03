@@ -1,55 +1,45 @@
-# 014 — Three-Phase Prune with Safety Checks
+# 014 — Prune: Always-On Analysis with an Interactive Picker
+
+> Supersedes the original three-phase design (candidate collection gated by
+> `--gone`/`--merged`, list+confirm, and a gone-upstream hint). The safety-check
+> ordering and override flags are unchanged; what changed is *visibility* and the
+> interaction model.
 
 ## Context
 
-Pruning worktrees is destructive and hard to undo: it deletes the working directory and removes the git worktree registration. Users may have uncommitted work, unmerged commits, or be working on a protected branch. We needed a design that is safe by default but scriptable with explicit overrides.
+Pruning worktrees is destructive and hard to undo: it deletes the working directory and removes the git worktree registration. The original design gated *visibility* of gone/merged worktrees behind `--gone`/`--merged`, treated named worktrees as fundamentally different from filtered ones, and surfaced a "gone upstream" hint on every bare run — three separate mental models for what is ultimately one question: "what's stale, and is it safe to delete?"
+
+v2 collapses this into one analysis pipeline that always runs in full, with `--gone`/`--merged`/naming only changing what's *pre-selected*, and an interactive multi-select picker replacing the list+confirm flow and the hint.
 
 ## Decision
 
-`prune` operates in four sequential phases (Phase 0 is optional):
+**Analysis is always total.** Every worktree in scope is evaluated for all three signals — `BranchDeleted`, `RemoteGone`, `Merged(target)` — plus safety state (dirty, unmerged, locked, protected). `--gone` and `--merged` no longer gate whether a worktree is considered; they only decide whether its signal counts as **active** (pre-checked / auto-pruned). `BranchDeleted` is always active. Fetch stays opt-in (`--fetch` / `workon.pruneFetch`); without it, gone annotations use cached refs, which can only under-report.
 
-**Phase 0 (optional) — Prune-fetch**: When `--fetch` is passed or `workon.pruneFetch = true`, prune-fetches from all remotes tracked by worktree branches (`git fetch --prune <remote>`). This deletes stale `refs/remotes/<remote>/*` entries, making "gone upstream" detection accurate. On failure (network error, auth failure, unknown remote), a warning is emitted and the phase continues with cached refs — a failed fetch can only cause under-pruning, never a false prune. `--no-fetch` suppresses the config-enabled behaviour for one run.
+**Scope**: bare `prune` considers every worktree except the default one, and only rows carrying at least one signal are shown. `prune <name>...` narrows the scope to exactly those worktrees (matched by worktree name or branch name) — nothing else is shown or touched. Any name that doesn't match is a hard error (`workon::prune::names_not_found`, nonzero exit) listing every miss, before anything is deleted. A named worktree with no signal at all still shows up, annotated "not prunable" — naming is how a healthy tree gets pulled into view — but it needs `--force` to actually be pruned (there's no affirmative reason otherwise). A named worktree that does carry a real issue (dirty, or unmerged commits) is not "healthy" and only needs the matching override (`--allow-dirty`/`--allow-unmerged`), not `--force`. The default worktree is excluded from the candidate pool unconditionally — naming it is an unmatched-name error even with `--force`.
 
-**Phase 1 — Candidate collection**: Builds the list of worktrees to consider. Explicit names come from positional arguments (reason: `Explicit`). Filter-based candidates come from: branches that no longer exist locally (`BranchDeleted`), worktrees whose upstream is gone when `--gone` is active (`RemoteGone`, using `WorktreeDescriptor::has_gone_upstream()`), or worktrees merged into a target with `--merged` flag (`Merged(target)`).
+**Safety checks** run in the same order as before, and are unaffected by whether a signal is "active": protected branch, locked worktree, dirty (uncommitted changes — `RemoteGone`-only rows use `has_tracked_changes()` instead of `is_dirty()`), unmerged commits (skipped entirely for any row carrying a signal, since the signal already implies the work was handled). `--force` disables all of them at once; `--allow-dirty`, `--allow-unmerged`, and `--include-locked` disable one each.
 
-Gone-upstream behaviour:
-- `--gone` / `workon.pruneGone = true` — include `RemoteGone` candidates (default: off)
-- `--no-gone` — suppress the config-enabled behaviour for one run
-- `--gone` and `--fetch` are independent: `--gone` alone uses cached refs; add `--fetch` to refresh first
+**Interaction model** picks one of three paths:
 
-Bare `prune` (no `--gone`) surfaces any gone-upstream worktrees as a non-destructive notice at the end, suggesting `--gone` (and `--fetch` if not already enabled). This hint is suppressed in `--json` mode.
+- **Interactive** (TTY, and none of `--yes`/`--json`/`--dry-run`): a custom checkbox picker (`picker::multi_select`, sharing the `find` picker's terminal loop) lists every selectable row in the find/list visual language — dim `./` + bold dir name, colored status indicators, dim activity time, plus a dim trailing prune annotation. Checkboxes reuse the project glyph vocabulary: `◉` (green) selected, `◯` (dim) unselected; `Space` toggles the cursor row, `a` toggles all, `Enter` confirms, `Esc` cancels. Locked-out rows — protected/locked, not overridden — are printed above the picker in the same row format with the guard reason (the picker has no per-item disable, so they simply aren't picker rows). Rows are pre-checked exactly where they'd be auto-pruned non-interactively, so Enter-Enter reproduces the old safe default. After selection, one summary confirm ("N worktree(s) and their branches will be deleted") replaces the old list-then-confirm and folds in orphaned-stash and dirty/unmerged-selection warnings.
+- **`--dry-run`**: prints the same annotated analysis — pre-checked / selectable / locked-out, each with its signals — and exits. No picker, no deletion.
+- **Non-interactive** (`--yes`, `--json`, or no TTY): bare mode prunes exactly the pre-checked set (unchanged from the old `--yes` behavior). Named mode prunes named worktrees when safe, per the rules above.
 
-**Phase 2 — Safety checks**: Each candidate passes through five ordered checks. If any check fails (and `--force` is not set), the candidate is moved to the "skipped" list with a reason:
-
-1. Protected branch (`workon.pruneProtectedBranches`)
-2. Default worktree
-3. Locked worktree — skip unless `--force` or `--include-locked`. Skip reason: `"locked (use --include-locked to override)"`.
-4. Dirty (uncommitted changes) — override with `--allow-dirty`. `RemoteGone` candidates use `has_tracked_changes()` instead of `is_dirty()`, so untracked files (build artifacts, IDE dirs) do not block pruning.
-5. Unmerged commits — override with `--allow-unmerged` (skipped for `BranchDeleted`, `Merged`, and `RemoteGone` candidates)
-
-**Phase 3 — Execution**: Displays skipped and to-prune lists, then (unless `--dry-run`) confirms interactively or proceeds with `--yes`. Execution removes the directory with `fs::remove_dir_all`, calls `worktree.prune()`, then deletes the local branch ref (unless `--keep-branch`).
-
-`--force` disables all five safety checks simultaneously. JSON mode skips interactive confirmation and prints a structured result.
-
-## Gone Detection Consolidation
-
-The "gone upstream" check is defined once in `WorktreeDescriptor::has_gone_upstream()` (`git-workon-lib/src/worktree.rs`). This is the same method used by `find --gone` and `list --gone`. An earlier private `is_upstream_gone()` in `prune.rs` was stricter (required both `branch.<n>.remote` and `branch.<n>.merge`) and inconsistent with the other commands; it has been removed.
+`--json` extends the existing envelope (`pruned`/`skipped`/`dry_run`) with a `signals` array per entry; `--dry-run --json` populates `pruned` with the would-be-pruned set and leaves `dry_run: true` without deleting anything, same as before.
 
 ## Consequences
 
-- Safe by default: dirty, unmerged, or locked worktrees are never silently deleted.
-- Gone detection is only accurate after a prune-fetch; the hint and `--gone` behaviour on stale refs can only under-prune, never false-prune.
-- `--gone` and `--fetch` are orthogonal: users control network I/O explicitly.
-- Config keys `workon.pruneGone` and `workon.pruneFetch` (both default false) let users opt into the behaviours permanently without typing extra flags each run.
-- Phases are independent: safety checks always run even for explicitly named worktrees.
-- `--force` is a single escape hatch rather than five separate `--no-*` flags, keeping the interface simple.
-- `BranchDeleted` and `Merged` candidates skip the "unmerged commits" check because the branch state already implies the work is handled.
-- `RemoteGone` candidates skip the "unmerged commits" check and use `has_tracked_changes()` for the dirty check, reducing false positives from untracked files.
-- Branch cleanup is default behavior: local branch refs are deleted after pruning unless `--keep-branch` is passed.
+- One mental model: "is there a signal, and is it active" replaces separate gating for gone/merged/explicit.
+- The gone-upstream hint is gone; `--dry-run` is the always-available way to see what's stale without deleting it.
+- Breaking UX change: bare `prune <name>` used to warn-and-skip an unmatched name and still prune whatever else matched; it now hard-errors and touches nothing.
+- Breaking UX change: `prune <name>` combined with `--gone`/`--merged` used to also sweep in filter-matched worktrees; naming now strictly narrows, never adds.
+- Fetch narrows to remotes tracked by named worktrees when names are given, reducing unnecessary network calls.
+- The interactive experience moves from "read a static list, type y/n" to "toggle checkboxes, confirm once" — more control, at the cost of one more keystroke for the default case (still just Enter, Enter).
 
 ## References
 
-- `docs/diagrams/prune-flow.md` — full phase flowchart
-- `git-workon/src/cmd/prune.rs` — `PruneReason`, `PruneCandidate`, all phases
+- `docs/diagrams/prune-flow.md` — full flow diagram
+- `git-workon/src/cmd/prune.rs` — `Signal`, `PruneRow`, `classify`, `run_interactive`
 - `git-workon-lib/src/fetch.rs` — `remotes_tracked_by_worktrees`, `prune_fetch`
 - `git-workon-lib/src/config.rs` — `WorkonConfig::prune_gone`, `WorkonConfig::prune_fetch`
+- `git-workon-lib/src/error.rs` — `PruneError::NamesNotFound`

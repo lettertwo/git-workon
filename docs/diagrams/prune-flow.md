@@ -1,99 +1,103 @@
-# Prune Command (3-Phase)
+# Prune Command (Always-On Analysis + Picker)
 
-`prune` removes stale worktrees in three sequential phases: candidate collection, safety filtering, and execution. Phases are independent — safety checks always run even for explicitly named worktrees.
+`prune` runs one analysis pass over every worktree in scope, then dispatches to one of three interaction modes. `--gone`/`--merged` only decide which signals are "active" (pre-checked / auto-pruned); they never hide a row from the analysis.
 
 ```mermaid
 flowchart TD
-    START([git workon prune]) --> SETUP["get_repo()\nget_worktrees()\nload WorkonConfig\nload pruneProtectedBranches"]
+    START([git workon prune]) --> SETUP["get_repo()\nget_worktrees()\nload WorkonConfig + pruneProtectedBranches\nresolve effective_gone / effective_fetch"]
 
-    subgraph PHASE1["Phase 1 — Candidate Collection"]
-        P1A["explicit names\n(positional args)"]
-        P1B["filter-based discovery\n(worktrees not in explicit list)"]
+    SETUP --> SCOPE{names given?}
+    SCOPE -->|no| POOL["scope = every worktree\nexcept the default one"]
+    SCOPE -->|yes| MATCH["match each name by\nworktree name or branch name\n(against the same pool, default excluded)"]
+    MATCH --> MISS{any name\nunmatched?}
+    MISS -->|yes| ERR["hard error: PruneError::NamesNotFound\nlists ALL misses — nothing touched\nnonzero exit"]
+    MISS -->|no| NAMED["scope = exactly the matched worktrees"]
 
-        P1A --> EXP_SCAN["for each name:\nfind worktree by name or branch\n→ PruneReason::Explicit"]
-        EXP_SCAN --> EXP_WARN["warn if not found"]
+    POOL --> FETCH
+    NAMED --> FETCH
 
-        P1B --> BRANCH_EXISTS{branch\nstill exists?}
-        BRANCH_EXISTS -->|no| CAND_DELETED["PruneReason::BranchDeleted\n(always candidate)"]
-        BRANCH_EXISTS -->|yes + --gone| UPSTREAM_GONE{upstream\ngone?}
-        UPSTREAM_GONE -->|yes| CAND_GONE["PruneReason::RemoteGone"]
-        UPSTREAM_GONE -->|no| SKIP_P1["skip (not a candidate)"]
-        BRANCH_EXISTS -->|yes + --merged| MERGED_CHECK{is_merged_into\ntarget?}
-        MERGED_CHECK -->|yes| CAND_MERGED["PruneReason::Merged(target)"]
-        MERGED_CHECK -->|no| SKIP_P1
-        BRANCH_EXISTS -->|"yes, no flags"| SKIP_P1
+    subgraph FETCH0["Phase 0 (optional) — Prune-fetch"]
+        FETCH{effective_fetch?}
+        FETCH -->|yes| REMOTES["remotes tracked by scope\n(narrowed to named worktrees\nwhen names given)"]
+        REMOTES --> DOFETCH["git fetch --prune per remote\nfailure: warn + continue on cached refs"]
+        FETCH -->|no| ANALYZE
+        DOFETCH --> ANALYZE
     end
 
-    SETUP --> PHASE1
-    PHASE1 --> PHASE2
-
-    subgraph PHASE2["Phase 2 — Safety Checks (per candidate)"]
-        S1{protected\nbranch?}
-        S1 -->|"yes + !force"| SKIP_PROTECTED["skip: protected\nby pruneProtectedBranches"]
-        S1 -->|no or force| S2
-
-        S2{is default\nbranch?}
-        S2 -->|"yes + !force"| SKIP_DEFAULT["skip: is default worktree"]
-        S2 -->|no or force| S2B
-
-        S2B{"is_locked?\nTODO(agent-integration)"}
-        S2B -->|"yes + !force + !include_locked"| SKIP_LOCKED["skip: locked\nuse --include-locked"]
-        S2B -->|no or overridden| S3
-
-        S3{"is_dirty?\n(RemoteGone: has_tracked_changes?)"}
-        S3 -->|"yes + !force + !allow_dirty"| SKIP_DIRTY["skip: uncommitted changes\nuse --allow-dirty"]
-        S3 -->|no or overridden| S4
-
-        S4{unmerged commits?\nAND NOT BranchDeleted\nAND NOT Merged reason\nAND NOT RemoteGone}
-        S4 -->|"yes + !force + !allow_unmerged"| SKIP_UNMERGED["skip: unmerged commits\nuse --allow-unmerged"]
-        S4 -->|no or overridden| KEEP["→ to_prune list"]
+    subgraph ANALYSIS["Analysis — every row in scope, always"]
+        ANALYZE["build_row() per worktree:\nsignals: BranchDeleted | RemoteGone | Merged(target)\n+ protected / locked / dirty / unmerged"]
+        ANALYZE --> VISIBLE{bare mode?}
+        VISIBLE -->|yes| FILTERSIG["keep only rows with >=1 signal"]
+        VISIBLE -->|no named| KEEPALL["keep every named row\n(signal or not)"]
     end
 
-    PHASE2 --> PHASE3
+    FILTERSIG --> DISPATCH
+    KEEPALL --> DISPATCH
 
-    subgraph PHASE3["Phase 3 — Execution"]
-        J{json mode?}
-        J -->|yes| JSON_EXEC["execute (unless --dry-run)\nprint JSON: {pruned, skipped, dry_run}"]
-        J -->|no| TEXT_MODE
-
-        TEXT_MODE --> SHOW_SKIP["display skipped worktrees\nwith reasons"]
-        SHOW_SKIP --> EMPTY2{to_prune\nempty?}
-        EMPTY2 -->|yes| MSG_NONE["print: no worktrees to prune"]
-        EMPTY2 -->|no| SHOW_LIST["display worktrees to prune\n(name, branch, reason)"]
-
-        SHOW_LIST --> DRY{--dry-run?}
-        DRY -->|yes| MSG_DRY["print: dry run — no changes"]
-        DRY -->|no| CONFIRM{--yes?}
-
-        CONFIRM -->|no| DIALOG["dialoguer::Confirm\n'Prune N worktree(s)?'"]
-        DIALOG -->|confirmed| EXEC
-        DIALOG -->|denied| MSG_CANCEL["print: cancelled"]
-        CONFIRM -->|yes| EXEC
-
-        EXEC["for each candidate:\n1. fs::remove_dir_all(path)\n2. repo.find_worktree(name)\n3. worktree.prune(valid=true)\n4. delete local branch ref\n   (unless --keep-branch)"]
-        EXEC --> MSG_OK["print: pruned N worktree(s)"]
+    subgraph DISPATCH_BLOCK["Dispatch"]
+        DISPATCH{mode?}
+        DISPATCH -->|--dry-run, !json| DRYTEXT["render annotated table:\n[pre-checked] / [selectable] / [locked out]\nwith signals — no deletion"]
+        DISPATCH -->|TTY && !yes && !json && !dry-run| PICKER
+        DISPATCH -->|--yes / --json / no TTY| CLASSIFY
     end
 
-    PHASE3 --> DONE(["Ok(None)"])
+    subgraph PICKER_BLOCK["Interactive picker"]
+        PICKER["locked-out rows (protected/locked,\nnot overridden) -> printed list, not selectable"]
+        PICKER --> MULTI["picker::multi_select over selectable rows\n(find/list row style + dim prune annotation;\nspace: toggle, a: all, enter: confirm)\ndefaults = pre-checked per active-criteria + safety"]
+        MULTI --> SUMMARY["one summary confirm:\n'N worktree(s) and their branches will be deleted'\n+ dirty/unmerged + orphaned-stash warnings"]
+        SUMMARY -->|confirmed| EXEC
+        SUMMARY -->|declined| CANCEL(["Cancelled"])
+    end
+
+    subgraph CLASSIFY_BLOCK["classify(): to_prune vs skipped"]
+        CLASSIFY{named?}
+        CLASSIFY -->|no| ACTIVE{signal active?\nBranchDeleted always;\nRemoteGone iff --gone;\nMerged iff --merged}
+        ACTIVE -->|no| DROP["not a candidate\n(not shown, not skipped)"]
+        ACTIVE -->|yes| SAFETY
+        CLASSIFY -->|yes| HEALTHY{healthy?\nno signal AND !dirty AND !unmerged}
+        HEALTHY -->|yes, !force| SKIP_HEALTHY["skipped: not prunable\n(no signal); use --force"]
+        HEALTHY -->|yes, force| SAFETY
+        HEALTHY -->|no| SAFETY
+
+        SAFETY["blocked_reason(): protected -> locked -> dirty -> unmerged\n(each overridable: --force / --include-locked / --allow-dirty / --allow-unmerged)"]
+        SAFETY -->|blocked| SKIP_SAFETY["skipped: reason"]
+        SAFETY -->|clear| TOPRUNE["to_prune"]
+    end
+
+    subgraph EXEC_BLOCK["Execution"]
+        EXEC["for each: remove_dir_all\nworktree.prune()\ndelete local branch ref\n(unless --keep-branch or BranchDeleted signal)"]
+        EXEC --> ORPHAN["warn per orphaned stash\n(collect_orphaned_stashes)"]
+    end
+
+    TOPRUNE --> JSONQ{--json?}
+    JSONQ -->|yes| JSONOUT["emit {pruned, skipped, dry_run}\neach entry includes 'signals'\ndry-run: list without deleting"]
+    JSONQ -->|no| CONFIRM{--yes?}
+    CONFIRM -->|no| DIALOG["dialoguer::Confirm\n(only reachable non-TTY, no --yes)"]
+    DIALOG -->|confirmed| EXEC
+    DIALOG -->|denied| CANCEL
+    CONFIRM -->|yes| EXEC
+
+    EXEC --> DONE(["Ok(None)"])
+    JSONOUT --> DONE
+    DRYTEXT --> DONE
+    ERR --> DONE2(["Err — nonzero exit"])
 ```
 
-## PruneReason variants
+## Signal reference
 
-| Reason | Source | Unmerged check? |
+| Signal | Meaning | Active when |
 |---|---|---|
-| `Explicit` | user-named argument | yes (checked against default branch) |
-| `BranchDeleted` | local branch ref missing | skipped (work already handled) |
-| `RemoteGone` | `--gone` flag, upstream ref missing | skipped (upstream gone implies work is pushed or abandoned) |
-| `Merged(target)` | `--merged`, `is_merged_into()` returned true | skipped (already verified) |
+| `BranchDeleted` | local branch ref no longer exists | always |
+| `RemoteGone` | upstream tracking ref is gone (`has_gone_upstream()`) | `--gone` / `workon.pruneGone` |
+| `Merged(target)` | `is_merged_into(target)` — target is `--merged=BRANCH` or the default branch | `--merged` passed (with or without a value) |
 
-## Force flag
-
-`--force` is a single override that disables all five safety checks simultaneously: protected, default-branch, locked, dirty, and unmerged. It does not affect JSON mode or dry-run behavior.
-
-`--include-locked` opts in to pruning locked worktrees without disabling other safety checks (TODO(agent-integration): implement with `--lock` / `is_locked()`).
+A row can carry more than one signal (e.g. a fresh worktree off the default branch is always trivially `Merged(default)`). `reason_display()`/`annotate()` join every signal present, not just the active ones.
 
 ## Key files
 
-- `git-workon/src/cmd/prune.rs` — all three phases, `PruneReason`, `PruneCandidate`, `is_upstream_gone()`, `is_protected()`
-- `git-workon-lib/src/worktree.rs` — `WorktreeDescriptor::is_dirty()`, `has_tracked_changes()`, `is_merged_into()`, `has_gone_upstream()`
-- `git-workon-lib/src/config.rs` — `prune_protected_branches()`, `is_protected()`
+- `git-workon/src/cmd/prune.rs` — `Signal`, `PruneRow`, `build_row`, `classify`, `is_prechecked`, `run_interactive`, `render_dry_run`, `emit_json`
+- `git-workon/src/picker.rs` — `multi_select` (checkbox pick loop shared with the `find` picker's terminal handling)
+- `git-workon/src/display.rs` — `worktree_display_row`, `format_aligned_rows_annotated` (find/list row style + trailing prune annotation)
+- `git-workon-lib/src/worktree.rs` — `is_dirty()`, `has_tracked_changes()`, `is_merged_into()`, `has_gone_upstream()`, `is_locked()`
+- `git-workon-lib/src/config.rs` — `prune_protected_branches()`, `prune_gone()`, `prune_fetch()`
+- `git-workon-lib/src/error.rs` — `PruneError::NamesNotFound`

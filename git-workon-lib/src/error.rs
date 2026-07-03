@@ -58,6 +58,11 @@ pub enum WorkonError {
     #[error(transparent)]
     #[diagnostic(forward(0))]
     Checkout(#[from] CheckoutError),
+
+    /// Prune-related errors
+    #[error(transparent)]
+    #[diagnostic(forward(0))]
+    Prune(#[from] PruneError),
 }
 
 /// Repository-specific errors
@@ -363,6 +368,17 @@ pub enum CheckoutError {
     #[error("Checkout aborted")]
     #[diagnostic(code(workon::checkout::aborted))]
     Aborted,
+}
+
+/// Prune-related errors
+#[derive(Error, Diagnostic, Debug)]
+pub enum PruneError {
+    #[error("worktree(s) not found: {}", .names.join(", "))]
+    #[diagnostic(
+        code(workon::prune::names_not_found),
+        help("Use 'git workon list' to see available worktrees")
+    )]
+    NamesNotFound { names: Vec<String> },
 }
 
 /// File copy errors

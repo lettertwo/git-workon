@@ -158,6 +158,20 @@ pub fn format_indicators(indicators: &[String]) -> String {
 /// worktree (used by `list`). When false, the marker column is omitted (used by
 /// interactive selection where the cursor serves as the active indicator).
 pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool) -> Vec<String> {
+    format_aligned_rows_annotated(rows, show_active_marker, &[])
+}
+
+/// Like [`format_aligned_rows`], appending a dim trailing annotation per row.
+///
+/// `annotations` is parallel to `rows`; an empty string (or missing entry) means no
+/// annotation for that row. Used by the prune picker to show signal/state notes
+/// (e.g. `branch deleted`, `merged into main`, `not prunable`) in the same visual
+/// language as the `find`/`list` rows.
+pub fn format_aligned_rows_annotated(
+    rows: &[WorktreeDisplayRow],
+    show_active_marker: bool,
+    annotations: &[String],
+) -> Vec<String> {
     if rows.is_empty() {
         return Vec::new();
     }
@@ -192,6 +206,12 @@ pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool
                 .map(|ann| format!("  {}", style::dim(ann)))
                 .unwrap_or_default();
 
+            let annotation = annotations
+                .get(i)
+                .filter(|a| !a.is_empty())
+                .map(|a| format!("  {}", style::dim(a)))
+                .unwrap_or_default();
+
             if show_active_marker {
                 let marker = if row.is_active {
                     style::green("→")
@@ -199,7 +219,7 @@ pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool
                     " ".to_string()
                 };
                 format!(
-                    "{} {}{}{} {}{}  {}{}",
+                    "{} {}{}{} {}{}  {}{}{}",
                     marker,
                     prefix,
                     name,
@@ -208,10 +228,11 @@ pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool
                     " ".repeat(indicators_pad),
                     activity,
                     branch,
+                    annotation,
                 )
             } else {
                 format!(
-                    "{}{}{} {}{}  {}{}",
+                    "{}{}{} {}{}  {}{}{}",
                     prefix,
                     name,
                     " ".repeat(name_pad),
@@ -219,6 +240,7 @@ pub fn format_aligned_rows(rows: &[WorktreeDisplayRow], show_active_marker: bool
                     " ".repeat(indicators_pad),
                     activity,
                     branch,
+                    annotation,
                 )
             }
         })
@@ -1602,5 +1624,57 @@ mod tests {
         // Both "grapple" and "apple" match "app"; apple should score higher (prefix)
         // and the cursor should land on it even though grapple comes first in list.
         assert_eq!(result.keys[result.cursor], "apple");
+    }
+
+    // ── format_aligned_rows_annotated ─────────────────────────────────────────
+
+    #[test]
+    fn format_aligned_rows_annotated_appends_annotation() {
+        let rows = vec![flat_row("feature", false)];
+        let lines = format_aligned_rows_annotated(&rows, false, &["branch deleted".to_string()]);
+        assert!(
+            lines[0].ends_with("branch deleted"),
+            "annotation should be appended at the end of the row, got: {:?}",
+            lines[0]
+        );
+        assert!(lines[0].starts_with("./feature"));
+    }
+
+    #[test]
+    fn format_aligned_rows_annotated_empty_annotation_matches_plain() {
+        // An empty annotation string (and a missing entry) must render identically
+        // to the un-annotated formatter.
+        let rows = vec![flat_row("feature", false), flat_row("other", false)];
+        let plain = format_aligned_rows(&rows, false);
+        let annotated = format_aligned_rows_annotated(&rows, false, &[String::new()]);
+        assert_eq!(plain, annotated);
+    }
+
+    #[test]
+    fn format_aligned_rows_annotated_preserves_name_alignment() {
+        // The annotation is trailing-only: the name/indicator columns must still be
+        // aligned across rows of different name widths.
+        let mut short = flat_row("a", false);
+        short.indicators = vec!["*".to_string()];
+        short.last_activity = "1h ago".to_string();
+        let mut long = flat_row("long-name", false);
+        long.indicators = vec!["*".to_string()];
+        long.last_activity = "2h ago".to_string();
+        let rows = vec![short, long];
+
+        let lines = format_aligned_rows_annotated(
+            &rows,
+            false,
+            &["gone".to_string(), "not prunable".to_string()],
+        );
+        let col_a = display_col_of(&lines[0], "*", "short row");
+        let col_b = display_col_of(&lines[1], "*", "long row");
+        assert_eq!(
+            col_a, col_b,
+            "indicator column must stay aligned:\nshort: {:?}\nlong:  {:?}",
+            lines[0], lines[1]
+        );
+        assert!(lines[0].ends_with("gone"));
+        assert!(lines[1].ends_with("not prunable"));
     }
 }

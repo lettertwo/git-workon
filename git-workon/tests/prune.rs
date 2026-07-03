@@ -544,7 +544,6 @@ fn prune_merged_with_specific_target() -> Result<(), Box<dyn std::error::Error>>
         .arg("--yes")
         .assert()
         .success()
-        .stderr(predicate::str::contains("default worktree"))
         .stderr(predicate::str::contains("Pruned 1 worktree"))
         .stderr(predicate::str::contains("merged into develop"));
 
@@ -777,7 +776,10 @@ fn prune_single_named_worktree() -> Result<(), Box<dyn std::error::Error>> {
         .assert()
         .success()
         .stderr(predicate::str::contains("Pruned 1 worktree"))
-        .stderr(predicate::str::contains("explicitly requested"));
+        // A worktree fresh off the default branch has no unique commits, so it is
+        // trivially "merged into main" — that signal is always computed and shown,
+        // even though naming bypasses the --merged flag gate.
+        .stderr(predicate::str::contains("merged into main"));
 
     // Verify feature-1 is gone, feature-2 still exists
     fixture
@@ -836,7 +838,41 @@ fn prune_multiple_named_worktrees() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_duplicate_names_prune_once() -> Result<(), Box<dyn std::error::Error>> {
+    // Repeating a name must dedupe to a single prune, not fail on the second pass
+    // after the first deregistered the worktree.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("feature")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::missing());
+    fixture.assert(predicate::repo::has_worktree("feature").not());
+    fixture.assert(predicate::repo::has_branch("feature").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_narrows_never_additive() -> Result<(), Box<dyn std::error::Error>> {
+    // Naming strictly narrows the scope: an unnamed worktree with a deleted branch
+    // (which would be a bare-mode candidate) must NOT be swept in just because some
+    // other worktree was named on the same invocation.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -847,10 +883,10 @@ fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error:
 
     let repo = fixture.repo()?;
 
-    // Delete feature-2 branch to make it a filter candidate
+    // Delete feature-2's branch — a bare-mode candidate, but not named here.
     repo.find_reference("refs/heads/feature-2")?.delete()?;
 
-    // Prune feature-1 by name AND all worktrees with deleted branches
+    // Prune feature-1 by name only.
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
@@ -859,9 +895,9 @@ fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error:
         .arg("--yes")
         .assert()
         .success()
-        .stderr(predicate::str::contains("Pruned 2 worktree"));
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
 
-    // Verify feature-1 and feature-2 are gone, feature-3 still exists
+    // Verify feature-1 is gone, feature-2 and feature-3 are untouched.
     fixture
         .root()?
         .child("feature-1")
@@ -869,7 +905,7 @@ fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error:
     fixture
         .root()?
         .child("feature-2")
-        .assert(predicate::path::missing());
+        .assert(predicate::path::is_dir());
     fixture
         .root()?
         .child("feature-3")
@@ -880,13 +916,14 @@ fn prune_named_worktree_combined_with_filter() -> Result<(), Box<dyn std::error:
 
 #[test]
 fn prune_named_worktree_not_found() -> Result<(), Box<dyn std::error::Error>> {
+    // An unmatched name is a hard error (nonzero exit) — nothing is touched, even if
+    // other names on the same invocation did match.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
         .worktree("feature-1")
         .build()?;
 
-    // Try to prune non-existent worktree
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
@@ -894,13 +931,43 @@ fn prune_named_worktree_not_found() -> Result<(), Box<dyn std::error::Error>> {
         .arg("does-not-exist")
         .arg("--yes")
         .assert()
-        .success()
+        .failure()
         .stderr(predicate::str::contains(
-            "Warning: worktree 'does-not-exist' not found",
-        ))
-        .stderr(predicate::str::contains("No worktrees to prune"));
+            "worktree(s) not found: does-not-exist",
+        ));
 
     // Verify feature-1 still exists
+    fixture
+        .root()?
+        .child("feature-1")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_worktree_lists_all_misses() -> Result<(), Box<dyn std::error::Error>> {
+    // Multiple unmatched names are all listed together, and even a name that DOES
+    // match is left untouched because the whole invocation fails before pruning.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-1")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature-1")
+        .arg("missing-one")
+        .arg("missing-two")
+        .arg("--yes")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing-one"))
+        .stderr(predicate::str::contains("missing-two"));
+
     fixture
         .root()?
         .child("feature-1")
@@ -1025,7 +1092,7 @@ fn prune_named_worktree_dry_run() -> Result<(), Box<dyn std::error::Error>> {
         .arg("--dry-run")
         .assert()
         .success()
-        .stderr(predicate::str::contains("Worktrees to prune"))
+        .stderr(predicate::str::contains("Prune analysis"))
         .stderr(predicate::str::contains("feature"))
         .stderr(predicate::str::contains("Dry run - no changes made"));
 
@@ -1137,14 +1204,17 @@ fn prune_force_overrides_unmerged_check() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
-fn prune_force_overrides_default_branch() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_default_worktree_never_matches_even_with_force() -> Result<(), Box<dyn std::error::Error>>
+{
+    // The default worktree is excluded from the candidate pool entirely — "never
+    // appears" is unconditional, unlike the protected/locked guards which --force can
+    // override. Naming it is therefore an unmatched-name error even with --force.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
         .worktree("main")
         .build()?;
 
-    // Prune default branch worktree with --force
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
@@ -1153,11 +1223,11 @@ fn prune_force_overrides_default_branch() -> Result<(), Box<dyn std::error::Erro
         .arg("--force")
         .arg("--yes")
         .assert()
-        .success()
-        .stderr(predicate::str::contains("Pruned 1 worktree"));
+        .failure()
+        .stderr(predicate::str::contains("worktree(s) not found: main"));
 
-    // Verify main worktree is gone
-    fixture.cwd()?.assert(predicate::path::missing());
+    // Verify main worktree still exists
+    fixture.cwd()?.assert(predicate::path::is_dir());
 
     Ok(())
 }
@@ -1538,7 +1608,10 @@ fn spawn_interactive(cwd: &Path, args: &[&str]) -> Session<OsProcess, OsStream> 
 }
 
 #[test]
-fn prune_interactive_confirm_yes() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_interactive_picker_confirm_yes() -> Result<(), Box<dyn std::error::Error>> {
+    // The picker replaces the old list+confirm flow: Enter accepts the pre-checked
+    // defaults (a fresh multi-select with nothing toggled), then a single summary
+    // confirm finalizes the deletion.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -1548,12 +1621,16 @@ fn prune_interactive_confirm_yes() -> Result<(), Box<dyn std::error::Error>> {
     let feature_dir = fixture.cwd()?;
     feature_dir.assert(predicate::path::is_dir());
 
-    // Delete the branch to make it a prune candidate
+    // Delete the branch to make it a prune candidate (active by default: no flags needed)
     let repo = fixture.repo()?;
     repo.find_reference("refs/heads/feature")?.delete()?;
 
     let mut session = spawn_interactive(fixture.as_ref(), &["prune"]);
 
+    session.expect("Select worktrees to prune")?;
+    // Rows render in the find/list style with a dim trailing prune annotation.
+    session.expect("branch deleted")?;
+    session.send("\r")?;
     session.expect("Prune 1 worktree")?;
     session.send("y\r")?;
 
@@ -1566,7 +1643,7 @@ fn prune_interactive_confirm_yes() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
-fn prune_interactive_confirm_no() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_interactive_picker_confirm_no() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -1576,12 +1653,13 @@ fn prune_interactive_confirm_no() -> Result<(), Box<dyn std::error::Error>> {
     let feature_dir = fixture.cwd()?;
     feature_dir.assert(predicate::path::is_dir());
 
-    // Delete the branch to make it a prune candidate
     let repo = fixture.repo()?;
     repo.find_reference("refs/heads/feature")?.delete()?;
 
     let mut session = spawn_interactive(fixture.as_ref(), &["prune"]);
 
+    session.expect("Select worktrees to prune")?;
+    session.send("\r")?;
     session.expect("Prune 1 worktree")?;
     session.send("n\r")?;
 
@@ -1593,12 +1671,44 @@ fn prune_interactive_confirm_no() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// --- Gone hint tests ---
+#[test]
+fn prune_interactive_picker_space_deselects() -> Result<(), Box<dyn std::error::Error>> {
+    // Space toggles the pre-checked row off; Enter with nothing selected exits
+    // without a confirm prompt and without deleting anything.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let feature_dir = fixture.cwd()?;
+    feature_dir.assert(predicate::path::is_dir());
+
+    let repo = fixture.repo()?;
+    repo.find_reference("refs/heads/feature")?.delete()?;
+
+    let mut session = spawn_interactive(fixture.as_ref(), &["prune"]);
+
+    session.expect("Select worktrees to prune")?;
+    session.send(" ")?;
+    session.send("\r")?;
+    session.expect("No worktrees selected")?;
+
+    session.expect(expectrl::Eof)?;
+
+    // Verify worktree directory still exists
+    feature_dir.assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+// --- Dry-run analysis tests (replaces the old gone-hint tests: annotations are now
+// always visible via --dry-run instead of a hint appended to a bare, non-dry run) ---
 
 #[test]
-fn prune_bare_shows_hint_for_gone_upstreams() -> Result<(), Box<dyn std::error::Error>> {
-    // A worktree whose upstream tracking ref is manually deleted (simulates a prune-fetch
-    // having run) should surface as a hint on bare prune, not be pruned automatically.
+fn prune_dry_run_annotates_prechecked_signal() -> Result<(), Box<dyn std::error::Error>> {
+    // A gone-upstream worktree is always shown by --dry-run, annotated with its
+    // signal, whether or not --gone is active.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -1607,142 +1717,114 @@ fn prune_bare_shows_hint_for_gone_upstreams() -> Result<(), Box<dyn std::error::
         .upstream("feature", "origin/feature")
         .build()?;
 
-    // Delete the remote-tracking ref to make the branch look "gone"
     fixture
         .repo()?
         .find_reference("refs/remotes/origin/feature")?
         .delete()?;
 
-    // Bare prune (no --gone): should NOT prune the worktree
+    // Without --gone: shown but only "selectable" (not an active criterion yet).
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
-        .arg("--yes")
+        .arg("--dry-run")
         .assert()
         .success()
-        .stderr(predicate::str::contains("No worktrees to prune"))
-        .stderr(predicate::str::contains("gone upstreams"))
-        .stderr(predicate::str::contains("--gone"));
+        .stderr(predicate::str::contains("[selectable]"))
+        .stderr(predicate::str::contains("remote gone"));
 
-    // Verify worktree still exists
+    // With --gone: the same row becomes pre-checked.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--gone")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[pre-checked]"))
+        .stderr(predicate::str::contains("remote gone"));
+
+    // Nothing was touched by either dry run.
     fixture.cwd()?.assert(predicate::path::is_dir());
 
     Ok(())
 }
 
 #[test]
-fn prune_bare_no_hint_when_no_gone_upstreams() -> Result<(), Box<dyn std::error::Error>> {
-    // When no worktrees have gone upstreams, the hint should not appear.
+fn prune_dry_run_bare_hides_signal_less_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    // Bare mode's dry-run table only ever includes rows carrying a signal — a freshly
+    // created worktree with no unique history (trivially merged, but that's the same
+    // as any other worktree) still carries a Merged signal, so exercise the "nothing
+    // to show" branch with a worktree deep enough that even Merged can't apply: the
+    // default worktree, which is excluded outright.
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
-        .worktree("feature")
         .build()?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
-        .arg("--yes")
+        .arg("--dry-run")
         .assert()
         .success()
-        .stderr(predicate::str::contains("gone upstreams").not());
+        .stderr(predicate::str::contains("No worktrees to prune"));
 
     Ok(())
 }
 
 #[test]
-fn prune_hint_mentions_fetch_when_fetch_not_active() -> Result<(), Box<dyn std::error::Error>> {
-    // The hint should recommend --fetch when fetch is not already enabled.
+fn prune_dry_run_named_shows_healthy_worktree_as_not_prunable(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A named worktree with a divergent, unmerged commit carries no signal but is not
+    // "healthy" either (it has real unmerged work) — the annotation should say so
+    // rather than "not prunable".
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
-        .remote("origin", "/dev/null")
         .worktree("feature")
-        .upstream("feature", "origin/feature")
         .build()?;
 
     fixture
-        .repo()?
-        .find_reference("refs/remotes/origin/feature")?
-        .delete()?;
+        .commit("feature")
+        .file("feature.txt", "feature")
+        .create("Feature commit")?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
         .current_dir(&fixture)
         .arg("prune")
-        .arg("--yes")
+        .arg("feature")
+        .arg("--dry-run")
         .assert()
         .success()
-        .stderr(predicate::str::contains("--fetch"));
+        .stderr(predicate::str::contains("[selectable]"))
+        .stderr(predicate::str::contains("unmerged"));
 
     Ok(())
 }
 
 #[test]
-fn prune_hint_no_fetch_mention_when_fetch_flag_used() -> Result<(), Box<dyn std::error::Error>> {
-    // When --fetch was actually run this invocation, the hint should not mention --fetch
-    // (the refs were just refreshed, so suggesting it again is noise). We can test this
-    // by verifying the hint IS present (gone upstream found) but --fetch is NOT mentioned.
-    // We use a local fixture as the remote so the fetch actually succeeds.
-    let upstream = FixtureBuilder::new()
-        .bare(true)
-        .default_branch("main")
-        .build()?;
-
-    let local = FixtureBuilder::new()
-        .bare(true)
-        .default_branch("main")
-        .remote("origin", &upstream)
-        .worktree("feature")
-        .upstream("feature", "origin/feature")
-        .build()?;
-
-    // Delete the remote-tracking ref manually to simulate a gone upstream
-    // (the fetch to our local upstream won't create it since upstream never had it)
-    local
-        .repo()?
-        .find_reference("refs/remotes/origin/feature")?
-        .delete()?;
-
-    let mut prune_cmd = cargo_bin_cmd!("git-workon");
-    prune_cmd
-        .current_dir(&local)
-        .arg("prune")
-        .arg("--fetch")
-        .arg("--yes")
-        .assert()
-        .success()
-        // hint is present (gone upstream found) but --fetch not mentioned since we just ran it
-        .stderr(predicate::str::contains("gone upstreams"))
-        .stderr(predicate::str::contains("--fetch").not());
-
-    Ok(())
-}
-
-#[test]
-fn prune_hint_suppressed_in_json_mode() -> Result<(), Box<dyn std::error::Error>> {
-    // The gone hint must not appear in JSON mode (structured output only).
+fn prune_dry_run_json_includes_signals() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
-        .remote("origin", "/dev/null")
         .worktree("feature")
-        .upstream("feature", "origin/feature")
         .build()?;
 
     fixture
         .repo()?
-        .find_reference("refs/remotes/origin/feature")?
+        .find_reference("refs/heads/feature")?
         .delete()?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     let output = prune_cmd
         .current_dir(&fixture)
         .arg("prune")
+        .arg("--dry-run")
         .arg("--json")
-        .arg("--yes")
         .output()?;
 
     assert!(
@@ -1750,11 +1832,108 @@ fn prune_hint_suppressed_in_json_mode() -> Result<(), Box<dyn std::error::Error>
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8(output.stderr)?;
-    assert!(
-        !stderr.contains("gone upstreams"),
-        "hint should not appear in JSON mode"
-    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
+    assert_eq!(json["dry_run"], serde_json::json!(true));
+    let pruned = json["pruned"].as_array().expect("pruned should be array");
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0]["branch_deleted"], serde_json::json!(false));
+    let signals = pruned[0]["signals"]
+        .as_array()
+        .expect("signals should be array");
+    assert!(signals.iter().any(|s| s.as_str() == Some("branch deleted")));
+
+    // Nothing was actually pruned.
+    fixture.cwd()?.assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_healthy_worktree_skipped_without_force() -> Result<(), Box<dyn std::error::Error>> {
+    // A named worktree with no signal, no dirty changes, and nothing unmerged (i.e.
+    // trivially caught up with the default branch) is "healthy" — naming it pulls it
+    // into view, but it still needs --force to actually be pruned.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--merged=develop-does-not-exist")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Skipped"))
+        .stderr(predicate::str::contains("not prunable"))
+        .stderr(predicate::str::contains("No worktrees to prune"));
+
+    fixture.cwd()?.assert(predicate::path::is_dir());
+
+    // --force prunes it anyway.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--merged=develop-does-not-exist")
+        .arg("--force")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture.cwd()?.assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_fetch_narrows_to_named_remotes() -> Result<(), Box<dyn std::error::Error>> {
+    // Naming a worktree narrows the prune-fetch to remotes tracked by that worktree
+    // only — an unreachable remote tracked solely by an un-named worktree must not be
+    // contacted (and therefore must not produce a fetch-failure warning).
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .remote("unreachable", "git://192.0.2.1/does-not-exist.git")
+        .worktree("feature")
+        .upstream("feature", "origin/feature")
+        .worktree("other")
+        .upstream("other", "unreachable/other")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/heads/feature")?
+        .delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("feature")
+        .arg("--fetch")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("could not fetch unreachable").not())
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture
+        .root()?
+        .child("feature")
+        .assert(predicate::path::missing());
+    fixture
+        .root()?
+        .child("other")
+        .assert(predicate::path::is_dir());
 
     Ok(())
 }

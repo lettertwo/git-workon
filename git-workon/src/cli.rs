@@ -250,22 +250,32 @@ pub struct Prune {
     #[allow(dead_code)]
     pub json: bool,
 
-    /// Specific worktree names to prune
+    /// Narrow pruning to these worktrees (matched by name or branch); any name that
+    /// doesn't match is an error. A named worktree with no prune signal still shows up
+    /// (as "not prunable") and can be pruned with --force.
     pub names: Vec<String>,
-    #[arg(short = 'n', long, help = "Preview removals without applying them")]
+    #[arg(
+        short = 'n',
+        long,
+        help = "Preview the annotated analysis without applying it"
+    )]
     pub dry_run: bool,
-    #[arg(short, long, help = "Skip confirmation prompts")]
+    #[arg(
+        short,
+        long,
+        help = "Skip the picker and confirmation; prune the pre-checked default selection"
+    )]
     pub yes: bool,
     #[arg(
         long,
         conflicts_with = "no_gone",
-        help = "Prune worktrees where the remote tracking branch is gone (see also workon.pruneGone)"
+        help = "Treat gone-upstream worktrees as an active criterion: pre-checked in the picker, auto-pruned with --yes (see also workon.pruneGone)"
     )]
     pub gone: bool,
     #[arg(
         long,
         conflicts_with = "gone",
-        help = "Do not prune gone-upstream worktrees, even if workon.pruneGone is true"
+        help = "Do not treat gone-upstream worktrees as active, even if workon.pruneGone is true"
     )]
     pub no_gone: bool,
     #[arg(
@@ -286,7 +296,7 @@ pub struct Prune {
         num_args = 0..=1,
         default_missing_value = "",
         require_equals = false,
-        help = "Also prune worktrees merged into BRANCH (or default branch)"
+        help = "Treat merged-into-BRANCH (or default branch) as an active criterion: pre-checked in the picker, auto-pruned with --yes"
     )]
     pub merged: Option<String>,
     #[arg(

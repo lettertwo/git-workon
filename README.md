@@ -110,16 +110,16 @@ git workon list --dirty --ahead  # filters combine with AND logic
 
 ### Prune stale worktrees
 
-By default, pruning deletes the local branch ref along with the worktree. Use `--keep-branch` to preserve it.
+`prune` always analyzes every worktree in scope for every signal (branch deleted, remote gone, merged into target) — `--gone`/`--merged` don't hide anything, they just decide what counts as an *active* criterion for pre-checking and auto-pruning. A branch-deleted worktree is always active. By default, pruning deletes the local branch ref along with the worktree; use `--keep-branch` to preserve it.
 
 ```sh
-git workon prune                 # interactive: shows candidates, prompts for confirmation
-git workon prune --yes           # skip confirmation prompt (for scripting)
-git workon prune --dry-run       # preview without deleting
-git workon prune my-feature      # prune a specific worktree by name
-git workon prune --gone          # also prune worktrees whose upstream branch is gone
+git workon prune                 # interactive: multi-select picker, pre-checked with the safe default
+git workon prune --yes           # skip the picker; prune exactly the pre-checked set (for scripting)
+git workon prune --dry-run       # print the annotated analysis (pre-checked/selectable/locked out) without deleting
+git workon prune my-feature      # narrow to this worktree only — nothing else is shown or touched
+git workon prune --gone          # treat gone-upstream worktrees as active (pre-checked / auto-pruned)
 git workon prune --gone --fetch  # fetch --prune from remotes first so gone status is fresh
-git workon prune --merged        # also prune worktrees merged into the default branch
+git workon prune --merged        # treat merged-into-default worktrees as active
 git workon prune --merged=release/v2  # merge target other than the default branch
 git workon prune --keep-branch   # prune worktrees but keep local branch refs
 git workon prune --allow-dirty   # prune even with uncommitted changes
@@ -128,9 +128,11 @@ git workon prune --include-locked # include locked worktrees
 git workon prune --force         # override all safety checks (protection, dirty, unmerged, locked)
 ```
 
-A bare `git workon prune` (no `--gone`) shows a hint if any worktrees have gone upstreams.
+Naming a worktree strictly narrows the scope — it's never additive with `--gone`/`--merged`. An unmatched name is a hard error listing every miss, before anything is deleted. A named worktree with nothing wrong with it (no signal, not dirty, not unmerged) still shows up — annotated "not prunable" — but needs `--force` to actually be pruned; naming is how a healthy worktree gets pulled into view, not how it gets deleted. The default worktree never appears, even when named with `--force`.
 
-Safety checks (skipped with `--force`): protected branches (`workon.pruneProtectedBranches`), default branch, uncommitted changes (tracked files only for `--gone` candidates), unmerged commits, locked worktrees.
+In an interactive terminal, `prune` opens a checkbox picker (pre-checked rows match the same "safe default" `--yes` would prune) followed by one summary confirm. Non-interactively (`--yes`, `--json`, or no TTY), it prunes the pre-checked set directly.
+
+Safety checks (skipped with `--force`): protected branches (`workon.pruneProtectedBranches`), locked worktrees (`--include-locked`), uncommitted changes (tracked files only when the only signal is a gone upstream; `--allow-dirty`), unmerged commits (skipped when any signal is present; `--allow-unmerged`).
 
 ### Rename a worktree
 

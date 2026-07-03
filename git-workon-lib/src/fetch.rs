@@ -24,9 +24,12 @@ use crate::worktree::WorktreeDescriptor;
 /// `branch.<name>.remote` from git config. Results are deduplicated and returned in
 /// stable (first-seen) order. Worktrees with detached HEAD or no upstream are
 /// silently skipped.
-pub fn remotes_tracked_by_worktrees(
+///
+/// Accepts any iterator of worktree references, so callers can pass a full
+/// `&[WorktreeDescriptor]` or a filtered subset of borrowed descriptors.
+pub fn remotes_tracked_by_worktrees<'a>(
     repo: &git2::Repository,
-    worktrees: &[WorktreeDescriptor],
+    worktrees: impl IntoIterator<Item = &'a WorktreeDescriptor>,
 ) -> Result<Vec<String>> {
     let config = repo.config()?;
     let mut remotes: Vec<String> = Vec::new();

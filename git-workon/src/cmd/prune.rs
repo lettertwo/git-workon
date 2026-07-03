@@ -1,32 +1,40 @@
-//! Prune command - remove merged/gone worktrees.
+//! Prune command - remove worktrees whose branches are stale.
 //!
-//! Removes worktrees whose branches have been merged or deleted, with safety checks
-//! to prevent accidental deletion of active work.
+//! ## Model
 //!
-//! ## Features
+//! Analysis always runs in full: every worktree in scope is evaluated for **all**
+//! prunability signals (branch deleted, remote gone, merged into target) plus safety
+//! state (dirty, unmerged, locked, protected). Nothing is hidden from the analysis;
+//! `--gone` and `--merged` only control which signals count as "active" for
+//! pre-checking (interactive) and auto-pruning (non-interactive) — they never gate
+//! visibility. `BranchDeleted` is always an active criterion.
 //!
-//! - **Targeted pruning**: `git workon prune <name>...` - prune specific worktrees
-//! - **Bulk pruning**: `--gone` and `--merged` flags for automatic discovery
-//! - **Gone hint**: bare `prune` surfaces worktrees with gone upstreams as a non-destructive notice
-//! - **Optional fetch**: `--fetch` (or `workon.pruneFetch = true`) prune-fetches from tracked
-//!   remotes before evaluating gone status, so `--gone` decisions use fresh refs
-//! - **Protected branches**: Respects `workon.pruneProtectedBranches` glob patterns
-//! - **Safety checks**: `--allow-dirty` and `--allow-unmerged` to override warnings
-//! - **Dry run**: `--dry-run` to preview without deleting
-//! - **Branch cleanup**: Local branch refs are deleted after pruning by default; use `--keep-branch` to preserve them
-//! - **Force mode**: `--force` overrides all safety checks (protected, default-branch, dirty, unmerged)
+//! - **Bare `prune`**: scope is every worktree except the default one. Only rows
+//!   carrying at least one signal are shown/considered.
+//! - **Named `prune <name>...`**: scope narrows to exactly those worktrees (matched
+//!   by worktree name or branch name). Any unmatched name is a hard error listing all
+//!   misses, before anything is touched. A named worktree with no signal at all still
+//!   appears — annotated "not prunable" — since naming is how you pull a healthy tree
+//!   into view; it is only pruned with `--force`.
+//! - **Interactive** (TTY, no `--yes`/`--json`/`--dry-run`): a checkbox picker
+//!   ([`crate::picker::multi_select`]) lists every selectable row in the find/list
+//!   visual language, pre-checked according to the active-criteria + safety rules
+//!   (Enter-Enter reproduces the safe default). Protected/locked rows are locked out
+//!   of the picker (shown separately, annotated) unless `--force` /
+//!   `--include-locked`. A single summary confirm follows selection.
+//! - **Non-interactive** (`--yes`, `--json`, or no TTY): bare mode prunes exactly the
+//!   pre-checked set; named mode prunes named worktrees when safe (dirty/unmerged
+//!   still require `--allow-dirty`/`--allow-unmerged`; a healthy named worktree is
+//!   skipped with a reason unless `--force`).
+//! - **`--dry-run`**: prints the annotated analysis (pre-checked / selectable / locked
+//!   out, with signals) and exits without touching anything.
 //!
-//! ## Gone Pruning and Fetch
+//! ## Fetch
 //!
-//! A branch is "gone" when its upstream tracking ref has been deleted on the remote.
-//! Detection relies on cached local refs, so it is only accurate after a prune-fetch.
-//!
-//! - `--gone` / `workon.pruneGone = true` — include gone-upstream worktrees as candidates
-//! - `--fetch` / `workon.pruneFetch = true` — run `git fetch --prune` on all tracked
-//!   remotes before candidate collection; makes gone status trustworthy
-//! - `--no-gone` / `--no-fetch` — suppress the config-enabled behaviour for one run
-//! - `--gone` and `--fetch` are independent: `--gone` alone uses cached refs; add
-//!   `--fetch` to refresh first
+//! Fetch stays opt-in (`--fetch` / `workon.pruneFetch`). Without it, gone-upstream
+//! annotations use cached refs, which can only under-report (never falsely flag a
+//! branch as gone). In named mode, the prune-fetch narrows to remotes tracked by the
+//! named worktrees only.
 //!
 //! ## Protected Branch Matching
 //!
@@ -35,25 +43,29 @@
 //! - Wildcard: `*` protects all branches
 //! - Prefix: `release/*` protects "release/v1", "release/v2", etc.
 //!
-//! ## Status Filtering
+//! ## Safety Leniency
 //!
-//! When using `--gone` or `--merged`, the command uses WorktreeDescriptor's status
-//! methods to detect which worktrees can be safely pruned. For `--gone` candidates
-//! (`RemoteGone`), the dirty check uses `has_tracked_changes()` instead of `is_dirty()`,
-//! so untracked files (build artifacts, IDE directories) do not block pruning. The
-//! unmerged check is also skipped for `RemoteGone` candidates.
+//! A row whose only signal is `RemoteGone` uses `has_tracked_changes()` instead of
+//! `is_dirty()` for the dirty check, so untracked files (build artifacts, IDE dirs)
+//! don't block pruning. The unmerged check is skipped entirely for any row carrying a
+//! signal (`BranchDeleted`, `RemoteGone`, or `Merged`) — the signal already implies the
+//! work was handled.
+
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 
 use dialoguer::Confirm;
-use log::debug;
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Report, Result};
 use serde_json::json;
 use workon::{
     get_default_branch, get_repo, get_worktrees, prune_fetch as remote_prune_fetch,
-    remotes_tracked_by_worktrees, WorktreeDescriptor,
+    remotes_tracked_by_worktrees, PruneError, WorktreeDescriptor,
 };
 
 use crate::cli::Prune;
+use crate::display::{format_aligned_rows_annotated, worktree_display_row, WorktreeDisplayRow};
 use crate::output;
+use crate::picker;
 
 use super::Run;
 
@@ -67,15 +79,53 @@ impl Run for Prune {
             .prune_fetch(self.fetch_override())
             .into_diagnostic()?;
         let worktrees = get_worktrees(&repo)?;
+        let default_branch = get_default_branch(&repo).ok();
+
+        // Scope resolution: the default worktree never appears. Bare mode considers
+        // every other worktree; named mode narrows to exactly the matched names, and
+        // any miss is a hard error before anything else runs.
+        let pool: Vec<&WorktreeDescriptor> = worktrees
+            .iter()
+            .filter(|wt| match (&default_branch, wt.branch()) {
+                (Some(db), Ok(Some(b))) => &b != db,
+                _ => true,
+            })
+            .collect();
+
+        let named = !self.names.is_empty();
+        let mut scope: Vec<&WorktreeDescriptor> = Vec::new();
+        if named {
+            let mut misses: Vec<String> = Vec::new();
+            for name in &self.names {
+                match pool.iter().find(|wt| {
+                    wt.name() == Some(name.as_str())
+                        || matches!(wt.branch(), Ok(Some(ref b)) if b == name)
+                }) {
+                    // Dedupe: repeated names (or a worktree named once by name and
+                    // once by branch) resolve to the same worktree; pruning it twice
+                    // would fail after the first pass deregistered it.
+                    Some(wt) if scope.iter().any(|s| s.name() == wt.name()) => {}
+                    Some(wt) => scope.push(wt),
+                    None => misses.push(name.clone()),
+                }
+            }
+            if !misses.is_empty() {
+                return Err(Report::from(PruneError::NamesNotFound { names: misses }));
+            }
+        } else {
+            scope = pool.clone();
+        }
 
         let pb = output::create_spinner();
 
-        // Phase 0 (optional): prune-fetch from all tracked remotes so that gone-upstream
-        // detection reflects the actual current state of the remote, not a stale local view.
-        // Failure is non-fatal: warn and continue on cached refs (a failed fetch can only
-        // cause under-pruning, never a false prune).
+        // Phase 0 (optional): prune-fetch so gone-upstream detection reflects the
+        // actual remote state. Named mode narrows the fetch to remotes tracked by the
+        // named worktrees only. Failure is non-fatal: a stale fetch can only
+        // under-prune, never cause a false prune.
         if effective_fetch {
-            let remotes = remotes_tracked_by_worktrees(&repo, &worktrees).into_diagnostic()?;
+            let fetch_scope = if named { &scope } else { &pool };
+            let remotes = remotes_tracked_by_worktrees(&repo, fetch_scope.iter().copied())
+                .into_diagnostic()?;
             for remote_name in &remotes {
                 pb.set_message(format!("Fetching {}...", remote_name));
                 if let Err(e) = remote_prune_fetch(&repo, remote_name) {
@@ -89,326 +139,89 @@ impl Run for Prune {
             }
         }
 
-        let mut candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = Vec::new();
-
-        // First, add explicitly named worktrees
-        for name in &self.names {
-            // Find worktree by name (exact match or branch name)
-            let matching_wt = worktrees.iter().find(|wt| {
-                // Match by worktree name or branch name
-                if let Some(wt_name) = wt.name() {
-                    if wt_name == name {
-                        return true;
-                    }
-                }
-                if let Ok(Some(branch)) = wt.branch() {
-                    if branch == *name {
-                        return true;
-                    }
-                }
-                false
-            });
-
-            if let Some(wt) = matching_wt {
-                // Get the branch name (if any)
-                let branch_name = match wt.branch() {
-                    Ok(Some(name)) => name,
-                    Ok(None) => "(detached HEAD)".to_string(),
-                    Err(_) => "(error reading branch)".to_string(),
-                };
-
-                candidates.push((
-                    wt,
-                    PruneCandidate {
-                        worktree_name: wt.name().unwrap_or("").to_string(),
-                        worktree_path: wt.path().to_path_buf(),
-                        branch_name,
-                        reason: PruneReason::Explicit,
-                    },
-                ));
-            } else {
-                output::warn(&format!("worktree '{}' not found, skipping", name));
-            }
-        }
-
-        // Then, add filter-based worktrees (if any filters are specified)
         pb.set_message("Checking worktree status...");
-        let filter_candidates: Vec<(&WorktreeDescriptor, PruneCandidate)> = worktrees
+        let merged_target: Option<String> = match &self.merged {
+            Some(m) if !m.is_empty() => Some(m.clone()),
+            _ => default_branch.clone(),
+        };
+        let merged_active = self.merged.is_some();
+
+        let rows: Vec<PruneRow> = scope
             .iter()
-            .filter_map(|wt| {
-                // Skip if already in candidates (from explicit names)
-                if candidates.iter().any(|(c, _)| c.name() == wt.name()) {
-                    return None;
-                }
-
-                // Get the branch name - skip detached worktrees and worktrees with errors
-                let branch_name = match wt.branch() {
-                    Ok(Some(name)) => name,
-                    Ok(None) | Err(_) => return None, // Detached HEAD or error, skip
-                };
-
-                // Check if the branch still exists in the main repo
-                let branch_exists = repo
-                    .find_branch(&branch_name, git2::BranchType::Local)
-                    .is_ok();
-
-                if !branch_exists {
-                    // Branch is deleted - always prune
-                    debug!("'{}': branch deleted, candidate for pruning", branch_name);
-                    Some((
-                        wt,
-                        PruneCandidate {
-                            worktree_name: wt.name()?.to_string(),
-                            worktree_path: wt.path().to_path_buf(),
-                            branch_name,
-                            reason: PruneReason::BranchDeleted,
-                        },
-                    ))
-                } else if effective_gone {
-                    // Branch exists - check if upstream is gone
-                    match wt.has_gone_upstream() {
-                        Ok(true) => {
-                            debug!("'{}': upstream gone, candidate for pruning", branch_name);
-                            Some((
-                                wt,
-                                PruneCandidate {
-                                    worktree_name: wt.name()?.to_string(),
-                                    worktree_path: wt.path().to_path_buf(),
-                                    branch_name,
-                                    reason: PruneReason::RemoteGone,
-                                },
-                            ))
-                        }
-                        _ => None,
-                    }
-                } else if let Some(ref merged_target) = self.merged {
-                    // Branch exists - check if merged into target (only if --merged flag is set)
-                    let target_branch = if merged_target.is_empty() {
-                        // Use default branch
-                        match get_default_branch(&repo) {
-                            Ok(b) => b,
-                            Err(_) => return None, // Can't determine default branch
-                        }
-                    } else {
-                        merged_target.clone()
-                    };
-
-                    match wt.is_merged_into(&target_branch) {
-                        Ok(true) => Some((
-                            wt,
-                            PruneCandidate {
-                                worktree_name: wt.name()?.to_string(),
-                                worktree_path: wt.path().to_path_buf(),
-                                branch_name,
-                                reason: PruneReason::Merged(target_branch),
-                            },
-                        )),
-                        _ => None,
-                    }
-                } else {
-                    debug!("'{}': no prune criteria matched, skipping", branch_name);
-                    None
-                }
+            .map(|wt| {
+                build_row(
+                    &repo,
+                    wt,
+                    default_branch.as_deref(),
+                    merged_target.as_deref(),
+                    &protected_patterns,
+                )
             })
             .collect();
         pb.finish_and_clear();
 
-        // Combine explicit and filter-based candidates
-        candidates.extend(filter_candidates);
+        // Bare mode only ever shows rows carrying a signal; named mode shows exactly
+        // the named worktrees, signal or not.
+        let visible: Vec<&PruneRow> = if named {
+            rows.iter().collect()
+        } else {
+            rows.iter().filter(|r| !r.signals.is_empty()).collect()
+        };
 
-        // Pre-compute default branch for safety checks
-        let default_branch = get_default_branch(&repo).ok();
+        let active = ActiveCriteria {
+            gone: effective_gone,
+            merged: merged_active,
+        };
+        let overrides = Overrides::from_cmd(self);
 
-        // Apply safety checks to filter out unsafe worktrees
-        let mut skipped: Vec<(PruneCandidate, String)> = Vec::new();
-        let to_prune: Vec<PruneCandidate> = candidates
-            .into_iter()
-            .filter_map(|(wt, candidate)| {
-                // Check if branch is protected
-                if !self.force && is_protected(&candidate.branch_name, &protected_patterns) {
-                    debug!("'{}': skipped (protected branch)", candidate.branch_name);
-                    skipped.push((
-                        candidate,
-                        "protected by workon.pruneProtectedBranches".to_string(),
-                    ));
-                    return None;
-                }
-
-                // Never prune the default worktree
-                if !self.force {
-                    if let Some(ref branch) = default_branch {
-                        if candidate.branch_name == *branch {
-                            skipped.push((candidate, "is the default worktree".to_string()));
-                            return None;
-                        }
-                    }
-                }
-
-                // Skip locked worktrees unless --include-locked or --force
-                if !self.force && !self.include_locked {
-                    if let Ok(true) = wt.is_locked() {
-                        skipped.push((
-                            candidate,
-                            "locked (use --include-locked to override)".to_string(),
-                        ));
-                        return None;
-                    }
-                }
-
-                // Check for uncommitted changes.
-                // For RemoteGone, only block on tracked-file changes — untracked files
-                // (build artifacts, IDE dirs, etc.) are common and not a safety concern.
-                if !self.force && !self.allow_dirty {
-                    let dirty = if matches!(candidate.reason, PruneReason::RemoteGone) {
-                        wt.has_tracked_changes()
-                    } else {
-                        wt.is_dirty()
-                    };
-                    match dirty {
-                        Ok(true) => {
-                            skipped.push((
-                                candidate,
-                                "has uncommitted changes, use --allow-dirty to override"
-                                    .to_string(),
-                            ));
-                            return None;
-                        }
-                        Err(_) => {
-                            skipped.push((candidate, "could not check status".to_string()));
-                            return None;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Check for unmerged commits into the default branch.
-                // Skip if branch is already deleted (deletion implies work was handled)
-                // or if --merged already verified it's merged into the specified target.
-                if !self.force
-                    && !self.allow_unmerged
-                    && !matches!(
-                        candidate.reason,
-                        PruneReason::BranchDeleted
-                            | PruneReason::RemoteGone
-                            | PruneReason::Merged(_)
-                    )
-                {
-                    if let Some(ref branch) = default_branch {
-                        if let Ok(false) = wt.is_merged_into(branch) {
-                            skipped.push((
-                                candidate,
-                                "has unmerged commits, use --allow-unmerged to override"
-                                    .to_string(),
-                            ));
-                            return None;
-                        }
-                    }
-                }
-
-                Some(candidate)
-            })
-            .collect();
-
-        if self.json {
-            // JSON mode: skip confirmation, output structured result
-            let delete_branch = !self.keep_branch;
-            let mut pruned_with_status: Vec<(&PruneCandidate, bool, Vec<String>)> = Vec::new();
-            let force_locked = self.force || self.include_locked;
-            if !self.dry_run {
-                for candidate in &to_prune {
-                    let orphaned = collect_orphaned_stashes(candidate);
-                    let branch_deleted =
-                        prune_worktree(&repo, candidate, delete_branch, force_locked)?;
-                    pruned_with_status.push((candidate, branch_deleted, orphaned));
-                }
-            } else {
-                for candidate in &to_prune {
-                    let orphaned = collect_orphaned_stashes(candidate);
-                    pruned_with_status.push((candidate, false, orphaned));
-                }
-            }
-
-            let result = json!({
-                "pruned": pruned_with_status.iter().map(|(c, branch_deleted, orphaned)| json!({
-                    "name": c.worktree_name,
-                    "path": c.worktree_path.to_str(),
-                    "branch": c.branch_name,
-                    "reason": c.reason.to_string(),
-                    "branch_deleted": branch_deleted,
-                    "orphaned_stashes": orphaned,
-                })).collect::<Vec<_>>(),
-                "skipped": skipped.iter().map(|(c, reason)| json!({
-                    "name": c.worktree_name,
-                    "path": c.worktree_path.to_str(),
-                    "branch": c.branch_name,
-                    "reason": reason,
-                })).collect::<Vec<_>>(),
-                "dry_run": self.dry_run,
-            });
-
-            let output = serde_json::to_string_pretty(&result).into_diagnostic()?;
-            println!("{}", output);
+        if self.dry_run && !self.json {
+            render_dry_run(&visible, active, overrides);
             return Ok(None);
         }
 
-        // Gone hint: when not actively pruning gone worktrees, check for any that exist
-        // and surface them as a non-destructive notice. Computed before to_prune/skipped
-        // are consumed so we can filter them out of the hint.
-        let gone_hint: Vec<&WorktreeDescriptor> = if !effective_gone {
-            worktrees
-                .iter()
-                .filter(|wt| {
-                    let name = wt.name();
-                    !to_prune
-                        .iter()
-                        .any(|c| Some(c.worktree_name.as_str()) == name)
-                        && !skipped
-                            .iter()
-                            .any(|(c, _)| Some(c.worktree_name.as_str()) == name)
-                })
-                .filter(|wt| wt.has_gone_upstream().unwrap_or(false))
-                .collect()
-        } else {
-            vec![]
-        };
+        let interactive =
+            !self.json && !self.dry_run && !self.yes && std::io::stdin().is_terminal();
+        if interactive {
+            return run_interactive(&repo, &visible, active, self);
+        }
 
-        // Display skipped worktrees
+        let (to_prune, skipped) = classify(&visible, named, active, overrides);
+
+        if self.json {
+            return emit_json(
+                &repo,
+                &to_prune,
+                &skipped,
+                self.dry_run,
+                self.keep_branch,
+                self.force,
+                self.include_locked,
+            );
+        }
+
         if !skipped.is_empty() {
             output::notice("Skipped worktrees (unsafe to prune):");
-            for (candidate, reason) in &skipped {
-                output::detail(&format!(
-                    "  {} ({})",
-                    candidate.worktree_path.display(),
-                    reason
-                ));
+            for (row, reason) in &skipped {
+                output::detail(&format!("  {} ({})", row.wt.path().display(), reason));
             }
             eprintln!();
         }
 
         if to_prune.is_empty() {
             output::status("No worktrees to prune");
-            print_gone_hint(&gone_hint, effective_fetch);
             return Ok(None);
         }
 
-        // Display what will be pruned
         output::info("Worktrees to prune:");
-        for candidate in &to_prune {
+        for row in &to_prune {
             output::detail(&format!(
                 "  {} (branch: {}, reason: {})",
-                candidate.worktree_path.display(),
-                candidate.branch_name,
-                candidate.reason
+                row.wt.path().display(),
+                row.branch,
+                reason_display(row)
             ));
         }
 
-        if self.dry_run {
-            output::notice("\nDry run - no changes made");
-            print_gone_hint(&gone_hint, effective_fetch);
-            return Ok(None);
-        }
-
-        // Confirm with user unless --yes flag is set
         if !self.yes {
             let prompt = if !self.keep_branch {
                 format!(
@@ -430,71 +243,509 @@ impl Run for Prune {
             }
         }
 
-        // Prune the worktrees
         let delete_branch = !self.keep_branch;
         let force_locked = self.force || self.include_locked;
-        for candidate in &to_prune {
-            for label in collect_orphaned_stashes(candidate) {
+        for row in &to_prune {
+            let candidate = to_candidate(row);
+            for label in collect_orphaned_stashes(&candidate) {
                 output::warn(&format!(
                     "pruning '{}' orphans shelved changes: {} (not restorable)",
                     candidate.worktree_name, label
                 ));
             }
-            prune_worktree(&repo, candidate, delete_branch, force_locked)?;
+            prune_worktree(&repo, &candidate, delete_branch, force_locked)?;
         }
 
         output::success(&format!("Pruned {} worktree(s)", to_prune.len()));
-        print_gone_hint(&gone_hint, effective_fetch);
         Ok(None)
     }
 }
 
-/// Print a non-destructive notice listing worktrees with gone upstreams.
-///
-/// Called at exit points when `effective_gone` is false, so the user knows
-/// to rerun with `--gone` (and optionally `--fetch`) to clean them up.
-fn print_gone_hint(gone: &[&WorktreeDescriptor], effective_fetch: bool) {
-    if gone.is_empty() {
-        return;
-    }
-    eprintln!();
-    output::notice(&format!("{} worktree(s) have gone upstreams:", gone.len()));
-    for wt in gone {
-        let branch = wt.branch().ok().flatten().unwrap_or_default();
-        output::detail(&format!("  {} (branch: {})", wt.path().display(), branch));
-    }
-    let suffix = if effective_fetch {
-        String::new()
-    } else {
-        " (add --fetch to refresh remote refs first)".to_string()
-    };
-    output::detail(&format!("  Rerun with --gone to prune them.{}", suffix));
-}
-
-#[derive(Debug)]
-enum PruneReason {
+/// A prune signal detected for a worktree. Signals are always computed for every
+/// row in scope; `--gone`/`--merged` only decide whether a signal counts as "active".
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Signal {
     BranchDeleted,
     RemoteGone,
     Merged(String),
-    Explicit,
 }
 
-impl std::fmt::Display for PruneReason {
+impl std::fmt::Display for Signal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PruneReason::BranchDeleted => write!(f, "branch deleted"),
-            PruneReason::RemoteGone => write!(f, "remote gone"),
-            PruneReason::Merged(target) => write!(f, "merged into {}", target),
-            PruneReason::Explicit => write!(f, "explicitly requested"),
+            Signal::BranchDeleted => write!(f, "branch deleted"),
+            Signal::RemoteGone => write!(f, "remote gone"),
+            Signal::Merged(target) => write!(f, "merged into {}", target),
         }
     }
 }
 
+/// Which signals currently count as "active" (pre-checked / auto-pruned), per the
+/// `--gone`/`--merged` flags. `BranchDeleted` is always active, so it has no field.
+#[derive(Debug, Clone, Copy)]
+struct ActiveCriteria {
+    gone: bool,
+    merged: bool,
+}
+
+/// Safety-check override flags, bundled to keep function signatures manageable.
+#[derive(Debug, Clone, Copy)]
+struct Overrides {
+    force: bool,
+    allow_dirty: bool,
+    allow_unmerged: bool,
+    include_locked: bool,
+}
+
+impl Overrides {
+    fn from_cmd(cmd: &Prune) -> Self {
+        Self {
+            force: cmd.force,
+            allow_dirty: cmd.allow_dirty,
+            allow_unmerged: cmd.allow_unmerged,
+            include_locked: cmd.include_locked,
+        }
+    }
+}
+
+/// A single worktree's full analysis: every signal it carries, plus raw safety state
+/// (protected/locked/dirty/unmerged) with no override flags baked in. Override flags
+/// (`--force`, `--allow-dirty`, etc.) are applied later, at classification time.
+struct PruneRow<'a> {
+    wt: &'a WorktreeDescriptor,
+    name: String,
+    branch: String,
+    signals: Vec<Signal>,
+    protected: bool,
+    locked: bool,
+    dirty: bool,
+    unmerged: bool,
+}
+
+fn build_row<'a>(
+    repo: &git2::Repository,
+    wt: &'a WorktreeDescriptor,
+    default_branch: Option<&str>,
+    merged_target: Option<&str>,
+    protected_patterns: &[String],
+) -> PruneRow<'a> {
+    let branch = match wt.branch() {
+        Ok(Some(name)) => name,
+        Ok(None) => "(detached HEAD)".to_string(),
+        Err(_) => "(error reading branch)".to_string(),
+    };
+
+    let mut signals = Vec::new();
+    if !branch.starts_with('(') {
+        let branch_exists = repo.find_branch(&branch, git2::BranchType::Local).is_ok();
+        if !branch_exists {
+            signals.push(Signal::BranchDeleted);
+        } else {
+            if wt.has_gone_upstream().unwrap_or(false) {
+                signals.push(Signal::RemoteGone);
+            }
+            if let Some(target) = merged_target {
+                if wt.is_merged_into(target).unwrap_or(false) {
+                    signals.push(Signal::Merged(target.to_string()));
+                }
+            }
+        }
+    }
+
+    let protected = is_protected(&branch, protected_patterns);
+    let locked = wt.is_locked().unwrap_or(false);
+
+    // RemoteGone-only rows use has_tracked_changes(): untracked files (build
+    // artifacts, IDE dirs) are common and not a safety concern for a gone upstream.
+    let remote_gone_only = signals.len() == 1 && signals[0] == Signal::RemoteGone;
+    let dirty = if remote_gone_only {
+        wt.has_tracked_changes().unwrap_or(true)
+    } else {
+        wt.is_dirty().unwrap_or(true)
+    };
+
+    // Any signal implies the work is already handled (deleted, pushed-and-gone, or
+    // merged), so the unmerged check is only meaningful for signal-less rows.
+    let unmerged = if !signals.is_empty() {
+        false
+    } else if let Some(db) = default_branch {
+        matches!(wt.is_merged_into(db), Ok(false))
+    } else {
+        false
+    };
+
+    PruneRow {
+        wt,
+        name: wt.name().unwrap_or("").to_string(),
+        branch,
+        signals,
+        protected,
+        locked,
+        dirty,
+        unmerged,
+    }
+}
+
+/// True if at least one of the row's signals is currently "active" per the
+/// `--gone`/`--merged` flags. `BranchDeleted` is always active.
+fn is_active(row: &PruneRow, active: ActiveCriteria) -> bool {
+    row.signals.iter().any(|s| match s {
+        Signal::BranchDeleted => true,
+        Signal::RemoteGone => active.gone,
+        Signal::Merged(_) => active.merged,
+    })
+}
+
+/// True if the row is locked out of selection entirely (protected or locked, and not
+/// overridden). Locked-out rows never appear as picker choices.
+fn is_locked_out(row: &PruneRow, overrides: Overrides) -> bool {
+    (row.protected && !overrides.force)
+        || (row.locked && !overrides.force && !overrides.include_locked)
+}
+
+fn lockout_reason(row: &PruneRow, overrides: Overrides) -> String {
+    if row.protected && !overrides.force {
+        "protected by workon.pruneProtectedBranches".to_string()
+    } else if row.locked && !overrides.force && !overrides.include_locked {
+        "locked (use --include-locked to override)".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// Reason the row is unsafe to prune right now, or `None` if it's clear. Ordered:
+/// protected, locked, dirty, unmerged — the same order the safety checks always ran.
+fn blocked_reason(row: &PruneRow, overrides: Overrides) -> Option<String> {
+    if !overrides.force && row.protected {
+        return Some("protected by workon.pruneProtectedBranches".to_string());
+    }
+    if !overrides.force && !overrides.include_locked && row.locked {
+        return Some("locked (use --include-locked to override)".to_string());
+    }
+    if !overrides.force && !overrides.allow_dirty && row.dirty {
+        return Some("has uncommitted changes, use --allow-dirty to override".to_string());
+    }
+    if !overrides.force && !overrides.allow_unmerged && row.unmerged {
+        return Some("has unmerged commits, use --allow-unmerged to override".to_string());
+    }
+    None
+}
+
+/// True if the row matches an active criterion and passes all safety checks —
+/// Enter-Enter on the picker, or the whole set pruned by a bare `--yes` run.
+fn is_prechecked(row: &PruneRow, active: ActiveCriteria, overrides: Overrides) -> bool {
+    is_active(row, active) && blocked_reason(row, overrides).is_none()
+}
+
+fn annotate(row: &PruneRow) -> String {
+    let mut parts: Vec<String> = row.signals.iter().map(|s| s.to_string()).collect();
+    if row.dirty {
+        parts.push("dirty".to_string());
+    }
+    if row.unmerged {
+        parts.push("unmerged".to_string());
+    }
+    if parts.is_empty() {
+        "not prunable".to_string()
+    } else {
+        parts.join(", ")
+    }
+}
+
+fn reason_display(row: &PruneRow) -> String {
+    if is_healthy(row) {
+        "explicitly requested".to_string()
+    } else {
+        annotate(row)
+    }
+}
+
+/// True if the row has nothing at all recommending it for pruning: no signal, no
+/// uncommitted changes, no unmerged commits. Named mode still shows these rows (that's
+/// the point of naming a healthy tree), but requires `--force` to actually prune one —
+/// there's no affirmative reason to, only the fact that the user typed its name.
+fn is_healthy(row: &PruneRow) -> bool {
+    row.signals.is_empty() && !row.dirty && !row.unmerged
+}
+
+/// Split rows into "to prune" and "skipped (with reason)" for non-interactive runs.
+///
+/// Bare mode only considers rows with an active signal. Named mode bypasses the
+/// active-criteria gate entirely (naming is itself the selection) but still runs
+/// every safety check — a healthy row requires `--force`, while a dirty/unmerged row
+/// still only needs `--allow-dirty`/`--allow-unmerged` since it did surface something.
+fn classify<'a>(
+    rows: &[&'a PruneRow<'a>],
+    named: bool,
+    active: ActiveCriteria,
+    overrides: Overrides,
+) -> (Vec<&'a PruneRow<'a>>, Vec<(&'a PruneRow<'a>, String)>) {
+    let mut to_prune = Vec::new();
+    let mut skipped = Vec::new();
+    for row in rows {
+        let row = *row;
+        if named && is_healthy(row) && !overrides.force {
+            skipped.push((
+                row,
+                "not prunable (no signal); use --force to override".to_string(),
+            ));
+            continue;
+        }
+        if !named && !is_active(row, active) {
+            continue;
+        }
+        match blocked_reason(row, overrides) {
+            Some(reason) => skipped.push((row, reason)),
+            None => to_prune.push(row),
+        }
+    }
+    (to_prune, skipped)
+}
+
+/// Render the annotated dry-run analysis (text mode) and exit without deleting.
+fn render_dry_run(rows: &[&PruneRow], active: ActiveCriteria, overrides: Overrides) {
+    if rows.is_empty() {
+        output::status("No worktrees to prune");
+        return;
+    }
+
+    output::info("Prune analysis:");
+    for row in rows {
+        let status = if is_locked_out(row, overrides) {
+            "locked out"
+        } else if is_prechecked(row, active, overrides) {
+            "pre-checked"
+        } else {
+            "selectable"
+        };
+        output::detail(&format!(
+            "  [{}] {} (branch: {}, {})",
+            status,
+            row.wt.path().display(),
+            row.branch,
+            annotate(row)
+        ));
+    }
+    output::notice("\nDry run - no changes made");
+}
+
+/// Build aligned display rows + prune annotations for a set of picker rows.
+///
+/// Falls back to a minimal row when the descriptor can't be fully read, so the
+/// output stays parallel to the input — picker indices must map 1:1 back to rows.
+fn build_picker_rows(
+    rows: &[&PruneRow],
+    root: &Path,
+    current_dir: &Path,
+    annotation: impl Fn(&PruneRow) -> String,
+) -> (Vec<WorktreeDisplayRow>, Vec<String>) {
+    let display_rows = rows
+        .iter()
+        .map(|row| {
+            worktree_display_row(row.wt, root, current_dir).unwrap_or_else(|_| WorktreeDisplayRow {
+                is_active: false,
+                dir_name: row.name.clone(),
+                branch_annotation: (row.branch != row.name).then(|| row.branch.clone()),
+                indicators: vec![],
+                last_activity: String::new(),
+                activity_epoch: None,
+            })
+        })
+        .collect();
+    let annotations = rows.iter().map(|row| annotation(row)).collect();
+    (display_rows, annotations)
+}
+
+/// Interactive picker: a checkbox multi-select of every selectable row (pre-checked
+/// per the active-criteria + safety rules), followed by a single summary confirm.
+/// Locked-out rows (protected/locked, not overridden) are listed above the picker in
+/// the same row format — the picker has no per-item disable, so they simply aren't
+/// picker rows.
+///
+/// Rows render in the find/list visual language: dim `./` + bold dir name, colored
+/// status indicators, dim activity time, dim branch annotation — plus a dim trailing
+/// prune annotation (signals / "not prunable" / guard reason).
+fn run_interactive(
+    repo: &git2::Repository,
+    visible: &[&PruneRow],
+    active: ActiveCriteria,
+    cmd: &Prune,
+) -> Result<Option<WorktreeDescriptor>> {
+    let overrides = Overrides::from_cmd(cmd);
+    let locked_out: Vec<&PruneRow> = visible
+        .iter()
+        .copied()
+        .filter(|r| is_locked_out(r, overrides))
+        .collect();
+    let selectable: Vec<&PruneRow> = visible
+        .iter()
+        .copied()
+        .filter(|r| !is_locked_out(r, overrides))
+        .collect();
+
+    let root = workon::workon_root(repo)?;
+    let current_dir = std::env::current_dir().into_diagnostic()?;
+
+    if !locked_out.is_empty() {
+        output::notice("Locked out (not selectable):");
+        let (display_rows, annotations) = build_picker_rows(&locked_out, root, &current_dir, |r| {
+            lockout_reason(r, overrides)
+        });
+        for line in format_aligned_rows_annotated(&display_rows, false, &annotations) {
+            output::detail(&format!("  {}", line));
+        }
+        eprintln!();
+    }
+
+    if selectable.is_empty() {
+        output::status("No worktrees to prune");
+        return Ok(None);
+    }
+
+    let (display_rows, annotations) = build_picker_rows(&selectable, root, &current_dir, annotate);
+    let items = format_aligned_rows_annotated(&display_rows, false, &annotations);
+    let defaults: Vec<bool> = selectable
+        .iter()
+        .map(|row| is_prechecked(row, active, overrides))
+        .collect();
+
+    let chosen = picker::multi_select("Select worktrees to prune", &items, &defaults)?;
+
+    let Some(indices) = chosen else {
+        output::notice("Cancelled");
+        return Ok(None);
+    };
+
+    if indices.is_empty() {
+        output::status("No worktrees selected");
+        return Ok(None);
+    }
+
+    let selected: Vec<&PruneRow> = indices.into_iter().map(|i| selectable[i]).collect();
+
+    output::info(&format!(
+        "{} worktree(s) and their branches will be deleted:",
+        selected.len()
+    ));
+    for row in &selected {
+        output::detail(&format!(
+            "  {} (branch: {})",
+            row.wt.path().display(),
+            row.branch
+        ));
+        if row.dirty {
+            output::warn(&format!("  '{}' has uncommitted changes", row.name));
+        }
+        if row.unmerged {
+            output::warn(&format!("  '{}' has unmerged commits", row.name));
+        }
+    }
+    for row in &selected {
+        let candidate = to_candidate(row);
+        for label in collect_orphaned_stashes(&candidate) {
+            output::warn(&format!(
+                "pruning '{}' orphans shelved changes: {} (not restorable)",
+                candidate.worktree_name, label
+            ));
+        }
+    }
+
+    let prompt = if !cmd.keep_branch {
+        format!(
+            "Prune {} worktree(s) and delete their branches?",
+            selected.len()
+        )
+    } else {
+        format!("Prune {} worktree(s)?", selected.len())
+    };
+    let confirmed = Confirm::new()
+        .with_prompt(prompt)
+        .default(false)
+        .interact()
+        .into_diagnostic()?;
+
+    if !confirmed {
+        output::notice("Cancelled");
+        return Ok(None);
+    }
+
+    let delete_branch = !cmd.keep_branch;
+    let force_locked = cmd.force || cmd.include_locked;
+    for row in &selected {
+        let candidate = to_candidate(row);
+        prune_worktree(repo, &candidate, delete_branch, force_locked)?;
+    }
+
+    output::success(&format!("Pruned {} worktree(s)", selected.len()));
+    Ok(None)
+}
+
+fn emit_json(
+    repo: &git2::Repository,
+    to_prune: &[&PruneRow],
+    skipped: &[(&PruneRow, String)],
+    dry_run: bool,
+    keep_branch: bool,
+    force: bool,
+    include_locked: bool,
+) -> Result<Option<WorktreeDescriptor>> {
+    let delete_branch = !keep_branch;
+    let force_locked = force || include_locked;
+
+    let mut pruned_rows: Vec<(&PruneRow, bool, Vec<String>)> = Vec::new();
+    for row in to_prune {
+        let candidate = to_candidate(row);
+        let orphaned = collect_orphaned_stashes(&candidate);
+        let branch_deleted = if dry_run {
+            false
+        } else {
+            prune_worktree(repo, &candidate, delete_branch, force_locked)?
+        };
+        pruned_rows.push((row, branch_deleted, orphaned));
+    }
+
+    let result = json!({
+        "pruned": pruned_rows.iter().map(|(row, branch_deleted, orphaned)| json!({
+            "name": row.name,
+            "path": row.wt.path().to_str(),
+            "branch": row.branch,
+            "reason": reason_display(row),
+            "signals": row.signals.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "branch_deleted": branch_deleted,
+            "orphaned_stashes": orphaned,
+        })).collect::<Vec<_>>(),
+        "skipped": skipped.iter().map(|(row, reason)| json!({
+            "name": row.name,
+            "path": row.wt.path().to_str(),
+            "branch": row.branch,
+            "reason": reason,
+            "signals": row.signals.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "dry_run": dry_run,
+    });
+
+    let output = serde_json::to_string_pretty(&result).into_diagnostic()?;
+    println!("{}", output);
+    Ok(None)
+}
+
 struct PruneCandidate {
     worktree_name: String,
-    worktree_path: std::path::PathBuf,
+    worktree_path: PathBuf,
     branch_name: String,
-    reason: PruneReason,
+    /// True when the branch is already gone (deleted or a detached/error sentinel),
+    /// so there's no local branch ref left to clean up.
+    skip_branch_delete: bool,
+}
+
+fn to_candidate(row: &PruneRow) -> PruneCandidate {
+    PruneCandidate {
+        worktree_name: row.name.clone(),
+        worktree_path: row.wt.path().to_path_buf(),
+        branch_name: row.branch.clone(),
+        skip_branch_delete: row.signals.contains(&Signal::BranchDeleted)
+            || row.branch.starts_with('('),
+    }
 }
 
 fn prune_worktree(
@@ -520,11 +771,7 @@ fn prune_worktree(
     worktree.prune(Some(&mut opts)).into_diagnostic()?;
 
     // Optionally delete the local branch ref.
-    // Skip if: --keep-branch, branch already deleted, or detached/error sentinel.
-    let branch_deleted = if delete_branch
-        && !matches!(candidate.reason, PruneReason::BranchDeleted)
-        && !candidate.branch_name.starts_with('(')
-    {
+    let branch_deleted = if delete_branch && !candidate.skip_branch_delete {
         match repo.find_branch(&candidate.branch_name, git2::BranchType::Local) {
             Ok(mut branch) => match branch.delete() {
                 Ok(()) => true,
