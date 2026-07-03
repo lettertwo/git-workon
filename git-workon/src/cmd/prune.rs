@@ -38,9 +38,11 @@
 //!
 //! ## Protected Branch Matching
 //!
-//! Simple glob patterns:
+//! Patterns use standard glob syntax (`*`, `?`, `[...]`) via the [`glob`] crate, with
+//! `*` matching across `/` (so `release-*` protects `release-v1` and `release/v1`
+//! alike). Invalid patterns are a hard config error, not a silent no-op:
 //! - Exact match: `main` protects only "main"
-//! - Wildcard: `*` protects all branches
+//! - Wildcard: `*` protects all branches, `release-*` protects "release-v1", etc.
 //! - Prefix: `release/*` protects "release/v1", "release/v2", etc.
 //!
 //! ## Safety Leniency
@@ -55,7 +57,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use dialoguer::Confirm;
-use miette::{IntoDiagnostic, Report, Result};
+use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use serde_json::json;
 use workon::{
     get_default_branch, get_repo, get_worktrees, prune_fetch as remote_prune_fetch,
@@ -73,7 +75,16 @@ impl Run for Prune {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let repo = get_repo(None)?;
         let config = workon::WorkonConfig::new(&repo)?;
-        let protected_patterns = config.prune_protected_branches()?;
+        let protected_patterns: Vec<glob::Pattern> = config
+            .prune_protected_branches()?
+            .into_iter()
+            .map(|p| {
+                glob::Pattern::new(&p).into_diagnostic().wrap_err(format!(
+                    "Invalid pattern '{}' in workon.pruneProtectedBranches",
+                    p
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let effective_gone = config.prune_gone(self.gone_override()).into_diagnostic()?;
         let effective_fetch = config
             .prune_fetch(self.fetch_override())
@@ -327,7 +338,7 @@ fn build_row<'a>(
     wt: &'a WorktreeDescriptor,
     default_branch: Option<&str>,
     merged_target: Option<&str>,
-    protected_patterns: &[String],
+    protected_patterns: &[glob::Pattern],
 ) -> PruneRow<'a> {
     let branch = match wt.branch() {
         Ok(Some(name)) => name,
@@ -803,13 +814,11 @@ fn prune_worktree(
 }
 
 /// Check if a branch name matches any of the protection patterns
-fn is_protected(branch_name: &str, patterns: &[String]) -> bool {
-    for pattern in patterns {
-        if glob_match(pattern, branch_name) {
-            return true;
-        }
-    }
-    false
+fn is_protected(branch_name: &str, patterns: &[glob::Pattern]) -> bool {
+    let opts = glob::MatchOptions::new();
+    patterns
+        .iter()
+        .any(|pattern| pattern.matches_with(branch_name, opts))
 }
 
 fn collect_orphaned_stashes(candidate: &PruneCandidate) -> Vec<String> {
@@ -817,33 +826,4 @@ fn collect_orphaned_stashes(candidate: &PruneCandidate) -> Vec<String> {
         return vec![];
     };
     workon::list_labeled_for_worktree(&mut wt_repo, &candidate.worktree_name).unwrap_or_default()
-}
-
-/// Simple glob pattern matching supporting * and ? wildcards
-fn glob_match(pattern: &str, text: &str) -> bool {
-    // Exact match
-    if pattern == text {
-        return true;
-    }
-
-    // Match all
-    if pattern == "*" {
-        return true;
-    }
-
-    // Prefix match with wildcard (e.g., "release/*")
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        return text.starts_with(prefix)
-            && text.len() > prefix.len()
-            && text[prefix.len()..].starts_with('/');
-    }
-
-    // Suffix match with wildcard (e.g., "*/branch")
-    if let Some(suffix) = pattern.strip_prefix("*/") {
-        return text.ends_with(suffix)
-            && text.len() > suffix.len()
-            && text[..text.len() - suffix.len()].ends_with('/');
-    }
-
-    false
 }

@@ -657,6 +657,78 @@ fn prune_skips_protected_branch_with_glob_pattern() -> Result<(), Box<dyn std::e
 }
 
 #[test]
+fn prune_skips_protected_branch_with_dashed_glob_pattern() -> Result<(), Box<dyn std::error::Error>>
+{
+    // Regression test: a pattern without a slash (e.g. "release-*") used to silently
+    // match nothing under the old hand-rolled glob_match, meaning the branch got no
+    // protection at all. glob::Pattern must match it correctly.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.pruneProtectedBranches", "release-*")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    use workon::{add_worktree, BranchType};
+    add_worktree(repo, "release-v3", None, BranchType::Normal, None, false)?;
+    add_worktree(repo, "feature/test", None, BranchType::Normal, None, false)?;
+
+    // Delete all branches to make them prune candidates
+    repo.find_reference("refs/heads/release-v3")?.delete()?;
+    repo.find_reference("refs/heads/feature/test")?.delete()?;
+
+    // Run prune - should skip release-v3 but prune feature/test
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Skipped"))
+        .stderr(predicate::str::contains("release-v3"))
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    // Verify release-v3 worktree still exists
+    fixture
+        .root()?
+        .child("release-v3")
+        .assert(predicate::path::is_dir());
+
+    // Verify feature worktree is gone
+    fixture
+        .root()?
+        .child("feature/test")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_rejects_invalid_protected_pattern() -> Result<(), Box<dyn std::error::Error>> {
+    // Malformed patterns must fail loudly (naming the pattern) rather than silently
+    // matching nothing, which would leave every branch unprotected.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.pruneProtectedBranches", "[")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("["))
+        .stderr(predicate::str::contains("workon.pruneProtectedBranches"));
+
+    Ok(())
+}
+
+#[test]
 fn prune_respects_multiple_protected_patterns() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
