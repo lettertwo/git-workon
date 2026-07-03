@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo clippy --all-targets --all-features --quiet 2>&1"
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/stop-check.sh"
           }
         ]
       }

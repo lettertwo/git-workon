@@ -1,0 +1,60 @@
+#!/bin/sh
+#
+# Git pre-commit hook to enforce formatting and lint quality
+#
+# Runs the same checks CI runs (cargo fmt --check, cargo clippy -D warnings)
+# so a red commit is caught locally instead of in CI.
+#
+# This hook never mutates files — if fmt/clippy fail, fix and re-stage
+# yourself. Bypass with: git commit --no-verify
+#
+# This hook also chains to global hooks if they exist, allowing both
+# repo-specific and global validations to run.
+#
+# To install this hook, run: make install-hooks
+#
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Check formatting
+if ! cargo fmt -- --check > /tmp/git-workon-fmt-check.$$ 2>&1; then
+  echo ""
+  echo "${RED}✗ Formatting check failed${NC}"
+  echo ""
+  cat /tmp/git-workon-fmt-check.$$
+  rm -f /tmp/git-workon-fmt-check.$$
+  echo ""
+  echo "  Run ${YELLOW}cargo fmt${NC} (or ${YELLOW}make fmt${NC}), review the changes, and re-stage."
+  echo ""
+  exit 1
+fi
+rm -f /tmp/git-workon-fmt-check.$$
+
+# Check lints
+if ! cargo clippy --all-targets --all-features -- -D warnings; then
+  echo ""
+  echo "${RED}✗ Clippy check failed${NC}"
+  echo ""
+  echo "  Fix the warnings above (or ${YELLOW}make clippy${NC} to reproduce) and re-stage."
+  echo ""
+  exit 1
+fi
+
+echo "${GREEN}✓${NC} Formatting and clippy checks passed"
+
+# Chain to global hook if it exists
+GLOBAL_HOOKS_PATH=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
+if [ -n "$GLOBAL_HOOKS_PATH" ]; then
+  GLOBAL_HOOKS_PATH="${GLOBAL_HOOKS_PATH/#\~/$HOME}"
+  GLOBAL_HOOK="$GLOBAL_HOOKS_PATH/pre-commit"
+  if [ -x "$GLOBAL_HOOK" ]; then
+    "$GLOBAL_HOOK" "$@"
+    exit $?
+  fi
+fi
+
+exit 0

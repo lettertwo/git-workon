@@ -55,6 +55,15 @@ else
   echo "Warning: git-hooks/pre-push not found"
 fi
 
+# Install pre-commit hook
+if [ -f git-hooks/pre-commit ]; then
+  cp git-hooks/pre-commit "$HOOKS_DIR/pre-commit"
+  chmod +x "$HOOKS_DIR/pre-commit"
+  echo "  ✓ Installed pre-commit → $HOOKS_DIR/pre-commit"
+else
+  echo "Warning: git-hooks/pre-commit not found"
+fi
+
 # Check if a global hooks path is configured
 GLOBAL_HOOKS_PATH=$(git config --global --get core.hooksPath 2>/dev/null || echo "")
 
@@ -62,7 +71,7 @@ if [ -n "$GLOBAL_HOOKS_PATH" ]; then
   echo ""
   echo "${YELLOW}Note: Global core.hooksPath is set to: $GLOBAL_HOOKS_PATH${NC}"
   echo "Setting local core.hooksPath to use repo-specific hooks."
-  echo "The commit-msg hook will chain to your global hook automatically."
+  echo "The commit-msg and pre-commit hooks will chain to your global hooks automatically."
 
   # Set local hooksPath to override global setting for this repo
   git config --local core.hooksPath "$HOOKS_DIR"
@@ -76,6 +85,7 @@ echo ""
 echo "Installed hooks:"
 echo "  • commit-msg  Validates Conventional Commits format"
 echo "  • pre-push    Prevents pushing fixup/squash/amend commits"
+echo "  • pre-commit  Runs cargo fmt --check and clippy"
 echo ""
 echo "To load the commit message template (recommended):"
 echo "  ${YELLOW}git config commit.template .gitmessage${NC}"
