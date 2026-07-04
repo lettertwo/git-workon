@@ -23,6 +23,10 @@
 //! Exclude patterns work the same way, checked after include patterns match.
 //! An empty include pattern list means "match all candidates".
 //!
+//! A directory whose relative path matches an exclude pattern is pruned from
+//! the walk entirely (gitignore-style): `target` and `target/**` both exclude
+//! the whole `target/` subtree without visiting its contents.
+//!
 //! ## Platform Optimizations
 //!
 //! Platform-specific copy-on-write optimizations for large files:
@@ -155,6 +159,21 @@ pub fn copy_untracked(
         require_literal_leading_dot: false,
     };
 
+    // Directory-level exclude pruning: a directory whose relative path matches
+    // an exclude pattern (or the pattern's `/**`-stripped prefix, so `target/**`
+    // prunes at `target`) is skipped without walking its contents. A `target/`
+    // tree can hold hundreds of thousands of files; discarding them one by one
+    // at the file check dominates copy time.
+    let mut dir_prune_patterns = exclude_patterns.clone();
+    for exclude in excludes {
+        if let Some(prefix) = exclude.strip_suffix("/**") {
+            // The full pattern compiled above, so its prefix compiles too.
+            if let Ok(pattern) = glob::Pattern::new(prefix) {
+                dir_prune_patterns.push(pattern);
+            }
+        }
+    }
+
     // Build walker. Include hidden files (e.g., .env, .vscode/).
     // By default, respects .gitignore — never descends into node_modules/, target/, etc.
     // With include_ignored, disable all git-based filtering to visit ignored files too.
@@ -165,6 +184,26 @@ pub fn copy_untracked(
             .git_ignore(false)
             .git_global(false)
             .git_exclude(false);
+    }
+    if !dir_prune_patterns.is_empty() {
+        let walk_root = from_path.to_path_buf();
+        builder.filter_entry(move |entry| {
+            if !entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                return true;
+            }
+            let Ok(rel) = entry.path().strip_prefix(&walk_root) else {
+                return true;
+            };
+            let Some(rel_str) = rel.to_str() else {
+                return true;
+            };
+            if rel_str.is_empty() {
+                return true;
+            }
+            !dir_prune_patterns
+                .iter()
+                .any(|p| p.matches_with(rel_str, match_opts))
+        });
     }
 
     let mut copied_files = Vec::new();

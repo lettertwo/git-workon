@@ -483,6 +483,46 @@ fn new_with_auto_copy_respects_excludes() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
+fn new_auto_copy_bare_dir_exclude_prunes_subtree() -> Result<(), Box<dyn std::error::Error>> {
+    use std::fs;
+
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.autoCopy", "true")
+        .config("workon.copyExclude", "target")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+
+    fs::write(main_worktree.join("data.txt"), "data")?;
+    fs::create_dir_all(main_worktree.join("target/debug"))?;
+    fs::write(main_worktree.join("target/debug/build.o"), "object")?;
+
+    let mut new_cmd = cargo_bin_cmd!("git-workon");
+    new_cmd
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("feature")
+        .assert()
+        .success();
+
+    let feature_worktree = fixture.root()?.join("feature");
+
+    assert!(
+        feature_worktree.join("data.txt").exists(),
+        "Should copy data.txt"
+    );
+    assert!(
+        !feature_worktree.join("target").exists(),
+        "Should not copy anything under target/ (bare dir name excludes the subtree)"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn new_copy_flag_overrides_config() -> Result<(), Box<dyn std::error::Error>> {
     use std::fs;
 

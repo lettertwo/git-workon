@@ -145,6 +145,81 @@ fn copy_with_excludes() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn copy_exclude_bare_dir_name_prunes_subtree() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .config("workon.copyExclude", "logs")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    fs::write(main_worktree.join("app.js"), "app code")?;
+    fs::create_dir_all(main_worktree.join("logs/nested"))?;
+    fs::write(main_worktree.join("logs/a.log"), "log")?;
+    fs::write(main_worktree.join("logs/nested/deep.txt"), "deep")?;
+
+    let mut cmd = cargo_bin_cmd!("git-workon");
+    cmd.current_dir(&fixture)
+        .arg("copy")
+        .arg("main")
+        .arg("feature")
+        .assert()
+        .success();
+
+    assert!(
+        feature_worktree.join("app.js").exists(),
+        "Should copy app.js (not excluded)"
+    );
+    assert!(
+        !feature_worktree.join("logs").exists(),
+        "Should not copy anything under logs/ (bare dir name excludes the subtree)"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn copy_exclude_dir_glob_prunes_subtree() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .config("workon.copyExclude", "target/**")
+        .build()?;
+
+    let main_worktree = fixture.root()?.join("main");
+    let feature_worktree = fixture.root()?.join("feature");
+
+    fs::write(main_worktree.join("app.js"), "app code")?;
+    fs::create_dir_all(main_worktree.join("target/debug"))?;
+    fs::write(main_worktree.join("target/debug/app.o"), "object")?;
+
+    let mut cmd = cargo_bin_cmd!("git-workon");
+    cmd.current_dir(&fixture)
+        .arg("copy")
+        .arg("main")
+        .arg("feature")
+        .assert()
+        .success();
+
+    assert!(
+        feature_worktree.join("app.js").exists(),
+        "Should copy app.js (not excluded)"
+    );
+    assert!(
+        !feature_worktree.join("target").exists(),
+        "Should not copy anything under target/ (dir/** excludes the subtree)"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn copy_with_pattern_override() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
