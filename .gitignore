@@ -1,4 +1,5 @@
 target
+.cargo/
 git-workon/dist/
 .claude/settings.local.json
 .envrc
