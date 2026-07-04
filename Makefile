@@ -11,7 +11,9 @@ install-dev: install-hooks install-man
 install-man:
 	@cargo build -p git-workon
 	@mkdir -p "$(PREFIX)/share/man/man1"
-	@ln -sf "$$(find target/debug/build -path '*/git-workon-*/out/git-workon.1' -print -quit)" "$(PREFIX)/share/man/man1/git-workon.1"
+	@build_dir=$$(cargo metadata --format-version 1 --no-deps 2>/dev/null | jq -r '.build_directory // empty'); \
+	build_dir=$${build_dir:-target}; \
+	ln -sf "$$(find "$$build_dir/debug/build" -path '*/git-workon-*/out/git-workon.1' -print -quit)" "$(PREFIX)/share/man/man1/git-workon.1"
 	@echo "Installed man page to $(PREFIX)/share/man/man1/git-workon.1"
 
 install-hooks:
