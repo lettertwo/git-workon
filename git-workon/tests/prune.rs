@@ -2177,3 +2177,141 @@ fn prune_no_fetch_flag_suppresses_config() -> Result<(), Box<dyn std::error::Err
 
     Ok(())
 }
+
+#[test]
+fn prune_removes_empty_namespace_dir() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    use workon::{add_worktree, BranchType};
+    add_worktree(repo, "claude/foo", None, BranchType::Normal, None, false)?;
+    repo.find_reference("refs/heads/claude/foo")?.delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    // The emptied namespace dir is cleaned up along with the worktree
+    fixture
+        .root()?
+        .child("claude")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_keeps_namespace_dir_with_remaining_worktrees() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    use workon::{add_worktree, BranchType};
+    add_worktree(repo, "release/1.0", None, BranchType::Normal, None, false)?;
+    add_worktree(repo, "release/2.0", None, BranchType::Normal, None, false)?;
+    repo.find_reference("refs/heads/release/1.0")?.delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture
+        .root()?
+        .child("release/1.0")
+        .assert(predicate::path::missing());
+    // The namespace dir survives because a sibling worktree still lives in it
+    fixture
+        .root()?
+        .child("release/2.0")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
+fn prune_removes_deeply_nested_namespace_dirs() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    use workon::{add_worktree, BranchType};
+    add_worktree(repo, "a/b/c", None, BranchType::Normal, None, false)?;
+    repo.find_reference("refs/heads/a/b/c")?.delete()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    // The whole emptied namespace chain is cleaned up
+    fixture
+        .root()?
+        .child("a")
+        .assert(predicate::path::missing());
+
+    Ok(())
+}
+
+#[test]
+fn prune_keeps_namespace_dir_with_stray_file() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    use workon::{add_worktree, BranchType};
+    add_worktree(repo, "claude/foo", None, BranchType::Normal, None, false)?;
+    repo.find_reference("refs/heads/claude/foo")?.delete()?;
+
+    fixture
+        .root()?
+        .child("claude/notes.txt")
+        .write_str("keep")?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    fixture
+        .root()?
+        .child("claude/foo")
+        .assert(predicate::path::missing());
+    // The namespace dir is not empty (stray file), so it is preserved
+    fixture
+        .root()?
+        .child("claude/notes.txt")
+        .assert(predicate::path::is_file());
+
+    Ok(())
+}

@@ -768,6 +768,7 @@ fn prune_worktree(
     // Remove the worktree directory first
     if candidate.worktree_path.exists() {
         std::fs::remove_dir_all(&candidate.worktree_path).into_diagnostic()?;
+        remove_empty_parents(repo, &candidate.worktree_path);
     }
 
     // Now prune the worktree metadata from git
@@ -811,6 +812,26 @@ fn prune_worktree(
     }
 
     Ok(branch_deleted)
+}
+
+/// Best-effort cleanup of namespace directories left empty by a prune: ascend from
+/// the removed worktree's parent toward the workon root, removing each directory
+/// until one is non-empty or the root is reached. Never fails the prune — a
+/// directory that can't be removed (non-empty, permissions) is simply left alone.
+fn remove_empty_parents(repo: &git2::Repository, worktree_path: &Path) {
+    let Ok(root) = workon::workon_root(repo) else {
+        return;
+    };
+    let mut dir = worktree_path.parent();
+    while let Some(path) = dir {
+        if path == root || !path.starts_with(root) {
+            break;
+        }
+        if std::fs::remove_dir(path).is_err() {
+            break;
+        }
+        dir = path.parent();
+    }
 }
 
 /// Check if a branch name matches any of the protection patterns
