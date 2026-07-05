@@ -29,7 +29,7 @@
 //! - **workon.pruneProtectedBranches** - Branches protected from pruning (multi-value, default: [])
 //! - **workon.pruneGone** - Treat gone-upstream worktrees as prune candidates by default (bool, default: false)
 //! - **workon.pruneFetch** - Fetch from tracked remotes before evaluating gone status (bool, default: false)
-//! - **workon.stackModel** - Active stack model: "auto", "graphite", or "none" (string, default: "auto")
+//! - **workon.stackModel** - Active stack model: "auto", "graphite", "git", or "none" (string, default: "auto")
 //! - **workon.stackWorktreeGranularity** - Worktree granularity for stacked diffs: "stack" (string, default: "stack")
 //! - **workon.gtAutoTrack** - Auto-run `gt track` after `workon new` (bool, default: true)
 //!
@@ -296,8 +296,9 @@ impl<'repo> WorkonConfig<'repo> {
     /// Auto-detection: returns `Graphite` when `gt` is on PATH and the repo has been
     /// `gt init`-ed (`.graphite_repo_config` exists). Otherwise returns `None`.
     ///
-    /// Accepted config values: `"graphite"`, `"none"`, `"auto"` (re-runs detection).
-    /// Anything else returns an error.
+    /// Accepted config values: `"graphite"`, `"git"`, `"none"`, `"auto"` (re-runs detection).
+    /// `"git"` opts into metadata-less git-inference ([`StackModel::Git`]) explicitly — it is
+    /// never the result of `"auto"`. Anything else returns an error.
     pub fn stack_model(&self, cli_override: Option<&str>) -> Result<StackModel> {
         let raw = if let Some(val) = cli_override {
             Some(val.to_string())
@@ -310,6 +311,7 @@ impl<'repo> WorkonConfig<'repo> {
             None | Some("auto") => Ok(StackModel::detect(self.repo)),
             Some("none") => Ok(StackModel::None),
             Some("graphite") => Ok(StackModel::Graphite),
+            Some("git") => Ok(StackModel::Git),
             Some(other) if matches!(other, "branchless" | "sapling" | "spr") => {
                 Err(StackError::UnsupportedModel {
                     model: other.to_string(),

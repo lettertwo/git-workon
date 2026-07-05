@@ -7,7 +7,8 @@
 //!
 //! Stack awareness is two-dimensional:
 //!
-//! - [`StackModel`] — which tool manages stacks (v1: Graphite; future: branchless, sapling, spr)
+//! - [`StackModel`] — which tool manages stacks (v1: Graphite, and metadata-less git-inference
+//!   via [`StackModel::Git`]; future: branchless, sapling, spr)
 //! - [`Granularity`] — how worktrees map to stacks (v1: [`Granularity::Stack`], one per stack)
 //!
 //! ## Default-on behavior
@@ -23,6 +24,14 @@
 //! JSON written by the `gt` CLI. No `gt` process is needed for detection or visualization.
 //! `gt track` is invoked only when registering a new branch (in `workon new` when creating a
 //! fork off a stack-worktree's branch).
+//!
+//! ## Git-inference (v1)
+//!
+//! [`StackModel::Git`] covers repositories with no stack tool at all: [`enumerate_stacks`] and
+//! [`current_stack`] treat it exactly like [`StackModel::None`] (no branch-level topology to
+//! report), but [`crate::assemble_changesets`] gives it meaning by walking `upstream..HEAD`,
+//! emitting one changeset per commit. It exists purely as an assembly-time model — see
+//! [`StackModel::detect`] for why it is never auto-detected.
 //!
 //! ## Cross-worktree grouping
 //!
@@ -47,6 +56,16 @@ pub enum StackModel {
     None,
     /// Graphite (`gt`) manages stacks via `refs/branch-metadata/*`.
     Graphite,
+    /// No stack-metadata tool; changesets are inferred purely from git, one per commit in
+    /// `upstream..HEAD`. Unlike [`StackModel::Graphite`], this carries no branch-level stack
+    /// topology: [`enumerate_stacks`] and [`current_stack`] treat it as flat (same as
+    /// [`StackModel::None`]), since there is no metadata to enumerate stacks from or to
+    /// group branches into. Only [`crate::assemble_changesets`] (M1 changeset assembly)
+    /// gives this variant meaning, walking `upstream..HEAD` per-commit.
+    ///
+    /// Not reachable via [`StackModel::detect`] — see the module docs' Default-on-behavior
+    /// note on why auto-detection never resolves to `Git`.
+    Git,
 }
 
 impl StackModel {
@@ -55,6 +74,13 @@ impl StackModel {
     /// Returns [`StackModel::Graphite`] when `gt` is on PATH **and** the repo has been
     /// initialized with `gt init` (`.graphite_repo_config` exists). Otherwise returns
     /// [`StackModel::None`].
+    ///
+    /// Never returns [`StackModel::Git`]: auto-detection only distinguishes "a stack tool is
+    /// active" from "no stack tool," since CLI routing treats any non-`None` model as
+    /// stack-active. Auto-resolving to `Git` for every repository with an upstream-tracking
+    /// branch would silently flip that routing for nearly every user. `Git` is reachable via
+    /// explicit `workon.stackModel = git` config, or a caller mapping `None` to `Git` before
+    /// calling [`crate::assemble_changesets`] (the review crate does this from M3 onward).
     pub fn detect(repo: &Repository) -> Self {
         if graphite::detect_gt() && graphite::is_graphite_repo(repo) {
             Self::Graphite
@@ -98,6 +124,8 @@ pub fn enumerate_stacks(repo: &Repository, model: StackModel) -> Result<Vec<Stac
     match model {
         StackModel::None => Ok(vec![]),
         StackModel::Graphite => graphite::enumerate_stacks(repo).map_err(Into::into),
+        // Git-inference has no branch-level stack topology to enumerate — flat, like None.
+        StackModel::Git => Ok(vec![]),
     }
 }
 
@@ -114,6 +142,8 @@ pub fn current_stack(
     match model {
         StackModel::None => Ok(None),
         StackModel::Graphite => graphite::current_stack(repo, head_branch).map_err(Into::into),
+        // Git-inference has no branch-level stack topology — flat, like None.
+        StackModel::Git => Ok(None),
     }
 }
 

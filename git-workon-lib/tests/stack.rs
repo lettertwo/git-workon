@@ -507,6 +507,32 @@ fn current_stack_resolves_metadata_when_repo_is_worktree_opened() -> Result<(), 
     Ok(())
 }
 
+// ── StackModel::Git — CLI-flatness guard ─────────────────────────────────────
+//
+// StackModel::Git carries no branch-level stack topology: current_stack/enumerate_stacks
+// must degrade to flat (None-equivalent) behavior even when Graphite metadata exists,
+// since Git is reachable independently of whether the repo happens to be gt-tracked.
+
+#[test]
+fn current_stack_returns_none_under_git_model_even_with_graphite_metadata(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = linear_chain(MetadataFormat::Refs)?;
+    let repo = fixture.repo()?;
+
+    assert!(current_stack(repo, "step-3", StackModel::Git)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn enumerate_stacks_returns_empty_under_git_model_even_with_graphite_metadata(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = linear_chain(MetadataFormat::Refs)?;
+    let repo = fixture.repo()?;
+
+    assert_eq!(enumerate_stacks(repo, StackModel::Git)?, vec![]);
+    Ok(())
+}
+
 // ── fixture predicates ────────────────────────────────────────────────────────
 
 #[test]

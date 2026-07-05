@@ -696,6 +696,10 @@ fn read_config_entries(
             "graphite".to_string(),
             scalar_source(repo, &git_config, "workon.stackModel"),
         ),
+        Ok(StackModel::Git) => (
+            "git".to_string(),
+            scalar_source(repo, &git_config, "workon.stackModel"),
+        ),
         Err(_) => (
             "(invalid)".to_string(),
             scalar_source(repo, &git_config, "workon.stackModel"),

@@ -218,7 +218,7 @@ pub enum StackError {
     #[error("Unknown stack model '{value}'")]
     #[diagnostic(
         code(workon::stack::unknown_model),
-        help("Valid values: graphite, none, auto")
+        help("Valid values: graphite, git, none, auto")
     )]
     UnknownModel { value: String },
 

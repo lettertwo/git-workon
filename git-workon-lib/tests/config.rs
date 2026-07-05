@@ -213,6 +213,17 @@ fn stack_model_graphite_returns_graphite_variant() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
+fn stack_model_git_returns_git_variant() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "git")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(cfg.stack_model(None)?, StackModel::Git);
+    Ok(())
+}
+
+#[test]
 fn stack_model_cli_override_wins_over_config() -> Result<(), Box<dyn Error>> {
     let fixture = FixtureBuilder::new()
         .config("workon.stackModel", "none")
