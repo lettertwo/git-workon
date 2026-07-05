@@ -2,12 +2,29 @@ use git_workon_fixture::prelude::*;
 use std::error::Error;
 use workon::{current_stack, enumerate_stacks, graphite_trunk, StackModel};
 
+// ── both-format parameterization ──────────────────────────────────────────────
+//
+// Core metadata-driven cases run against both Graphite metadata formats: the legacy
+// `refs/branch-metadata/*` blobs (gt < 1.8) and the `.graphite_metadata.db` SQLite database
+// (gt >= 1.8). `both_formats!` turns a plain `fn(MetadataFormat) -> Result<(), Box<dyn Error>>`
+// helper into a `mod` with `refs`/`sqlite` test functions.
+macro_rules! both_formats {
+    ($($name:ident),+ $(,)?) => {$(
+        mod $name {
+            use super::*;
+            #[test] fn refs()   { super::$name(MetadataFormat::Refs).unwrap() }
+            #[test] fn sqlite() { super::$name(MetadataFormat::Sqlite).unwrap() }
+        }
+    )+};
+}
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 /// Build a fixture with Graphite metadata for a linear chain:
 /// main → step-1 → step-2 → step-3
-fn linear_chain() -> Result<Fixture, Box<dyn Error>> {
+fn linear_chain(format: MetadataFormat) -> Result<Fixture, Box<dyn Error>> {
     FixtureBuilder::new()
+        .metadata_format(format)
         .graphite_config(&["main"])
         .branch_metadata("step-1", "main")
         .branch_metadata("step-2", "step-1")
@@ -93,7 +110,7 @@ fn read_trunks_parses_multiple_trunks() -> Result<(), Box<dyn Error>> {
 
 #[test]
 fn current_stack_returns_none_when_model_is_none() -> Result<(), Box<dyn Error>> {
-    let fixture = linear_chain()?;
+    let fixture = linear_chain(MetadataFormat::Refs)?;
     let repo = fixture.repo()?;
 
     // StackModel::None always short-circuits to None regardless of metadata.
@@ -101,11 +118,12 @@ fn current_stack_returns_none_when_model_is_none() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-// ── current_stack — Graphite path ────────────────────────────────────────────
+// ── current_stack — Graphite path (both metadata formats) ───────────────────
 
-#[test]
-fn current_stack_linear_chain_returns_bfs_branches_and_trunk() -> Result<(), Box<dyn Error>> {
-    let fixture = linear_chain()?;
+fn current_stack_linear_chain_returns_bfs_branches_and_trunk(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = linear_chain(format)?;
     let repo = fixture.repo()?;
 
     let stack = current_stack(repo, "step-3", StackModel::Graphite)?.unwrap();
@@ -115,10 +133,12 @@ fn current_stack_linear_chain_returns_bfs_branches_and_trunk() -> Result<(), Box
     assert_eq!(stack.diffs, vec!["step-1", "step-2", "step-3"]);
     Ok(())
 }
+both_formats!(current_stack_linear_chain_returns_bfs_branches_and_trunk);
 
-#[test]
-fn current_stack_returns_full_stack_from_any_member() -> Result<(), Box<dyn Error>> {
-    let fixture = linear_chain()?;
+fn current_stack_returns_full_stack_from_any_member(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
+    let fixture = linear_chain(format)?;
     let repo = fixture.repo()?;
 
     // From step-1, all three branches are still visible.
@@ -127,41 +147,46 @@ fn current_stack_returns_full_stack_from_any_member() -> Result<(), Box<dyn Erro
     assert_eq!(stack.current, "step-1");
     Ok(())
 }
+both_formats!(current_stack_returns_full_stack_from_any_member);
 
-#[test]
-fn current_stack_unknown_branch_returns_none() -> Result<(), Box<dyn Error>> {
-    let fixture = linear_chain()?;
+fn current_stack_unknown_branch_returns_none(format: MetadataFormat) -> Result<(), Box<dyn Error>> {
+    let fixture = linear_chain(format)?;
     let repo = fixture.repo()?;
 
-    // "untracked" has no refs/branch-metadata entry → None.
+    // "untracked" has no branch-metadata entry → None.
     assert!(current_stack(repo, "untracked", StackModel::Graphite)?.is_none());
     Ok(())
 }
+both_formats!(current_stack_unknown_branch_returns_none);
 
-#[test]
-fn current_stack_missing_metadata_refs_returns_none() -> Result<(), Box<dyn Error>> {
-    // No branch-metadata refs at all.
-    let fixture = FixtureBuilder::new().build()?;
+fn current_stack_missing_metadata_refs_returns_none(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
+    // No branch-metadata entries at all.
+    let fixture = FixtureBuilder::new().metadata_format(format).build()?;
     let repo = fixture.repo()?;
 
     assert!(current_stack(repo, "main", StackModel::Graphite)?.is_none());
     Ok(())
 }
+both_formats!(current_stack_missing_metadata_refs_returns_none);
 
-#[test]
-fn current_stack_head_is_trunk_returns_none() -> Result<(), Box<dyn Error>> {
-    let fixture = linear_chain()?;
+fn current_stack_head_is_trunk_returns_none(format: MetadataFormat) -> Result<(), Box<dyn Error>> {
+    let fixture = linear_chain(format)?;
     let repo = fixture.repo()?;
 
     // "main" is trunk; the code returns None because head_branch is trunk itself.
     assert!(current_stack(repo, "main", StackModel::Graphite)?.is_none());
     Ok(())
 }
+both_formats!(current_stack_head_is_trunk_returns_none);
 
-#[test]
-fn current_stack_diamond_bfs_includes_all_branches() -> Result<(), Box<dyn Error>> {
+fn current_stack_diamond_bfs_includes_all_branches(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
     // main → A; A → B; A → C (fork)
     let fixture = FixtureBuilder::new()
+        .metadata_format(format)
         .graphite_config(&["main"])
         .branch_metadata("feat-a", "main")
         .branch_metadata("feat-b", "feat-a")
@@ -195,6 +220,9 @@ fn current_stack_diamond_bfs_includes_all_branches() -> Result<(), Box<dyn Error
     assert!(idx_a < idx_b && idx_a < idx_c);
     Ok(())
 }
+both_formats!(current_stack_diamond_bfs_includes_all_branches);
+
+// ── Refs-only: malformed blob handling (raw_branch_metadata is Refs-only) ───────
 
 #[test]
 fn current_stack_malformed_blob_branch_is_excluded() -> Result<(), Box<dyn Error>> {
@@ -226,12 +254,50 @@ fn current_stack_malformed_blob_for_head_returns_none() -> Result<(), Box<dyn Er
     Ok(())
 }
 
-// ── Stack.parents — tree structure ────────────────────────────────────────────
+// ── Sqlite-only: corrupt database (no silent fallback to refs) ─────────────────
 
 #[test]
-fn current_stack_linear_chain_parents_map_is_populated() -> Result<(), Box<dyn Error>> {
+fn current_stack_corrupt_sqlite_db_errors_not_falls_back_to_refs() -> Result<(), Box<dyn Error>> {
+    // Build a Refs-format fixture with VALID metadata for feat-a, then write garbage bytes at
+    // the sqlite db path. Before this changeset, a present-but-unreadable db silently fell back
+    // to refs metadata; now it must be a hard error. Including valid refs-format metadata
+    // alongside the garbage db proves the error is not masked by a fallback.
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let db_path = repo.commondir().join(".graphite_metadata.db");
+    std::fs::write(&db_path, b"not a sqlite database")?;
+
+    let current_err = current_stack(repo, "feat-a", StackModel::Graphite).unwrap_err();
+    assert!(
+        matches!(
+            current_err,
+            workon::WorkonError::Stack(workon::StackError::GtParseFailed { .. })
+        ),
+        "expected GtParseFailed, got {current_err:?}"
+    );
+
+    let enumerate_err = enumerate_stacks(repo, StackModel::Graphite).unwrap_err();
+    assert!(
+        matches!(
+            enumerate_err,
+            workon::WorkonError::Stack(workon::StackError::GtParseFailed { .. })
+        ),
+        "expected GtParseFailed, got {enumerate_err:?}"
+    );
+    Ok(())
+}
+
+// ── Stack.parents — tree structure (both metadata formats) ───────────────────
+
+fn current_stack_linear_chain_parents_map_is_populated(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
     // main → step-1 → step-2 → step-3
-    let fixture = linear_chain()?;
+    let fixture = linear_chain(format)?;
     let repo = fixture.repo()?;
 
     let stack = current_stack(repo, "step-3", StackModel::Graphite)?.unwrap();
@@ -258,11 +324,14 @@ fn current_stack_linear_chain_parents_map_is_populated() -> Result<(), Box<dyn E
     );
     Ok(())
 }
+both_formats!(current_stack_linear_chain_parents_map_is_populated);
 
-#[test]
-fn current_stack_branching_stack_parents_map_covers_all_diffs() -> Result<(), Box<dyn Error>> {
+fn current_stack_branching_stack_parents_map_covers_all_diffs(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
     // main → feat-a → feat-b (linear), and also main → feat-a → feat-c (fork at feat-a)
     let fixture = FixtureBuilder::new()
+        .metadata_format(format)
         .graphite_config(&["main"])
         .branch_metadata("feat-a", "main")
         .branch_metadata("feat-b", "feat-a")
@@ -288,11 +357,12 @@ fn current_stack_branching_stack_parents_map_covers_all_diffs() -> Result<(), Bo
     assert_eq!(stack.parents.len(), 3);
     Ok(())
 }
+both_formats!(current_stack_branching_stack_parents_map_covers_all_diffs);
 
-#[test]
-fn enumerate_stacks_parents_map_is_populated() -> Result<(), Box<dyn Error>> {
+fn enumerate_stacks_parents_map_is_populated(format: MetadataFormat) -> Result<(), Box<dyn Error>> {
     // Verify that the parents map is also populated via enumerate_stacks (metadata-only path).
     let fixture = FixtureBuilder::new()
+        .metadata_format(format)
         .graphite_config(&["main"])
         .branch_metadata("api-1", "main")
         .branch_metadata("api-2", "api-1")
@@ -309,6 +379,32 @@ fn enumerate_stacks_parents_map_is_populated() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+both_formats!(enumerate_stacks_parents_map_is_populated);
+
+// ── ghost / deleted-branch filtering (both metadata formats) ─────────────────
+
+fn enumerate_stacks_filters_ghost_branch_but_keeps_live_sibling(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
+    // ghost-a's row/blob lingers (deleted/merged branch) with no local branch ref; feat-a is a
+    // live sibling under the same trunk. Only feat-a's stack should surface.
+    let fixture = FixtureBuilder::new()
+        .metadata_format(format)
+        .graphite_config(&["main"])
+        .ghost_branch_metadata("ghost-a", "main")
+        .branch_metadata("feat-a", "main")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let stacks = enumerate_stacks(repo, StackModel::Graphite)?;
+    assert_eq!(stacks.len(), 1);
+    assert!(!stacks[0].diffs.contains(&"ghost-a".to_string()));
+    assert!(stacks[0].diffs.contains(&"feat-a".to_string()));
+    Ok(())
+}
+both_formats!(enumerate_stacks_filters_ghost_branch_but_keeps_live_sibling);
+
+// ── cycle guard ────────────────────────────────────────────────────────────────
 
 #[test]
 fn current_stack_cycle_in_metadata_terminates() -> Result<(), Box<dyn Error>> {

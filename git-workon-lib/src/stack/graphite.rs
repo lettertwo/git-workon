@@ -7,8 +7,10 @@
 //! - **gt < 1.8** — `refs/branch-metadata/<branch>` git refs: blobs containing JSON
 //!   `{ "parentBranchName": "step-1", "parentBranchRevision": "<sha>" }`.
 //!
-//! The database format is tried first; refs are the fallback for older installations.
-//! Trunk names come from `.graphite_repo_config` in both cases.
+//! The database format is tried first; refs are the fallback for older installations, but only
+//! when the database file is absent — a present-but-unreadable database is a hard error, never
+//! a silent fallback to (possibly stale) refs metadata. Trunk names come from
+//! `.graphite_repo_config` in both cases.
 //!
 //! `gt track` is invoked only when registering a new branch after `workon new` creates a
 //! worktree forked off an existing stack-worktree branch.
@@ -94,21 +96,35 @@ fn read_trunks(repo: &Repository) -> Vec<String> {
     vec!["main".to_string()]
 }
 
-/// Build a `branch → parent_branch` map.
-///
-/// Tries the SQLite database (gt ≥ 1.8) first; falls back to git refs (gt < 1.8).
-fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
-    let db_path = repo.commondir().join(".graphite_metadata.db");
-    if db_path.exists() {
-        if let Ok(map) = build_parent_map_from_sqlite(&db_path) {
-            return Ok(map);
-        }
-    }
-    build_parent_map_from_refs(repo)
+/// One branch's Graphite metadata: its recorded parent branch and (if known) the parent
+/// revision snapshotted at `gt track`/`gt restack` time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BranchMetadata {
+    pub parent: String,
+    pub parent_revision: Option<String>,
 }
 
-/// Read `branch → parent_branch` from the gt ≥ 1.8 SQLite database.
-fn build_parent_map_from_sqlite(db_path: &Path) -> Result<HashMap<String, String>, StackError> {
+/// Read per-branch Graphite metadata (parent branch + recorded parent revision).
+///
+/// Tries the SQLite database (gt ≥ 1.8) first; falls back to git refs (gt < 1.8) only when
+/// the database file is **absent**. A present-but-unreadable/corrupt database is a hard
+/// error (`StackError::GtParseFailed`) — it never silently falls back to (possibly stale)
+/// refs metadata.
+pub(crate) fn read_branch_metadata(
+    repo: &Repository,
+) -> Result<HashMap<String, BranchMetadata>, StackError> {
+    let db_path = repo.commondir().join(".graphite_metadata.db");
+    if db_path.exists() {
+        read_branch_metadata_from_sqlite(&db_path)
+    } else {
+        read_branch_metadata_from_refs(repo)
+    }
+}
+
+/// Read branch metadata from the gt ≥ 1.8 SQLite database.
+fn read_branch_metadata_from_sqlite(
+    db_path: &Path,
+) -> Result<HashMap<String, BranchMetadata>, StackError> {
     let conn = rusqlite::Connection::open_with_flags(
         db_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -119,7 +135,7 @@ fn build_parent_map_from_sqlite(db_path: &Path) -> Result<HashMap<String, String
 
     let mut stmt = conn
         .prepare(
-            "SELECT branch_name, parent_branch_name \
+            "SELECT branch_name, parent_branch_name, parent_branch_revision \
              FROM branch_metadata \
              WHERE parent_branch_name IS NOT NULL AND parent_branch_name != ''",
         )
@@ -130,19 +146,35 @@ fn build_parent_map_from_sqlite(db_path: &Path) -> Result<HashMap<String, String
     let mut map = HashMap::new();
     let rows = stmt
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })
         .map_err(|e| StackError::GtParseFailed {
             message: format!("failed to read .graphite_metadata.db rows: {e}"),
         })?;
-    for row in rows.flatten() {
-        map.insert(row.0, row.1);
+    for row in rows {
+        let (branch, parent, parent_revision) = row.map_err(|e| StackError::GtParseFailed {
+            message: format!("failed to read .graphite_metadata.db row: {e}"),
+        })?;
+        let parent_revision = parent_revision.filter(|r| !r.is_empty());
+        map.insert(
+            branch,
+            BranchMetadata {
+                parent,
+                parent_revision,
+            },
+        );
     }
     Ok(map)
 }
 
-/// Read `branch → parent_branch` from gt < 1.8 `refs/branch-metadata/*` git refs.
-fn build_parent_map_from_refs(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
+/// Read branch metadata from gt < 1.8 `refs/branch-metadata/*` git refs.
+fn read_branch_metadata_from_refs(
+    repo: &Repository,
+) -> Result<HashMap<String, BranchMetadata>, StackError> {
     let mut map = HashMap::new();
     let references = repo
         .references_glob("refs/branch-metadata/*")
@@ -172,10 +204,60 @@ fn build_parent_map_from_refs(repo: &Repository) -> Result<HashMap<String, Strin
             continue;
         };
         if let Some(parent) = json.get("parentBranchName").and_then(|p| p.as_str()) {
-            map.insert(branch.to_string(), parent.to_string());
+            let parent_revision = json
+                .get("parentBranchRevision")
+                .and_then(|r| r.as_str())
+                .map(String::from)
+                .filter(|r| !r.is_empty());
+            map.insert(
+                branch.to_string(),
+                BranchMetadata {
+                    parent: parent.to_string(),
+                    parent_revision,
+                },
+            );
         }
     }
     Ok(map)
+}
+
+/// Build a `branch → parent_branch` map (thin wrapper over [`read_branch_metadata`] for
+/// callers that only need parent-branch topology, not recorded revisions).
+fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
+    Ok(read_branch_metadata(repo)?
+        .into_iter()
+        .map(|(branch, metadata)| (branch, metadata.parent))
+        .collect())
+}
+
+/// Read PR titles from `<git-common-dir>/.graphite_pr_info`, keyed by branch name
+/// (`prInfos[].headRefName`).
+///
+/// Titles are cosmetic: a missing or corrupt file, or entries missing `headRefName`/`title`,
+/// yield an empty map or are silently skipped rather than surfacing as an error.
+///
+/// Not yet called from production code — `assemble_changesets` (m1-changeset-assembly) is its
+/// first consumer. Exercised by unit tests below in the meantime.
+#[allow(dead_code)]
+pub(crate) fn read_pr_titles(repo: &Repository) -> HashMap<String, String> {
+    let path = repo.commondir().join(".graphite_pr_info");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(json) = serde_json::from_str::<Value>(&content) else {
+        return HashMap::new();
+    };
+    let Some(pr_infos) = json.get("prInfos").and_then(|p| p.as_array()) else {
+        return HashMap::new();
+    };
+    pr_infos
+        .iter()
+        .filter_map(|entry| {
+            let branch = entry.get("headRefName").and_then(|v| v.as_str())?;
+            let title = entry.get("title").and_then(|v| v.as_str())?;
+            Some((branch.to_string(), title.to_string()))
+        })
+        .collect()
 }
 
 /// Return all stacks present in `refs/branch-metadata/*`, one per connected component.
@@ -355,4 +437,156 @@ pub fn current_stack(repo: &Repository, head_branch: &str) -> Result<Option<Stac
         current: head_branch.to_string(),
         parents,
     }))
+}
+
+// `read_branch_metadata`'s `parent_revision` field is not (yet) reachable through the public
+// `Stack`/`current_stack`/`enumerate_stacks` API — that plumbing lands in the m1-changeset-assembly
+// changeset. These unit tests exercise it directly via the fixture crate (a dev-dependency of
+// this lib), covering both metadata formats.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git_workon_fixture::prelude::*;
+
+    #[test]
+    fn read_branch_metadata_resolves_live_parent_revision_refs() {
+        let fixture = FixtureBuilder::new()
+            .branch_metadata("feat-a", "main")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let metadata = read_branch_metadata(repo).unwrap();
+        let entry = metadata.get("feat-a").expect("feat-a metadata present");
+        assert_eq!(entry.parent, "main");
+
+        let main_tip = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        assert_eq!(
+            entry.parent_revision.as_deref(),
+            Some(main_tip.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn read_branch_metadata_resolves_live_parent_revision_sqlite() {
+        let fixture = FixtureBuilder::new()
+            .metadata_format(MetadataFormat::Sqlite)
+            .branch_metadata("feat-a", "main")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let metadata = read_branch_metadata(repo).unwrap();
+        let entry = metadata.get("feat-a").expect("feat-a metadata present");
+        assert_eq!(entry.parent, "main");
+
+        let main_tip = repo
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        assert_eq!(
+            entry.parent_revision.as_deref(),
+            Some(main_tip.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn read_branch_metadata_preserves_verbatim_stale_parent_revision_refs() {
+        let fixture = FixtureBuilder::new()
+            .branch_metadata_at(
+                "feat-a",
+                "main",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "cafebabecafebabecafebabecafebabecafebabe",
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let metadata = read_branch_metadata(repo).unwrap();
+        let entry = metadata.get("feat-a").expect("feat-a metadata present");
+        assert_eq!(
+            entry.parent_revision.as_deref(),
+            Some("cafebabecafebabecafebabecafebabecafebabe")
+        );
+    }
+
+    #[test]
+    fn read_branch_metadata_preserves_verbatim_stale_parent_revision_sqlite() {
+        let fixture = FixtureBuilder::new()
+            .metadata_format(MetadataFormat::Sqlite)
+            .branch_metadata_at(
+                "feat-a",
+                "main",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "cafebabecafebabecafebabecafebabecafebabe",
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let metadata = read_branch_metadata(repo).unwrap();
+        let entry = metadata.get("feat-a").expect("feat-a metadata present");
+        assert_eq!(
+            entry.parent_revision.as_deref(),
+            Some("cafebabecafebabecafebabecafebabecafebabe")
+        );
+    }
+
+    #[test]
+    fn read_branch_metadata_treats_empty_parent_revision_as_none_refs() {
+        let fixture = FixtureBuilder::new()
+            .branch_metadata_at("feat-a", "main", "", "")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let metadata = read_branch_metadata(repo).unwrap();
+        let entry = metadata.get("feat-a").expect("feat-a metadata present");
+        assert_eq!(entry.parent_revision, None);
+    }
+
+    #[test]
+    fn read_branch_metadata_treats_empty_parent_revision_as_none_sqlite() {
+        let fixture = FixtureBuilder::new()
+            .metadata_format(MetadataFormat::Sqlite)
+            .branch_metadata_at("feat-a", "main", "", "")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let metadata = read_branch_metadata(repo).unwrap();
+        let entry = metadata.get("feat-a").expect("feat-a metadata present");
+        assert_eq!(entry.parent_revision, None);
+    }
+
+    #[test]
+    fn read_pr_titles_maps_branch_to_title() {
+        let fixture = FixtureBuilder::new()
+            .graphite_pr_info("feat-a", 42, "Add feature A")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let titles = read_pr_titles(repo);
+        assert_eq!(
+            titles.get("feat-a").map(String::as_str),
+            Some("Add feature A")
+        );
+    }
+
+    #[test]
+    fn read_pr_titles_empty_when_file_missing() {
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert!(read_pr_titles(repo).is_empty());
+    }
 }
