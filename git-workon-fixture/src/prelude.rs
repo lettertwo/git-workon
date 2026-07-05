@@ -1,11 +1,12 @@
 pub use crate::{
     assert::{FixtureAssert, IntoFixturePredicate},
     fixture::{CommitBuilder, Fixture},
-    fixture_builder::{FixtureBuilder, RemoteSource},
+    fixture_builder::{FixtureBuilder, MetadataFormat, RemoteSource},
     predicates::{
         BranchPointsToPredicate, HasBranchMetadataPredicate, HasBranchPredicate,
-        HasConfigPredicate, HasGraphiteConfigPredicate, HasRemoteBranchPredicate,
-        HasRemotePredicate, HasRemoteUrlPredicate, HasStashPredicate, HasUpstreamPredicate,
+        HasConfigPredicate, HasGraphiteConfigPredicate, HasMetadataParentRevisionPredicate,
+        HasRemoteBranchPredicate, HasRemotePredicate, HasRemoteUrlPredicate,
+        HasSqliteBranchMetadataPredicate, HasStashPredicate, HasUpstreamPredicate,
         HasWorktreePredicate, HeadCommitMessageContainsPredicate, HeadCommitParentCountPredicate,
         HeadMatchesPredicate, IsBarePredicate, IsEmptyPredicate, IsHeadDetachedPredicate,
         IsWorktreePredicate,
@@ -24,9 +25,10 @@ pub mod predicate {
     pub mod repo {
         pub use crate::predicates::{
             branch_points_to, has_branch, has_branch_metadata, has_config, has_graphite_config,
-            has_no_stash, has_remote, has_remote_branch, has_remote_url, has_stash, has_upstream,
-            has_worktree, head_commit_message_contains, head_commit_parent_count, head_matches,
-            is_bare, is_empty, is_head_detached, is_worktree,
+            has_metadata_parent_revision, has_no_stash, has_remote, has_remote_branch,
+            has_remote_url, has_sqlite_branch_metadata, has_stash, has_upstream, has_worktree,
+            head_commit_message_contains, head_commit_parent_count, head_matches, is_bare,
+            is_empty, is_head_detached, is_worktree,
         };
     }
     // Re-export predicates for convenience

@@ -596,6 +596,7 @@ dependencies = [
  "git2",
  "log",
  "predicates",
+ "rusqlite",
  "serde_json",
 ]
 

@@ -6,6 +6,45 @@ use workon::empty_commit;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Which on-disk format Graphite branch-metadata is written in.
+///
+/// Real `gt` versions before 1.8 wrote `refs/branch-metadata/<branch>` blobs; 1.8+ writes
+/// a SQLite database at `<git-common-dir>/.graphite_metadata.db`. The fixture can emit either
+/// so lib/review tests can be parameterized over both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetadataFormat {
+    /// gt < 1.8: `refs/branch-metadata/<branch>` JSON blobs.
+    #[default]
+    Refs,
+    /// gt >= 1.8: `<git-common-dir>/.graphite_metadata.db` SQLite database.
+    Sqlite,
+}
+
+/// One tracked (or ghost) Graphite branch-metadata entry.
+///
+/// `branch_rev`/`parent_rev` of `None` resolve to the live `refs/heads/<name>` tip at
+/// `build()` time, after all build-time commits have landed. Use
+/// [`FixtureBuilder::branch_metadata_at`] to pin verbatim (possibly stale or bogus) strings.
+#[derive(Debug, Clone)]
+struct MetadataEntry {
+    branch: String,
+    parent: String,
+    branch_rev: Option<String>,
+    parent_rev: Option<String>,
+    /// Ghost entries simulate a branch that Graphite still tracks but whose git ref was
+    /// deleted (merged/removed). No local branch ref is created for these.
+    ghost: bool,
+}
+
+/// A [`MetadataEntry`] with revisions resolved (or left as verbatim overrides), ready to
+/// write in whichever [`MetadataFormat`] is active.
+struct ResolvedMetadataEntry {
+    branch: String,
+    parent: String,
+    branch_rev: Option<String>,
+    parent_rev: Option<String>,
+}
+
 /// Represents a remote URL source
 pub enum RemoteSource {
     /// Path to another repository (from a Fixture)
@@ -53,7 +92,8 @@ pub struct FixtureBuilder<'fixture> {
     upstreams: Vec<(String, String)>, // (local_branch, remote_branch)
     configs: Vec<(String, String)>,   // (key, value) for git config
     graphite_config: Option<Vec<String>>, // trunk branch names for .graphite_repo_config
-    branch_metadata: Vec<(String, String)>, // (branch, parent) for refs/branch-metadata/*
+    metadata_format: MetadataFormat,
+    metadata_entries: Vec<MetadataEntry>,
     raw_branch_metadata: Vec<(String, Vec<u8>)>, // (branch, raw_bytes) for malformed-blob tests
 }
 
@@ -68,9 +108,18 @@ impl<'fixture> FixtureBuilder<'fixture> {
             upstreams: Vec::new(),
             configs: Vec::new(),
             graphite_config: None,
-            branch_metadata: Vec::new(),
+            metadata_format: MetadataFormat::default(),
+            metadata_entries: Vec::new(),
             raw_branch_metadata: Vec::new(),
         }
+    }
+
+    /// Select the on-disk format for Graphite branch-metadata written by
+    /// [`branch_metadata`](Self::branch_metadata), [`ghost_branch_metadata`](Self::ghost_branch_metadata),
+    /// and [`branch_metadata_at`](Self::branch_metadata_at). Defaults to [`MetadataFormat::Refs`].
+    pub fn metadata_format(mut self, format: MetadataFormat) -> Self {
+        self.metadata_format = format;
+        self
     }
 
     pub fn bare(mut self, bare: bool) -> Self {
@@ -129,42 +178,49 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
-    /// Write Graphite branch-metadata for `branch` with parent `parent`.
+    /// Write Graphite branch-metadata for `branch` with parent `parent`, in the active
+    /// [`MetadataFormat`] (see [`metadata_format`](Self::metadata_format)).
     ///
-    /// Creates a blob at `refs/branch-metadata/<branch>` containing
-    /// `{"branchName": "<branch>", "parentBranchName": "<parent>"}`, mirroring
-    /// what `gt track` writes.
+    /// `branch_revision`/`parentBranchRevision` resolve to the live `refs/heads/<name>` tips
+    /// at `build()` time, mirroring what `gt track` writes right after tracking a branch.
+    /// Also creates a local branch ref for `branch` if one does not already exist, so
+    /// metadata-only stack diffs resolve as live branches rather than ghosts.
     pub fn branch_metadata(mut self, branch: &str, parent: &str) -> Self {
-        self.branch_metadata
-            .push((branch.to_string(), parent.to_string()));
+        self.metadata_entries.push(MetadataEntry {
+            branch: branch.to_string(),
+            parent: parent.to_string(),
+            branch_rev: None,
+            parent_rev: None,
+            ghost: false,
+        });
         self
     }
 
-    /// Write Graphite branch-metadata for a **deleted** branch (ghost entry).
+    /// Write Graphite branch-metadata for a **deleted** branch (ghost entry), in the active
+    /// [`MetadataFormat`].
     ///
     /// Same as [`branch_metadata`] but intentionally does NOT create a local git branch ref.
     /// Use this to simulate a branch that was merged/deleted after being tracked by Graphite —
-    /// metadata lingers in `refs/branch-metadata/<branch>` but the branch ref is gone.
+    /// metadata lingers (a blob or a db row) but the branch ref is gone.
     /// This is the precondition for the `DeletedNode` resolution and ghost-branch filtering tests.
     ///
     /// [`branch_metadata`]: Self::branch_metadata
     pub fn ghost_branch_metadata(mut self, branch: &str, parent: &str) -> Self {
-        // Store the same way as branch_metadata but mark it by NOT creating a git branch.
-        // We reuse `raw_branch_metadata` storage with valid JSON so the parser succeeds
-        // while bypassing the auto-branch-creation in the build step.
-        let content = serde_json::json!({
-            "branchName": branch,
-            "parentBranchName": parent,
-        })
-        .to_string();
-        self.raw_branch_metadata
-            .push((branch.to_string(), content.into_bytes()));
+        self.metadata_entries.push(MetadataEntry {
+            branch: branch.to_string(),
+            parent: parent.to_string(),
+            branch_rev: None,
+            parent_rev: None,
+            ghost: true,
+        });
         self
     }
 
     /// Write a raw blob at `refs/branch-metadata/<branch>`.
     ///
     /// Use this to simulate malformed metadata (e.g. non-JSON content) for error-path tests.
+    /// Refs-only: writes the legacy blob format regardless of [`metadata_format`](Self::metadata_format),
+    /// since malformed sqlite rows aren't a meaningful scenario to fixture the same way.
     pub fn raw_branch_metadata(mut self, branch: &str, bytes: Vec<u8>) -> Self {
         self.raw_branch_metadata.push((branch.to_string(), bytes));
         self
@@ -279,29 +335,98 @@ impl<'fixture> FixtureBuilder<'fixture> {
             std::fs::write(&config_path, config_json.to_string())?;
         }
 
-        // Write branch-metadata blobs for Graphite stack tracking.
-        // Also create a local branch ref when one does not already exist: in real Graphite
-        // repos every tracked branch has a corresponding git ref. Creating it here lets
-        // branch_exists() correctly identify live branches vs ghost entries in tests.
-        for (branch, parent) in &self.branch_metadata {
-            let content = serde_json::json!({
-                "branchName": branch,
-                "parentBranchName": parent,
-            })
-            .to_string();
-            let oid = repo.blob(content.as_bytes())?;
-            repo.reference(
-                &format!("refs/branch-metadata/{branch}"),
-                oid,
-                false,
-                "add branch metadata",
-            )?;
-            // Trunk and worktree branches already have refs; metadata-only stack
-            // diffs do not — create a local branch pointing to HEAD for them.
-            if repo.find_branch(branch, BranchType::Local).is_err() {
+        // Create local branch refs for tracked (non-ghost) metadata entries before resolving
+        // live tips below. Trunk and worktree branches already have refs; metadata-only stack
+        // diffs do not — create a local branch pointing to HEAD for them. branch_exists() then
+        // correctly identifies live branches vs ghost entries in tests.
+        for entry in &self.metadata_entries {
+            if !entry.ghost && repo.find_branch(&entry.branch, BranchType::Local).is_err() {
                 let head = repo.head()?;
                 let commit = head.peel_to_commit()?;
-                repo.branch(branch, &commit, false)?;
+                repo.branch(&entry.branch, &commit, false)?;
+            }
+        }
+
+        // Resolve live `refs/heads/<name>` tips for entries that didn't pin a verbatim
+        // revision. Ghost entries have no branch ref to resolve `branch_rev` from, so theirs
+        // stays None unless a verbatim value was given.
+        let resolve_tip = |name: &str| -> Option<String> {
+            repo.find_branch(name, BranchType::Local)
+                .ok()
+                .and_then(|b| b.get().target())
+                .map(|oid| oid.to_string())
+        };
+        let resolved_metadata: Vec<ResolvedMetadataEntry> = self
+            .metadata_entries
+            .iter()
+            .map(|entry| ResolvedMetadataEntry {
+                branch: entry.branch.clone(),
+                parent: entry.parent.clone(),
+                branch_rev: entry
+                    .branch_rev
+                    .clone()
+                    .or_else(|| resolve_tip(&entry.branch)),
+                parent_rev: entry
+                    .parent_rev
+                    .clone()
+                    .or_else(|| resolve_tip(&entry.parent)),
+            })
+            .collect();
+
+        // Write Graphite branch-metadata in the active format.
+        match self.metadata_format {
+            MetadataFormat::Refs => {
+                for entry in &resolved_metadata {
+                    let content = serde_json::json!({
+                        "branchName": entry.branch,
+                        "parentBranchName": entry.parent,
+                        "parentBranchRevision": entry.parent_rev,
+                    })
+                    .to_string();
+                    let oid = repo.blob(content.as_bytes())?;
+                    repo.reference(
+                        &format!("refs/branch-metadata/{}", entry.branch),
+                        oid,
+                        false,
+                        "add branch metadata",
+                    )?;
+                }
+            }
+            MetadataFormat::Sqlite => {
+                let db_path = repo.path().join(".graphite_metadata.db");
+                let conn = rusqlite::Connection::open(&db_path)?;
+                conn.execute_batch(
+                    r#"CREATE TABLE "branch_metadata" ("branch_name" text not null primary key,
+                      "parent_branch_name" text, "parent_branch_revision" text,
+                      "last_submitted_version" text, "state" text, "children" text,
+                      "branch_revision" text, "validation_result" text, "parent_head_revision" text);
+                    CREATE INDEX "idx_branch_metadata_parent" on "branch_metadata" ("parent_branch_name");"#,
+                )?;
+                for entry in &resolved_metadata {
+                    conn.execute(
+                        "INSERT INTO branch_metadata \
+                         (branch_name, parent_branch_name, parent_branch_revision, branch_revision) \
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            entry.branch,
+                            entry.parent,
+                            entry.parent_rev,
+                            entry.branch_rev
+                        ],
+                    )?;
+                }
+                // One trunk row per configured trunk, with the real-gt-faithful empty-string
+                // parent (NOT NULL) — the lib's parent-name filter excludes both NULL and ''.
+                if let Some(trunks) = &self.graphite_config {
+                    for trunk in trunks {
+                        let branch_rev = resolve_tip(trunk);
+                        conn.execute(
+                            "INSERT INTO branch_metadata (branch_name, parent_branch_name, branch_revision) \
+                             VALUES (?1, '', ?2)",
+                            rusqlite::params![trunk, branch_rev],
+                        )?;
+                    }
+                }
             }
         }
 
