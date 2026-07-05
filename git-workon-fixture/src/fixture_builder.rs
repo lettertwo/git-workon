@@ -196,6 +196,32 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Write Graphite branch-metadata for `branch` with parent `parent`, pinning **verbatim**
+    /// revision strings instead of resolving live tips.
+    ///
+    /// Use this to fixture stale or bogus recorded revisions (e.g. a `branch_revision` left
+    /// behind after plain-git commits advanced the branch past what Graphite recorded, or a
+    /// non-resolving hex string) for trap-7-style tests. `branch_rev`/`parent_rev` are written
+    /// exactly as given, in the active [`MetadataFormat`]; they need not resolve to real
+    /// commits. Also creates a local branch ref for `branch` if one does not already exist,
+    /// same as [`branch_metadata`](Self::branch_metadata).
+    pub fn branch_metadata_at(
+        mut self,
+        branch: &str,
+        parent: &str,
+        branch_rev: &str,
+        parent_rev: &str,
+    ) -> Self {
+        self.metadata_entries.push(MetadataEntry {
+            branch: branch.to_string(),
+            parent: parent.to_string(),
+            branch_rev: Some(branch_rev.to_string()),
+            parent_rev: Some(parent_rev.to_string()),
+            ghost: false,
+        });
+        self
+    }
+
     /// Write Graphite branch-metadata for a **deleted** branch (ghost entry), in the active
     /// [`MetadataFormat`].
     ///

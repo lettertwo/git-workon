@@ -165,4 +165,81 @@ mod metadata {
 
         Ok(())
     }
+
+    #[test]
+    fn branch_metadata_at_persists_verbatim_strings_sqlite(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .metadata_format(MetadataFormat::Sqlite)
+            .branch_metadata_at(
+                "feature",
+                "main",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "cafebabecafebabecafebabecafebabecafebabe",
+            )
+            .build()?;
+
+        let repo = fixture.repo()?;
+        repo.assert(predicate::repo::has_metadata_parent_revision(
+            MetadataFormat::Sqlite,
+            "feature",
+            "cafebabecafebabecafebabecafebabecafebabe",
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn branch_metadata_at_persists_verbatim_strings_refs() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let fixture = FixtureBuilder::new()
+            .branch_metadata_at(
+                "feature",
+                "main",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "cafebabecafebabecafebabecafebabecafebabe",
+            )
+            .build()?;
+
+        let repo = fixture.repo()?;
+        repo.assert(predicate::repo::has_metadata_parent_revision(
+            MetadataFormat::Refs,
+            "feature",
+            "cafebabecafebabecafebabecafebabecafebabe",
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn branch_metadata_at_allows_non_resolving_revision_sqlite(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // A verbatim 40-hex string need not resolve to a real commit; the fixture is not
+        // responsible for validating it — that's the lib's job (InvalidParentRevision).
+        let fixture = FixtureBuilder::new()
+            .metadata_format(MetadataFormat::Sqlite)
+            .branch_metadata_at(
+                "feature",
+                "main",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            )
+            .build()?;
+
+        let repo = fixture.repo()?;
+        assert!(
+            repo.find_commit(git2::Oid::from_str(
+                "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+            )?)
+            .is_err(),
+            "the verbatim revision should not resolve to a real commit"
+        );
+        repo.assert(predicate::repo::has_metadata_parent_revision(
+            MetadataFormat::Sqlite,
+            "feature",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        ));
+
+        Ok(())
+    }
 }
