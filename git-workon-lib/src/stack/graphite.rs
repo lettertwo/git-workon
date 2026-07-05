@@ -38,9 +38,10 @@ pub fn detect_gt() -> bool {
 /// Returns `true` if the repository has been Graphite-initialized.
 ///
 /// Checks for either the SQLite metadata DB (gt ≥ 1.8) or the legacy config file (gt < 1.8).
-/// Uses `repo.path()`, which returns the shared git dir for both bare repos and worktrees.
+/// Uses `repo.commondir()`, which resolves to the shared git dir for both bare repos and
+/// linked worktrees (`repo.path()` would instead return the worktree's private gitdir).
 pub fn is_graphite_repo(repo: &Repository) -> bool {
-    let git_dir = repo.path();
+    let git_dir = repo.commondir();
     git_dir.join(".graphite_metadata.db").exists() || git_dir.join(".graphite_repo_config").exists()
 }
 
@@ -50,7 +51,7 @@ pub fn is_graphite_repo(repo: &Repository) -> bool {
 /// Unlike [`read_trunks`], this never falls back to a hardcoded `"main"` — `None`
 /// means "unknown", which callers can use to omit `--parent` and let `gt` infer.
 pub fn graphite_trunk(repo: &Repository) -> Option<String> {
-    let path = repo.path().join(".graphite_repo_config");
+    let path = repo.commondir().join(".graphite_repo_config");
     let content = std::fs::read_to_string(&path).ok()?;
     let json = serde_json::from_str::<Value>(&content).ok()?;
     if let Some(trunks) = json.get("trunks").and_then(|t| t.as_array()) {
@@ -69,7 +70,7 @@ pub fn graphite_trunk(repo: &Repository) -> Option<String> {
 ///
 /// Falls back to `["main"]` if the file is missing or unparseable.
 fn read_trunks(repo: &Repository) -> Vec<String> {
-    let path = repo.path().join(".graphite_repo_config");
+    let path = repo.commondir().join(".graphite_repo_config");
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
         Err(_) => return vec!["main".to_string()],
@@ -97,7 +98,7 @@ fn read_trunks(repo: &Repository) -> Vec<String> {
 ///
 /// Tries the SQLite database (gt ≥ 1.8) first; falls back to git refs (gt < 1.8).
 fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
-    let db_path = repo.path().join(".graphite_metadata.db");
+    let db_path = repo.commondir().join(".graphite_metadata.db");
     if db_path.exists() {
         if let Ok(map) = build_parent_map_from_sqlite(&db_path) {
             return Ok(map);

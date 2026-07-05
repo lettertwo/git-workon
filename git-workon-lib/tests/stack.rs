@@ -332,6 +332,40 @@ fn current_stack_cycle_in_metadata_terminates() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// ── worktree-opened repo (commondir vs gitdir regression) ────────────────────
+
+#[test]
+fn current_stack_resolves_metadata_when_repo_is_worktree_opened() -> Result<(), Box<dyn Error>> {
+    // Graphite writes `.graphite_repo_config` / branch-metadata to the git *common* dir.
+    // When `repo` is opened at a linked worktree, `repo.path()` is the worktree's private
+    // gitdir (`<common>/worktrees/<name>/`), not the common dir — only `repo.commondir()`
+    // resolves there. This is a regression test for that bug: the fixture opens `step-2`
+    // as a linked worktree, so metadata reads must go through `commondir()`.
+    //
+    // The trunk is deliberately named "develop" (not "main"): `read_trunks`'s hardcoded
+    // `"main"` fallback would otherwise mask the bug (a missing/unreadable config file
+    // falls back to `vec!["main"]`, which happens to be the right answer when the real
+    // trunk actually is "main"). `graphite_trunk` is the assertion that fails pre-fix;
+    // `current_stack` is independently robust to this bug (its upward walk terminates on
+    // a missing parent-map entry for the trunk branch either way), so its assertions are
+    // a behavior-completeness check, not the discriminating ones.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .graphite_config(&["develop"])
+        .worktree("step-2")
+        .branch_metadata("step-1", "develop")
+        .branch_metadata("step-2", "step-1")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    assert_eq!(graphite_trunk(repo), Some("develop".to_string()));
+
+    let stack = current_stack(repo, "step-2", StackModel::Graphite)?.unwrap();
+    assert_eq!(stack.trunk, "develop");
+    assert_eq!(stack.diffs, vec!["step-1", "step-2"]);
+    Ok(())
+}
+
 // ── fixture predicates ────────────────────────────────────────────────────────
 
 #[test]
