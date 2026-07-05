@@ -6,7 +6,8 @@ pub use crate::{
         BranchPointsToPredicate, HasBranchMetadataPredicate, HasBranchPredicate,
         HasConfigPredicate, HasGraphiteConfigPredicate, HasMetadataParentRevisionPredicate,
         HasRemoteBranchPredicate, HasRemotePredicate, HasRemoteUrlPredicate,
-        HasSqliteBranchMetadataPredicate, HasStashPredicate, HasUpstreamPredicate,
+        HasSqliteBranchMetadataPredicate, HasStagedFilePredicate, HasStashPredicate,
+        HasUnstagedFilePredicate, HasUntrackedFilePredicate, HasUpstreamPredicate,
         HasWorktreePredicate, HeadCommitMessageContainsPredicate, HeadCommitParentCountPredicate,
         HeadMatchesPredicate, IsBarePredicate, IsEmptyPredicate, IsHeadDetachedPredicate,
         IsWorktreePredicate,
@@ -26,7 +27,8 @@ pub mod predicate {
         pub use crate::predicates::{
             branch_points_to, has_branch, has_branch_metadata, has_config, has_graphite_config,
             has_metadata_parent_revision, has_no_stash, has_remote, has_remote_branch,
-            has_remote_url, has_sqlite_branch_metadata, has_stash, has_upstream, has_worktree,
+            has_remote_url, has_sqlite_branch_metadata, has_staged_file, has_stash,
+            has_unstaged_file, has_untracked_file, has_upstream, has_worktree,
             head_commit_message_contains, head_commit_parent_count, head_matches, is_bare,
             is_empty, is_head_detached, is_worktree,
         };

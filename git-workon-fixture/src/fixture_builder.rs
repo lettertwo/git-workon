@@ -1,7 +1,7 @@
 use crate::fixture::Fixture;
 use assert_fs::TempDir;
 use git2::{BranchType, Repository, WorktreeAddOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use workon::empty_commit;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -103,6 +103,9 @@ pub struct FixtureBuilder<'fixture> {
     metadata_entries: Vec<MetadataEntry>,
     raw_branch_metadata: Vec<(String, Vec<u8>)>, // (branch, raw_bytes) for malformed-blob tests
     pr_infos: Vec<PrInfoEntry>,
+    staged_files: Vec<(String, String)>, // (path, content)
+    unstaged_files: Vec<(String, String, String)>, // (path, committed, modified)
+    untracked_files: Vec<(String, String)>, // (path, content)
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -120,6 +123,9 @@ impl<'fixture> FixtureBuilder<'fixture> {
             metadata_entries: Vec::new(),
             raw_branch_metadata: Vec::new(),
             pr_infos: Vec::new(),
+            staged_files: Vec::new(),
+            unstaged_files: Vec::new(),
+            untracked_files: Vec::new(),
         }
     }
 
@@ -278,6 +284,45 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Write `path` with `content` in the fixture's cwd repo working tree and stage it
+    /// (added to the index but not committed).
+    ///
+    /// Applies to the LAST worktree added, or the main repo if none. Errors at [`build`](Self::build)
+    /// if the fixture is `bare(true)` with no worktree (there is no working tree to stage into).
+    pub fn staged_file(mut self, path: &str, content: &str) -> Self {
+        self.staged_files
+            .push((path.to_string(), content.to_string()));
+        self
+    }
+
+    /// Commit `path` with `committed` content on the cwd repo's branch during `build()`
+    /// (moving the branch tip), then rewrite the working tree copy to `modified` — an
+    /// unstaged modification with a clean index entry for `path`.
+    ///
+    /// The baseline commit lands before Graphite-metadata live-tip resolution, so any
+    /// `branch_metadata` entry recording this branch's tip reflects the moved tip, not the
+    /// pre-baseline one. Applies to the LAST worktree added, or the main repo if none. Errors
+    /// at [`build`](Self::build) if the fixture is `bare(true)` with no worktree.
+    pub fn unstaged_file(mut self, path: &str, committed: &str, modified: &str) -> Self {
+        self.unstaged_files.push((
+            path.to_string(),
+            committed.to_string(),
+            modified.to_string(),
+        ));
+        self
+    }
+
+    /// Write `path` with `content` in the fixture's cwd repo working tree; never staged
+    /// (untracked).
+    ///
+    /// Applies to the LAST worktree added, or the main repo if none. Errors at [`build`](Self::build)
+    /// if the fixture is `bare(true)` with no worktree.
+    pub fn untracked_file(mut self, path: &str, content: &str) -> Self {
+        self.untracked_files
+            .push((path.to_string(), content.to_string()));
+        self
+    }
+
     pub fn build(self) -> Result<Fixture> {
         let tmpdir = TempDir::new()?;
         let path = tmpdir.path().join(if self.bare {
@@ -371,6 +416,57 @@ impl<'fixture> FixtureBuilder<'fixture> {
             // Set upstream tracking
             let mut local_branch = repo.find_branch(branch, BranchType::Local)?;
             local_branch.set_upstream(Some(remote_branch))?;
+        }
+
+        // Resolve the fixture's cwd repo path — the LAST worktree added, or the main repo if
+        // none. Index-state builders (staged/unstaged/untracked files) apply here.
+        let cwd_path = if self.worktrees.is_empty() {
+            path.clone()
+        } else {
+            tmpdir.path().join(self.worktrees.last().unwrap())
+        };
+
+        let has_index_state = !self.staged_files.is_empty()
+            || !self.unstaged_files.is_empty()
+            || !self.untracked_files.is_empty();
+        if has_index_state && self.bare && self.worktrees.is_empty() {
+            return Err(
+                "staged_file/unstaged_file/untracked_file require a working tree: fixture is \
+                 bare(true) with no worktree"
+                    .into(),
+            );
+        }
+
+        // `unstaged_file` baseline commits land BEFORE Graphite-metadata live-tip resolution
+        // below: they move the cwd branch's tip, and any metadata entry recording that tip
+        // must reflect the moved one, not the pre-baseline commit.
+        if !self.unstaged_files.is_empty() {
+            let cwd_repo = Repository::open(&cwd_path)?;
+            for (file_path, committed, _modified) in &self.unstaged_files {
+                let abs_path = cwd_path.join(file_path);
+                if let Some(parent) = abs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&abs_path, committed)?;
+
+                let mut index = cwd_repo.index()?;
+                index.add_path(Path::new(file_path))?;
+                index.write()?;
+
+                let tree_id = index.write_tree()?;
+                let tree = cwd_repo.find_tree(tree_id)?;
+                let sig =
+                    git2::Signature::now("git-workon-fixture", "git-workon-fixture@fake.com")?;
+                let parent_commit = cwd_repo.head()?.peel_to_commit()?;
+                cwd_repo.commit(
+                    Some("HEAD"),
+                    &sig,
+                    &sig,
+                    "unstaged_file baseline",
+                    &tree,
+                    &[&parent_commit],
+                )?;
+            }
         }
 
         // Write .graphite_repo_config
@@ -512,14 +608,44 @@ impl<'fixture> FixtureBuilder<'fixture> {
             std::fs::write(&pr_info_path, pr_info_json.to_string())?;
         }
 
+        // Index mutations last: staged adds, unstaged working-tree rewrites, untracked
+        // writes. These run after metadata writes so they never affect resolved revisions.
+        if has_index_state {
+            let cwd_repo = Repository::open(&cwd_path)?;
+
+            if !self.staged_files.is_empty() {
+                let mut index = cwd_repo.index()?;
+                for (file_path, content) in &self.staged_files {
+                    let abs_path = cwd_path.join(file_path);
+                    if let Some(parent) = abs_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&abs_path, content)?;
+                    index.add_path(Path::new(file_path))?;
+                }
+                index.write()?;
+            }
+
+            for (file_path, _committed, modified) in &self.unstaged_files {
+                std::fs::write(cwd_path.join(file_path), modified)?;
+            }
+
+            for (file_path, content) in &self.untracked_files {
+                let abs_path = cwd_path.join(file_path);
+                if let Some(parent) = abs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&abs_path, content)?;
+            }
+        }
+
         if self.worktrees.is_empty() {
             // No worktrees specified - return the main repo
             Ok(Fixture::new(repo, path, tmpdir))
         } else {
             // Open the repository from the worktree path instead of using the bare/main repo
-            let worktree_path = tmpdir.path().join(self.worktrees.last().unwrap());
-            let worktree_repo = Repository::open(&worktree_path)?;
-            Ok(Fixture::new(worktree_repo, worktree_path, tmpdir))
+            let worktree_repo = Repository::open(&cwd_path)?;
+            Ok(Fixture::new(worktree_repo, cwd_path, tmpdir))
         }
     }
 }
