@@ -56,6 +56,12 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 - `docs/adr/009-pr-workflow-gh-cli.md`
 - Key source: `git-workon-lib/src/pr.rs`, `git-workon/src/cmd/new.rs`
 
+### review / workon-review
+
+- `docs/rfc/workon-review.md`
+- `docs/adr/027-review-crate-workspace-placement.md`
+- Key source: `git-workon-review/src/`
+
 ## Cross-cutting Concerns
 
 ### errors / error-handling / miette
