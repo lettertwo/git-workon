@@ -8,11 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace Structure
 
-This is a Cargo workspace with three crates:
+This is a Cargo workspace with four crates:
 
 - **git-workon** (git-workon/): The CLI binary that provides the user-facing commands
 - **git-workon-lib** (git-workon-lib/): Core library (published as `workon`) containing the git worktree manipulation logic
 - **git-workon-fixture** (git-workon-fixture/): Testing utilities that provide fixture builders and custom predicates for git repository tests
+- **git-workon-review** (git-workon-review/): Lib+bin crate for the review TUI domain — diff parsing, staging, changeset views; the binary is the TUI
 
 ## File Location Quick Reference
 
@@ -32,6 +33,9 @@ This is a Cargo workspace with three crates:
 - Add integration tests → `git-workon-lib/tests/` or `git-workon/tests/`
 - Find workon root logic → `git-workon-lib/src/workon_root.rs`
 - Smart routing logic → `git-workon/src/main.rs` (lines 20-38)
+- Add review domain logic → `git-workon-review/src/`
+- Add review CLI entry → `git-workon-review/src/main.rs`
+- Add review error types → `git-workon-review/src/error.rs` (ADR-008 pattern: concrete enums with `#[derive(Error, Diagnostic)]`)
 
 ## Key Architecture Concepts
 
@@ -73,7 +77,7 @@ Inline test/clippy runs go through `cargo-gate test`/`clippy` (a raw `cargo test
 
 **Valid types**: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`
 
-**Scopes** (optional): `cli`, `lib`, `fixture`, `config`, `worktree`, `hooks`, `copy`, `pr`, `completions`, `build`, `release`
+**Scopes** (optional): `cli`, `lib`, `fixture`, `review`, `config`, `worktree`, `hooks`, `copy`, `pr`, `completions`, `build`, `release`
 
 **Breaking changes**: append `!` — e.g. `feat(cli)!: change output format`
 
