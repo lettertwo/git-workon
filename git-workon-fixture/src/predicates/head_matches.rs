@@ -19,9 +19,7 @@ impl fmt::Display for HeadMatchesPredicate {
 impl Predicate<Repository> for HeadMatchesPredicate {
     fn eval(&self, repo: &Repository) -> bool {
         match repo.head() {
-            Ok(head) => head
-                .name()
-                .map_or(false, |name| name.contains(&self.pattern)),
+            Ok(head) => head.name().is_ok_and(|name| name.contains(&self.pattern)),
             Err(_) => false,
         }
     }

@@ -22,7 +22,7 @@ impl Predicate<Repository> for HeadCommitMessageContainsPredicate {
             Ok(head) => match head.peel_to_commit() {
                 Ok(commit) => commit
                     .message()
-                    .map_or(false, |msg| msg.contains(&self.pattern)),
+                    .is_ok_and(|msg| msg.contains(&self.pattern)),
                 Err(_) => false,
             },
             Err(_) => false,
