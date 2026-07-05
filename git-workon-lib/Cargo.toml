@@ -24,8 +24,6 @@ name = "workon"
 vendored = ["git2/vendored-libgit2", "git2/vendored-openssl"]
 
 [dependencies]
-dialoguer.workspace = true
-env_logger.workspace = true
 git2.workspace = true
 auth-git2.workspace = true
 glob.workspace = true
