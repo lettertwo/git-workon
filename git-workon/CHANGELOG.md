@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.8.0...git-workon-v0.9.0) - 2026-07-05
+
+### Added
+
+- *(cli)* [**breaking**] replace prune discovery flow with annotated picker
+
+### Fixed
+
+- *(cli)* remove empty namespace dirs after prune
+- *(copy)* prune excluded directories from the walk
+- *(cli)* use real glob matching for protected branches
+
 ## [0.8.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.7.4...git-workon-v0.8.0) - 2026-06-24
 
 ### Added
