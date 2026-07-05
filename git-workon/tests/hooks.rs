@@ -52,10 +52,13 @@ fn hook_failure_shows_warning() -> Result<(), Box<dyn std::error::Error>> {
         .config("workon.postCreateHook", "exit 1")
         .build()?;
 
-    // Create a new worktree with a failing hook
+    // Create a new worktree with a failing hook. NO_COLOR pins the warning to plain
+    // text: the spawned binary inherits this process's env, where FORCE_COLOR (if set)
+    // would style the warning and break the substring assertion below.
     let mut new_cmd = cargo_bin_cmd!("git-workon");
     let output = new_cmd
         .current_dir(&fixture)
+        .env("NO_COLOR", "1")
         .arg("new")
         .arg("feature")
         .output()?;

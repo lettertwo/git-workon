@@ -317,29 +317,37 @@ impl Drop for CursorGuard<'_> {
 mod tests {
     use super::*;
 
-    // Colors are auto-disabled in the test environment (stdout is not a TTY), so
-    // rendered rows are plain strings and glyph assertions are byte-exact.
+    /// Pin color off so rendered rows are plain strings and glyph assertions are
+    /// byte-exact. Color support is process-global and env-sensitive — FORCE_COLOR
+    /// enables styling even when stdout is not a TTY.
+    fn no_color() {
+        crate::output::set_no_color(true);
+    }
 
     #[test]
     fn render_multi_row_checked_uses_filled_glyph() {
+        no_color();
         let row = render_multi_row("./feature", true, false);
         assert_eq!(row, "  ◉ ./feature");
     }
 
     #[test]
     fn render_multi_row_unchecked_uses_hollow_glyph() {
+        no_color();
         let row = render_multi_row("./feature", false, false);
         assert_eq!(row, "  ◯ ./feature");
     }
 
     #[test]
     fn render_multi_row_cursor_shows_marker() {
+        no_color();
         let row = render_multi_row("./feature", false, true);
         assert_eq!(row, "▶ ◯ ./feature");
     }
 
     #[test]
     fn render_multi_row_cursor_and_checked_combine() {
+        no_color();
         let row = render_multi_row("./feature", true, true);
         assert_eq!(row, "▶ ◉ ./feature");
     }

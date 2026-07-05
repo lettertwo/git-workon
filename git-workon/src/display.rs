@@ -1257,6 +1257,13 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// Pin color off for tests that assert exact rendered strings. Color support is
+    /// process-global and env-sensitive — FORCE_COLOR enables styling even when stdout
+    /// is not a TTY — which would embed ANSI codes in the asserted output.
+    fn no_color() {
+        crate::output::set_no_color(true);
+    }
+
     fn leaf(branch: &str, is_active: bool) -> TreeNode {
         TreeNode {
             branch: branch.to_string(),
@@ -1536,6 +1543,7 @@ mod tests {
         //
         // Despite the different gutter widths, the indicator column must start at
         // the same byte offset in every row that has indicators.
+        no_color();
         let s1 = leaf_with_data("s1", false, &["*"], "2h ago");
         let shared = leaf_with_data("shared", false, &[], "3d ago");
         let mut root = leaf_with_data("main", true, &["↑"], "1d ago");
@@ -1558,6 +1566,7 @@ mod tests {
     #[test]
     fn format_tree_lines_activity_column_aligned_across_lanes() {
         // Same setup as above; also verify the activity strings start at the same offset.
+        no_color();
         let s1 = leaf_with_data("s1", false, &["*"], "2h ago");
         let shared = leaf_with_data("shared", false, &[], "3d ago");
         let mut root = leaf_with_data("main", true, &["↑"], "1d ago");
@@ -1630,6 +1639,7 @@ mod tests {
 
     #[test]
     fn format_aligned_rows_annotated_appends_annotation() {
+        no_color();
         let rows = vec![flat_row("feature", false)];
         let lines = format_aligned_rows_annotated(&rows, false, &["branch deleted".to_string()]);
         assert!(
@@ -1644,6 +1654,7 @@ mod tests {
     fn format_aligned_rows_annotated_empty_annotation_matches_plain() {
         // An empty annotation string (and a missing entry) must render identically
         // to the un-annotated formatter.
+        no_color();
         let rows = vec![flat_row("feature", false), flat_row("other", false)];
         let plain = format_aligned_rows(&rows, false);
         let annotated = format_aligned_rows_annotated(&rows, false, &[String::new()]);
@@ -1654,6 +1665,7 @@ mod tests {
     fn format_aligned_rows_annotated_preserves_name_alignment() {
         // The annotation is trailing-only: the name/indicator columns must still be
         // aligned across rows of different name widths.
+        no_color();
         let mut short = flat_row("a", false);
         short.indicators = vec!["*".to_string()];
         short.last_activity = "1h ago".to_string();
