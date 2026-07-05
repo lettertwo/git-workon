@@ -45,6 +45,13 @@ struct ResolvedMetadataEntry {
     parent_rev: Option<String>,
 }
 
+/// One `prInfos[]` entry for `.graphite_pr_info` (see [`FixtureBuilder::graphite_pr_info`]).
+struct PrInfoEntry {
+    branch: String,
+    number: u64,
+    title: String,
+}
+
 /// Represents a remote URL source
 pub enum RemoteSource {
     /// Path to another repository (from a Fixture)
@@ -95,6 +102,7 @@ pub struct FixtureBuilder<'fixture> {
     metadata_format: MetadataFormat,
     metadata_entries: Vec<MetadataEntry>,
     raw_branch_metadata: Vec<(String, Vec<u8>)>, // (branch, raw_bytes) for malformed-blob tests
+    pr_infos: Vec<PrInfoEntry>,
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -111,6 +119,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
             metadata_format: MetadataFormat::default(),
             metadata_entries: Vec::new(),
             raw_branch_metadata: Vec::new(),
+            pr_infos: Vec::new(),
         }
     }
 
@@ -249,6 +258,19 @@ impl<'fixture> FixtureBuilder<'fixture> {
     /// since malformed sqlite rows aren't a meaningful scenario to fixture the same way.
     pub fn raw_branch_metadata(mut self, branch: &str, bytes: Vec<u8>) -> Self {
         self.raw_branch_metadata.push((branch.to_string(), bytes));
+        self
+    }
+
+    /// Append a PR entry to `.graphite_pr_info` in the main repo's git dir.
+    ///
+    /// Repeated calls accumulate into one `prInfos` array, mirroring how `gt` maintains a
+    /// single file across multiple tracked PRs. `body` is always written as an empty string.
+    pub fn graphite_pr_info(mut self, branch: &str, number: u64, title: &str) -> Self {
+        self.pr_infos.push(PrInfoEntry {
+            branch: branch.to_string(),
+            number,
+            title: title.to_string(),
+        });
         self
     }
 
@@ -465,6 +487,25 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 false,
                 "add raw branch metadata",
             )?;
+        }
+
+        // Write .graphite_pr_info (PR titles, read by branch name)
+        if !self.pr_infos.is_empty() {
+            let pr_info_objects: Vec<serde_json::Value> = self
+                .pr_infos
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "headRefName": entry.branch,
+                        "number": entry.number,
+                        "title": entry.title,
+                        "body": "",
+                    })
+                })
+                .collect();
+            let pr_info_json = serde_json::json!({ "prInfos": pr_info_objects });
+            let pr_info_path = repo.path().join(".graphite_pr_info");
+            std::fs::write(&pr_info_path, pr_info_json.to_string())?;
         }
 
         if self.worktrees.is_empty() {
