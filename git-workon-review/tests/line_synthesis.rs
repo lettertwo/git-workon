@@ -1,8 +1,6 @@
-//! Line-precise patch synthesis round-trips (trap 1: direction-dependent drop rules), run
-//! against both appliers via `for_each_applier` — see `tests/apply.rs` for the pattern this
-//! borrows (fresh fixture per applier backend).
-//!
-//! Trap-2 (the EOFNL splice) round-trips land in a follow-up commit.
+//! Line-precise patch synthesis round-trips (trap 1: direction-dependent drop rules; trap 2:
+//! the EOFNL del-to-context splice), run against both appliers via `for_each_applier` — see
+//! `tests/apply.rs` for the pattern this borrows (fresh fixture per applier backend).
 
 use git_workon_fixture::prelude::*;
 use workon_review::acquire::diff_uncommitted;
@@ -10,7 +8,9 @@ use workon_review::apply::{
     Applier, ApplyDestination, ApplyDirection, CliApplier, Git2Applier, StageVerb,
 };
 use workon_review::model::{FileChange, LineKind};
-use workon_review::synthesis::{partial_hunk_patch, LineSelection, PatchBase};
+use workon_review::synthesis::{
+    partial_hunk_patch, LineSelection, PatchBase, PatchHunk, PatchLine, PatchText,
+};
 
 /// Run `test` once per applier backend. Each invocation gets its own closure body so callers
 /// build a fresh fixture inside `test` rather than sharing one across backends (appliers mutate
@@ -181,4 +181,203 @@ fn base_old_partial_patch_fails_under_reverse_apply() {
         ),
         "expected reverse-applying a base=Old partial patch to fail, got {result:?}"
     );
+}
+
+/// Fixture for the trap-2 (EOFNL splice) tests: the committed file's last line ("last") has NO
+/// trailing newline; the modification deletes that line and adds two new ones, the last of
+/// which ("more\n") DOES end in a newline (so the file gains a trailing newline overall). This
+/// is the shape that produces a deletion carrying `missing_newline` with kept lines after it —
+/// trap 2's precondition.
+fn eofnl_fixture() -> FixtureBuilder<'static> {
+    FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .unstaged_file("f.txt", "a\nb\nlast", "a\nb\nreplaced\nmore\n")
+}
+
+/// Hand-built patch replicating what `partial_hunk_patch` would have produced BEFORE the trap-2
+/// splice: the dropped deletion of "last" rendered as a plain context line, still carrying its
+/// `missing_newline` marker, immediately followed by the kept "+more" addition. This is a
+/// test-only stand-in for the naive (pre-fix) code path — there's no live way to ask the current
+/// `partial_hunk_patch` for it, since the splice isn't optional.
+fn naive_unspliced_patch() -> PatchText {
+    PatchText {
+        old_path: Some("f.txt".to_string()),
+        new_path: Some("f.txt".to_string()),
+        hunks: vec![PatchHunk {
+            old_start: 1,
+            old_count: 3,
+            new_start: 1,
+            new_count: 4,
+            header: b"@@ -1,3 +1,4 @@\n".to_vec(),
+            lines: vec![
+                PatchLine {
+                    kind: LineKind::Context,
+                    content: b"a\n".to_vec(),
+                    missing_newline: false,
+                },
+                PatchLine {
+                    kind: LineKind::Context,
+                    content: b"b\n".to_vec(),
+                    missing_newline: false,
+                },
+                PatchLine {
+                    kind: LineKind::Context,
+                    content: b"last".to_vec(),
+                    missing_newline: true,
+                },
+                PatchLine {
+                    kind: LineKind::Addition,
+                    content: b"more\n".to_vec(),
+                    missing_newline: false,
+                },
+            ],
+        }],
+    }
+}
+
+/// THE TRIPWIRE, first: documents that `git apply` does NOT reject the naive (unspliced) form —
+/// it exits 0 and silently concatenates "more" directly onto "last" with no separating newline,
+/// corrupting the blob. Verified against the system `git` binary; pinned here exactly so a
+/// future git version that starts rejecting (or otherwise changes) this shape is caught by a
+/// test failure instead of a passing suite over a stale assumption.
+#[test]
+fn naive_unspliced_eofnl_patch_silently_corrupts_the_index() {
+    let fixture = eofnl_fixture().build().expect("fixture build");
+    let repo = fixture.repo().expect("repo");
+    let patch = naive_unspliced_patch();
+
+    let result = CliApplier.apply(
+        repo,
+        &patch,
+        ApplyDestination::Index,
+        ApplyDirection::Forward,
+    );
+
+    assert!(
+        result.is_ok(),
+        "expected git apply to silently accept the naive form, got {result:?}"
+    );
+    fixture.assert(predicate::repo::index_blob_equals(
+        "f.txt",
+        b"a\nb\nlastmore\n".to_vec(),
+    ));
+}
+
+#[test]
+fn spliced_eofnl_patch_stages_correct_bytes() {
+    for_each_applier(|applier| {
+        let fixture = eofnl_fixture().build().expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+        let file = &diffs.unstaged.files[0];
+        // Keep only "more\n"; drop the "last" deletion (context, missing_newline) and the
+        // "replaced\n" addition (omitted under base=Old) — trap 2's exact precondition.
+        let keep_add = line_index(file, 0, LineKind::Addition, "more\n");
+        let sel = LineSelection {
+            keep_adds: [keep_add].into(),
+            keep_dels: [].into(),
+        };
+        let patch = partial_hunk_patch(file, 0, &sel, PatchBase::Old).expect("partial_hunk_patch");
+
+        let (_, dest, dir) = StageVerb::Stage.plan();
+        applier.apply(repo, &patch, dest, dir).expect("apply");
+
+        fixture.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            b"a\nb\nlast\nmore\n".to_vec(),
+        ));
+    });
+}
+
+/// The spliced patch must still be a well-formed unified diff, not just something `git apply`
+/// happens to tolerate — `git2::Diff::from_buffer` parses stricter (plan risk #4).
+#[test]
+fn spliced_eofnl_patch_reparses_via_git2_from_buffer() {
+    let fixture = eofnl_fixture().build().expect("fixture build");
+    let repo = fixture.repo().expect("repo");
+
+    let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+    let file = &diffs.unstaged.files[0];
+    let keep_add = line_index(file, 0, LineKind::Addition, "more\n");
+    let sel = LineSelection {
+        keep_adds: [keep_add].into(),
+        keep_dels: [].into(),
+    };
+    let patch = partial_hunk_patch(file, 0, &sel, PatchBase::Old).expect("partial_hunk_patch");
+
+    git2::Diff::from_buffer(&patch.to_bytes()).expect("spliced patch reparses");
+}
+
+/// The splice-NOT-needed case: the dropped no-newline deletion is the LAST emitted line (nothing
+/// kept comes after it), so it renders as plain context and applies cleanly with no splice.
+#[test]
+fn dropped_eofnl_deletion_as_last_line_needs_no_splice() {
+    for_each_applier(|applier| {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "x\ny\nlast", "X\ny\nreplacedlast")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+        let file = &diffs.unstaged.files[0];
+        // Keep the "x"->"X" change; drop the "last"->"replacedlast" change entirely (its
+        // deletion converts to context under base=Old, its addition is omitted) — the dropped
+        // deletion ends up as the LAST emitted line.
+        let keep_add = line_index(file, 0, LineKind::Addition, "X\n");
+        let keep_del = line_index(file, 0, LineKind::Deletion, "x\n");
+        let sel = LineSelection {
+            keep_adds: [keep_add].into(),
+            keep_dels: [keep_del].into(),
+        };
+        let patch = partial_hunk_patch(file, 0, &sel, PatchBase::Old).expect("partial_hunk_patch");
+
+        let (_, dest, dir) = StageVerb::Stage.plan();
+        applier.apply(repo, &patch, dest, dir).expect("apply");
+
+        fixture.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            b"X\ny\nlast".to_vec(),
+        ));
+    });
+}
+
+/// The base=New mirror: a dropped ADDITION carrying `missing_newline` converts to context. Per
+/// [`workon_review::synthesis`]'s doc comment on `splice_eofnl_context_lines`, this can never
+/// have kept lines after it — `missing_newline` is only ever set on a file's true last line, and
+/// synthesis never reorders `hunk.lines` — so it needs no splice. This test is the evidence for
+/// that reasoning: the committed file HAS a trailing newline, the modification drops it (the
+/// addition "replaced" is the new EOF); discarding while dropping that addition must reproduce
+/// the original content without corruption.
+#[test]
+fn dropped_eofnl_addition_as_context_needs_no_splice_under_base_new() {
+    for_each_applier(|applier| {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "a\nb\nlast\n", "a\nb\nreplaced")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+        let file = &diffs.unstaged.files[0];
+        // Keep the deletion of "last\n" (restore it on discard); drop the addition "replaced"
+        // (base=New converts it to context — it's the file's new EOF, so nothing follows it).
+        let keep_del = line_index(file, 0, LineKind::Deletion, "last\n");
+        let sel = LineSelection {
+            keep_adds: [].into(),
+            keep_dels: [keep_del].into(),
+        };
+        let patch = partial_hunk_patch(file, 0, &sel, PatchBase::New).expect("partial_hunk_patch");
+
+        let (_, dest, dir) = StageVerb::Discard.plan();
+        applier.apply(repo, &patch, dest, dir).expect("apply");
+
+        fixture.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            b"a\nb\nlast\nreplaced".to_vec(),
+        ));
+    });
 }
