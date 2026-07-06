@@ -57,6 +57,7 @@ enum Action {
     PrevFile,
     NextHunk,
     PrevHunk,
+    ToggleLayout,
     None,
 }
 
@@ -86,6 +87,7 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
         }
         KeyCode::Char('g') => Action::ScrollTop,
         KeyCode::Char('G') => Action::ScrollBottom,
+        KeyCode::Char('L') => Action::ToggleLayout,
         KeyCode::Tab => Action::NextFile,
         KeyCode::BackTab => Action::PrevFile,
         KeyCode::Char(']') => {
@@ -111,6 +113,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::PrevFile => app.prev_file(),
         Action::NextHunk => app.next_hunk_row(),
         Action::PrevHunk => app.prev_hunk_row(),
+        Action::ToggleLayout => app.toggle_layout(),
         Action::None => {}
     }
     false
@@ -243,6 +246,15 @@ mod tests {
         assert_eq!(
             map_key(&mut pending, key(KeyCode::Char('G')), 20),
             Action::ScrollBottom
+        );
+    }
+
+    #[test]
+    fn shift_l_maps_to_toggle_layout() {
+        let mut pending = None;
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('L')), 20),
+            Action::ToggleLayout
         );
     }
 

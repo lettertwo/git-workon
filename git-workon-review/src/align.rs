@@ -259,6 +259,116 @@ fn collapse_gaps_with(rows: &[AlignedRow], context: usize) -> Vec<DisplayRow> {
     out
 }
 
+/// One row of the inline (unified, single-column) display.
+///
+/// Built by [`inline_rows`] from the SAME gap-collapsed [`DisplayRow`] vector [`collapse_gaps`]
+/// already produces for the side-by-side layout — inline reuses that pass unchanged rather than
+/// re-running gap collapse over its own row type (context-gap detection is layout-agnostic; only
+/// how the surviving rows spread onto the screen differs). Because a del/add change block
+/// becomes MULTIPLE `InlineRow` entries (deletions first, then additions — there's no second
+/// column to pad against, so unlike [`AlignedRow`] there is no `Filler` variant here), this
+/// vector's indices are a DIFFERENT coordinate space than `display`'s: [`crate::app::FileView`]
+/// keeps a separate word-span cache keyed by THIS vector's row index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineRow {
+    /// An unchanged line; carries both linenos since old and new agree on its content.
+    Context {
+        old: usize,
+        new: usize,
+    },
+    /// A deleted line. `paired_new` is the addition it was aligned with in the SAME
+    /// [`AlignedRow`] (index-paired within the change block), if any — kept only so the renderer
+    /// can still run word-level diffing on the pair even though the two lines are no longer
+    /// visually adjacent.
+    Del {
+        old: usize,
+        paired_new: Option<usize>,
+    },
+    /// An added line. `paired_old` mirrors [`InlineRow::Del::paired_new`].
+    Add {
+        new: usize,
+        paired_old: Option<usize>,
+    },
+    Gap {
+        skipped: usize,
+    },
+}
+
+impl InlineRow {
+    /// True when this row has an index-paired counterpart on the other side, eligible for
+    /// word-level diffing — the inline analog of [`AlignedRow::is_word_diff_pair`].
+    pub fn is_word_diff_pair(&self) -> bool {
+        matches!(
+            self,
+            InlineRow::Del {
+                paired_new: Some(_),
+                ..
+            } | InlineRow::Add {
+                paired_old: Some(_),
+                ..
+            }
+        )
+    }
+}
+
+/// Convert a gap-collapsed side-by-side display vector into the inline layout's row vector.
+///
+/// Walks maximal runs of non-context rows (a "change block": consecutive `AlignedRow`s where
+/// `old_kind`/`new_kind` isn't `(Context, Context)`) and, within each run, emits every deletion
+/// line first, then every addition line — matching git's own convention of listing removed lines
+/// before added ones — dropping `Filler` entries entirely (inline has no second column to pad
+/// against).
+pub fn inline_rows(display: &[DisplayRow]) -> Vec<InlineRow> {
+    let mut out = Vec::with_capacity(display.len());
+    let mut run: Vec<AlignedRow> = Vec::new();
+
+    fn flush(run: &mut Vec<AlignedRow>, out: &mut Vec<InlineRow>) {
+        for r in run.iter().filter(|r| r.old_kind == CellKind::Del) {
+            let Row::Line(old) = r.old else {
+                unreachable!("a Del row always carries a Line on its old side")
+            };
+            let paired_new = match r.new {
+                Row::Line(n) if r.new_kind == CellKind::Add => Some(n),
+                _ => None,
+            };
+            out.push(InlineRow::Del { old, paired_new });
+        }
+        for r in run.iter().filter(|r| r.new_kind == CellKind::Add) {
+            let Row::Line(new) = r.new else {
+                unreachable!("an Add row always carries a Line on its new side")
+            };
+            let paired_old = match r.old {
+                Row::Line(o) if r.old_kind == CellKind::Del => Some(o),
+                _ => None,
+            };
+            out.push(InlineRow::Add { new, paired_old });
+        }
+        run.clear();
+    }
+
+    for row in display {
+        match row {
+            DisplayRow::Gap { skipped } => {
+                flush(&mut run, &mut out);
+                out.push(InlineRow::Gap { skipped: *skipped });
+            }
+            DisplayRow::Row(r)
+                if r.old_kind == CellKind::Context && r.new_kind == CellKind::Context =>
+            {
+                flush(&mut run, &mut out);
+                let (Row::Line(old), Row::Line(new)) = (r.old, r.new) else {
+                    unreachable!("a Context row always carries a Line on both sides")
+                };
+                out.push(InlineRow::Context { old, new });
+            }
+            DisplayRow::Row(r) => run.push(*r),
+        }
+    }
+    flush(&mut run, &mut out);
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +638,109 @@ mod tests {
             DisplayRow::Gap { skipped } => assert_eq!(skipped, 7),
             other => panic!("expected gap row, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn inline_del_run_precedes_add_run_within_a_block() {
+        // 3 dels / 1 add block: SBS index-pairs del[0]/add[0] and fillers the rest; inline must
+        // emit all 3 dels first, then the 1 add — not interleaved by pairing index.
+        let h = hunk(
+            1,
+            5,
+            1,
+            3,
+            vec![
+                hl(LineKind::Context, Some(1), Some(1)),
+                hl(LineKind::Deletion, Some(2), None),
+                hl(LineKind::Deletion, Some(3), None),
+                hl(LineKind::Deletion, Some(4), None),
+                hl(LineKind::Addition, None, Some(2)),
+                hl(LineKind::Context, Some(5), Some(3)),
+            ],
+        );
+        let aligned = align_file(&[h], 5, 3);
+        let display = collapse_gaps(&aligned.rows);
+        let inline = inline_rows(&display);
+
+        assert_eq!(
+            inline,
+            vec![
+                InlineRow::Context { old: 1, new: 1 },
+                InlineRow::Del {
+                    old: 2,
+                    paired_new: Some(2)
+                },
+                InlineRow::Del {
+                    old: 3,
+                    paired_new: None
+                },
+                InlineRow::Del {
+                    old: 4,
+                    paired_new: None
+                },
+                InlineRow::Add {
+                    new: 2,
+                    paired_old: Some(2)
+                },
+                InlineRow::Context { old: 5, new: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_has_no_filler_rows() {
+        let h = hunk(
+            0,
+            0,
+            1,
+            2,
+            vec![
+                hl(LineKind::Addition, None, Some(1)),
+                hl(LineKind::Addition, None, Some(2)),
+            ],
+        );
+        let aligned = align_file(&[h], 0, 2);
+        let display = collapse_gaps(&aligned.rows);
+        let inline = inline_rows(&display);
+
+        assert_eq!(
+            inline,
+            vec![
+                InlineRow::Add {
+                    new: 1,
+                    paired_old: None
+                },
+                InlineRow::Add {
+                    new: 2,
+                    paired_old: None
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn inline_passes_gap_rows_through_unchanged() {
+        let mut rows = vec![change_row(
+            Row::Line(1),
+            Row::Line(1),
+            CellKind::Del,
+            CellKind::Add,
+        )];
+        rows.extend((2..=11).map(context_row));
+        rows.push(change_row(
+            Row::Line(12),
+            Row::Line(12),
+            CellKind::Del,
+            CellKind::Add,
+        ));
+
+        let display = collapse_gaps_with(&rows, 3);
+        let inline = inline_rows(&display);
+        assert!(
+            inline
+                .iter()
+                .any(|r| matches!(r, InlineRow::Gap { skipped: 4 })),
+            "expected the gap row to survive the inline conversion unchanged: {inline:?}"
+        );
     }
 }
