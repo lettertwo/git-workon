@@ -203,6 +203,8 @@ fn naive_unspliced_patch() -> PatchText {
     PatchText {
         old_path: Some("f.txt".to_string()),
         new_path: Some("f.txt".to_string()),
+        old_mode: 0o100644,
+        new_mode: 0o100644,
         hunks: vec![PatchHunk {
             old_start: 1,
             old_count: 3,
@@ -378,6 +380,47 @@ fn dropped_eofnl_addition_as_context_needs_no_splice_under_base_new() {
         fixture.assert(predicate::repo::workdir_file_equals(
             "f.txt",
             b"a\nb\nlast\nreplaced".to_vec(),
+        ));
+    });
+}
+
+/// The bug this fix targets: a KEPT deletion (not a dropped-to-context one) carrying
+/// `missing_newline` under `base == New`, followed by dropped-additions-turned-context. Before
+/// the fix, `partial_hunk_patch` emitted the kept deletion verbatim (never routed through the
+/// trap-2 splice, which only ever looked at dropped-deletion-turned-context lines) — the CLI
+/// applier silently concatenated the next line onto it (`"lastreplaced\n"`), while the git2
+/// applier rejected the patch outright (`invalid patch hunk`). Same fixture as
+/// `dropped_eofnl_addition_as_context_needs_no_splice_under_base_new`'s mirror
+/// (`eofnl_fixture`), but this time KEEPING the "last" deletion (instead of dropping it) so it
+/// stays a `Deletion` line rather than converting to context.
+#[test]
+fn kept_eofnl_deletion_needs_splice_under_base_new() {
+    for_each_applier(|applier| {
+        let fixture = eofnl_fixture().build().expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+        let file = &diffs.unstaged.files[0];
+        // Keep the deletion of "last" (no trailing newline); drop both additions
+        // ("replaced\n"/"more\n") — base=New converts each to context, so the kept deletion is
+        // followed by more emitted lines.
+        let keep_del = line_index(file, 0, LineKind::Deletion, "last");
+        let sel = LineSelection {
+            keep_adds: [].into(),
+            keep_dels: [keep_del].into(),
+        };
+        let patch = partial_hunk_patch(file, 0, &sel, PatchBase::New).expect("partial_hunk_patch");
+
+        // The spliced patch must still be well-formed enough for git2 to reparse (plan risk #4)
+        // — before the fix, git2 rejected this shape outright.
+        git2::Diff::from_buffer(&patch.to_bytes()).expect("spliced patch reparses");
+
+        let (_, dest, dir) = StageVerb::Discard.plan();
+        applier.apply(repo, &patch, dest, dir).expect("apply");
+
+        fixture.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            b"a\nb\nlast\nreplaced\nmore\n".to_vec(),
         ));
     });
 }
