@@ -18,7 +18,9 @@ impl fmt::Display for HasUntrackedFilePredicate {
 impl Predicate<Repository> for HasUntrackedFilePredicate {
     fn eval(&self, repo: &Repository) -> bool {
         let mut opts = StatusOptions::new();
-        opts.include_untracked(true);
+        // Without recursion, libgit2 reports an untracked file inside a new directory as a
+        // single WT_NEW entry for the directory ("sub/"), never for the file itself.
+        opts.include_untracked(true).recurse_untracked_dirs(true);
         let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
             return false;
         };

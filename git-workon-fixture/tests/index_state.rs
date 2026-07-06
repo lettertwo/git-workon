@@ -44,6 +44,20 @@ mod index_state {
     }
 
     #[test]
+    fn untracked_file_in_subdirectory() -> Result<(), Box<dyn std::error::Error>> {
+        // The builder creates parent directories; the predicate must recurse into
+        // untracked directories to see the file (not just the "sub/" dir entry).
+        let fixture = FixtureBuilder::new()
+            .untracked_file("sub/new.txt", "new content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        repo.assert(predicate::repo::has_untracked_file("sub/new.txt"));
+
+        Ok(())
+    }
+
+    #[test]
     fn all_three_combined() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new()
             .staged_file("staged.txt", "staged content")
