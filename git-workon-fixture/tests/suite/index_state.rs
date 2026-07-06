@@ -341,3 +341,63 @@ fn deleted_file_baseline_commit_lands_before_metadata_resolution(
 
     Ok(())
 }
+
+#[test]
+fn partially_staged_file_has_three_distinct_states() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .partially_staged_file("f.txt", "committed", "staged", "workdir")
+        .build()?;
+
+    let repo = fixture.repo()?;
+    repo.assert(predicate::repo::index_blob_equals(
+        "f.txt",
+        b"staged".to_vec(),
+    ));
+    repo.assert(predicate::repo::workdir_file_equals(
+        "f.txt",
+        b"workdir".to_vec(),
+    ));
+
+    let head_commit = repo.head()?.peel_to_commit()?;
+    let tree = head_commit.tree()?;
+    let entry = tree.get_path(std::path::Path::new("f.txt"))?;
+    let blob = repo.find_blob(entry.id())?;
+    assert_eq!(blob.content(), b"committed");
+
+    Ok(())
+}
+
+#[test]
+fn partially_staged_file_bare_with_no_worktree_errors() {
+    let result = FixtureBuilder::new()
+        .bare(true)
+        .partially_staged_file("f.txt", "committed", "staged", "workdir")
+        .build();
+
+    assert!(
+        result.is_err(),
+        "bare fixture with no worktree has no working tree to partially stage into"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn untracked_symlink_is_visible_via_lstat_even_when_dangling(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .untracked_symlink("broken-link", "nonexistent-target")
+        .build()?;
+
+    let dir = fixture.cwd()?;
+    let link_path = dir.path().join("broken-link");
+    assert!(
+        link_path.symlink_metadata().is_ok(),
+        "lstat should see the dangling symlink"
+    );
+    assert!(
+        !link_path.exists(),
+        "Path::exists follows the link and should report false for a dangling target"
+    );
+
+    Ok(())
+}

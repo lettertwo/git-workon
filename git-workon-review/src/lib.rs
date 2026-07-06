@@ -7,12 +7,14 @@
 //! ## Status
 //!
 //! M2: the diff model ([`model`]), its acquisition from [`workon::Changeset`]s
-//! ([`acquire`]), whole-hunk patch synthesis ([`synthesis`]), and the apply chokepoint
-//! ([`apply`]) exist; line-precise synthesis, file ops, staging, and refresh land in later M2
-//! changesets.
+//! ([`acquire`]), patch synthesis ([`synthesis`]), the apply chokepoint ([`apply`]), whole-file
+//! ops ([`file_ops`]), and the patch-vs-file-op routing layer ([`ops`]) exist; staging and
+//! refresh land in later M2 changesets.
 
 pub mod acquire;
 pub mod apply;
 pub mod error;
+pub mod file_ops;
 pub mod model;
+pub mod ops;
 pub mod synthesis;
