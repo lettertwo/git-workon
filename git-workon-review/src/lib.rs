@@ -14,6 +14,7 @@
 
 pub mod acquire;
 pub mod align;
+pub mod app;
 pub mod apply;
 pub mod error;
 pub mod file_ops;
@@ -22,5 +23,6 @@ pub mod model;
 pub mod ops;
 pub mod queue;
 pub mod refresh;
+pub mod render;
 pub mod synthesis;
 pub mod wordiff;
