@@ -52,7 +52,8 @@ Hard-won semantics from the prototype, all of which caused real bugs. Each becom
 
 The round-trip corpus (`git-workon-review/tests/roundtrip_corpus.rs`) drives every write-path
 scenario class from the trap corpus above through `ops.rs`'s entry points against both backends.
-Measured result: **0 divergences** across 22 scenarios.
+Measured result (updated after the 2026-07-06 stack review, see below): **0 divergences** across
+23 scenarios.
 
 | Scenario class | git2 verdict |
 |---|---|
@@ -67,6 +68,7 @@ Measured result: **0 divergences** across 22 scenarios.
 | Untracked/added/deleted file ops | pass |
 | Line-selection refusals (never reach an applier) | pass |
 | Staging storm (mixed stage/unstage/discard, three-way end state) | pass |
+| Executable file (100755) whole-hunk stage | pass (fixed by review — was a divergence, see below) |
 
 Per the plan's decision procedure: 0 divergences means **`Git2Applier` is the default write
 path**; `CliApplier` is retained as the corpus's oracle and as the documented escape hatch
@@ -90,6 +92,37 @@ not just corpus coverage:
   in `git-workon-review/tests/line_synthesis.rs` — a dropped deletion converted to context while
   still carrying its `\ No newline at end of file` marker, followed by a kept line, is accepted
   by `git apply` (exit 0) but silently concatenates the two lines into one corrupt line.
+
+### Post-verdict corrections (2026-07-06 stack review)
+
+The "0 divergences across 22 scenarios" claim above predates a high-effort stack review that
+found two more divergence classes the original corpus missed. Both were fixed in place (in the
+M2 changeset that introduced them) and are now pinned in the corpus/regression suite, so the
+verdict — `Git2Applier` as the default write path — **stands**; these are corrections to the
+evidence, not to the conclusion.
+
+1. **Exec-bit mode handling** (`git-workon-review/src/synthesis.rs`): `PatchText::to_bytes`
+   hardcoded `index 0000000..0000000 100644` on every synthesized patch. libgit2 takes the new
+   index entry's mode straight from this line, so staging any hunk of a `100755` file via
+   `Git2Applier` silently reset its mode to `100644` — a real divergence from `CliApplier`, which
+   reads the mode from the working tree and never had this bug. Fixed by threading the real mode
+   (`FileChange::old_mode`/`new_mode`, from `delta.{old,new}_file().mode()`) onto `PatchText` and
+   swapping it in `PatchText::invert`. Pinned by the `executable_whole_hunk_stage` corpus
+   scenario (table above) and by `synthesis.rs`'s own `whole_hunk_patch_carries_real_mode_into_index_line`/`invert_swaps_old_and_new_mode`
+   unit tests.
+2. **Kept-EOFNL-deletion under `base == New`** (`git-workon-review/src/synthesis.rs`): a KEPT
+   deletion carrying `missing_newline: true`, followed by a dropped addition converted to context
+   (`base == New`'s drop rule), produced a hunk where the two backends actually DISAGREED rather
+   than merely diverging in end state: `CliApplier` accepted it and silently concatenated the
+   next line onto the no-newline deletion (the same class of corruption as the original trap-2
+   finding); `Git2Applier` rejected the patch outright (`invalid patch hunk`). In this instance
+   git2 was the SAFE side — refusing a malformed patch is preferable to silently corrupting a
+   file — which is itself evidence for, not against, the `Git2Applier`-default verdict. Fixed by
+   extending the trap-2 splice (`splice_eofnl_context_lines`) to also rewrite a kept deletion's
+   own bytes (real trailing `\n`, marker dropped) when a later emitted line is context. Pinned by
+   `kept_eofnl_deletion_needs_splice_under_base_new` in `git-workon-review/tests/line_synthesis.rs`
+   (covers both backends via `Discard`); not duplicated into the corpus since that test already
+   exercises the identical fixture/selection/direction against both appliers end-to-end.
 
 ## Milestones
 
