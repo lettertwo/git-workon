@@ -5,44 +5,75 @@
 //! (a committed rev pair, or "uncommitted"); this module only knows *how* to turn that into
 //! git2 diffs and then a [`DiffModel`].
 
-use git2::{DiffOptions, Oid, Repository};
+use git2::{DiffFindOptions, DiffOptions, Oid, Repository};
 use workon::{Changeset, ChangesetSource};
 
 use crate::error::DiffError;
 use crate::model::DiffModel;
 
-/// The two working-tree diffs a review session needs: the index against `HEAD` (staged), and
-/// the working tree against the index (unstaged, including untracked content).
+/// The working-tree diffs a review session needs: the index against `HEAD` (staged), the
+/// working tree against the index (unstaged, including untracked content), and the fused
+/// `HEAD` ↔ worktree view (combined) the M3 renderer reviews by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeDiffs {
     pub staged: DiffModel,
     pub unstaged: DiffModel,
+    /// `HEAD`'s tree diffed straight against the working tree (index consulted only for
+    /// untracked/ignore filtering), fusing staged and unstaged hunks on the same file into one
+    /// diff — the combined-zoom view the M3 renderer reviews (locked design decision #2).
+    pub combined: DiffModel,
 }
 
-/// Diff `HEAD`'s tree against the index (staged) and the index against the working tree
-/// (unstaged), for a [`ChangesetSource::Uncommitted`] changeset.
+/// Diff `HEAD`'s tree against the index (staged), the index against the working tree
+/// (unstaged), and `HEAD`'s tree against the working tree directly (combined), for a
+/// [`ChangesetSource::Uncommitted`] changeset.
 ///
-/// The unstaged side sets `include_untracked`/`recurse_untracked_dirs`/
+/// The unstaged and combined sides both set `include_untracked`/`recurse_untracked_dirs`/
 /// `show_untracked_content` so untracked files carry real content in the model (git2 gives
-/// `Delta::Untracked` natively here — no `/dev/null` header synthesis needed).
+/// `Delta::Untracked` natively here — no `/dev/null` header synthesis needed). `find_similar`
+/// runs on all three diffs before materialization so worktree renames (e.g. an untracked file
+/// that replaces a tracked one under a new name) surface as [`crate::model::FileStatus::Renamed`]
+/// rather than a delete+add pair — the read side already handles that status (corpus-proven).
+///
+/// The two untracked-including diffs (unstaged, combined) pass explicit
+/// [`DiffFindOptions::for_untracked`] — plain `find_similar(None)`'s default flags (just
+/// `GIT_DIFF_FIND_RENAMES`) do NOT pair an untracked file with a workdir deletion; libgit2
+/// requires `for_untracked` opted in separately for that side of the match. The staged diff
+/// never sees untracked deltas, so `None` (matching [`diff_committed`]'s convention) is enough
+/// there.
 pub fn diff_uncommitted(repo: &Repository) -> Result<WorktreeDiffs, DiffError> {
     let head_tree = repo.head()?.peel_to_tree()?;
 
     let mut staged_opts = DiffOptions::new();
     staged_opts.context_lines(3);
-    let staged_diff = repo.diff_tree_to_index(Some(&head_tree), None, Some(&mut staged_opts))?;
+    let mut staged_diff =
+        repo.diff_tree_to_index(Some(&head_tree), None, Some(&mut staged_opts))?;
+    staged_diff.find_similar(None)?;
     let staged = DiffModel::from_git2(&staged_diff)?;
 
-    let mut unstaged_opts = DiffOptions::new();
-    unstaged_opts
+    let mut worktree_opts = DiffOptions::new();
+    worktree_opts
         .include_untracked(true)
         .recurse_untracked_dirs(true)
         .show_untracked_content(true)
         .context_lines(3);
-    let unstaged_diff = repo.diff_index_to_workdir(None, Some(&mut unstaged_opts))?;
+    let mut untracked_find = DiffFindOptions::new();
+    untracked_find.renames(true).for_untracked(true);
+
+    let mut unstaged_diff = repo.diff_index_to_workdir(None, Some(&mut worktree_opts))?;
+    unstaged_diff.find_similar(Some(&mut untracked_find))?;
     let unstaged = DiffModel::from_git2(&unstaged_diff)?;
 
-    Ok(WorktreeDiffs { staged, unstaged })
+    let mut combined_diff =
+        repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut worktree_opts))?;
+    combined_diff.find_similar(Some(&mut untracked_find))?;
+    let combined = DiffModel::from_git2(&combined_diff)?;
+
+    Ok(WorktreeDiffs {
+        staged,
+        unstaged,
+        combined,
+    })
 }
 
 /// Diff `base`'s tree against `head`'s tree, for a [`ChangesetSource::Committed`] changeset —
