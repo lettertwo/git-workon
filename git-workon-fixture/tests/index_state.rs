@@ -157,4 +157,115 @@ mod index_state {
 
         Ok(())
     }
+
+    #[test]
+    fn index_blob_equals_matches_staged_content() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .staged_file("staged.txt", "staged content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        repo.assert(predicate::repo::index_blob_equals(
+            "staged.txt",
+            b"staged content".to_vec(),
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_blob_equals_rejects_wrong_content() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .staged_file("staged.txt", "staged content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        assert!(
+            !predicate::repo::index_blob_equals("staged.txt", b"wrong content".to_vec()).eval(repo)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn index_blob_equals_rejects_missing_path() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new().build()?;
+
+        let repo = fixture.repo()?;
+        assert!(
+            !predicate::repo::index_blob_equals("missing.txt", b"anything".to_vec()).eval(repo)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn workdir_file_equals_matches_modified_content() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .unstaged_file("tracked.txt", "committed content", "modified content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        repo.assert(predicate::repo::workdir_file_equals(
+            "tracked.txt",
+            b"modified content".to_vec(),
+        ));
+
+        Ok(())
+    }
+
+    #[test]
+    fn workdir_file_equals_rejects_wrong_content() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .unstaged_file("tracked.txt", "committed content", "modified content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        assert!(!predicate::repo::workdir_file_equals("tracked.txt", b"wrong".to_vec()).eval(repo));
+
+        Ok(())
+    }
+
+    #[test]
+    fn workdir_file_equals_rejects_missing_path() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new().build()?;
+
+        let repo = fixture.repo()?;
+        assert!(
+            !predicate::repo::workdir_file_equals("missing.txt", b"anything".to_vec()).eval(repo)
+        );
+
+        Ok(())
+    }
+
+    // `has_staged_deletion` predates the `deleted_file` builder (added alongside it in a
+    // later commit); fabricate the INDEX_DELETED state directly via git2 to self-test the
+    // predicate in isolation.
+    #[test]
+    fn has_staged_deletion_matches_removed_index_entry() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .unstaged_file("tracked.txt", "committed content", "committed content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        let mut index = repo.index()?;
+        index.remove_path(std::path::Path::new("tracked.txt"))?;
+        index.write()?;
+
+        repo.assert(predicate::repo::has_staged_deletion("tracked.txt"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn has_staged_deletion_rejects_untouched_file() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .unstaged_file("tracked.txt", "committed content", "committed content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        assert!(!predicate::repo::has_staged_deletion("tracked.txt").eval(repo));
+
+        Ok(())
+    }
 }
