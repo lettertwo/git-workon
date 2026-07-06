@@ -48,11 +48,54 @@ Hard-won semantics from the prototype, all of which caused real bugs. Each becom
 6. **git2 re-verification**: all of the above were validated against git CLI. Re-run the round-trip corpus against libgit2's apply/index. Divergence → shell out to `git apply` for writes (reads stay git2).
 7. **Metadata revisions are snapshots, not refs** (found dogfooding the prototype on this repo, 2026-07-05): graphite's `branch_revision` updates only when gt runs — commits made with plain git (i.e. any commit made outside gt) leave it stale. The prototype used it as the changeset head, so a freshly-committed branch rendered an EMPTY changeset (`head_rev == parent_rev ==` fork point) while still appearing in the stack. Changeset head must resolve the live ref (`refs/heads/<branch>`); `parentBranchRevision` remains the correct BASE (diff-as-authored + needs-restack input) — do not "fix" it to live trunk. Related: the prototype swallows per-changeset diff errors into an empty file list — a failed diff must be distinguishable from a genuinely empty changeset. Test: fixture branch tracked in metadata, then commits added with plain git; assert the changeset spans fork..live-head and that a bad ref surfaces an error, not an empty changeset.
 
+## M2 verdict (git2 vs CLI apply)
+
+The round-trip corpus (`git-workon-review/tests/roundtrip_corpus.rs`) drives every write-path
+scenario class from the trap corpus above through `ops.rs`'s entry points against both backends.
+Measured result: **0 divergences** across 22 scenarios.
+
+| Scenario class | git2 verdict |
+|---|---|
+| Whole-hunk stage/unstage/discard | pass |
+| Partial stage (adds-only/dels-only/mixed) | pass |
+| Partial unstage / partial discard | pass |
+| EOFNL per verb (whole-hunk) | pass |
+| EOFNL trap-2 splice (partial stage) | pass |
+| Multi-hunk file, one hunk staged | pass |
+| Space-in-filename header handling | pass |
+| Rename (read-side, `diff_committed`) | pass |
+| Untracked/added/deleted file ops | pass |
+| Line-selection refusals (never reach an applier) | pass |
+| Staging storm (mixed stage/unstage/discard, three-way end state) | pass |
+
+Per the plan's decision procedure: 0 divergences means **`Git2Applier` is the default write
+path**; `CliApplier` is retained as the corpus's oracle and as the documented escape hatch
+(`is_lock_contention` already classifies errors from both backends identically, so the seam has
+no additional cost to keep). `Applier` stays a trait specifically so this can flip without
+touching call sites if a future libgit2 upgrade regresses.
+
+`tests/roundtrip_corpus.rs` runs both backends on every `cargo test` — it is the permanent guard
+this decision rests on. If a future libgit2 upgrade changes apply behavior, `corpus_against_git2`
+fails with the specific scenario and divergence class, and the fix is to update
+`KNOWN_DIVERGENCES` (or flip the default writer) with that evidence in hand, not to relitigate
+this section from memory.
+
+Two tripwire findings from earlier M2 changesets are now pinned as permanent regression tests,
+not just corpus coverage:
+
+- **Trap 3 (empty-blob deletion staging)**: `naive_hunk_stage_of_deletion_stages_empty_blob` in
+  `git-workon-review/tests/file_ops.rs` — a naive whole-hunk stage of a deletion is accepted by
+  `git apply --cached` but stages an empty blob instead of removing the index entry.
+- **Trap 2 (EOFNL silent concatenation)**: `naive_unspliced_eofnl_patch_silently_corrupts_the_index`
+  in `git-workon-review/tests/line_synthesis.rs` — a dropped deletion converted to context while
+  still carrying its `\ No newline at end of file` marker, followed by a kept line, is accepted
+  by `git apply` (exit 0) but silently concatenates the two lines into one corrupt line.
+
 ## Milestones
 
 - **M0 — workspace plumbing.** New member crate `git-workon-review` (lib+bin, clap, error model matching workspace: thiserror+miette). Toolchain bump (ratatui/tree-sitter won't meet 1.68.2; resolved: workspace-wide `rust-version = 1.88` — no crate had ever inherited the old value, so there was no lib MSRV to preserve). Lib hygiene (drop unused dialoguer/env_logger). CI: tree-sitter C builds. Release posture per [ADR-033](../adr/033-review-crate-workspace-placement.md): `publish = false` keeps the crate out of release-plz and cargo-dist entirely; release-plz wiring is deliberately deferred to the M3 flip — do NOT add a release-plz.toml entry in M0. Acceptance: `cargo build --workspace` green, empty `git-workon-review` binary runs and prints help.
 - **M1 — fixture extensions + lib stack capabilities (test-first).** Fixture: sqlite metadata mode (also finally exercises the lib's primary read path), index-state builders. Lib: `parentBranchRevision` read (both formats) + needs-restack; git-inference StackModel; changeset assembly API (`Vec<Changeset> {branch, base_ref, head_ref, title, current, needs_restack}` + uncommitted layer). Acceptance: existing lib tests green + new capabilities spec'd against fixtures in both metadata formats.
-- **M2 — trap corpus port.** Diff parser + patch synthesis in the review lib, the six trap items as tests, git2-vs-CLI verdict rendered (and the write-path decision recorded here). Acceptance: round-trip corpus green against real repos.
+- **M2 — trap corpus port.** Diff parser + patch synthesis in the review lib, the six trap items as tests, git2-vs-CLI verdict rendered (and the write-path decision recorded here). Acceptance: round-trip corpus green against real repos. — DONE (2026-07-06): corpus green on both backends; verdict recorded above.
 - **M3 — renderer + uncommitted source.** Port spike modules; wire changeset → parsed diff → SBS/inline render; file nav; the uncommitted source end-to-end. Acceptance: dogfood-able read-only review of a dirty worktree.
 - **M4 — staging verbs + zoom states.** Queue, hunk/file/line ops (visual-style line selection), the `_gate` zoom matrix, attributed rendering. Acceptance: prototype staging parity, index watcher stable under external writes.
 - **M5 — stack + ref sources, outline.** Changeset navigation, outline panel, needs-restack markers, focus semantics (open at current branch; uncommitted adjacent-after, focused when present).
