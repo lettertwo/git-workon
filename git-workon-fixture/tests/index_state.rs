@@ -269,21 +269,6 @@ mod index_state {
         Ok(())
     }
 
-    /// `deleted_file` removes a committed file from the working tree only (the index still
-    /// has a clean entry for it) — `WT_DELETED`, not `INDEX_DELETED`. There is no
-    /// `has_staged_deletion`-style predicate for the working-tree side yet, so check the
-    /// status directly.
-    fn has_workdir_deletion(repo: &git2::Repository, path: &str) -> bool {
-        let mut opts = git2::StatusOptions::new();
-        opts.include_untracked(false);
-        let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
-            return false;
-        };
-        statuses.iter().any(|entry| {
-            entry.path().ok() == Some(path) && entry.status().intersects(git2::Status::WT_DELETED)
-        })
-    }
-
     #[test]
     fn deleted_file_alone() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new()
@@ -291,7 +276,7 @@ mod index_state {
             .build()?;
 
         let repo = fixture.repo()?;
-        assert!(has_workdir_deletion(repo, "gone.txt"));
+        repo.assert(predicate::repo::has_workdir_deletion("gone.txt"));
 
         let dir = fixture.cwd()?;
         dir.child("gone.txt").assert(predicate::path::missing());
@@ -312,7 +297,7 @@ mod index_state {
         repo.assert(predicate::repo::has_staged_file("staged.txt"));
         repo.assert(predicate::repo::has_unstaged_file("tracked.txt"));
         repo.assert(predicate::repo::has_untracked_file("new.txt"));
-        assert!(has_workdir_deletion(repo, "gone.txt"));
+        repo.assert(predicate::repo::has_workdir_deletion("gone.txt"));
 
         Ok(())
     }
