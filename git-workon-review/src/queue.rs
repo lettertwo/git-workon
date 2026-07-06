@@ -46,6 +46,10 @@ pub struct OpContext<'a> {
 pub fn path_has_staged_changes(repo: &Repository, path: &str) -> Result<bool, ApplyError> {
     let mut opts = StatusOptions::new();
     opts.pathspec(path);
+    // Without this, `pathspec` treats `path` as a glob — a path containing glob metacharacters
+    // (e.g. `app/[slug]/page.tsx`) then never matches itself, and this always resolves "no
+    // staged changes" regardless of the real index state.
+    opts.disable_pathspec_match(true);
     opts.include_untracked(true);
     let statuses = repo.statuses(Some(&mut opts))?;
     let index_bits = git2::Status::INDEX_NEW
@@ -160,7 +164,14 @@ impl StagingQueue {
                 };
                 match catch_unwind(AssertUnwindSafe(|| op.run(&retry_ctx))) {
                     Ok(Ok(())) => OpOutcome::Completed(id),
-                    Ok(Err(_)) => OpOutcome::Failed(id, ApplyError::IndexLocked { attempts: 2 }),
+                    // Only a SECOND lock-contention error collapses into the "gave up
+                    // retrying" outcome — any other error on retry is its own distinct
+                    // failure and must propagate as itself, not be swallowed under a
+                    // misleading `IndexLocked` label.
+                    Ok(Err(e)) if crate::apply::is_lock_contention(&e) => {
+                        OpOutcome::Failed(id, ApplyError::IndexLocked { attempts: 2 })
+                    }
+                    Ok(Err(e)) => OpOutcome::Failed(id, e),
                     Err(_) => OpOutcome::Panicked(id),
                 }
             }
@@ -266,6 +277,24 @@ mod tests {
         }
     }
 
+    /// A fake op that fails with a lock error on its first call, then a DIFFERENT (non-lock)
+    /// error on every call after — the shape that catches the retry-arm bug: a second failure
+    /// that isn't itself a lock error must surface as itself, not get relabeled `IndexLocked`.
+    struct FlakyThenDifferentErrorOp {
+        calls: u32,
+    }
+
+    impl StagingOp for FlakyThenDifferentErrorOp {
+        fn run(&mut self, _ctx: &OpContext<'_>) -> Result<(), ApplyError> {
+            self.calls += 1;
+            if self.calls == 1 {
+                Err(lock_error())
+            } else {
+                Err(ApplyError::GitSpawn(std::io::Error::other("boom")))
+            }
+        }
+    }
+
     /// An op whose `run` panics unconditionally.
     struct PanickingOp;
 
@@ -364,6 +393,25 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), Some(2));
     }
 
+    /// Regression: `path_has_staged_changes` must match a literal path even when it contains
+    /// glob metacharacters (`[...]`) — without `disable_pathspec_match`, `StatusOptions::pathspec`
+    /// treats `path` as a glob, and a bracketed path like `app/[slug]/page.tsx` never matches
+    /// itself, so this always resolved "no staged changes" regardless of the real index state.
+    #[test]
+    fn path_has_staged_changes_matches_bracketed_path() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("app/[slug]/page.tsx", "content\n")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        assert!(
+            path_has_staged_changes(repo, "app/[slug]/page.tsx").expect("path_has_staged_changes"),
+            "expected the bracketed path's staged entry to be found"
+        );
+    }
+
     /// Two toggles queued for the same path, starting unstaged: if an implementation resolved
     /// "stage" once at enqueue time and reused it, both ops would stage, leaving the file
     /// staged. Because `ToggleOp::run` calls `path_has_staged_changes` against the LIVE index
@@ -443,6 +491,35 @@ mod tests {
             *sleep_calls.lock().unwrap(),
             1,
             "expected only one retry sleep, not one per attempt"
+        );
+    }
+
+    /// Regression: a lock error on the first attempt followed by a DIFFERENT (non-lock) error
+    /// on the retry must surface as that second error, not get collapsed into
+    /// `IndexLocked{attempts: 2}` — the retry arm previously matched `Ok(Err(_))` unconditionally
+    /// on the second attempt, swallowing whatever error actually occurred.
+    #[test]
+    fn lock_failure_then_different_error_propagates_that_error() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .worktree("main")
+            .bare(true)
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let (mut queue, sleep_calls) = fresh_queue();
+        queue.enqueue(FlakyThenDifferentErrorOp { calls: 0 });
+
+        let outcome = queue.pump(repo, &CliApplier).expect("pump");
+        assert!(
+            matches!(outcome, OpOutcome::Failed(_, ApplyError::GitSpawn(_))),
+            "expected the retry's own GitSpawn error to propagate, got {outcome:?}"
+        );
+        assert_eq!(
+            *sleep_calls.lock().unwrap(),
+            1,
+            "expected exactly one retry sleep (only the first attempt was a lock error)"
         );
     }
 
