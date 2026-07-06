@@ -41,7 +41,7 @@
 //! set)`, so two worktrees in the same connected stack always collapse into one group regardless
 //! of the [`Stack::diffs`] vector order returned by [`current_stack`].
 
-mod graphite;
+pub(crate) mod graphite;
 
 use std::collections::{BTreeMap, HashMap};
 

@@ -86,7 +86,7 @@ pub fn graphite_trunk(repo: &Repository) -> Option<String> {
 /// Read trunk branch names from `.graphite_repo_config`.
 ///
 /// Falls back to `["main"]` if the file is missing or unparseable.
-fn read_trunks(repo: &Repository) -> Vec<String> {
+pub(crate) fn read_trunks(repo: &Repository) -> Vec<String> {
     let path = repo.commondir().join(".graphite_repo_config");
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -256,9 +256,7 @@ fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackE
 /// Titles are cosmetic: a missing or corrupt file, or entries missing `headRefName`/`title`,
 /// yield an empty map or are silently skipped rather than surfacing as an error.
 ///
-/// Not yet called from production code — `assemble_changesets` (m1-changeset-assembly) is its
-/// first consumer. Exercised by unit tests below in the meantime.
-#[allow(dead_code)]
+/// Used by [`crate::assemble_changesets`] to label Graphite stack nodes with their PR title.
 pub(crate) fn read_pr_titles(repo: &Repository) -> HashMap<String, String> {
     let path = repo.commondir().join(".graphite_pr_info");
     let Ok(content) = std::fs::read_to_string(&path) else {

@@ -63,6 +63,11 @@ pub enum WorkonError {
     #[error(transparent)]
     #[diagnostic(forward(0))]
     Prune(#[from] PruneError),
+
+    /// Changeset assembly errors
+    #[error(transparent)]
+    #[diagnostic(forward(0))]
+    Changeset(#[from] ChangesetError),
 }
 
 /// Repository-specific errors
@@ -271,6 +276,35 @@ pub enum StackError {
         )
     )]
     DeletedBranchNode { branch: String },
+}
+
+/// Changeset assembly errors
+#[derive(Error, Diagnostic, Debug)]
+pub enum ChangesetError {
+    #[error("Branch '{branch}' has no resolvable local ref")]
+    #[diagnostic(
+        code(workon::changeset::unresolvable_branch),
+        help("The branch may have been deleted while stack metadata lingered; run 'gt sync' or re-create the branch")
+    )]
+    UnresolvableBranch { branch: String },
+
+    #[error(
+        "Recorded parent revision '{revision}' for branch '{branch}' does not resolve to a commit"
+    )]
+    #[diagnostic(
+        code(workon::changeset::invalid_parent_revision),
+        help("Stack metadata may be corrupt or copied from another clone; run 'gt restack' to rewrite it")
+    )]
+    InvalidParentRevision { branch: String, revision: String },
+
+    #[error("Branch '{branch}' has no upstream to infer changesets from")]
+    #[diagnostic(
+        code(workon::changeset::no_upstream),
+        help(
+            "Set an upstream (git branch --set-upstream-to=<remote>/<branch>) or use a stack tool"
+        )
+    )]
+    NoUpstream { branch: String },
 }
 
 /// Pull request-related errors
