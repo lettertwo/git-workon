@@ -7,17 +7,18 @@
 //! (not opaque bytes) so that inversion is a pure, testable transform instead of a text
 //! rewrite.
 //!
-//! This module only synthesizes WHOLE hunks (`[whole_hunk_patch]`). Line-precise synthesis
-//! (traps 1-2: direction-dependent drop rules, the EOFNL splice) lands in CS3
-//! (`partial_hunk_patch`).
+//! This module synthesizes WHOLE hunks (`[whole_hunk_patch]`) and line-precise selections
+//! (`[partial_hunk_patch]`, traps 1-2: direction-dependent drop rules, the EOFNL splice).
+
+use std::collections::BTreeSet;
 
 use crate::error::SynthesisError;
 use crate::model::{FileChange, FileStatus, LineKind};
 
 /// Which side of a patch is the "before" image — the direction-dependent drop rules (trap 1)
-/// key off this. Whole-hunk patches (this module) don't drop lines, so `PatchBase` is
-/// currently only consumed by [`crate::apply::StageVerb::plan`]; line-precise synthesis (CS3)
-/// is where it drives which lines get kept vs. converted to context.
+/// key off this. Whole-hunk patches don't drop lines, so `PatchBase` only affects
+/// [`partial_hunk_patch`] (and is otherwise threaded through by [`crate::apply::StageVerb::plan`]
+/// to pick which model a caller synthesizes from).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatchBase {
     Old,
@@ -266,6 +267,186 @@ pub fn whole_hunk_patch(file: &FileChange, hunk_idx: usize) -> Result<PatchText,
     })
 }
 
+/// Which of a hunk's addition/deletion lines to keep in a line-precise patch.
+///
+/// Indices are into [`crate::model::Hunk::lines`] — the `Vec` position, NOT the old/new line
+/// numbers (`HunkLine::old_lnum`/`new_lnum`), which are `None` for the wrong side of an
+/// add/del and therefore can't uniquely key a selection on their own.
+///
+/// An index that doesn't name an [`LineKind::Addition`] line in `keep_adds` (or a
+/// [`LineKind::Deletion`] line in `keep_dels`) — because it's out of range, or names a
+/// [`LineKind::Context`] line, or is in the wrong set — is silently ignored by
+/// [`partial_hunk_patch`]. This matches the frozen prototype, whose keep-sets were predicates
+/// over lines and inherently ignored anything that didn't match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineSelection {
+    pub keep_adds: BTreeSet<usize>,
+    pub keep_dels: BTreeSet<usize>,
+}
+
+/// Synthesize a patch for a LINE-PRECISE selection of `file`'s hunk at `hunk_idx` — the
+/// direction-dependent drop rules (trap 1).
+///
+/// Context lines are always emitted as context. For the rest, `base` decides what happens to a
+/// line that ISN'T kept:
+///
+/// - `base == Old` (forward apply — [`crate::apply::StageVerb::Stage`], staging into an index
+///   that doesn't have the change yet): a dropped addition is OMITTED (the index shouldn't
+///   gain it); a dropped deletion becomes CONTEXT (the index should keep what's still there).
+/// - `base == New` (reverse apply — [`crate::apply::StageVerb::Unstage`]/[`Discard`], where the
+///   apply target ALREADY has the change and reverse-applying undoes the kept lines): a dropped
+///   addition becomes CONTEXT (it must stay in the target, so it has to match on reverse-apply
+///   just like an untouched line does); a dropped deletion is OMITTED (it's already absent from
+///   the target, so it must never be matched against). This is the mirror of the `Old` rules,
+///   not merely a coincidence: whichever side already contains the "dropped" line is the side
+///   the patch's context has to agree with, and `base` names that side.
+///
+///   [`crate::apply::CliApplier`]/[`crate::apply::Git2Applier`] reverse-apply by adding
+///   `--reverse` or by [`PatchText::invert`]ing before a forward apply — either way the patch
+///   itself is always WRITTEN in forward orientation with the rules above; a `base == Old`
+///   patch fed through a reverse apply is a different, incompatible set of drop rules and git
+///   rejects it outright (see the tripwire test in `tests/line_synthesis.rs`).
+///
+/// [`LineSelection`] entries that don't name an add/del line in this hunk are ignored (see
+/// [`LineSelection`]'s docs). If, after ignoring those, no addition and no deletion ended up
+/// kept, there is nothing to synthesize a patch for: [`SynthesisError::EmptySelection`].
+///
+/// Counts are recomputed per emitted line (context, converted-to-context, kept-add, kept-del
+/// all bump the relevant side(s)); the header is rebuilt as
+/// `@@ -old_start,old_count +new_start,new_count @@` plus the source hunk's header suffix
+/// (reused via [`header_suffix`]) — the starts are unchanged, only the counts move.
+///
+/// Same refusals as [`whole_hunk_patch`]: binary files ([`SynthesisError::BinaryFile`]),
+/// unsupported statuses ([`SynthesisError::LineSelectionUnsupported`]), and an out-of-range
+/// `hunk_idx` ([`SynthesisError::HunkOutOfRange`]).
+///
+/// This function does not yet apply the trap-2 EOFNL splice (a dropped deletion converted to
+/// context that carries [`crate::model::HunkLine::missing_newline`], followed by any kept
+/// line, silently corrupts the blob under `git apply`) — see the follow-up commit.
+pub fn partial_hunk_patch(
+    file: &FileChange,
+    hunk_idx: usize,
+    sel: &LineSelection,
+    base: PatchBase,
+) -> Result<PatchText, SynthesisError> {
+    if file.is_binary {
+        return Err(SynthesisError::BinaryFile {
+            path: file.path.clone(),
+        });
+    }
+    match file.status {
+        FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => {}
+        other => {
+            return Err(SynthesisError::LineSelectionUnsupported {
+                path: file.path.clone(),
+                status: other,
+            })
+        }
+    }
+    let hunk = file
+        .hunks
+        .get(hunk_idx)
+        .ok_or_else(|| SynthesisError::HunkOutOfRange {
+            path: file.path.clone(),
+            index: hunk_idx,
+        })?;
+
+    let mut kept_any = false;
+    let mut old_count = 0u32;
+    let mut new_count = 0u32;
+    let mut lines = Vec::with_capacity(hunk.lines.len());
+
+    for (idx, line) in hunk.lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Context => {
+                old_count += 1;
+                new_count += 1;
+                lines.push(PatchLine {
+                    kind: LineKind::Context,
+                    content: line.content.clone(),
+                    missing_newline: line.missing_newline,
+                });
+            }
+            LineKind::Addition => {
+                if sel.keep_adds.contains(&idx) {
+                    kept_any = true;
+                    new_count += 1;
+                    lines.push(PatchLine {
+                        kind: LineKind::Addition,
+                        content: line.content.clone(),
+                        missing_newline: line.missing_newline,
+                    });
+                } else if base == PatchBase::New {
+                    // Dropped addition, base=New: it must remain in the (already-changed)
+                    // target, so it has to match as context on reverse-apply.
+                    old_count += 1;
+                    new_count += 1;
+                    lines.push(PatchLine {
+                        kind: LineKind::Context,
+                        content: line.content.clone(),
+                        missing_newline: line.missing_newline,
+                    });
+                }
+                // base=Old: dropped addition is omitted — the target doesn't have it yet and
+                // shouldn't gain it.
+            }
+            LineKind::Deletion => {
+                if sel.keep_dels.contains(&idx) {
+                    kept_any = true;
+                    old_count += 1;
+                    lines.push(PatchLine {
+                        kind: LineKind::Deletion,
+                        content: line.content.clone(),
+                        missing_newline: line.missing_newline,
+                    });
+                } else if base == PatchBase::Old {
+                    // Dropped deletion, base=Old: it's still there in the target, so it has to
+                    // match as context.
+                    old_count += 1;
+                    new_count += 1;
+                    lines.push(PatchLine {
+                        kind: LineKind::Context,
+                        content: line.content.clone(),
+                        missing_newline: line.missing_newline,
+                    });
+                }
+                // base=New: dropped deletion is omitted — it's already absent from the target
+                // and must never be matched against.
+            }
+        }
+    }
+
+    if !kept_any {
+        return Err(SynthesisError::EmptySelection {
+            path: file.path.clone(),
+            hunk: hunk_idx,
+        });
+    }
+
+    let mut header = format!(
+        "@@ -{},{old_count} +{},{new_count} @@",
+        hunk.old_start, hunk.new_start
+    )
+    .into_bytes();
+    header.extend_from_slice(&header_suffix(&hunk.header));
+
+    let old_path = file.old_path.clone().unwrap_or_else(|| file.path.clone());
+    let new_path = file.path.clone();
+
+    Ok(PatchText {
+        old_path: Some(old_path),
+        new_path: Some(new_path),
+        hunks: vec![PatchHunk {
+            old_start: hunk.old_start,
+            old_count,
+            new_start: hunk.new_start,
+            new_count,
+            header,
+            lines,
+        }],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +676,202 @@ mod tests {
 
         assert_eq!(patch.old_path.as_deref(), Some("old.txt"));
         assert_eq!(patch.new_path.as_deref(), Some("f.txt"));
+    }
+
+    /// Two separate changes ("old2"->"new2" and "old4"->"new4") in one hunk, with a context
+    /// line between them — the shape `partial_hunk_patch`'s direction rules are tested against:
+    /// keeping only the first change should drop the second one per `base`'s rule, not just
+    /// omit it uniformly.
+    ///
+    /// Line indices (into `hunk.lines`): 0 ctx "line1", 1 del "old2", 2 add "new2", 3 ctx
+    /// "line3", 4 del "old4", 5 add "new4", 6 ctx "line5".
+    fn two_change_hunk() -> Hunk {
+        let line = |kind, content: &str, old_lnum, new_lnum| HunkLine {
+            kind,
+            content: content.as_bytes().to_vec(),
+            old_lnum,
+            new_lnum,
+            missing_newline: false,
+        };
+        Hunk {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+            header: b"@@ -1,5 +1,5 @@\n".to_vec(),
+            lines: vec![
+                line(LineKind::Context, "line1\n", Some(1), Some(1)),
+                line(LineKind::Deletion, "old2\n", Some(2), None),
+                line(LineKind::Addition, "new2\n", None, Some(2)),
+                line(LineKind::Context, "line3\n", Some(3), Some(3)),
+                line(LineKind::Deletion, "old4\n", Some(4), None),
+                line(LineKind::Addition, "new4\n", None, Some(4)),
+                line(LineKind::Context, "line5\n", Some(5), Some(5)),
+            ],
+        }
+    }
+
+    fn keep_first_change() -> LineSelection {
+        LineSelection {
+            keep_adds: BTreeSet::from([2]),
+            keep_dels: BTreeSet::from([1]),
+        }
+    }
+
+    #[test]
+    fn partial_base_old_omits_dropped_add_and_contexts_dropped_del() {
+        let file = modified_file(two_change_hunk());
+        let patch = partial_hunk_patch(&file, 0, &keep_first_change(), PatchBase::Old).unwrap();
+
+        let expected = [
+            "diff --git a/f.txt b/f.txt\n",
+            "index 0000000..0000000 100644\n",
+            "--- a/f.txt\n",
+            "+++ b/f.txt\n",
+            "@@ -1,5 +1,5 @@\n",
+            " line1\n",
+            "-old2\n",
+            "+new2\n",
+            " line3\n",
+            " old4\n",
+            " line5\n",
+        ]
+        .concat()
+        .into_bytes();
+
+        assert_eq!(patch.to_bytes(), expected);
+    }
+
+    #[test]
+    fn partial_base_new_omits_dropped_del_and_contexts_dropped_add() {
+        let file = modified_file(two_change_hunk());
+        let patch = partial_hunk_patch(&file, 0, &keep_first_change(), PatchBase::New).unwrap();
+
+        let expected = [
+            "diff --git a/f.txt b/f.txt\n",
+            "index 0000000..0000000 100644\n",
+            "--- a/f.txt\n",
+            "+++ b/f.txt\n",
+            "@@ -1,5 +1,5 @@\n",
+            " line1\n",
+            "-old2\n",
+            "+new2\n",
+            " line3\n",
+            " new4\n",
+            " line5\n",
+        ]
+        .concat()
+        .into_bytes();
+
+        assert_eq!(patch.to_bytes(), expected);
+    }
+
+    #[test]
+    fn partial_recomputes_counts_when_kept_and_dropped_lines_differ() {
+        // Keep only the addition of the first change, dropping its deletion too (base=Old
+        // contexts the dropped deletion) — old_count grows relative to a hunk that dropped
+        // nothing, new_count reflects only the one kept addition among the two.
+        let file = modified_file(two_change_hunk());
+        let sel = LineSelection {
+            keep_adds: BTreeSet::from([2]),
+            keep_dels: BTreeSet::new(),
+        };
+        let patch = partial_hunk_patch(&file, 0, &sel, PatchBase::Old).unwrap();
+
+        // line1(ctx) old2(ctx, dropped del) new2(add, kept) line3(ctx) old4(ctx, dropped del)
+        // line5(ctx): old side never sees "new2" (5 lines), new side does (6 lines); new4
+        // (dropped, unkept addition) is omitted from both.
+        assert_eq!(patch.hunks[0].old_count, 5);
+        assert_eq!(patch.hunks[0].new_count, 6);
+        assert_eq!(&patch.hunks[0].header[..], b"@@ -1,5 +1,6 @@\n".as_slice());
+    }
+
+    #[test]
+    fn partial_ignores_selection_indices_that_are_not_add_or_del() {
+        let file = modified_file(two_change_hunk());
+        let mut sel = keep_first_change();
+        // Index 0 is a context line; index 99 is out of range. Neither should change the
+        // rendered patch.
+        sel.keep_adds.insert(99);
+        sel.keep_dels.insert(0);
+
+        let baseline = partial_hunk_patch(&file, 0, &keep_first_change(), PatchBase::Old).unwrap();
+        let with_junk = partial_hunk_patch(&file, 0, &sel, PatchBase::Old).unwrap();
+
+        assert_eq!(with_junk.to_bytes(), baseline.to_bytes());
+    }
+
+    #[test]
+    fn partial_empty_selection_errors() {
+        let file = modified_file(two_change_hunk());
+        let sel = LineSelection::default();
+
+        assert!(matches!(
+            partial_hunk_patch(&file, 0, &sel, PatchBase::Old),
+            Err(SynthesisError::EmptySelection { .. })
+        ));
+    }
+
+    #[test]
+    fn partial_selection_naming_only_context_lines_is_effectively_empty() {
+        let file = modified_file(two_change_hunk());
+        let sel = LineSelection {
+            keep_adds: BTreeSet::from([0, 3, 6]), // all context indices, none are additions
+            keep_dels: BTreeSet::new(),
+        };
+
+        assert!(matches!(
+            partial_hunk_patch(&file, 0, &sel, PatchBase::Old),
+            Err(SynthesisError::EmptySelection { .. })
+        ));
+    }
+
+    #[test]
+    fn partial_refuses_binary_file() {
+        let file = FileChange {
+            path: "bin.dat".to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            is_binary: true,
+            hunks: vec![],
+        };
+        assert!(matches!(
+            partial_hunk_patch(&file, 0, &keep_first_change(), PatchBase::Old),
+            Err(SynthesisError::BinaryFile { .. })
+        ));
+    }
+
+    #[test]
+    fn partial_refuses_hunk_index_out_of_range() {
+        let file = modified_file(two_change_hunk());
+        assert!(matches!(
+            partial_hunk_patch(&file, 1, &keep_first_change(), PatchBase::Old),
+            Err(SynthesisError::HunkOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn partial_refuses_statuses_a_hunk_patch_cannot_express() {
+        for status in [
+            FileStatus::Added,
+            FileStatus::Deleted,
+            FileStatus::Untracked,
+            FileStatus::Unmerged,
+        ] {
+            let file = FileChange {
+                path: "f.txt".to_string(),
+                old_path: None,
+                status,
+                is_binary: false,
+                hunks: vec![two_change_hunk()],
+            };
+            assert!(
+                matches!(
+                    partial_hunk_patch(&file, 0, &keep_first_change(), PatchBase::Old),
+                    Err(SynthesisError::LineSelectionUnsupported { .. })
+                ),
+                "expected refusal for status {status:?}"
+            );
+        }
     }
 }
