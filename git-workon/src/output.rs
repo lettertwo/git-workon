@@ -47,13 +47,18 @@ pub fn set_no_color(enabled: bool) {
 }
 
 /// Checks if we should use color (terminal + NO_COLOR not set)
+///
+/// Only the env/TTY detection is cached: the `set_no_color` override is read on every
+/// call so it takes effect even after the first styled output. Caching the override
+/// would silently ignore late `set_no_color` calls — from tests pinning color off, or
+/// a future --no-color flag parsed after early output.
 fn use_color() -> bool {
-    static C: OnceLock<bool> = OnceLock::new();
-    *C.get_or_init(|| {
-        !NO_COLOR.load(Ordering::Relaxed)
-            && std::env::var_os("NO_COLOR").is_none()
-            && supports_color::on(supports_color::Stream::Stdout).is_some()
-    })
+    static ENV: OnceLock<bool> = OnceLock::new();
+    !NO_COLOR.load(Ordering::Relaxed)
+        && *ENV.get_or_init(|| {
+            std::env::var_os("NO_COLOR").is_none()
+                && supports_color::on(supports_color::Stream::Stdout).is_some()
+        })
 }
 
 /// Print a warning to stderr. Formats as "Warning: {msg}".
