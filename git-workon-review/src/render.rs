@@ -12,8 +12,8 @@ use ratatui::text::{Line, Span as TSpan};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::align::{CellKind, DisplayRow, Row};
-use crate::app::{App, FileView};
+use crate::align::{CellKind, DisplayRow, InlineRow, Row};
+use crate::app::{App, FileView, Layout as AppLayout};
 use crate::highlight::FgSpan;
 use crate::model::FileStatus;
 use crate::wordiff::Span as WordSpan;
@@ -63,7 +63,7 @@ fn compose_segments(
         }
         let mid = start;
         // Later-pushed bg spans are more specific (word-level strong emphasis is pushed after
-        // the whole-line subtle span in `build_pane_line`) and must win, so the lookup scans in
+        // the whole-line subtle span in `content_spans`) and must win, so the lookup scans in
         // REVERSE push order. The spike's forward `find` silently dropped word-level emphasis:
         // the whole-line subtle span contains every offset, so it always matched first.
         let bg = bg_spans
@@ -90,6 +90,52 @@ fn gutter_width(max_lineno: usize) -> usize {
 enum Side {
     Old,
     New,
+}
+
+/// Build the styled content spans (everything after the gutter) for one line of text, shared by
+/// [`build_pane_line`] (SBS) and [`build_inline_line`] (inline) — the two differ only in how they
+/// resolve `text`/`hl`/`emphasis` from a [`Row`] vs an [`InlineRow`] and in their gutter, not in
+/// how a resolved line gets colored.
+///
+/// `emphasis` is `Some((subtle, strong))` for a `Del`/`Add` line (whole-line subtle background,
+/// plus per-`word_spans` strong background when `is_word_pair`; whole-line strong when not paired
+/// — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at all).
+fn content_spans(
+    text: &str,
+    hl: Option<&Vec<FgSpan>>,
+    emphasis: Option<(Color, Color)>,
+    word_spans: &[WordSpan],
+    is_word_pair: bool,
+) -> Vec<TSpan<'static>> {
+    let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
+    if let Some((subtle_bg, strong_bg)) = emphasis {
+        if is_word_pair {
+            bg_spans.push((0, text.len(), subtle_bg));
+            for s in word_spans {
+                bg_spans.push((s.start, s.end, strong_bg));
+            }
+        } else {
+            // Unpaired excess line: whole-line strong emphasis.
+            bg_spans.push((0, text.len(), strong_bg));
+        }
+    }
+
+    let segments = compose_segments(text.len(), &bg_spans, hl);
+    let mut spans = Vec::with_capacity(segments.len().max(1));
+    if segments.is_empty() && !text.is_empty() {
+        spans.push(TSpan::styled(
+            text.to_string(),
+            Style::default().fg(FG_DEFAULT),
+        ));
+    }
+    for seg in segments {
+        let mut style = Style::default().fg(seg.fg);
+        if let Some(bg) = seg.bg {
+            style = style.bg(bg);
+        }
+        spans.push(TSpan::styled(text[seg.start..seg.end].to_string(), style));
+    }
+    spans
 }
 
 /// Build a single rendered line for one pane at a display row's resolved [`Row`]/[`CellKind`].
@@ -125,36 +171,11 @@ fn build_pane_line(
             let gutter = format!("{n:>gutter_w$} ");
             let mut spans = vec![TSpan::styled(gutter, Style::default().fg(FG_GUTTER))];
 
-            let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
-            match kind {
-                CellKind::Del | CellKind::Add => {
-                    if is_word_pair {
-                        bg_spans.push((0, text.len(), subtle_bg));
-                        for s in word_spans {
-                            bg_spans.push((s.start, s.end, strong_bg));
-                        }
-                    } else {
-                        // Unpaired excess line: whole-line strong emphasis.
-                        bg_spans.push((0, text.len(), strong_bg));
-                    }
-                }
-                CellKind::Context | CellKind::Filler => {}
-            }
-
-            let segments = compose_segments(text.len(), &bg_spans, hl);
-            if segments.is_empty() && !text.is_empty() {
-                spans.push(TSpan::styled(
-                    text.to_string(),
-                    Style::default().fg(FG_DEFAULT),
-                ));
-            }
-            for seg in segments {
-                let mut style = Style::default().fg(seg.fg);
-                if let Some(bg) = seg.bg {
-                    style = style.bg(bg);
-                }
-                spans.push(TSpan::styled(text[seg.start..seg.end].to_string(), style));
-            }
+            let emphasis = match kind {
+                CellKind::Del | CellKind::Add => Some((subtle_bg, strong_bg)),
+                CellKind::Context | CellKind::Filler => None,
+            };
+            spans.extend(content_spans(text, hl, emphasis, word_spans, is_word_pair));
             Line::from(spans)
         }
     }
@@ -204,7 +225,8 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect) {
-    let text = "j/k scroll  Ctrl-d/u half-page  g/G top/bottom  ]f/[f file  ]h/[h hunk  q quit";
+    let text =
+        "j/k scroll  Ctrl-d/u half-page  g/G top/bottom  ]f/[f file  ]h/[h hunk  L layout  q quit";
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(FG_DIM)),
         area,
@@ -236,6 +258,13 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     app.ensure_loaded(idx);
     app.pane_height = area.height as usize;
 
+    match app.layout {
+        AppLayout::Sbs => render_body_sbs(frame, app, area),
+        AppLayout::Inline => render_body_inline(frame, app, area),
+    }
+}
+
+fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
     let left_w = area.width.saturating_sub(1) / 2;
     let right_w = area.width.saturating_sub(1).saturating_sub(left_w);
     let hlayout = Layout::default()
@@ -330,6 +359,123 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
                 frame
                     .buffer_mut()
                     .set_line(new_area.x, y, &new_line, new_area.width);
+            }
+        }
+    }
+}
+
+/// Right-align `n` in a field of width `w`, or blank it out (`w` spaces) when there's no lineno
+/// for this side — used by the inline gutter, which always reserves both the old and new lineno
+/// columns even though a `Del`/`Add` row only fills one of them.
+fn gutter_field(n: Option<usize>, w: usize) -> String {
+    match n {
+        Some(n) => format!("{n:>w$}"),
+        None => " ".repeat(w),
+    }
+}
+
+/// Build a single rendered line for the inline layout's one full-width pane at a given
+/// [`InlineRow`]. Context rows show BOTH the old and new lineno (there's a real line on each
+/// side to number, and showing both matches the familiar unified-diff gutter convention); `Del`
+/// rows show only the old-side column, `Add` rows only the new-side column — the other column is
+/// blank rather than reused for anything, so a scan down the gutter reads as two honest,
+/// independent line-number tracks.
+fn build_inline_line(
+    view: &FileView,
+    row: &InlineRow,
+    word_spans: &[WordSpan],
+    old_gutter_w: usize,
+    new_gutter_w: usize,
+) -> Line<'static> {
+    let (old_opt, new_opt, text, hl, kind) = match *row {
+        InlineRow::Context { old, new } => (
+            Some(old),
+            Some(new),
+            view.new_line(new),
+            view.new_hl.as_ref().and_then(|v| v.get(new - 1)),
+            CellKind::Context,
+        ),
+        InlineRow::Del { old, .. } => (
+            Some(old),
+            None,
+            view.old_line(old),
+            view.old_hl.as_ref().and_then(|v| v.get(old - 1)),
+            CellKind::Del,
+        ),
+        InlineRow::Add { new, .. } => (
+            None,
+            Some(new),
+            view.new_line(new),
+            view.new_hl.as_ref().and_then(|v| v.get(new - 1)),
+            CellKind::Add,
+        ),
+        InlineRow::Gap { .. } => {
+            unreachable!("gap rows render via render_gap_row, not build_inline_line")
+        }
+    };
+
+    let gutter = format!(
+        "{} {} ",
+        gutter_field(old_opt, old_gutter_w),
+        gutter_field(new_opt, new_gutter_w)
+    );
+    let mut spans = vec![TSpan::styled(gutter, Style::default().fg(FG_GUTTER))];
+
+    let is_word_pair = row.is_word_diff_pair();
+    // `kind` is always Del/Add/Context here — inline has no Filler rows.
+    let emphasis = match kind {
+        CellKind::Del => Some((BG_DEL_SUBTLE, BG_DEL_STRONG)),
+        CellKind::Add => Some((BG_ADD_SUBTLE, BG_ADD_STRONG)),
+        CellKind::Context | CellKind::Filler => None,
+    };
+    spans.extend(content_spans(text, hl, emphasis, word_spans, is_word_pair));
+    Line::from(spans)
+}
+
+fn render_body_inline(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Some(view) = app.current_view_ref() else {
+        frame.render_widget(Paragraph::new("(failed to load file)"), area);
+        return;
+    };
+    let old_gutter_w = gutter_width(view.old_line_count());
+    let new_gutter_w = gutter_width(view.new_line_count());
+    let scroll = app.scroll;
+    let pane_height = app.pane_height;
+    let end = (scroll + pane_height).min(view.inline.len());
+
+    // Same two-phase mutable/immutable dance as `render_body_sbs`, over the inline coordinate
+    // space instead.
+    if let Some(view) = app.current_view() {
+        for row_idx in scroll..end {
+            if matches!(view.inline.get(row_idx), Some(r) if r.is_word_diff_pair()) {
+                view.inline_word_spans_for_row(row_idx);
+            }
+        }
+    }
+
+    let Some(view) = app.current_view_ref() else {
+        return;
+    };
+
+    for (i, row_idx) in (scroll..end).enumerate() {
+        let y = area.y + i as u16;
+        match &view.inline[row_idx] {
+            InlineRow::Gap { skipped } => {
+                render_gap_row(frame.buffer_mut(), area, y, *skipped);
+            }
+            row => {
+                let (old_spans, new_spans) = if row.is_word_diff_pair() {
+                    view.peek_inline_word_spans(row_idx)
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let word_spans: &[WordSpan] = match row {
+                    InlineRow::Del { .. } => &old_spans,
+                    InlineRow::Add { .. } => &new_spans,
+                    _ => &[],
+                };
+                let line = build_inline_line(view, row, word_spans, old_gutter_w, new_gutter_w);
+                frame.buffer_mut().set_line(area.x, y, &line, area.width);
             }
         }
     }
@@ -517,6 +663,79 @@ mod tests {
         assert!(
             header.contains("old_name.txt @ HEAD -> new_name.txt"),
             "expected renamed header with old_path @ base -> new_path, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn toggling_layout_reflows_the_same_fixture_and_toggling_back_restores_sbs() {
+        use crate::app::Layout;
+
+        let old = "l1\nl2\nl3\nl4\nl5\nold word here\nl7\nl8\nl9\nl10\n";
+        let new = "l1\nl2\nl3\nl4\nl5\nnew word here\nl7\nl8\nl9\nl10\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("small.txt", old, new)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        // SBS: old and new side by side on the SAME row.
+        let sbs_buf = render_once(&mut app, 60, 20);
+        let sbs_content = buf_lines(&sbs_buf);
+        let sbs_row = sbs_content
+            .iter()
+            .position(|line| line.contains("old word here"))
+            .expect("SBS row pairs old and new on one row");
+        assert!(
+            sbs_content[sbs_row].contains("new word here"),
+            "expected SBS to show del and add on the same row, got:\n{}",
+            sbs_content.join("\n")
+        );
+
+        app.toggle_layout();
+        assert_eq!(app.layout, Layout::Inline);
+
+        let inline_buf = render_once(&mut app, 60, 20);
+        let inline_content = buf_lines(&inline_buf);
+        let del_row = inline_content
+            .iter()
+            .position(|line| line.contains("old word here"))
+            .expect("inline shows the deleted line");
+        let add_row = inline_content
+            .iter()
+            .position(|line| line.contains("new word here"))
+            .expect("inline shows the added line");
+        assert!(
+            del_row < add_row,
+            "expected the inline del line above its paired add line, got:\n{}",
+            inline_content.join("\n")
+        );
+        assert_ne!(
+            del_row, add_row,
+            "del and add must be on separate rows in inline layout"
+        );
+
+        // Toggling back re-renders SBS (single row again) rather than staying stuck in inline.
+        app.toggle_layout();
+        assert_eq!(app.layout, Layout::Sbs);
+        let sbs_again = render_once(&mut app, 60, 20);
+        let sbs_again_content: Vec<String> = (0..sbs_again.area.height)
+            .map(|y| {
+                (0..sbs_again.area.width)
+                    .map(|x| cell_text(&sbs_again, x, y))
+                    .collect::<String>()
+            })
+            .collect();
+        let row = sbs_again_content
+            .iter()
+            .position(|line| line.contains("old word here"))
+            .expect("SBS (again) row pairs old and new on one row");
+        assert!(
+            sbs_again_content[row].contains("new word here"),
+            "expected toggling back to re-render SBS with del/add on one row, got:\n{}",
+            sbs_again_content.join("\n")
         );
     }
 }
