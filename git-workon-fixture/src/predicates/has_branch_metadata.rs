@@ -1,3 +1,4 @@
+use crate::predicates::metadata_common::refs_metadata_json;
 use git2::Repository;
 use predicates::prelude::Predicate;
 use predicates::reflection::PredicateReflection;
@@ -22,17 +23,7 @@ impl fmt::Display for HasBranchMetadataPredicate {
 
 impl Predicate<Repository> for HasBranchMetadataPredicate {
     fn eval(&self, repo: &Repository) -> bool {
-        let refname = format!("refs/branch-metadata/{}", self.branch);
-        let Ok(reference) = repo.find_reference(&refname) else {
-            return false;
-        };
-        let Ok(object) = reference.peel(git2::ObjectType::Blob) else {
-            return false;
-        };
-        let Ok(blob) = object.into_blob() else {
-            return false;
-        };
-        let Ok(json) = serde_json::from_slice::<serde_json::Value>(blob.content()) else {
+        let Some(json) = refs_metadata_json(repo, &self.branch) else {
             return false;
         };
         json.get("parentBranchName")

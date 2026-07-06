@@ -5,6 +5,8 @@ mod has_config;
 mod has_config_multivar;
 mod has_graphite_config;
 mod has_metadata_parent_revision;
+mod metadata_common;
+
 mod has_remote;
 mod has_remote_branch;
 mod has_remote_url;

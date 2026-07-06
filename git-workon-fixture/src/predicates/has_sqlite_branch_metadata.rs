@@ -1,3 +1,4 @@
+use crate::predicates::metadata_common::sqlite_metadata_field;
 use git2::Repository;
 use predicates::prelude::Predicate;
 use predicates::reflection::PredicateReflection;
@@ -22,19 +23,7 @@ impl fmt::Display for HasSqliteBranchMetadataPredicate {
 
 impl Predicate<Repository> for HasSqliteBranchMetadataPredicate {
     fn eval(&self, repo: &Repository) -> bool {
-        let db_path = repo.commondir().join(".graphite_metadata.db");
-        let Ok(conn) = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ) else {
-            return false;
-        };
-        let result: rusqlite::Result<String> = conn.query_row(
-            "SELECT parent_branch_name FROM branch_metadata WHERE branch_name = ?1",
-            [&self.branch],
-            |row| row.get(0),
-        );
-        result
+        sqlite_metadata_field(repo, &self.branch, "parent_branch_name")
             .map(|parent| parent == self.expected_parent)
             .unwrap_or(false)
     }

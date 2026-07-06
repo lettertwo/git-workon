@@ -1,4 +1,5 @@
 use crate::fixture_builder::MetadataFormat;
+use crate::predicates::metadata_common::{refs_metadata_json, sqlite_metadata_field};
 use git2::Repository;
 use predicates::prelude::Predicate;
 use predicates::reflection::PredicateReflection;
@@ -26,35 +27,12 @@ impl Predicate<Repository> for HasMetadataParentRevisionPredicate {
     fn eval(&self, repo: &Repository) -> bool {
         match self.format {
             MetadataFormat::Sqlite => {
-                let db_path = repo.commondir().join(".graphite_metadata.db");
-                let Ok(conn) = rusqlite::Connection::open_with_flags(
-                    &db_path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                ) else {
-                    return false;
-                };
-                let result: rusqlite::Result<String> = conn.query_row(
-                    "SELECT parent_branch_revision FROM branch_metadata WHERE branch_name = ?1",
-                    [&self.branch],
-                    |row| row.get(0),
-                );
-                result
+                sqlite_metadata_field(repo, &self.branch, "parent_branch_revision")
                     .map(|revision| revision == self.expected_revision)
                     .unwrap_or(false)
             }
             MetadataFormat::Refs => {
-                let refname = format!("refs/branch-metadata/{}", self.branch);
-                let Ok(reference) = repo.find_reference(&refname) else {
-                    return false;
-                };
-                let Ok(object) = reference.peel(git2::ObjectType::Blob) else {
-                    return false;
-                };
-                let Ok(blob) = object.into_blob() else {
-                    return false;
-                };
-                let Ok(json) = serde_json::from_slice::<serde_json::Value>(blob.content()) else {
+                let Some(json) = refs_metadata_json(repo, &self.branch) else {
                     return false;
                 };
                 json.get("parentBranchRevision")
