@@ -190,8 +190,10 @@ impl<'fixture> FixtureBuilder<'fixture> {
     /// Write Graphite branch-metadata for `branch` with parent `parent`, in the active
     /// [`MetadataFormat`] (see [`metadata_format`](Self::metadata_format)).
     ///
-    /// `branch_revision`/`parentBranchRevision` resolve to the live `refs/heads/<name>` tips
-    /// at `build()` time, mirroring what `gt track` writes right after tracking a branch.
+    /// Revisions resolve to the live `refs/heads/<name>` tips at `build()` time, mirroring
+    /// what `gt track` writes right after tracking a branch. `parentBranchRevision` is
+    /// persisted in both formats; `branch_revision` only in [`MetadataFormat::Sqlite`] —
+    /// legacy refs blobs have no branch-revision field.
     /// Also creates a local branch ref for `branch` if one does not already exist, so
     /// metadata-only stack diffs resolve as live branches rather than ghosts.
     pub fn branch_metadata(mut self, branch: &str, parent: &str) -> Self {
@@ -210,10 +212,12 @@ impl<'fixture> FixtureBuilder<'fixture> {
     ///
     /// Use this to fixture stale or bogus recorded revisions (e.g. a `branch_revision` left
     /// behind after plain-git commits advanced the branch past what Graphite recorded, or a
-    /// non-resolving hex string) for trap-7-style tests. `branch_rev`/`parent_rev` are written
-    /// exactly as given, in the active [`MetadataFormat`]; they need not resolve to real
-    /// commits. Also creates a local branch ref for `branch` if one does not already exist,
-    /// same as [`branch_metadata`](Self::branch_metadata).
+    /// non-resolving hex string) for trap-7-style tests. `parent_rev` is written exactly as
+    /// given in either format; `branch_rev` is persisted only in [`MetadataFormat::Sqlite`]
+    /// (legacy refs blobs have no branch-revision field, so it is ignored in
+    /// [`MetadataFormat::Refs`]). Neither needs to resolve to a real commit. Also creates a
+    /// local branch ref for `branch` if one does not already exist, same as
+    /// [`branch_metadata`](Self::branch_metadata).
     pub fn branch_metadata_at(
         mut self,
         branch: &str,
