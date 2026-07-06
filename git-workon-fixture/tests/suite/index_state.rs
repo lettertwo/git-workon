@@ -401,3 +401,28 @@ fn untracked_symlink_is_visible_via_lstat_even_when_dangling(
 
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn executable_unstaged_file_has_100755_mode_at_head_and_on_disk(
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = FixtureBuilder::new()
+        .executable_unstaged_file("run.sh", "echo committed\n", "echo modified\n")
+        .build()?;
+
+    let repo = fixture.repo()?;
+    repo.assert(predicate::repo::has_index_mode("run.sh", 0o100755));
+
+    let dir = fixture.cwd()?;
+    let abs_path = dir.path().join("run.sh");
+    let perms = std::fs::metadata(&abs_path)?.permissions();
+    assert_eq!(
+        perms.mode() & 0o111,
+        0o111,
+        "expected the working tree copy to keep its executable bits"
+    );
+
+    Ok(())
+}

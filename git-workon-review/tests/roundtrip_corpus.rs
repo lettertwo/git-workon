@@ -38,6 +38,24 @@ fn line_index(file: &FileChange, hunk_idx: usize, kind: LineKind, content: &str)
         .unwrap_or_else(|| panic!("no {kind:?} line with content {content:?} in hunk {hunk_idx}"))
 }
 
+/// Stage `path`'s current working-tree content directly (bypassing `ops.rs`) as scenario setup
+/// — e.g. so an Unstage/Discard scenario's preimage is already staged before the op under test
+/// runs.
+///
+/// `index.read(true)` forces a reload from disk before mutating: `Fixture`'s `Repository` handle
+/// can carry an in-memory index cached from before the fixture builder's baseline commit, and
+/// `write()` after `add_path` would otherwise silently drop every OTHER path's entries back out
+/// of the on-disk index — harmless with one file in a fixture, corrupting with more than one
+/// (verified empirically in `staging_storm_ops`'s three-file fixture: the naive form staged all
+/// three files as untracked-since-deleted).
+fn pre_stage(repo: &Repository, path: &str) -> Result<(), ReviewError> {
+    let mut index = repo.index()?;
+    index.read(true)?;
+    index.add_path(Path::new(path))?;
+    index.write()?;
+    Ok(())
+}
+
 type BuildFn = fn() -> Fixture;
 type OpsFn = fn(&Repository, &dyn Applier) -> Result<(), ReviewError>;
 type VerifyFn = fn(&Fixture);
@@ -187,6 +205,12 @@ fn scenarios() -> Vec<Scenario> {
             ops: staging_storm_ops,
             verify: staging_storm_verify,
         },
+        Scenario {
+            name: "executable_whole_hunk_stage",
+            build: executable_build,
+            ops: executable_whole_hunk_stage_ops,
+            verify: executable_whole_hunk_stage_verify,
+        },
     ]
 }
 
@@ -224,17 +248,9 @@ fn whole_hunk_stage_verify(fixture: &Fixture) {
 
 fn whole_hunk_unstage_ops(repo: &Repository, applier: &dyn Applier) -> Result<(), ReviewError> {
     // Setup: stage the full modification directly so the staged model sees it — the Unstage
-    // patch's preimage is the index (plan risk #3), not what's under test here.
-    //
-    // `read(true)` forces a reload from disk before mutating: `Fixture`'s `Repository` handle
-    // can carry an in-memory index cached from before the fixture builder's baseline commit, and
-    // `write()` after `add_path` would otherwise silently drop every OTHER path's entries back
-    // out of the on-disk index (harmless with one file in the fixture, corrupting with more than
-    // one — see `staging_storm_ops`, which needs this for real).
-    let mut index = repo.index()?;
-    index.read(true)?;
-    index.add_path(Path::new("f.txt"))?;
-    index.write()?;
+    // patch's preimage is the index (plan risk #3), not what's under test here. See
+    // `pre_stage`'s docs for why `index.read(true)` is load-bearing, not defensive.
+    pre_stage(repo, "f.txt")?;
 
     let diffs = diff_uncommitted(repo)?;
     let file = &diffs.staged.files[0];
@@ -368,11 +384,9 @@ fn partial_stage_mixed_verify(fixture: &Fixture) {
 
 fn partial_unstage_ops(repo: &Repository, applier: &dyn Applier) -> Result<(), ReviewError> {
     // Setup: stage the full modification first so the staged model (the correct preimage for
-    // an Unstage patch) sees both changes. `read(true)`: see `whole_hunk_unstage_ops`.
-    let mut index = repo.index()?;
-    index.read(true)?;
-    index.add_path(Path::new("f.txt"))?;
-    index.write()?;
+    // an Unstage patch) sees both changes. See `pre_stage`'s docs for why `index.read(true)` is
+    // load-bearing.
+    pre_stage(repo, "f.txt")?;
 
     let diffs = diff_uncommitted(repo)?;
     let file = &diffs.staged.files[0];
@@ -434,11 +448,8 @@ fn eofnl_whole_stage_verify(fixture: &Fixture) {
 }
 
 fn eofnl_whole_unstage_ops(repo: &Repository, applier: &dyn Applier) -> Result<(), ReviewError> {
-    // `read(true)`: see `whole_hunk_unstage_ops`.
-    let mut index = repo.index()?;
-    index.read(true)?;
-    index.add_path(Path::new("f.txt"))?;
-    index.write()?;
+    // See `pre_stage`'s docs for why `index.read(true)` is load-bearing.
+    pre_stage(repo, "f.txt")?;
 
     let diffs = diff_uncommitted(repo)?;
     let file = &diffs.staged.files[0];
@@ -834,16 +845,10 @@ fn staging_storm_build() -> Fixture {
 
 fn staging_storm_ops(repo: &Repository, applier: &dyn Applier) -> Result<(), ReviewError> {
     // Setup: pre-stage fileB's modification (not part of the storm itself) so the storm can
-    // unstage it. `read(true)` is load-bearing here, not defensive: `Fixture`'s `Repository`
-    // handle can carry an in-memory index cached from before the fixture builder's baseline
-    // commit (which added fileA/fileB/fileC together); without a reload first, `add_path` +
-    // `write` writes back only what THIS index object knows about, silently dropping fileA's
-    // and fileC's index entries (verified empirically — the naive form staged all three files
-    // as untracked-since-deleted).
-    let mut index = repo.index()?;
-    index.read(true)?;
-    index.add_path(Path::new("fileB.txt"))?;
-    index.write()?;
+    // unstage it. See `pre_stage`'s docs for why `index.read(true)` is load-bearing here, not
+    // defensive — this fixture's three-file baseline commit is exactly the multi-path case that
+    // bites without the reload.
+    pre_stage(repo, "fileB.txt")?;
 
     let diffs = diff_uncommitted(repo)?;
     let file_a = diffs
@@ -902,6 +907,44 @@ fn staging_storm_verify(fixture: &Fixture) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// executable file (100755) whole-hunk stage — pins the exec-bit-mode divergence class the
+// 2026-07-06 stack review found: `PatchText::to_bytes` used to hardcode `index 0000000..0000000
+// 100644` on the synthesized patch's index line, so staging any hunk of an executable file via
+// `Git2Applier` silently reset its index mode to `100644` — a real divergence `CliApplier` never
+// had (it reads the mode from the working tree). Fixed by threading the real mode through
+// `FileChange`/`PatchText` (see `synthesis.rs`).
+// ---------------------------------------------------------------------------------------------
+
+const EXECUTABLE_COMMITTED: &str = "#!/bin/sh\necho committed\n";
+const EXECUTABLE_MODIFIED: &str = "#!/bin/sh\necho modified\n";
+
+fn executable_build() -> Fixture {
+    FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .executable_unstaged_file("run.sh", EXECUTABLE_COMMITTED, EXECUTABLE_MODIFIED)
+        .build()
+        .expect("fixture build")
+}
+
+fn executable_whole_hunk_stage_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    apply_hunk(repo, applier, file, 0, StageVerb::Stage)
+}
+
+fn executable_whole_hunk_stage_verify(fixture: &Fixture) {
+    fixture.assert(predicate::repo::index_blob_equals(
+        "run.sh",
+        EXECUTABLE_MODIFIED.as_bytes().to_vec(),
+    ));
+    // The regression: staging must NOT clobber the index entry's mode back to 0o100644.
+    fixture.assert(predicate::repo::has_index_mode("run.sh", 0o100755));
+}
+
+// ---------------------------------------------------------------------------------------------
 // The verdict tests
 // ---------------------------------------------------------------------------------------------
 
@@ -938,7 +981,25 @@ fn run_scenario_against_git2(scenario: &Scenario) -> Result<(), String> {
     match outcome {
         Ok(Ok(())) => Ok(()),
         Ok(Err(detail)) => Err(detail),
-        Err(_) => Err("git2 pass panicked (ops error or a verify assertion failed)".to_string()),
+        Err(payload) => Err(format!(
+            "git2 pass panicked: {}",
+            panic_payload_message(&payload)
+        )),
+    }
+}
+
+/// Extract a human-readable message from a `catch_unwind` panic payload — `panic!("{msg}")` and
+/// `assert!`/`unwrap`/`expect` failures carry it as `&'static str` or `String` depending on
+/// whether the message was formatted; anything else (a non-string payload) falls back to a
+/// fixed placeholder so a [`KNOWN_DIVERGENCES`] entry can still cite whatever detail IS
+/// available instead of a uniform, evidence-free string for every panic.
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else {
+        "(non-string panic payload)".to_string()
     }
 }
 
