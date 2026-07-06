@@ -13,6 +13,7 @@
 //! verdict corpus lands in the next M2 changeset.
 
 pub mod acquire;
+pub mod align;
 pub mod apply;
 pub mod error;
 pub mod file_ops;
