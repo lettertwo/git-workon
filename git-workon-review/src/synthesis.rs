@@ -267,6 +267,68 @@ pub fn whole_hunk_patch(file: &FileChange, hunk_idx: usize) -> Result<PatchText,
     })
 }
 
+/// Trap 2: rewrite dropped-deletion-turned-context lines that carry
+/// [`crate::model::HunkLine::missing_newline`] into git's canonical delete+re-add form, when
+/// anything else is emitted after them.
+///
+/// `base == Old`'s drop rule turns a dropped deletion into a plain context line (see
+/// [`partial_hunk_patch`]). That is correct UNLESS the original deletion was the file's old-side
+/// EOF (no trailing newline) and the new file has more content after it (kept additions) — i.e.
+/// the file transitions from "ends without a newline here" to "has more content after this
+/// line," which is a real change to this line (it now needs a trailing newline) that a context
+/// line — byte-identical on both sides by definition — cannot express.
+///
+/// `git apply` does not reject this malformed shape. Empirically (verified against the system
+/// `git` binary; see `tests/line_synthesis.rs`'s tripwire), it silently accepts a context line
+/// missing its newline followed by more lines and concatenates the next line's bytes directly
+/// onto it with no separator — e.g. content `"last"` (no `\n`) followed by an addition `"more\n"`
+/// becomes the single corrupt line `"lastmore\n"` in the applied blob, exit code 0.
+///
+/// The fix: emit the line as a deletion (unchanged: original content, `missing_newline: true`,
+/// carrying its own `\ No newline at end of file` marker) immediately followed by a re-add of
+/// the SAME line — but WITH a real trailing newline appended and no marker, since in the new
+/// file this line is no longer the last one. This nets the same +1 old/+1 new count as a context
+/// line while giving git a real newline byte to anchor the next line on.
+///
+/// Note this deviates from an earlier draft of this fix that also marked the re-added copy
+/// `missing_newline: true` (mirroring the deletion exactly). That form was tested empirically
+/// against `git apply` and found to reproduce the IDENTICAL corruption (`git apply --check`
+/// reports success, but the applied content is still the concatenated `"lastmore\n"`) — the
+/// marker on a non-final `+` line doesn't stop git from raw-copying the next line onto it. Only
+/// giving the re-added line a genuine trailing newline (no marker) produces the correct byte
+/// sequence, hence the choice codified here.
+///
+/// Only the deletion side ever needs this. A dropped ADDITION converted to context (`base ==
+/// New`) can never have this problem: [`crate::model::HunkLine::missing_newline`] is only ever
+/// set on a line that is the true last line of the file (see the module docs on the EOFNL
+/// characterization), and [`partial_hunk_patch`] never reorders `hunk.lines` — so an addition
+/// carrying the flag is always the LAST entry synthesized for its hunk, with nothing emitted
+/// after it to corrupt against. `tests/line_synthesis.rs` has a test pinning this reasoning
+/// against a real apply rather than asserting it blind.
+fn splice_eofnl_context_lines(emitted: Vec<(PatchLine, bool)>) -> Vec<PatchLine> {
+    let last = emitted.len().saturating_sub(1);
+    let mut out = Vec::with_capacity(emitted.len());
+    for (i, (line, dropped_del_context)) in emitted.into_iter().enumerate() {
+        if dropped_del_context && line.missing_newline && i != last {
+            let mut readded = line.content.clone();
+            readded.push(b'\n');
+            out.push(PatchLine {
+                kind: LineKind::Deletion,
+                content: line.content,
+                missing_newline: true,
+            });
+            out.push(PatchLine {
+                kind: LineKind::Addition,
+                content: readded,
+                missing_newline: false,
+            });
+        } else {
+            out.push(line);
+        }
+    }
+    out
+}
+
 /// Which of a hunk's addition/deletion lines to keep in a line-precise patch.
 ///
 /// Indices are into [`crate::model::Hunk::lines`] — the `Vec` position, NOT the old/new line
@@ -320,9 +382,10 @@ pub struct LineSelection {
 /// unsupported statuses ([`SynthesisError::LineSelectionUnsupported`]), and an out-of-range
 /// `hunk_idx` ([`SynthesisError::HunkOutOfRange`]).
 ///
-/// This function does not yet apply the trap-2 EOFNL splice (a dropped deletion converted to
-/// context that carries [`crate::model::HunkLine::missing_newline`], followed by any kept
-/// line, silently corrupts the blob under `git apply`) — see the follow-up commit.
+/// A dropped deletion converted to context (see above) that carries
+/// [`crate::model::HunkLine::missing_newline`], followed by any other emitted line, is spliced
+/// by [`splice_eofnl_context_lines`] into git's canonical delete+re-add form rather than left as
+/// a raw context line — see that function's docs for why (trap 2).
 pub fn partial_hunk_patch(
     file: &FileChange,
     hunk_idx: usize,
@@ -354,38 +417,50 @@ pub fn partial_hunk_patch(
     let mut kept_any = false;
     let mut old_count = 0u32;
     let mut new_count = 0u32;
-    let mut lines = Vec::with_capacity(hunk.lines.len());
+    // Each entry pairs the emitted line with whether it's a dropped-DELETION-turned-context
+    // line — the only shape the trap-2 splice (below) ever needs to consider — kept as one
+    // `push` per line so the two can't drift out of sync with each other.
+    let mut emitted: Vec<(PatchLine, bool)> = Vec::with_capacity(hunk.lines.len());
 
     for (idx, line) in hunk.lines.iter().enumerate() {
         match line.kind {
             LineKind::Context => {
                 old_count += 1;
                 new_count += 1;
-                lines.push(PatchLine {
-                    kind: LineKind::Context,
-                    content: line.content.clone(),
-                    missing_newline: line.missing_newline,
-                });
+                emitted.push((
+                    PatchLine {
+                        kind: LineKind::Context,
+                        content: line.content.clone(),
+                        missing_newline: line.missing_newline,
+                    },
+                    false,
+                ));
             }
             LineKind::Addition => {
                 if sel.keep_adds.contains(&idx) {
                     kept_any = true;
                     new_count += 1;
-                    lines.push(PatchLine {
-                        kind: LineKind::Addition,
-                        content: line.content.clone(),
-                        missing_newline: line.missing_newline,
-                    });
+                    emitted.push((
+                        PatchLine {
+                            kind: LineKind::Addition,
+                            content: line.content.clone(),
+                            missing_newline: line.missing_newline,
+                        },
+                        false,
+                    ));
                 } else if base == PatchBase::New {
                     // Dropped addition, base=New: it must remain in the (already-changed)
                     // target, so it has to match as context on reverse-apply.
                     old_count += 1;
                     new_count += 1;
-                    lines.push(PatchLine {
-                        kind: LineKind::Context,
-                        content: line.content.clone(),
-                        missing_newline: line.missing_newline,
-                    });
+                    emitted.push((
+                        PatchLine {
+                            kind: LineKind::Context,
+                            content: line.content.clone(),
+                            missing_newline: line.missing_newline,
+                        },
+                        false,
+                    ));
                 }
                 // base=Old: dropped addition is omitted — the target doesn't have it yet and
                 // shouldn't gain it.
@@ -394,21 +469,27 @@ pub fn partial_hunk_patch(
                 if sel.keep_dels.contains(&idx) {
                     kept_any = true;
                     old_count += 1;
-                    lines.push(PatchLine {
-                        kind: LineKind::Deletion,
-                        content: line.content.clone(),
-                        missing_newline: line.missing_newline,
-                    });
+                    emitted.push((
+                        PatchLine {
+                            kind: LineKind::Deletion,
+                            content: line.content.clone(),
+                            missing_newline: line.missing_newline,
+                        },
+                        false,
+                    ));
                 } else if base == PatchBase::Old {
                     // Dropped deletion, base=Old: it's still there in the target, so it has to
                     // match as context.
                     old_count += 1;
                     new_count += 1;
-                    lines.push(PatchLine {
-                        kind: LineKind::Context,
-                        content: line.content.clone(),
-                        missing_newline: line.missing_newline,
-                    });
+                    emitted.push((
+                        PatchLine {
+                            kind: LineKind::Context,
+                            content: line.content.clone(),
+                            missing_newline: line.missing_newline,
+                        },
+                        true,
+                    ));
                 }
                 // base=New: dropped deletion is omitted — it's already absent from the target
                 // and must never be matched against.
@@ -422,6 +503,8 @@ pub fn partial_hunk_patch(
             hunk: hunk_idx,
         });
     }
+
+    let lines = splice_eofnl_context_lines(emitted);
 
     let mut header = format!(
         "@@ -{},{old_count} +{},{new_count} @@",
