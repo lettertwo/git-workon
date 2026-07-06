@@ -442,31 +442,29 @@ impl<'fixture> FixtureBuilder<'fixture> {
         // must reflect the moved one, not the pre-baseline commit.
         if !self.unstaged_files.is_empty() {
             let cwd_repo = Repository::open(&cwd_path)?;
+            let mut index = cwd_repo.index()?;
             for (file_path, committed, _modified) in &self.unstaged_files {
                 let abs_path = cwd_path.join(file_path);
                 if let Some(parent) = abs_path.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&abs_path, committed)?;
-
-                let mut index = cwd_repo.index()?;
                 index.add_path(Path::new(file_path))?;
-                index.write()?;
-
-                let tree_id = index.write_tree()?;
-                let tree = cwd_repo.find_tree(tree_id)?;
-                let sig =
-                    git2::Signature::now("git-workon-fixture", "git-workon-fixture@fake.com")?;
-                let parent_commit = cwd_repo.head()?.peel_to_commit()?;
-                cwd_repo.commit(
-                    Some("HEAD"),
-                    &sig,
-                    &sig,
-                    "unstaged_file baseline",
-                    &tree,
-                    &[&parent_commit],
-                )?;
             }
+            index.write()?;
+
+            let tree_id = index.write_tree()?;
+            let tree = cwd_repo.find_tree(tree_id)?;
+            let sig = cwd_repo.signature()?;
+            let parent_commit = cwd_repo.head()?.peel_to_commit()?;
+            cwd_repo.commit(
+                Some("HEAD"),
+                &sig,
+                &sig,
+                "unstaged_file baseline",
+                &tree,
+                &[&parent_commit],
+            )?;
         }
 
         // Write .graphite_repo_config
