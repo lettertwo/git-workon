@@ -337,6 +337,10 @@ fn assemble_git(repo: &Repository, head_branch: &str) -> Result<Vec<Changeset>> 
     revwalk.push(head_oid)?;
     revwalk.hide(upstream_oid)?;
     revwalk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::REVERSE)?;
+    // Follow only the branch's own first-parent line: without this, a merge into the
+    // branch enumerates every merged-in commit as its own changeset AND the merge commit
+    // (whose base is its first parent) spans the same content again — double-counted.
+    revwalk.simplify_first_parent()?;
 
     let mut changesets: Vec<Changeset> = Vec::new();
     for oid in revwalk {
