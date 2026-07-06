@@ -127,6 +127,16 @@ pub struct FileChange {
     pub old_path: Option<String>,
     pub status: FileStatus,
     pub is_binary: bool,
+    /// Raw octal file mode (e.g. `0o100644`, `0o100755`) of the pre-image, from
+    /// `delta.old_file().mode()`. Carried alongside [`Self::new_mode`] so
+    /// [`crate::synthesis::whole_hunk_patch`] can pick the right mode for the patch's
+    /// direction — and [`crate::synthesis::PatchText::invert`] can swap them — instead of
+    /// clobbering the index entry's mode with a hardcoded `100644` (a real divergence: staging
+    /// any hunk of an executable file via the git2 applier used to silently reset it).
+    pub old_mode: i32,
+    /// Raw octal file mode of the post-image, from `delta.new_file().mode()`. See
+    /// [`Self::old_mode`].
+    pub new_mode: i32,
     pub hunks: Vec<Hunk>,
 }
 
@@ -180,6 +190,8 @@ impl DiffModel {
                 old_path,
                 status,
                 is_binary,
+                old_mode: i32::from(delta.old_file().mode()),
+                new_mode: i32::from(delta.new_file().mode()),
                 hunks,
             });
         }

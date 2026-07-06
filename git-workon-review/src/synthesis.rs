@@ -133,6 +133,13 @@ fn header_suffix(header: &[u8]) -> Vec<u8> {
 pub struct PatchText {
     pub old_path: Option<String>,
     pub new_path: Option<String>,
+    /// Raw octal mode of the pre-image (see [`FileChange::old_mode`]); swapped with
+    /// [`Self::new_mode`] by [`Self::invert`].
+    pub old_mode: i32,
+    /// Raw octal mode of the post-image (see [`FileChange::new_mode`]) — this is the mode
+    /// written into the synthesized `index` line, since a forward patch's target state is the
+    /// post-image.
+    pub new_mode: i32,
     pub hunks: Vec<PatchHunk>,
 }
 
@@ -141,10 +148,15 @@ impl PatchText {
     /// hunk's bytes. Always ends in `\n` (each hunk's last line is either a real line with its
     /// own trailing `\n`, or a `missing_newline` line whose marker supplies one).
     ///
-    /// The `index 0000000..0000000 100644` line is a placeholder — this crate never reads
-    /// blob OIDs off the model (untracked deltas don't have them either), and `git apply`
-    /// ignores it. It exists because `git2::Diff::from_buffer` parses stricter than `git
-    /// apply` and rejects a bare 3-line header (plan risk #4).
+    /// The `index 0000000..0000000 <mode>` line's OIDs are a placeholder — this crate never
+    /// reads blob OIDs off the model (untracked deltas don't have them either), and `git
+    /// apply` ignores them. The line exists because `git2::Diff::from_buffer` parses stricter
+    /// than `git apply` and rejects a bare 3-line header (plan risk #4). The MODE, however, is
+    /// load-bearing: `Repository::apply(ApplyLocation::Index, ..)` takes the new index entry's
+    /// mode straight from this line, so it must be the file's real mode
+    /// ([`Self::new_mode`]) — a hardcoded `100644` here used to silently clobber the exec bit
+    /// of any staged `100755` file (the `git apply` CLI path never had this bug: it reads the
+    /// mode from the working tree instead).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let diff_git_old = self
@@ -158,7 +170,7 @@ impl PatchText {
             .or(self.old_path.as_deref())
             .unwrap_or("");
         out.extend_from_slice(format!("diff --git a/{diff_git_old} b/{diff_git_new}\n").as_bytes());
-        out.extend_from_slice(b"index 0000000..0000000 100644\n");
+        out.extend_from_slice(format!("index 0000000..0000000 {:06o}\n", self.new_mode).as_bytes());
         let old_label = match &self.old_path {
             Some(p) => format!("a/{p}"),
             None => "/dev/null".to_string(),
@@ -182,6 +194,8 @@ impl PatchText {
         PatchText {
             old_path: self.new_path.clone(),
             new_path: self.old_path.clone(),
+            old_mode: self.new_mode,
+            new_mode: self.old_mode,
             hunks: self.hunks.iter().map(PatchHunk::invert).collect(),
         }
     }
@@ -239,6 +253,8 @@ pub fn whole_hunk_patch(file: &FileChange, hunk_idx: usize) -> Result<PatchText,
     Ok(PatchText {
         old_path: Some(old_path),
         new_path: Some(new_path),
+        old_mode: file.old_mode,
+        new_mode: file.new_mode,
         hunks: vec![PatchHunk {
             old_start: hunk.old_start,
             old_count: hunk.old_count,
@@ -261,6 +277,8 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             is_binary: false,
+            old_mode: 0o100644,
+            new_mode: 0o100644,
             hunks: vec![hunk],
         }
     }
@@ -328,6 +346,36 @@ mod tests {
     }
 
     #[test]
+    fn whole_hunk_patch_carries_real_mode_into_index_line() {
+        let mut file = modified_file(simple_hunk());
+        file.old_mode = 0o100755;
+        file.new_mode = 0o100755;
+        let patch = whole_hunk_patch(&file, 0).unwrap();
+
+        let rendered = patch.to_bytes();
+        let rendered = String::from_utf8(rendered).unwrap();
+        assert!(
+            rendered.contains("index 0000000..0000000 100755\n"),
+            "expected the real 100755 mode in the index line, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn invert_swaps_old_and_new_mode() {
+        let mut file = modified_file(simple_hunk());
+        file.old_mode = 0o100644;
+        file.new_mode = 0o100755;
+        let patch = whole_hunk_patch(&file, 0).unwrap();
+
+        let inverted = patch.invert();
+        assert_eq!(inverted.old_mode, 0o100755);
+        assert_eq!(inverted.new_mode, 0o100644);
+        assert!(String::from_utf8(inverted.to_bytes())
+            .unwrap()
+            .contains("index 0000000..0000000 100644\n"));
+    }
+
+    #[test]
     fn whole_hunk_render_body_matches_model_hunk_to_diff_bytes() {
         let hunk = simple_hunk();
         let file = modified_file(hunk.clone());
@@ -392,6 +440,8 @@ mod tests {
             old_path: None,
             status: FileStatus::Modified,
             is_binary: true,
+            old_mode: 0o100644,
+            new_mode: 0o100644,
             hunks: vec![],
         };
         assert!(matches!(
@@ -422,6 +472,8 @@ mod tests {
                 old_path: None,
                 status,
                 is_binary: false,
+                old_mode: 0o100644,
+                new_mode: 0o100644,
                 hunks: vec![simple_hunk()],
             };
             assert!(
