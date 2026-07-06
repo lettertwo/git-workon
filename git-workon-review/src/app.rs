@@ -300,11 +300,16 @@ impl App {
         self.row_count().saturating_sub(self.pane_height.max(1))
     }
 
+    /// Relative scroll, clamped to `[0, max_scroll()]` — except it never snaps backward past
+    /// the current position when that position is itself beyond `max_scroll()` (e.g. right
+    /// after [`Self::next_hunk_row`]/[`Self::prev_hunk_row`] jumped the hunk to the top of a
+    /// pane taller than the remaining display). A relative scroll past a jump-placed position
+    /// is a no-op in the over-scrolled direction rather than a backward leap; scrolling back the
+    /// other way still works normally.
     pub fn scroll_by(&mut self, delta: i64) {
-        let max = self.max_scroll();
+        let max = self.max_scroll() as i64;
         let cur = self.scroll as i64;
-        let next = (cur + delta).clamp(0, max as i64);
-        self.scroll = next as usize;
+        self.scroll = (cur + delta).clamp(0, max.max(cur)) as usize;
     }
 
     pub fn scroll_top(&mut self) {
@@ -314,6 +319,53 @@ impl App {
     pub fn scroll_bottom(&mut self) {
         self.scroll = self.max_scroll();
     }
+
+    /// Scroll to the next hunk-start row after the current scroll position (`]h`). A no-op if
+    /// there is no later hunk, or the current file has no loaded view.
+    pub fn next_hunk_row(&mut self) {
+        let Some(view) = self.current_view_ref() else {
+            return;
+        };
+        if let Some(row) = find_next_hunk_row(&view.display, self.scroll) {
+            self.scroll = row;
+        }
+    }
+
+    /// Scroll to the previous hunk-start row before the current scroll position (`[h`). A no-op
+    /// if there is no earlier hunk, or the current file has no loaded view.
+    pub fn prev_hunk_row(&mut self) {
+        let Some(view) = self.current_view_ref() else {
+            return;
+        };
+        if let Some(row) = find_prev_hunk_row(&view.display, self.scroll) {
+            self.scroll = row;
+        }
+    }
+}
+
+/// True for a display row that carries change content (Del/Add/Filler on either side) rather
+/// than pure context — the unit hunk navigation jumps between.
+fn is_hunk_content_row(row: &DisplayRow) -> bool {
+    matches!(
+        row,
+        DisplayRow::Row(r) if !(r.old_kind == CellKind::Context && r.new_kind == CellKind::Context)
+    )
+}
+
+/// Row index of the next "hunk start" strictly after `after` — a hunk start is a content row
+/// whose preceding row is context/gap/absent (i.e. a transition INTO a hunk, not every changed
+/// row). Returns `None` if there is no such row.
+fn find_next_hunk_row(display: &[DisplayRow], after: usize) -> Option<usize> {
+    (after + 1..display.len()).find(|&i| {
+        is_hunk_content_row(&display[i]) && (i == 0 || !is_hunk_content_row(&display[i - 1]))
+    })
+}
+
+/// Row index of the previous "hunk start" strictly before `before`. See [`find_next_hunk_row`].
+fn find_prev_hunk_row(display: &[DisplayRow], before: usize) -> Option<usize> {
+    (0..before.min(display.len())).rev().find(|&i| {
+        is_hunk_content_row(&display[i]) && (i == 0 || !is_hunk_content_row(&display[i - 1]))
+    })
 }
 
 /// Test-only helper for building an [`App`] straight from a fixture, shared by `app.rs`'s own
@@ -342,6 +394,8 @@ mod tests {
     use git_workon_fixture::prelude::*;
 
     use super::test_support::app_from_fixture;
+    use super::{find_next_hunk_row, find_prev_hunk_row};
+    use crate::align::{AlignedRow, CellKind, DisplayRow, Row};
     use crate::model::FileStatus;
 
     #[test]
@@ -443,5 +497,138 @@ mod tests {
         assert!(app.files[0].is_binary);
         app.ensure_loaded(0);
         assert!(app.current_view_ref().is_none());
+    }
+
+    // Hunk-nav helpers below operate purely over `DisplayRow` vectors — no fixture repo needed.
+
+    fn ctx_row(n: usize) -> DisplayRow {
+        DisplayRow::Row(AlignedRow {
+            old: Row::Line(n),
+            new: Row::Line(n),
+            old_kind: CellKind::Context,
+            new_kind: CellKind::Context,
+        })
+    }
+
+    fn change_row(n: usize) -> DisplayRow {
+        DisplayRow::Row(AlignedRow {
+            old: Row::Line(n),
+            new: Row::Line(n),
+            old_kind: CellKind::Del,
+            new_kind: CellKind::Add,
+        })
+    }
+
+    fn gap_row(skipped: usize) -> DisplayRow {
+        DisplayRow::Gap { skipped }
+    }
+
+    #[test]
+    fn find_next_hunk_row_skips_within_a_hunk_and_stops_at_the_next_start() {
+        // ctx, change, change (same hunk — not a new "start"), ctx, ctx, change (next hunk).
+        let display = vec![
+            ctx_row(1),
+            change_row(2),
+            change_row(3),
+            ctx_row(4),
+            ctx_row(5),
+            change_row(6),
+        ];
+        assert_eq!(find_next_hunk_row(&display, 0), Some(1));
+        // From inside the first hunk, the next START is the second hunk, not row 2 itself.
+        assert_eq!(find_next_hunk_row(&display, 1), Some(5));
+        assert_eq!(find_next_hunk_row(&display, 5), None);
+    }
+
+    #[test]
+    fn find_prev_hunk_row_mirrors_next() {
+        let display = vec![
+            ctx_row(1),
+            change_row(2),
+            change_row(3),
+            ctx_row(4),
+            ctx_row(5),
+            change_row(6),
+        ];
+        assert_eq!(find_prev_hunk_row(&display, 6), Some(5));
+        assert_eq!(find_prev_hunk_row(&display, 5), Some(1));
+        assert_eq!(find_prev_hunk_row(&display, 1), None);
+    }
+
+    #[test]
+    fn hunk_row_helpers_treat_gap_rows_as_context() {
+        let display = vec![change_row(1), gap_row(10), change_row(12)];
+        assert_eq!(find_next_hunk_row(&display, 0), Some(2));
+        assert_eq!(find_prev_hunk_row(&display, 2), Some(0));
+    }
+
+    #[test]
+    fn app_next_and_prev_hunk_row_scroll_between_hunks() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "many.txt",
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n",
+                "1\nCHANGED\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nCHANGED_TOO\n",
+            )
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let first_hunk_row = app.scroll;
+
+        app.next_hunk_row();
+        assert!(
+            app.scroll > first_hunk_row,
+            "should scroll to the later hunk"
+        );
+        let second_hunk_row = app.scroll;
+
+        // No hunk after the last one: no-op.
+        app.next_hunk_row();
+        assert_eq!(app.scroll, second_hunk_row);
+
+        app.prev_hunk_row();
+        assert_eq!(app.scroll, first_hunk_row);
+
+        // No hunk before the first one: no-op.
+        app.prev_hunk_row();
+        assert_eq!(app.scroll, first_hunk_row);
+    }
+
+    #[test]
+    fn scroll_by_does_not_snap_backward_past_a_hunk_jump() {
+        // A small file (fits in the default pane height) with two hunks: `max_scroll() == 0`,
+        // but `next_hunk_row` still jumps `scroll` to the second hunk's row unclamped, leaving
+        // the view over-scrolled relative to `max_scroll()`.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "small.txt",
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+                "1\nCHANGED\n3\n4\n5\n6\n7\n8\n9\nCHANGED_TOO\n",
+            )
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.max_scroll(), 0, "whole file must fit in one pane");
+
+        app.next_hunk_row();
+        let over_scrolled = app.scroll;
+        assert!(
+            over_scrolled > 0,
+            "hunk jump should place scroll past max_scroll"
+        );
+
+        // `j` (scroll_by(1)) at an over-scrolled position is a no-op, not a backward snap.
+        app.scroll_by(1);
+        assert_eq!(app.scroll, over_scrolled);
+
+        // `k` (scroll_by(-1)) still scrolls up normally.
+        app.scroll_by(-1);
+        assert_eq!(app.scroll, over_scrolled - 1);
     }
 }

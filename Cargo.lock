@@ -961,6 +961,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "crossterm",
  "git-workon-fixture",
  "git-workon-lib",
  "git2",
