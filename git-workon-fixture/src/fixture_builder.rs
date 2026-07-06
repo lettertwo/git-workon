@@ -127,6 +127,7 @@ pub struct FixtureBuilder<'fixture> {
     staged_files: Vec<(String, String)>, // (path, content)
     unstaged_files: Vec<(String, String, String)>, // (path, committed, modified)
     untracked_files: Vec<(String, String)>, // (path, content)
+    deleted_files: Vec<(String, String)>, // (path, committed)
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -147,6 +148,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
             staged_files: Vec::new(),
             unstaged_files: Vec::new(),
             untracked_files: Vec::new(),
+            deleted_files: Vec::new(),
         }
     }
 
@@ -344,6 +346,21 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Commit `path` with `committed_content` on the cwd repo's branch during `build()`
+    /// (moving the branch tip, in the same baseline-commit block as
+    /// [`unstaged_file`](Self::unstaged_file)), then remove it from the working tree — a
+    /// staged-clean, working-tree-deleted file (`WT_DELETED`).
+    ///
+    /// The baseline commit lands before Graphite-metadata live-tip resolution, same rationale
+    /// as [`unstaged_file`](Self::unstaged_file). Applies to the LAST worktree added, or the
+    /// main repo if none. Errors at [`build`](Self::build) if the fixture is `bare(true)` with
+    /// no worktree.
+    pub fn deleted_file(mut self, path: &str, committed_content: &str) -> Self {
+        self.deleted_files
+            .push((path.to_string(), committed_content.to_string()));
+        self
+    }
+
     pub fn build(self) -> Result<Fixture> {
         isolate_ambient_git_config();
         let tmpdir = TempDir::new()?;
@@ -450,22 +467,32 @@ impl<'fixture> FixtureBuilder<'fixture> {
 
         let has_index_state = !self.staged_files.is_empty()
             || !self.unstaged_files.is_empty()
-            || !self.untracked_files.is_empty();
+            || !self.untracked_files.is_empty()
+            || !self.deleted_files.is_empty();
         if has_index_state && self.bare && self.worktrees.is_empty() {
             return Err(
-                "staged_file/unstaged_file/untracked_file require a working tree: fixture is \
-                 bare(true) with no worktree"
+                "staged_file/unstaged_file/untracked_file/deleted_file require a working tree: \
+                 fixture is bare(true) with no worktree"
                     .into(),
             );
         }
 
-        // `unstaged_file` baseline commits land BEFORE Graphite-metadata live-tip resolution
-        // below: they move the cwd branch's tip, and any metadata entry recording that tip
-        // must reflect the moved one, not the pre-baseline commit.
-        if !self.unstaged_files.is_empty() {
+        // `unstaged_file`/`deleted_file` baseline commits land BEFORE Graphite-metadata
+        // live-tip resolution below: they move the cwd branch's tip, and any metadata entry
+        // recording that tip must reflect the moved one, not the pre-baseline commit. Both
+        // builders share one baseline commit.
+        if !self.unstaged_files.is_empty() || !self.deleted_files.is_empty() {
             let cwd_repo = Repository::open(&cwd_path)?;
             let mut index = cwd_repo.index()?;
             for (file_path, committed, _modified) in &self.unstaged_files {
+                let abs_path = cwd_path.join(file_path);
+                if let Some(parent) = abs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&abs_path, committed)?;
+                index.add_path(Path::new(file_path))?;
+            }
+            for (file_path, committed) in &self.deleted_files {
                 let abs_path = cwd_path.join(file_path);
                 if let Some(parent) = abs_path.parent() {
                     std::fs::create_dir_all(parent)?;
@@ -656,6 +683,10 @@ impl<'fixture> FixtureBuilder<'fixture> {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&abs_path, content)?;
+            }
+
+            for (file_path, _committed) in &self.deleted_files {
+                std::fs::remove_file(cwd_path.join(file_path))?;
             }
         }
 

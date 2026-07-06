@@ -268,4 +268,98 @@ mod index_state {
 
         Ok(())
     }
+
+    /// `deleted_file` removes a committed file from the working tree only (the index still
+    /// has a clean entry for it) — `WT_DELETED`, not `INDEX_DELETED`. There is no
+    /// `has_staged_deletion`-style predicate for the working-tree side yet, so check the
+    /// status directly.
+    fn has_workdir_deletion(repo: &git2::Repository, path: &str) -> bool {
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(false);
+        let Ok(statuses) = repo.statuses(Some(&mut opts)) else {
+            return false;
+        };
+        statuses.iter().any(|entry| {
+            entry.path().ok() == Some(path) && entry.status().intersects(git2::Status::WT_DELETED)
+        })
+    }
+
+    #[test]
+    fn deleted_file_alone() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .deleted_file("gone.txt", "committed content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        assert!(has_workdir_deletion(repo, "gone.txt"));
+
+        let dir = fixture.cwd()?;
+        dir.child("gone.txt").assert(predicate::path::missing());
+
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_file_combined_with_other_index_builders() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .staged_file("staged.txt", "staged content")
+            .unstaged_file("tracked.txt", "committed content", "modified content")
+            .untracked_file("new.txt", "new content")
+            .deleted_file("gone.txt", "committed content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+        repo.assert(predicate::repo::has_staged_file("staged.txt"));
+        repo.assert(predicate::repo::has_unstaged_file("tracked.txt"));
+        repo.assert(predicate::repo::has_untracked_file("new.txt"));
+        assert!(has_workdir_deletion(repo, "gone.txt"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn deleted_file_bare_with_no_worktree_errors() {
+        let result = FixtureBuilder::new()
+            .bare(true)
+            .deleted_file("gone.txt", "committed content")
+            .build();
+
+        assert!(
+            result.is_err(),
+            "bare fixture with no worktree has no working tree to delete from"
+        );
+    }
+
+    #[test]
+    fn deleted_file_baseline_commit_lands_before_metadata_resolution(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .branch("feature")
+            .branch_metadata("feature", "main")
+            .deleted_file("gone.txt", "committed content")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        let main_tip = repo
+            .find_branch("main", BranchType::Local)?
+            .get()
+            .target()
+            .unwrap();
+        let head_commit = repo.head()?.peel_to_commit()?;
+        assert_eq!(
+            head_commit.parent_count(),
+            1,
+            "the baseline commit should have landed on main, giving it a parent"
+        );
+        assert_eq!(main_tip, head_commit.id());
+
+        repo.assert(predicate::repo::has_metadata_parent_revision(
+            MetadataFormat::Refs,
+            "feature",
+            main_tip.to_string(),
+        ));
+
+        Ok(())
+    }
 }

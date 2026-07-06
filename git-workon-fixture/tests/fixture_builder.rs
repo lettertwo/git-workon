@@ -678,6 +678,32 @@ mod fixture_builder {
     }
 
     #[test]
+    fn fixture_commit_builder_file_bytes_is_binary_detected(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
+
+        let nul_content = vec![0u8, 1, 2, 3, b'a', b'b', 0u8];
+        let commit_oid = fixture
+            .commit("main")
+            .file_bytes("binary.dat", nul_content.clone())
+            .create("Add binary file")?;
+
+        let repo = fixture.repo()?;
+        let commit = repo.find_commit(commit_oid)?;
+        let tree = commit.tree()?;
+        let entry = tree.get_name("binary.dat").expect("binary.dat in tree");
+        let blob = repo.find_blob(entry.id())?;
+
+        assert_eq!(blob.content(), nul_content.as_slice());
+        assert!(
+            blob.is_binary(),
+            "NUL-containing content should be binary-detected by git2"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn fixture_update_branch() -> Result<(), Box<dyn std::error::Error>> {
         let fixture = FixtureBuilder::new().bare(true).worktree("main").build()?;
 

@@ -212,7 +212,7 @@ impl FixtureAssert for Fixture {
 pub struct CommitBuilder<'a> {
     fixture: &'a Fixture,
     worktree_name: &'a str,
-    files: Vec<(String, String)>, // (path, content)
+    files: Vec<(String, Vec<u8>)>, // (path, content)
 }
 
 impl<'a> CommitBuilder<'a> {
@@ -226,7 +226,15 @@ impl<'a> CommitBuilder<'a> {
 
     /// Add a file to be committed
     pub fn file(mut self, path: &str, content: &str) -> Self {
-        self.files.push((path.to_string(), content.to_string()));
+        self.files
+            .push((path.to_string(), content.as_bytes().to_vec()));
+        self
+    }
+
+    /// Add a file to be committed with EXACT byte content, e.g. NUL-containing bytes to
+    /// exercise binary-file detection.
+    pub fn file_bytes(mut self, path: &str, content: Vec<u8>) -> Self {
+        self.files.push((path.to_string(), content));
         self
     }
 
