@@ -23,6 +23,11 @@ pub enum ReviewError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Synthesis(#[from] SynthesisError),
+
+    /// Applying a synthesized patch failed
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Apply(#[from] ApplyError),
 }
 
 /// Errors building a [`crate::model::DiffModel`] from git2 structures, or acquiring one for a
@@ -71,4 +76,38 @@ pub enum SynthesisError {
     #[error("'{path}' is a binary file and cannot be patched by hunk")]
     #[diagnostic(code(workon::review::binary_file))]
     BinaryFile { path: String },
+}
+
+/// Errors applying a [`crate::synthesis::PatchText`] via a [`crate::apply::Applier`].
+#[derive(Error, Diagnostic, Debug)]
+pub enum ApplyError {
+    /// A git2 call failed while applying a patch
+    #[error(transparent)]
+    #[diagnostic(code(workon::review::apply_git_error))]
+    Git(#[from] git2::Error),
+
+    /// The index stayed locked across every retry (see `queue.rs`'s retry-once policy).
+    #[error("index locked after {attempts} attempt(s)")]
+    #[diagnostic(code(workon::review::index_locked))]
+    IndexLocked { attempts: u32 },
+
+    /// `git apply` exited non-zero.
+    #[error("git apply failed (args: {args:?}): {stderr}")]
+    #[diagnostic(code(workon::review::cli_apply_failed))]
+    CliApplyFailed { args: Vec<String>, stderr: String },
+
+    /// Spawning or communicating with the `git` subprocess failed (not a nonzero exit — that's
+    /// [`ApplyError::CliApplyFailed`]).
+    #[error("failed to spawn or communicate with git")]
+    #[diagnostic(code(workon::review::git_spawn_failed))]
+    GitSpawn(#[source] std::io::Error),
+
+    /// A whole-file operation's filesystem I/O failed (`file_ops.rs`, CS4).
+    #[error("file operation on '{path}' failed")]
+    #[diagnostic(code(workon::review::file_op_io))]
+    Io {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
