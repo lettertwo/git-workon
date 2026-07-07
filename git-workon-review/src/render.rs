@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
-use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Role};
+use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role, Severity};
 use crate::attribute::Attribution;
 use crate::highlight::FgSpan;
 use crate::model::FileStatus;
@@ -34,6 +34,9 @@ const BG_ADD_STAGED_SUBTLE: Color = Color::Rgb(24, 34, 26);
 const BG_ADD_STAGED_STRONG: Color = Color::Rgb(34, 50, 38);
 const FG_DEFAULT: Color = Color::Gray;
 const FG_DIM: Color = Color::DarkGray;
+/// Footer text color for an [`Severity::Error`] [`Notice`] — a clearly-red tone that reads on
+/// both light and dark terminal themes.
+const FG_ERROR: Color = Color::Rgb(220, 60, 60);
 const FG_GUTTER: Color = Color::DarkGray;
 /// Tint blended into the cursor row's background (see [`blend_bg`]) — a cool slate-blue, chosen
 /// to read as "cursor here" without competing with the warm del/add hues above.
@@ -323,7 +326,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let footer_area = vlayout[2];
 
     render_header(frame, app, header_area);
-    render_footer(frame, footer_area);
+    render_footer(frame, app, footer_area);
     render_body(frame, app, body_area);
 }
 
@@ -349,12 +352,26 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
-    let text = "j/k scroll  ]f/[f file  ]h/[h hunk  L layout  z zoom  w focus  q quit";
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(FG_DIM)),
-        area,
-    );
+fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    match &app.notice {
+        Some(Notice { text, severity }) => {
+            let fg = match severity {
+                Severity::Error => FG_ERROR,
+                Severity::Info => FG_DEFAULT,
+            };
+            frame.render_widget(
+                Paragraph::new(text.as_str()).style(Style::default().fg(fg)),
+                area,
+            );
+        }
+        None => {
+            let text = "j/k scroll  ]f/[f file  ]h/[h hunk  L layout  z zoom  w focus  q quit";
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(FG_DIM)),
+                area,
+            );
+        }
+    }
 }
 
 /// Write a gap row's `··· N unchanged lines ···` marker across the FULL body width (both panes
@@ -1330,6 +1347,53 @@ mod tests {
         assert_ne!(
             staged_add_bg, unstaged_add_bg,
             "staged and unstaged Add rows must render with visibly distinct backgrounds"
+        );
+    }
+
+    #[test]
+    fn footer_shows_hint_string_when_no_notice_is_set() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        assert!(app.notice.is_none());
+
+        let buf = render_once(&mut app, 80, 10);
+        let footer_y = buf.area.height - 1;
+        let footer: String = (0..buf.area.width)
+            .map(|x| cell_text(&buf, x, footer_y))
+            .collect();
+        assert!(
+            footer.contains("j/k scroll"),
+            "expected the hint string in the footer, got: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_shows_an_error_notice_in_the_error_fg_color() {
+        use crate::app::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.notify("cannot discard: nothing staged", Severity::Error);
+
+        let buf = render_once(&mut app, 80, 10);
+        let footer_y = buf.area.height - 1;
+        let footer: String = (0..buf.area.width)
+            .map(|x| cell_text(&buf, x, footer_y))
+            .collect();
+        assert!(
+            footer.contains("cannot discard: nothing staged"),
+            "expected the notice text in the footer, got: {footer:?}"
+        );
+        assert_eq!(
+            buf.cell((0, footer_y)).unwrap().style().fg,
+            Some(super::FG_ERROR),
+            "expected the error notice to render in the error fg color"
         );
     }
 }

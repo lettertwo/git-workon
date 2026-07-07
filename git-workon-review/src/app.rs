@@ -477,6 +477,28 @@ pub struct App {
     /// Which split pane has focus. Only meaningful under [`EffectiveZoom::Split`]; reset to
     /// `Unstaged` (the top pane) whenever a file opens or the zoom changes.
     split_focus: SplitPane,
+    /// A transient, footer-rendered message — set by [`Self::notify`], cleared by
+    /// [`Self::clear_notice`] (the latter called by the event loop on the next keypress, so a
+    /// notice stays visible until the user acts). `None` renders the footer's normal hint string
+    /// instead (see `render::render_footer`).
+    pub notice: Option<Notice>,
+}
+
+/// How severely a [`Notice`] should read in the footer — decides its color (see
+/// `render::FG_ERROR`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Info,
+}
+
+/// A transient footer message: the text to show and how severely to color it. Set via
+/// [`App::notify`]; producers are the confirm/discard flows landing in m4-staging (refusals,
+/// errors) — this crate has no in-crate caller yet, which is expected for a `pub` API this early.
+#[derive(Debug, Clone)]
+pub struct Notice {
+    pub text: String,
+    pub severity: Severity,
 }
 
 impl App {
@@ -514,6 +536,7 @@ impl App {
             layout: Layout::default(),
             zoom: Zoom::default(),
             split_focus: SplitPane::Unstaged,
+            notice: None,
         }
     }
 
@@ -954,6 +977,20 @@ impl App {
             };
         }
         self.derive_scroll();
+    }
+
+    /// Set a transient footer notice (see [`Self::notice`]'s doc comment). Overwrites any
+    /// currently-showing notice rather than queuing — only one message is ever on screen.
+    pub fn notify(&mut self, text: impl Into<String>, severity: Severity) {
+        self.notice = Some(Notice {
+            text: text.into(),
+            severity,
+        });
+    }
+
+    /// Dismiss the current footer notice, if any (a no-op if there isn't one).
+    pub fn clear_notice(&mut self) {
+        self.notice = None;
     }
 }
 
@@ -1825,5 +1862,39 @@ mod tests {
             SplitPane::Unstaged,
             "focus toggle must do nothing when the file isn't a split"
         );
+    }
+
+    #[test]
+    fn notify_sets_a_notice_with_the_given_text_and_severity() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        assert!(app.notice.is_none(), "no notice by default");
+
+        app.notify("something went wrong", Severity::Error);
+        let notice = app.notice.as_ref().expect("notice set by notify");
+        assert_eq!(notice.text, "something went wrong");
+        assert_eq!(notice.severity, Severity::Error);
+    }
+
+    #[test]
+    fn clear_notice_clears_a_set_notice() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+
+        app.notify("saved", Severity::Info);
+        assert!(app.notice.is_some());
+
+        app.clear_notice();
+        assert!(app.notice.is_none(), "clear_notice must clear a set notice");
     }
 }
