@@ -128,9 +128,17 @@ fn apply_action(app: &mut App, action: Action) -> bool {
 /// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize and
 /// Tick are no-ops today — ratatui re-measures `body_area` every frame regardless, and Tick
 /// exists for M4's periodic-refresh consumers, not M3's read-only loop.
+///
+/// A `Key` event clears any showing footer notice BEFORE applying the key's own action, so a
+/// notice stays visible until the user's next keystroke — that same keystroke both dismisses the
+/// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
+/// tick isn't the user acting on the message.
 fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
     match event {
-        AppEvent::Key(key) => apply_action(app, map_key(pending, key, app.pane_height)),
+        AppEvent::Key(key) => {
+            app.clear_notice();
+            apply_action(app, map_key(pending, key, app.pane_height))
+        }
         AppEvent::Resize(_, _) | AppEvent::Tick => false,
     }
 }
@@ -344,6 +352,73 @@ mod tests {
         assert_eq!(
             pending, None,
             "pending bracket must be cleared, not left dangling"
+        );
+    }
+
+    /// Build an [`App`] straight from a fixture's repo, for `tui`'s own event-loop tests. `app.rs`
+    /// has an identical private helper (`test_support::app_from_fixture`), but that's
+    /// `pub(crate)` to the `workon_review` LIB crate — invisible here, since `tui.rs` compiles
+    /// into the separate bin crate (see `main.rs`'s `mod tui;`). Not worth promoting the lib's
+    /// helper to `pub` just to share four lines across a crate boundary.
+    fn app_from_fixture(fixture: &git_workon_fixture::fixture::Fixture) -> App {
+        use git2::Repository;
+        use workon_review::acquire::diff_uncommitted;
+
+        let repo = fixture.repo().expect("fixture repo");
+        let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+        let owned = Repository::open(repo.workdir().expect("fixture has a workdir"))
+            .expect("reopen fixture repo");
+        App::new(owned, diffs)
+    }
+
+    #[test]
+    fn key_event_through_update_clears_a_previously_set_notice() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let mut pending = None;
+
+        app.notify("something happened", Severity::Info);
+        assert!(app.notice.is_some());
+
+        // Any key — even one that maps to no action — dismisses the notice.
+        update(
+            &mut app,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('x'))),
+        );
+        assert!(
+            app.notice.is_none(),
+            "a Key event must clear a showing notice"
+        );
+    }
+
+    #[test]
+    fn tick_and_resize_events_do_not_clear_a_notice() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let mut pending = None;
+
+        app.notify("something happened", Severity::Info);
+
+        update(&mut app, &mut pending, AppEvent::Tick);
+        assert!(app.notice.is_some(), "a Tick event must not clear a notice");
+
+        update(&mut app, &mut pending, AppEvent::Resize(80, 24));
+        assert!(
+            app.notice.is_some(),
+            "a Resize event must not clear a notice"
         );
     }
 }
