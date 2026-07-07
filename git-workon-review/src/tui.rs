@@ -60,6 +60,7 @@ enum Action {
     ToggleLayout,
     CycleZoom,
     ToggleSplitFocus,
+    Refresh,
     None,
 }
 
@@ -92,6 +93,7 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
         KeyCode::Char('L') => Action::ToggleLayout,
         KeyCode::Char('z') => Action::CycleZoom,
         KeyCode::Char('w') => Action::ToggleSplitFocus,
+        KeyCode::Char('r') => Action::Refresh,
         KeyCode::Tab => Action::NextFile,
         KeyCode::BackTab => Action::PrevFile,
         KeyCode::Char(']') => {
@@ -120,6 +122,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::ToggleLayout => app.toggle_layout(),
         Action::CycleZoom => app.cycle_zoom(),
         Action::ToggleSplitFocus => app.toggle_split_focus(),
+        Action::Refresh => app.refresh(),
         Action::None => {}
     }
     false
@@ -289,6 +292,15 @@ mod tests {
     }
 
     #[test]
+    fn r_maps_to_refresh() {
+        let mut pending = None;
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('r')), 20),
+            Action::Refresh
+        );
+    }
+
+    #[test]
     fn tab_and_backtab_map_to_file_nav() {
         let mut pending = None;
         assert_eq!(
@@ -396,6 +408,31 @@ mod tests {
             app.notice.is_none(),
             "a Key event must clear a showing notice"
         );
+    }
+
+    #[test]
+    fn r_key_through_update_refreshes_without_panicking() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let mut pending = None;
+
+        update(
+            &mut app,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('r'))),
+        );
+
+        // A no-op refresh (nothing changed externally) still rebuilds the view in place; the
+        // smoke test is simply that this doesn't panic and the file is still there.
+        assert_eq!(app.files.len(), 1);
+        assert_eq!(app.files[0].path, "a.txt");
     }
 
     #[test]
