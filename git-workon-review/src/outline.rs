@@ -3,8 +3,11 @@
 //! renders and the outline cursor indexes — no [`crate::app::App`]/[`crate::app::ChangesetView`]
 //! dependency, mirroring how [`crate::attribute`] stays a pure module consumed by `app`/`render`.
 //!
-//! CS3 ships two of the eventual four modes ([`OutlineMode::Flat`]/[`OutlineMode::Stack`]); the
-//! two path-trie modes (tree / stack-tree) are CS4's addition to this same module.
+//! CS3 shipped two of the four modes ([`OutlineMode::Flat`]/[`OutlineMode::Stack`]); CS4 (this
+//! revision) adds the two path-trie modes ([`OutlineMode::Tree`]/[`OutlineMode::StackTree`]) via
+//! the private [`TrieNode`] builder below.
+
+use std::collections::HashMap;
 
 /// Which of the outline's row-building strategies is active — cycled by `i` (only while the
 /// outline pane has focus; see `App::outline_cycle_mode`).
@@ -17,14 +20,25 @@ pub enum OutlineMode {
     /// structure M5 exists to surface).
     #[default]
     Stack,
+    /// [`Self::Flat`]'s de-duped path set, rendered as a directory trie (dir rows + file leaves)
+    /// instead of a bare list.
+    Tree,
+    /// [`Self::Stack`]'s per-changeset grouping, but each changeset's files are rendered as their
+    /// own nested trie instead of a bare list.
+    StackTree,
 }
 
 impl OutlineMode {
-    /// `i`'s cycle order: `Flat -> Stack -> Flat`. CS4 will extend this to all four modes.
+    /// `i`'s cycle order: `Flat -> Stack -> Tree -> StackTree -> Flat`. Flat/Stack (the
+    /// non-trie modes) come first since they're the CS3 default pair; the trie modes follow in
+    /// the same flat/grouped pairing (Tree mirrors Flat's cross-stack dedup, StackTree mirrors
+    /// Stack's per-changeset grouping).
     pub fn cycle(self) -> Self {
         match self {
             OutlineMode::Flat => OutlineMode::Stack,
-            OutlineMode::Stack => OutlineMode::Flat,
+            OutlineMode::Stack => OutlineMode::Tree,
+            OutlineMode::Tree => OutlineMode::StackTree,
+            OutlineMode::StackTree => OutlineMode::Flat,
         }
     }
 }
@@ -101,22 +115,54 @@ pub struct OutlineChangeset {
 /// index into `App`'s changeset list the row belongs to; `file_idx` (on [`Self::File`]) is the
 /// index into THAT changeset's file list — together they're exactly what
 /// `App::switch_changeset`/`App::goto_changeset` need to jump the diff there.
+///
+/// `guides` (on [`Self::Dir`]/[`Self::File`]) is the tree-guide vector CS4 adds: one bool per
+/// nesting level from the shallowest ancestor down to the row itself, `true` meaning "this
+/// level is its parent's last child". Rendering uses every-element-but-the-last to decide
+/// whether to draw a continuing `│` or blank space at that column, and the last element to draw
+/// `└─`/`├─` for the row's own connector. [`OutlineMode::Flat`]/[`OutlineMode::Stack`] rows carry
+/// an EMPTY `guides` — that's the signal to `render::build_outline_line` to fall back to the
+/// flat two-space indent instead of drawing tree connectors; a non-empty `guides` of length 1
+/// means "top-level tree row" (depth 0), so emptiness and depth-0 are deliberately distinguishable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutlineItem {
-    /// A changeset header — only emitted in [`OutlineMode::Stack`].
+    /// A changeset header — emitted in [`OutlineMode::Stack`]/[`OutlineMode::StackTree`].
     Header {
         cs_idx: usize,
         label: String,
         current: bool,
         needs_restack: bool,
     },
-    /// A file row — the target of every outline->diff jump.
+    /// A directory row — only emitted in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`]. Not a
+    /// jump target: it carries no `cs_idx`/`file_idx`, so `App::outline_move_by` no-ops on it
+    /// (same as [`Self::Header`]) and `App::outline_confirm` also no-ops on it (CS4 decision —
+    /// there's no expand/collapse state to toggle, so Enter on a directory row does nothing but
+    /// still returns focus to the diff, matching every other confirm outcome).
+    Dir { name: String, guides: Vec<bool> },
+    /// A file row — the target of every outline->diff jump. `path` is the FULL path in
+    /// [`OutlineMode::Flat`]/[`OutlineMode::Stack`] (unchanged from CS3), but is just the leaf
+    /// segment in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`] — the ancestor directory rows
+    /// already carry the rest of the path, so re-printing it on every leaf would be redundant.
     File {
         cs_idx: usize,
         file_idx: usize,
         path: String,
         status: StagedStatus,
+        guides: Vec<bool>,
     },
+}
+
+impl OutlineItem {
+    /// Nesting depth for indentation math: `0` for [`Self::Header`] and any flat/stack row
+    /// (empty `guides`), else `guides.len() - 1`.
+    pub fn depth(&self) -> usize {
+        match self {
+            OutlineItem::Header { .. } => 0,
+            OutlineItem::Dir { guides, .. } | OutlineItem::File { guides, .. } => {
+                guides.len().saturating_sub(1)
+            }
+        }
+    }
 }
 
 /// Build the outline's row list for `mode` from every reviewed changeset, in the same base ->
@@ -125,6 +171,8 @@ pub fn build_items(changesets: &[OutlineChangeset], mode: OutlineMode) -> Vec<Ou
     match mode {
         OutlineMode::Flat => build_flat(changesets),
         OutlineMode::Stack => build_stack(changesets),
+        OutlineMode::Tree => build_tree(changesets),
+        OutlineMode::StackTree => build_stack_tree(changesets),
     }
 }
 
@@ -146,6 +194,7 @@ fn build_stack(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
                 file_idx,
                 path: file.path.clone(),
                 status: file.status,
+                guides: Vec::new(),
             });
         }
     }
@@ -160,8 +209,7 @@ fn build_stack(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
 /// committed one.
 fn build_flat(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
     let mut order: Vec<String> = Vec::new();
-    let mut latest: std::collections::HashMap<String, (usize, usize, StagedStatus)> =
-        std::collections::HashMap::new();
+    let mut latest: HashMap<String, (usize, usize, StagedStatus)> = HashMap::new();
     for (cs_idx, cs) in changesets.iter().enumerate() {
         for (file_idx, file) in cs.files.iter().enumerate() {
             if !latest.contains_key(&file.path) {
@@ -179,9 +227,141 @@ fn build_flat(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
                 file_idx,
                 path,
                 status,
+                guides: Vec::new(),
             }
         })
         .collect()
+}
+
+/// De-dupe every changed path across the stack to its LAST occurrence (mirrors
+/// [`build_flat`]'s last-write-wins rule), independent of iteration/insertion order — the trie
+/// builders below re-sort by path segment anyway, so no stable-order bookkeeping is needed here.
+fn latest_by_path(
+    changesets: &[OutlineChangeset],
+) -> HashMap<String, (usize, usize, StagedStatus)> {
+    let mut latest = HashMap::new();
+    for (cs_idx, cs) in changesets.iter().enumerate() {
+        for (file_idx, file) in cs.files.iter().enumerate() {
+            latest.insert(file.path.clone(), (cs_idx, file_idx, file.status));
+        }
+    }
+    latest
+}
+
+/// A node in the path trie the tree modes build. A node with `file.is_some()` is a leaf (a
+/// changed file at that exact path); otherwise it's a pure directory node. Git paths never
+/// collide a file and a directory at the same path, so a node is never both.
+#[derive(Debug, Default)]
+struct TrieNode {
+    file: Option<(usize, usize, StagedStatus)>,
+    /// Insertion order is irrelevant — [`emit`] re-sorts children (dirs-after-files, alpha
+    /// within group) every time it flattens a node.
+    children: Vec<(String, TrieNode)>,
+}
+
+impl TrieNode {
+    fn insert(&mut self, segments: &[&str], cs_idx: usize, file_idx: usize, status: StagedStatus) {
+        let (head, rest) = segments
+            .split_first()
+            .expect("insert is never called with an empty segment list");
+        let idx = match self.children.iter().position(|(name, _)| name == head) {
+            Some(idx) => idx,
+            None => {
+                self.children.push((head.to_string(), TrieNode::default()));
+                self.children.len() - 1
+            }
+        };
+        let child = &mut self.children[idx].1;
+        if rest.is_empty() {
+            // Last-write-wins: a later insert of the same full path overwrites the leaf data.
+            child.file = Some((cs_idx, file_idx, status));
+        } else {
+            child.insert(rest, cs_idx, file_idx, status);
+        }
+    }
+}
+
+/// Flatten `node`'s children into `items`, depth-first, in "dirs after files at each level,
+/// alpha within group" order (matches the `~/.config/nvim/lua/app/review/ui/outline.lua`
+/// prototype's `_build_path_tree`/`_emit_tree_node`: files read before directories at a given
+/// level, so a directory's own contents don't visually separate its sibling files from the
+/// directory listing above them). `ancestors_last` is the growing guide vector — see
+/// [`OutlineItem`]'s doc comment for how rendering consumes it.
+fn emit(node: &TrieNode, ancestors_last: &[bool], items: &mut Vec<OutlineItem>) {
+    let mut files: Vec<&(String, TrieNode)> = node
+        .children
+        .iter()
+        .filter(|(_, n)| n.file.is_some())
+        .collect();
+    let mut dirs: Vec<&(String, TrieNode)> = node
+        .children
+        .iter()
+        .filter(|(_, n)| n.file.is_none())
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    dirs.sort_by(|a, b| a.0.cmp(&b.0));
+    let ordered: Vec<&(String, TrieNode)> = files.into_iter().chain(dirs).collect();
+    let n = ordered.len();
+    for (i, (name, child)) in ordered.into_iter().enumerate() {
+        let is_last = i == n - 1;
+        let mut guides = ancestors_last.to_vec();
+        guides.push(is_last);
+        match child.file {
+            Some((cs_idx, file_idx, status)) => {
+                items.push(OutlineItem::File {
+                    cs_idx,
+                    file_idx,
+                    path: name.clone(),
+                    status,
+                    guides,
+                });
+            }
+            None => {
+                items.push(OutlineItem::Dir {
+                    name: name.clone(),
+                    guides: guides.clone(),
+                });
+                emit(child, &guides, items);
+            }
+        }
+    }
+}
+
+/// [`OutlineMode::Tree`]: [`build_flat`]'s de-duped path set, rendered as a single directory
+/// trie spanning the whole stack (no changeset headers).
+fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
+    let latest = latest_by_path(changesets);
+    let mut root = TrieNode::default();
+    for (path, (cs_idx, file_idx, status)) in &latest {
+        let segments: Vec<&str> = path.split('/').collect();
+        root.insert(&segments, *cs_idx, *file_idx, *status);
+    }
+    let mut items = Vec::new();
+    emit(&root, &[], &mut items);
+    items
+}
+
+/// [`OutlineMode::StackTree`]: [`build_stack`]'s per-changeset header grouping, but each
+/// changeset's own files are flattened into their own nested trie (no cross-changeset dedup —
+/// each changeset trie is built from just that changeset's files, matching `build_stack`'s "every
+/// changeset's own copy gets its own row" rule).
+fn build_stack_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
+    let mut items = Vec::new();
+    for (cs_idx, cs) in changesets.iter().enumerate() {
+        items.push(OutlineItem::Header {
+            cs_idx,
+            label: cs.label.clone(),
+            current: cs.current,
+            needs_restack: cs.needs_restack,
+        });
+        let mut root = TrieNode::default();
+        for (file_idx, file) in cs.files.iter().enumerate() {
+            let segments: Vec<&str> = file.path.split('/').collect();
+            root.insert(&segments, cs_idx, file_idx, file.status);
+        }
+        emit(&root, &[], &mut items);
+    }
+    items
 }
 
 #[cfg(test)]
@@ -229,6 +409,7 @@ mod tests {
                     file_idx: 0,
                     path: "a1.txt".to_string(),
                     status: StagedStatus::None,
+                    guides: Vec::new(),
                 },
                 OutlineItem::Header {
                     cs_idx: 1,
@@ -241,6 +422,7 @@ mod tests {
                     file_idx: 0,
                     path: "b1.txt".to_string(),
                     status: StagedStatus::None,
+                    guides: Vec::new(),
                 },
             ]
         );
@@ -284,6 +466,7 @@ mod tests {
                 file_idx: 0,
                 path: "shared.txt".to_string(),
                 status: StagedStatus::Unstaged,
+                guides: Vec::new(),
             },
             "must point at cs-b (the LATER/newer changeset), not cs-a"
         );
@@ -308,7 +491,7 @@ mod tests {
             .iter()
             .map(|it| match it {
                 OutlineItem::File { path, .. } => path.as_str(),
-                OutlineItem::Header { .. } => unreachable!(),
+                OutlineItem::Header { .. } | OutlineItem::Dir { .. } => unreachable!(),
             })
             .collect();
         assert_eq!(
@@ -330,8 +513,146 @@ mod tests {
     }
 
     #[test]
-    fn mode_cycles_between_flat_and_stack() {
+    fn mode_cycle_round_trips_all_four_modes() {
         assert_eq!(OutlineMode::Flat.cycle(), OutlineMode::Stack);
-        assert_eq!(OutlineMode::Stack.cycle(), OutlineMode::Flat);
+        assert_eq!(OutlineMode::Stack.cycle(), OutlineMode::Tree);
+        assert_eq!(OutlineMode::Tree.cycle(), OutlineMode::StackTree);
+        assert_eq!(OutlineMode::StackTree.cycle(), OutlineMode::Flat);
+    }
+
+    /// Deep-path fixture used by the tree-mode tests: a top-level file, a top-level directory
+    /// with both its own file and a nested subdirectory of two more files — enough to exercise
+    /// depth > 1 and the dirs-after-files/alpha-within-group ordering at every level.
+    fn deep_path_changeset(label: &str, current: bool, needs_restack: bool) -> OutlineChangeset {
+        cs(
+            label,
+            current,
+            needs_restack,
+            &[
+                ("top.rs", StagedStatus::None),
+                ("src/a/b.rs", StagedStatus::None),
+                ("src/a/c.rs", StagedStatus::None),
+                ("src/d.rs", StagedStatus::None),
+            ],
+        )
+    }
+
+    #[test]
+    fn tree_mode_builds_dirs_after_files_alpha_within_group_with_correct_depth_and_guides() {
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let items = build_items(&changesets, OutlineMode::Tree);
+        assert_eq!(
+            items,
+            vec![
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 0,
+                    path: "top.rs".to_string(),
+                    status: StagedStatus::None,
+                    guides: vec![false],
+                },
+                OutlineItem::Dir {
+                    name: "src".to_string(),
+                    guides: vec![true],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 3,
+                    path: "d.rs".to_string(),
+                    status: StagedStatus::None,
+                    guides: vec![true, false],
+                },
+                OutlineItem::Dir {
+                    name: "a".to_string(),
+                    guides: vec![true, true],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 1,
+                    path: "b.rs".to_string(),
+                    status: StagedStatus::None,
+                    guides: vec![true, true, false],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 2,
+                    path: "c.rs".to_string(),
+                    status: StagedStatus::None,
+                    guides: vec![true, true, true],
+                },
+            ],
+            "root: top.rs (file) then src/ (dir); under src/: d.rs (file) then a/ (dir); \
+             under src/a/: b.rs then c.rs — files-before-dirs, alpha within each group"
+        );
+        assert_eq!(items[0].depth(), 0, "top.rs is a root-level row");
+        assert_eq!(items[1].depth(), 0, "src/ is a root-level row");
+        assert_eq!(items[2].depth(), 1, "src/d.rs is one level deep");
+        assert_eq!(items[4].depth(), 2, "src/a/b.rs is two levels deep");
+    }
+
+    #[test]
+    fn tree_mode_dedupes_a_shared_path_to_the_newest_changesets_occurrence() {
+        let changesets = vec![
+            cs("cs-a", false, false, &[("shared.txt", StagedStatus::None)]),
+            cs("cs-b", true, false, &[("shared.txt", StagedStatus::Staged)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::Tree);
+        assert_eq!(
+            items,
+            vec![OutlineItem::File {
+                cs_idx: 1,
+                file_idx: 0,
+                path: "shared.txt".to_string(),
+                status: StagedStatus::Staged,
+                guides: vec![true],
+            }],
+            "the shared path must appear exactly once, pointing at the newer changeset"
+        );
+    }
+
+    #[test]
+    fn stack_tree_mode_nests_each_changesets_files_under_its_own_header() {
+        let changesets = vec![
+            cs("cs-a", false, false, &[("x/y.txt", StagedStatus::None)]),
+            cs("cs-b", true, true, &[("z.txt", StagedStatus::Unstaged)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::StackTree);
+        assert_eq!(
+            items,
+            vec![
+                OutlineItem::Header {
+                    cs_idx: 0,
+                    label: "cs-a".to_string(),
+                    current: false,
+                    needs_restack: false,
+                },
+                OutlineItem::Dir {
+                    name: "x".to_string(),
+                    guides: vec![true],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 0,
+                    path: "y.txt".to_string(),
+                    status: StagedStatus::None,
+                    guides: vec![true, true],
+                },
+                OutlineItem::Header {
+                    cs_idx: 1,
+                    label: "cs-b".to_string(),
+                    current: true,
+                    needs_restack: true,
+                },
+                OutlineItem::File {
+                    cs_idx: 1,
+                    file_idx: 0,
+                    path: "z.txt".to_string(),
+                    status: StagedStatus::Unstaged,
+                    guides: vec![true],
+                },
+            ],
+            "each changeset's files form their own trie nested under that changeset's header, \
+             with no cross-changeset dedup"
+        );
     }
 }

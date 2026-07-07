@@ -1494,7 +1494,10 @@ impl App {
                 // so the cursor follows off the header row onto the file it just jumped to.
                 self.sync_outline_to_current();
             }
-            None => {}
+            // A directory row (Tree/StackTree modes) is not a jump target — no expand/collapse
+            // state exists to toggle (CS4 decision), so Enter here is a no-op beyond the
+            // unconditional unfocus below, same as confirming on nothing at all.
+            Some(OutlineItem::Dir { .. }) | None => {}
         }
         self.outline.focused = false;
     }
@@ -4751,18 +4754,25 @@ mod tests {
     }
 
     #[test]
-    fn outline_cycle_mode_switches_between_flat_and_stack() {
+    fn outline_cycle_mode_round_trips_all_four_modes() {
         let mut app = two_committed_changesets_two_and_one_files();
         let start = app.outline_mode();
 
-        app.outline_cycle_mode();
-        assert_ne!(app.outline_mode(), start);
+        let mut seen = vec![start];
+        for _ in 0..3 {
+            app.outline_cycle_mode();
+            assert!(
+                !seen.contains(&app.outline_mode()),
+                "each of the first 4 cycles must be a mode not yet seen"
+            );
+            seen.push(app.outline_mode());
+        }
 
         app.outline_cycle_mode();
         assert_eq!(
             app.outline_mode(),
             start,
-            "cycling twice returns to the start"
+            "the 4th cycle returns to the start"
         );
     }
 
@@ -4860,6 +4870,7 @@ mod tests {
                 file_idx: 0,
                 path: "c1.txt".to_string(),
                 status: StagedStatus::None,
+                guides: Vec::new(),
             },
             "a committed changeset's file must carry no staged-ness status"
         );
@@ -4952,8 +4963,123 @@ mod tests {
                 file_idx: 0,
                 path: "b1.txt".to_string(),
                 status: StagedStatus::None,
+                guides: Vec::new(),
             },
             "the outline cursor must follow the diff's new position"
+        );
+    }
+
+    #[test]
+    fn diff_initiated_nav_syncs_the_outline_cursor_in_tree_mode() {
+        // CS4: Tree mode's rows still carry the same cs_idx/file_idx a File row always has, so
+        // `sync_outline_to_current`'s match-by-those-fields logic needs no tree-specific branch —
+        // this pins that it actually still lands correctly once the row also carries `guides`.
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Tree;
+
+        app.next_changeset();
+        assert!(
+            !app.outline_focused(),
+            "a diff-initiated nav must never steal focus from the diff to the outline"
+        );
+        let items = app.outline_items();
+        assert_eq!(
+            items[app.outline_cursor()],
+            OutlineItem::File {
+                cs_idx: 1,
+                file_idx: 0,
+                path: "b1.txt".to_string(),
+                status: StagedStatus::None,
+                guides: vec![true],
+            },
+            "the outline cursor must follow the diff's new position, landing on b1.txt's row \
+             even though Tree mode reshuffles the row order alphabetically"
+        );
+    }
+
+    #[test]
+    fn outline_cycle_mode_reaches_tree_and_stack_tree() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+
+        app.outline_cycle_mode();
+        assert_eq!(app.outline_mode(), OutlineMode::Tree);
+
+        app.outline_cycle_mode();
+        assert_eq!(app.outline_mode(), OutlineMode::StackTree);
+    }
+
+    /// A single committed changeset touching two files under `src/`, for the Dir-row no-op
+    /// tests — the two-and-one-files fixture above is deliberately flat and never produces a
+    /// [`OutlineItem::Dir`] row in Tree mode.
+    fn single_changeset_with_nested_paths() -> App {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("src/a.txt", "a\n")
+            .file("src/b.txt", "b\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: "cs".to_string(),
+            source: ChangesetSource::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        app
+    }
+
+    #[test]
+    fn outline_move_by_and_confirm_on_a_dir_row_do_not_jump_the_diff() {
+        let mut app = single_changeset_with_nested_paths();
+        app.outline.mode = OutlineMode::Tree;
+        let items = app.outline_items();
+        let dir_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ dir row present in Tree mode");
+
+        let before_cs = app.current_cs();
+        let before_file = app.current;
+
+        app.outline.cursor = dir_idx;
+        app.outline_move_by(0);
+        assert_eq!(app.current_cs(), before_cs);
+        assert_eq!(
+            app.current, before_file,
+            "moving onto a Dir row must not jump the diff"
+        );
+
+        app.outline.cursor = dir_idx;
+        app.outline.focused = true;
+        app.outline_confirm();
+        assert_eq!(app.current_cs(), before_cs);
+        assert_eq!(
+            app.current, before_file,
+            "confirming a Dir row must not jump the diff"
+        );
+        assert!(
+            !app.outline_focused(),
+            "confirm still returns focus to the diff, even as a no-op"
         );
     }
 

@@ -428,6 +428,26 @@ fn render_outline(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Render a tree-guide prefix from an [`OutlineItem::Dir`]/[`OutlineItem::File`] `guides`
+/// vector: every element but the last draws a continuing `│` (if that ancestor level was NOT
+/// its parent's last child) or blank space (if it was), and the last element draws the row's own
+/// `└─`/`├─` connector.
+fn tree_prefix(guides: &[bool]) -> String {
+    let mut s = String::new();
+    let Some((&is_last, ancestors)) = guides.split_last() else {
+        return s;
+    };
+    for &last in ancestors {
+        s.push_str(if last { "   " } else { "\u{2502}  " });
+    }
+    s.push_str(if is_last {
+        "\u{2514}\u{2500} "
+    } else {
+        "\u{251C}\u{2500} "
+    });
+    s
+}
+
 /// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
 /// marker rules.
 fn build_outline_line(item: &OutlineItem) -> Line<'static> {
@@ -452,9 +472,29 @@ fn build_outline_line(item: &OutlineItem) -> Line<'static> {
             }
             Line::from(spans)
         }
-        OutlineItem::File { path, status, .. } => {
+        OutlineItem::Dir { name, guides } => {
+            let text = format!("{}{name}/", tree_prefix(guides));
+            Line::from(TSpan::styled(
+                text,
+                Style::default().fg(FG_DIM).add_modifier(Modifier::ITALIC),
+            ))
+        }
+        OutlineItem::File {
+            path,
+            status,
+            guides,
+            ..
+        } => {
             let glyph = status.glyph();
-            let text = format!("  {glyph} {path}");
+            // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
+            // non-empty `guides` (Tree/StackTree modes) draws tree connectors instead — see
+            // `OutlineItem`'s doc comment for why emptiness is the mode signal.
+            let prefix = if guides.is_empty() {
+                "  ".to_string()
+            } else {
+                tree_prefix(guides)
+            };
+            let text = format!("{prefix}{glyph} {path}");
             Line::from(TSpan::styled(text, Style::default().fg(FG_DEFAULT)))
         }
     }
@@ -2114,7 +2154,9 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
-        app.outline_cycle_mode(); // Stack -> Flat
+        app.outline_cycle_mode(); // Stack -> Tree
+        app.outline_cycle_mode(); // Tree -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Flat);
 
         let items = app.outline_items();
@@ -2122,8 +2164,9 @@ mod tests {
             .iter()
             .map(|it| match it {
                 crate::outline::OutlineItem::File { path, .. } => path.as_str(),
-                crate::outline::OutlineItem::Header { .. } => {
-                    panic!("Flat mode must not emit header rows")
+                crate::outline::OutlineItem::Header { .. }
+                | crate::outline::OutlineItem::Dir { .. } => {
+                    panic!("Flat mode must not emit header or dir rows")
                 }
             })
             .collect();
@@ -2134,6 +2177,86 @@ mod tests {
             paths.len(),
             sorted.len(),
             "every path must appear exactly once in Flat mode, got: {paths:?}"
+        );
+    }
+
+    /// A single committed changeset touching a nested path (`src/a.txt`) and a top-level path
+    /// (`top.txt`), for the Tree-mode render test — the outline test fixtures above are
+    /// deliberately flat and never produce a directory row.
+    fn changeset_with_nested_paths(fixture: &Fixture) -> App {
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSource};
+
+        use crate::app::ChangesetView;
+
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("top.txt", "t\n")
+            .file("src/a.txt", "a\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: "cs".to_string(),
+            source: ChangesetSource::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        app
+    }
+
+    #[test]
+    fn outline_tree_mode_renders_directory_rows_with_tree_guides() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        // A lone changeset defaults the outline closed (locked design) — force it open so this
+        // render test can inspect its rows.
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> Tree
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        // Row order per the dirs-after-files/alpha-within-group rule, one outline row per
+        // buffer row starting at y=1 (y=0 is the winbar): `top.txt` (file, root, NOT the root's
+        // last child — `src/` follows), `src/` (dir, root, IS the root's last child), then
+        // `a.txt` nested one level under `src/` (the only — hence last — child of `src/`).
+        assert!(
+            content[1].contains('\u{251C}') && content[1].contains("top.txt"),
+            "expected row 1 to be top.txt with a non-last '├─' guide, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content[2].contains('\u{2514}') && content[2].contains("src/"),
+            "expected row 2 to be the src/ directory row with a last-child '└─' guide, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content[3].contains('\u{2514}') && content[3].contains("a.txt"),
+            "expected row 3 to be src/a.txt, indented under src/ with its own last-child '└─' \
+             guide, got:\n{}",
+            content.join("\n")
         );
     }
 }
