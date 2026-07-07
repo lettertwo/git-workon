@@ -483,8 +483,8 @@ mod tests {
 
         // A no-op refresh (nothing changed externally) still rebuilds the view in place; the
         // smoke test is simply that this doesn't panic and the file is still there.
-        assert_eq!(app.files.len(), 1);
-        assert_eq!(app.files[0].path, "a.txt");
+        assert_eq!(app.files().len(), 1);
+        assert_eq!(app.files()[0].path, "a.txt");
     }
 
     #[test]
@@ -531,8 +531,8 @@ mod tests {
         let quit = update(&mut app, &mut pending, AppEvent::Tick);
 
         assert!(!quit, "Tick must never quit the loop");
-        assert_eq!(app.files.len(), 1);
-        assert_eq!(app.files[0].path, "a.txt");
+        assert_eq!(app.files().len(), 1);
+        assert_eq!(app.files()[0].path, "a.txt");
     }
 
     #[test]

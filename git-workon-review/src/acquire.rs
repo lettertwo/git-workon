@@ -6,7 +6,7 @@
 //! git2 diffs and then a [`DiffModel`].
 
 use git2::{DiffFindOptions, DiffOptions, Oid, Repository};
-use workon::{Changeset, ChangesetSource};
+use workon::{assemble_changesets, Changeset, ChangesetSource, StackModel};
 
 use crate::error::DiffError;
 use crate::model::DiffModel;
@@ -115,6 +115,40 @@ pub fn diff_changeset(repo: &Repository, cs: &Changeset) -> Result<ChangesetDiff
     }
 }
 
+/// Resolve the changeset stack the review App opens on for the worktree whose `HEAD` is
+/// `head_branch` (locked design decision M5-fork-7, "auto-detect"): the full Graphite stack
+/// when one is active, or a single synthetic [`Changeset`] spanning the uncommitted worktree
+/// otherwise.
+///
+/// This does NOT simply forward to [`workon::assemble_changesets`] with the detected
+/// [`StackModel`]: that function returns `Ok(vec![])` for [`StackModel::None`] unconditionally
+/// (see its module docs) rather than a reviewable uncommitted layer, and mapping `None` to
+/// [`StackModel::Git`] instead would make every branch without upstream tracking (the common
+/// case for a scratch/local branch) fail with `NoUpstream` before it ever got to review a dirty
+/// tree — a regression from M2–M4's "just diff the worktree" default. So the non-Graphite case
+/// is built directly here, matching exactly what `assemble_changesets`'s own
+/// `insert_uncommitted_layer` would produce for a lone dirty tree: one `current` entry, no
+/// title, not needing a restack.
+pub fn resolve_changesets(
+    repo: &Repository,
+    head_branch: &str,
+) -> Result<Vec<Changeset>, DiffError> {
+    match StackModel::detect(repo) {
+        StackModel::Graphite => Ok(assemble_changesets(
+            repo,
+            head_branch,
+            StackModel::Graphite,
+        )?),
+        StackModel::None | StackModel::Git => Ok(vec![Changeset {
+            name: head_branch.to_string(),
+            source: ChangesetSource::Uncommitted,
+            title: None,
+            current: true,
+            needs_restack: false,
+        }]),
+    }
+}
+
 /// Fold a [`DiffError`] into [`DiffError::ChangesetDiffFailed`], attaching the changeset name.
 fn changeset_diff_failed(name: &str, err: DiffError) -> DiffError {
     match err {
@@ -123,5 +157,9 @@ fn changeset_diff_failed(name: &str, err: DiffError) -> DiffError {
             source,
         },
         already_wrapped @ DiffError::ChangesetDiffFailed { .. } => already_wrapped,
+        // `diff_committed`/`diff_uncommitted` only ever raise `Git`, so this arm is
+        // unreachable in practice — kept exhaustive rather than a wildcard so a future
+        // `DiffError` variant forces a decision here instead of silently falling through.
+        already_wrapped @ DiffError::StackAssembly(_) => already_wrapped,
     }
 }
