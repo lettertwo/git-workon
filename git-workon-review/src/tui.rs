@@ -61,6 +61,10 @@ enum Action {
     CycleZoom,
     ToggleSplitFocus,
     Refresh,
+    StageHunk,
+    StageFile,
+    DiscardHunk,
+    DiscardFile,
     None,
 }
 
@@ -94,6 +98,10 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
         KeyCode::Char('z') => Action::CycleZoom,
         KeyCode::Char('w') => Action::ToggleSplitFocus,
         KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Char('s') => Action::StageHunk,
+        KeyCode::Char('S') => Action::StageFile,
+        KeyCode::Char('d') => Action::DiscardHunk,
+        KeyCode::Char('D') => Action::DiscardFile,
         KeyCode::Tab => Action::NextFile,
         KeyCode::BackTab => Action::PrevFile,
         KeyCode::Char(']') => {
@@ -123,6 +131,10 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::CycleZoom => app.cycle_zoom(),
         Action::ToggleSplitFocus => app.toggle_split_focus(),
         Action::Refresh => app.refresh(),
+        Action::StageHunk => app.stage_hunk(),
+        Action::StageFile => app.stage_file(),
+        Action::DiscardHunk => app.discard_hunk(),
+        Action::DiscardFile => app.discard_file(),
         Action::None => {}
     }
     false
@@ -136,8 +148,22 @@ fn apply_action(app: &mut App, action: Action) -> bool {
 /// notice stays visible until the user's next keystroke — that same keystroke both dismisses the
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
+///
+/// A pending discard confirm captures the keyboard FIRST (before the notice clear and the normal
+/// key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal that
+/// neither clears the notice nor runs a normal action while it's up.
 fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
     match event {
+        AppEvent::Key(key) if app.pending_confirm.is_some() => {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => app.resolve_confirm(true),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    app.resolve_confirm(false)
+                }
+                _ => {}
+            }
+            false
+        }
         AppEvent::Key(key) => {
             app.clear_notice();
             apply_action(app, map_key(pending, key, app.pane_height))
@@ -457,5 +483,83 @@ mod tests {
             app.notice.is_some(),
             "a Resize event must not clear a notice"
         );
+    }
+
+    #[test]
+    fn staging_keys_map_to_their_actions() {
+        let mut pending = None;
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('s')), 20),
+            Action::StageHunk
+        );
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('S')), 20),
+            Action::StageFile
+        );
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('d')), 20),
+            Action::DiscardHunk
+        );
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('D')), 20),
+            Action::DiscardFile
+        );
+        // Ctrl-d keeps its half-page meaning — the plain-`d` staging arm must not shadow it.
+        assert_eq!(
+            map_key(&mut pending, ctrl_key('d'), 20),
+            Action::MoveCursorBy(10)
+        );
+    }
+
+    #[test]
+    fn pending_confirm_captures_y_and_n_and_ignores_other_keys() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let mut pending = None;
+
+        // A pending confirm makes every non-answer key a no-op — the cursor doesn't move and the
+        // confirm stays up.
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+        let cursor_before = app.cursor;
+        update(
+            &mut app,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        );
+        assert!(
+            app.pending_confirm.is_some(),
+            "a non-answer key must not resolve the confirm"
+        );
+        assert_eq!(
+            app.cursor, cursor_before,
+            "a captured key must not run its normal action"
+        );
+
+        // `n` cancels it.
+        update(
+            &mut app,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('n'))),
+        );
+        assert!(app.pending_confirm.is_none(), "n must cancel the confirm");
+
+        // `y` resolves (and runs) a fresh confirm.
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+        update(
+            &mut app,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('y'))),
+        );
+        assert!(app.pending_confirm.is_none(), "y must resolve the confirm");
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
     }
 }

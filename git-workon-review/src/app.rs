@@ -16,8 +16,11 @@ use git2::Repository;
 
 use crate::acquire::{diff_uncommitted, WorktreeDiffs};
 use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
+use crate::apply::{Git2Applier, StageVerb};
 use crate::highlight::{FgSpan, TsHighlighter};
-use crate::model::{DiffModel, FileChange, FileStatus};
+use crate::model::{DiffModel, FileChange, FileStatus, Hunk};
+use crate::queue::{OpOutcome, StagingQueue};
+use crate::stage_op::FileStagingOp;
 use crate::wordiff::{word_diff_spans, Span};
 
 /// Minimum rows kept between the cursor and the top/bottom of the pane while scrolling — see
@@ -70,6 +73,15 @@ pub struct FileView {
     /// `InlineRow` entries at different indices instead of one `AlignedRow`), so the two caches
     /// cannot share keys.
     inline_word_spans: HashMap<usize, (Vec<Span>, Vec<Span>)>,
+    /// Which hunk (index into the file's `hunks`) each [`Self::display`] row belongs to, or
+    /// `None` for a row outside every hunk's span (a collapsed gap, or the leading/trailing
+    /// context that lies beyond any `@@` block). Computed once at [`Self::load`] so staging ops
+    /// can resolve "the hunk under the cursor" without re-walking the diff — see
+    /// [`Self::hunk_at_display_row`]. A SEPARATE vector per coordinate space, exactly like the
+    /// two word-span caches, since `display` and `inline` disagree on row count/index.
+    display_hunk: Vec<Option<usize>>,
+    /// Inline-coordinate analog of [`Self::display_hunk`], indexed against [`Self::inline`].
+    inline_hunk: Vec<Option<usize>>,
 }
 
 impl FileView {
@@ -128,6 +140,21 @@ impl FileView {
             .position(is_inline_hunk_content_row)
             .unwrap_or(0);
 
+        let display_hunk = display
+            .iter()
+            .map(|row| {
+                let (old, new) = display_row_linenos(row);
+                hunk_for_linenos(&file.hunks, old, new)
+            })
+            .collect();
+        let inline_hunk = inline
+            .iter()
+            .map(|row| {
+                let (old, new) = inline_row_linenos(row);
+                hunk_for_linenos(&file.hunks, old, new)
+            })
+            .collect();
+
         Self {
             old_text,
             new_text,
@@ -141,7 +168,21 @@ impl FileView {
             word_spans: HashMap::new(),
             inline,
             inline_word_spans: HashMap::new(),
+            display_hunk,
+            inline_hunk,
         }
+    }
+
+    /// The hunk (index into the file's `hunks`) whose span covers display row `row`, or `None`
+    /// for a row outside every hunk (a gap, or context beyond any `@@` block). A context line git
+    /// kept inside a hunk's header counts as "in" that hunk (matching the prototype's `hunk_at`).
+    pub(crate) fn hunk_at_display_row(&self, row: usize) -> Option<usize> {
+        self.display_hunk.get(row).copied().flatten()
+    }
+
+    /// Inline-coordinate analog of [`Self::hunk_at_display_row`].
+    pub(crate) fn hunk_at_inline_row(&self, row: usize) -> Option<usize> {
+        self.inline_hunk.get(row).copied().flatten()
     }
 
     pub fn old_line(&self, n: usize) -> &str {
@@ -482,6 +523,41 @@ pub struct App {
     /// notice stays visible until the user acts). `None` renders the footer's normal hint string
     /// instead (see `render::render_footer`).
     pub notice: Option<Notice>,
+    /// FIFO queue every staging verb enqueues through, then drains on the same beat (locked
+    /// decision #5). Going through the queue (rather than calling `ops::apply_*` directly) buys
+    /// the queue's lock-retry and panic isolation for free; because the drain is synchronous and
+    /// a refresh follows before the next keystroke, only ever one op is in flight.
+    queue: StagingQueue,
+    /// The default write path (M2 verdict): libgit2's `Repository::apply`. Held as the concrete
+    /// type — [`crate::apply::Applier`] stays a trait for the CLI escape hatch, but the field is
+    /// the default.
+    applier: Git2Applier,
+    /// A destructive op awaiting the user's `y`/`n`/`Esc`. Set by [`Self::request_confirm`] (the
+    /// discard verbs), resolved by [`Self::resolve_confirm`]. While `Some`, the event loop routes
+    /// `y`/`n`/`Esc` to it and IGNORES every other key (a modal capture — see `tui::update`); the
+    /// footer shows its prompt in place of the notice/hints.
+    pub pending_confirm: Option<Confirm>,
+}
+
+/// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
+/// (plus a hunk index for the hunk variant) rather than by a captured closure — an enum stores
+/// cleanly on [`App`] and is resolved against the live diff at `y`-time. Both variants are
+/// discards; line-precise discard is the next changeset (m4-select).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingOp {
+    /// Discard one hunk of the file at `file_idx` from the worktree. `hunk_idx` indexes the
+    /// UNSTAGED role's hunks (discard only acts in the unstaged pane), matching where the cursor
+    /// resolved it.
+    DiscardHunk { file_idx: usize, hunk_idx: usize },
+    /// Discard all of the file at `file_idx`'s worktree changes.
+    DiscardFile { file_idx: usize },
+}
+
+/// A pending destructive op plus the scope-stating prompt shown on the footer until answered.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub prompt: String,
+    pub op: PendingOp,
 }
 
 /// How severely a [`Notice`] should read in the footer — decides its color (see
@@ -533,6 +609,9 @@ impl App {
             zoom: Zoom::default(),
             split_focus: SplitPane::Unstaged,
             notice: None,
+            queue: StagingQueue::new(),
+            applier: Git2Applier,
+            pending_confirm: None,
         }
     }
 
@@ -1048,6 +1127,204 @@ impl App {
     pub fn clear_notice(&mut self) {
         self.notice = None;
     }
+
+    /// The hunk (index into the FOCUSED role view's hunks) under the cursor, in whichever
+    /// coordinate space [`Self::layout`] is active — `None` when the cursor sits on context
+    /// outside every hunk, or there's no loaded view. Staging ops resolve their hunk target
+    /// through this.
+    pub fn hunk_at_cursor(&self) -> Option<usize> {
+        let view = self.current_view_ref()?;
+        match self.layout {
+            Layout::Sbs => view.hunk_at_display_row(self.cursor),
+            Layout::Inline => view.hunk_at_inline_row(self.cursor),
+        }
+    }
+
+    /// The role a staging verb acts in for the current file: the single effective role, or the
+    /// focused split pane's role. `None` for [`Role::Combined`] — the combined view fuses both
+    /// sub-diffs, so staging there has no unambiguous direction and the verbs refuse (locked
+    /// decision #1).
+    fn staging_role(&self) -> Option<Role> {
+        match self.effective_zoom_for(self.current) {
+            EffectiveZoom::Single(Role::Combined) => None,
+            EffectiveZoom::Single(role) => Some(role),
+            EffectiveZoom::Split => Some(self.split_focus_role()),
+        }
+    }
+
+    /// Toggle-direction by role (locked decision #1): the unstaged pane stages, the staged pane
+    /// unstages. `None` for [`Role::Combined`] (never a staging target).
+    fn verb_for_role(role: Role) -> Option<StageVerb> {
+        match role {
+            Role::Unstaged => Some(StageVerb::Stage),
+            Role::Staged => Some(StageVerb::Unstage),
+            Role::Combined => None,
+        }
+    }
+
+    /// Stage (unstaged pane) or unstage (staged pane) the hunk under the cursor (`s`). Refuses on
+    /// the combined view, or when the cursor isn't in a hunk.
+    pub fn stage_hunk(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let Some(role) = self.staging_role() else {
+            self.notify(
+                "stage in the unstaged/staged pane — cycle zoom (z)",
+                Severity::Error,
+            );
+            return;
+        };
+        let Some(verb) = Self::verb_for_role(role) else {
+            return;
+        };
+        let Some(hunk_idx) = self.hunk_at_cursor() else {
+            self.notify("no hunk under cursor", Severity::Error);
+            return;
+        };
+        // The hunk index is into the ROLE's own hunks, so the op must apply against that role's
+        // sub-`FileChange`, not the combined one.
+        let Some(file) = self.role_change(self.current, role).cloned() else {
+            return;
+        };
+        self.run_op(FileStagingOp::hunk(file, hunk_idx, verb));
+    }
+
+    /// Stage (unstaged pane) or unstage (staged pane) the whole current file (`S`) — ignores the
+    /// cursor. Refuses on the combined view.
+    pub fn stage_file(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let Some(role) = self.staging_role() else {
+            self.notify(
+                "stage in the unstaged/staged pane — cycle zoom (z)",
+                Severity::Error,
+            );
+            return;
+        };
+        let Some(verb) = Self::verb_for_role(role) else {
+            return;
+        };
+        // A whole-file op routes on path + status only ([`crate::ops::apply_file`]), which the
+        // combined file carries authoritatively (e.g. Untracked-ness for a discard).
+        let file = self.files[self.current].clone();
+        self.run_op(FileStagingOp::file(file, verb));
+    }
+
+    /// Request confirmation to discard the hunk under the cursor from the worktree (`d`). Refuses
+    /// on the combined view, in a staged pane (discard only reverts worktree changes), or when the
+    /// cursor isn't in a hunk. The discard itself runs when the user answers `y`.
+    pub fn discard_hunk(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let Some(role) = self.staging_role() else {
+            self.notify(
+                "stage in the unstaged/staged pane — cycle zoom (z)",
+                Severity::Error,
+            );
+            return;
+        };
+        if role != Role::Unstaged {
+            self.notify("discard acts in the unstaged pane", Severity::Error);
+            return;
+        }
+        let Some(hunk_idx) = self.hunk_at_cursor() else {
+            self.notify("no hunk under cursor", Severity::Error);
+            return;
+        };
+        self.request_confirm(
+            "Discard this hunk from the worktree? (y/n)".to_string(),
+            PendingOp::DiscardHunk {
+                file_idx: self.current,
+                hunk_idx,
+            },
+        );
+    }
+
+    /// Request confirmation to discard the whole current file's worktree changes (`D`). Refuses on
+    /// the combined view or in a staged pane; the discard runs on `y`.
+    pub fn discard_file(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let Some(role) = self.staging_role() else {
+            self.notify(
+                "stage in the unstaged/staged pane — cycle zoom (z)",
+                Severity::Error,
+            );
+            return;
+        };
+        if role != Role::Unstaged {
+            self.notify("discard acts in the unstaged pane", Severity::Error);
+            return;
+        }
+        let path = self.files[self.current].path.clone();
+        self.request_confirm(
+            format!("Discard all changes to `{path}`? (y/n)"),
+            PendingOp::DiscardFile {
+                file_idx: self.current,
+            },
+        );
+    }
+
+    /// Set a pending confirm (see [`Self::pending_confirm`]). Overwrites any current one.
+    pub fn request_confirm(&mut self, prompt: impl Into<String>, op: PendingOp) {
+        self.pending_confirm = Some(Confirm {
+            prompt: prompt.into(),
+            op,
+        });
+    }
+
+    /// Resolve a pending confirm: on `accept` run its op, then clear it either way. A no-op with
+    /// no confirm pending. A cancel (`accept == false`) is left silent — the cleared prompt is
+    /// feedback enough.
+    pub fn resolve_confirm(&mut self, accept: bool) {
+        let Some(confirm) = self.pending_confirm.take() else {
+            return;
+        };
+        if !accept {
+            return;
+        }
+        match confirm.op {
+            PendingOp::DiscardHunk { file_idx, hunk_idx } => {
+                // The hunk index came from the unstaged pane's view, so discard against the
+                // unstaged role's sub-`FileChange`.
+                let Some(file) = self.role_change(file_idx, Role::Unstaged).cloned() else {
+                    return;
+                };
+                self.run_op(FileStagingOp::hunk(file, hunk_idx, StageVerb::Discard));
+            }
+            PendingOp::DiscardFile { file_idx } => {
+                let Some(file) = self.files.get(file_idx).cloned() else {
+                    return;
+                };
+                self.run_op(FileStagingOp::file(file, StageVerb::Discard));
+            }
+        }
+    }
+
+    /// Enqueue `op`, drain the queue on the same beat, then act on the outcomes: any failure or
+    /// panic surfaces on the footer and does NOT refresh (the index didn't change as intended); an
+    /// all-`Completed` drain refreshes once, rebuilding the views + attribution from the new index
+    /// (locked decision #5). Only ever one op is in flight, so the queue's trap-4 staleness can't
+    /// arise — the queue is here for its lock-retry and panic isolation.
+    fn run_op(&mut self, op: FileStagingOp) {
+        self.queue.enqueue(op);
+        // Distinct fields (`queue` mutable, `repo`/`applier` shared) — the borrow checker permits
+        // the disjoint borrows in one call, so the queue needn't be taken out and put back.
+        let outcomes = self.queue.drain(&self.repo, &self.applier);
+        let failure = outcomes.iter().find_map(|outcome| match outcome {
+            OpOutcome::Failed(_, err) => Some(format!("staging failed: {err}")),
+            OpOutcome::Panicked(_) => Some("staging operation panicked".to_string()),
+            OpOutcome::Completed(_) => None,
+        });
+        match failure {
+            Some(message) => self.notify(message, Severity::Error),
+            None => self.refresh(),
+        }
+    }
 }
 
 /// The diff-derived pieces [`App::new`] and [`App::refresh`] both build fresh from a
@@ -1131,6 +1408,57 @@ fn find_prev_hunk_row(display: &[DisplayRow], before: usize) -> Option<usize> {
 /// `Filler` variant — see [`InlineRow`]'s doc comment), false for `Context`/`Gap`.
 fn is_inline_hunk_content_row(row: &InlineRow) -> bool {
     matches!(row, InlineRow::Del { .. } | InlineRow::Add { .. })
+}
+
+/// The 1-based line number a [`Row`] carries on its side, or `None` for a filler.
+fn row_lineno(row: Row) -> Option<usize> {
+    match row {
+        Row::Line(n) => Some(n),
+        Row::Filler => None,
+    }
+}
+
+/// The (old, new) 1-based line numbers a display row occupies — `None` on a filler side, and
+/// `(None, None)` for a gap row (which belongs to no hunk).
+fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
+    match row {
+        DisplayRow::Row(r) => (row_lineno(r.old), row_lineno(r.new)),
+        DisplayRow::Gap { .. } => (None, None),
+    }
+}
+
+/// Inline-coordinate analog of [`display_row_linenos`].
+fn inline_row_linenos(row: &InlineRow) -> (Option<usize>, Option<usize>) {
+    match *row {
+        InlineRow::Context { old, new } => (Some(old), Some(new)),
+        InlineRow::Del { old, .. } => (Some(old), None),
+        InlineRow::Add { new, .. } => (None, Some(new)),
+        InlineRow::Gap { .. } => (None, None),
+    }
+}
+
+/// Which hunk (index into `hunks`) a row occupying old line `old` / new line `new` falls in, by
+/// matching its line number against each hunk's `old_start`/`old_count` (or
+/// `new_start`/`new_count`) span — the same counters [`align_file`] reads. A row inside a hunk's
+/// span, INCLUDING a context line git kept within the `@@` block, belongs to that hunk; a row
+/// outside every span (a between-hunks gap, or leading/trailing context) is `None`. First match
+/// wins on the rare touching-span boundary between two adjacent hunks.
+fn hunk_for_linenos(hunks: &[Hunk], old: Option<usize>, new: Option<usize>) -> Option<usize> {
+    hunks.iter().position(|h| {
+        if let Some(o) = old {
+            let (start, count) = (h.old_start as usize, h.old_count as usize);
+            if count > 0 && o >= start && o < start + count {
+                return true;
+            }
+        }
+        if let Some(n) = new {
+            let (start, count) = (h.new_start as usize, h.new_count as usize);
+            if count > 0 && n >= start && n < start + count {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// Inline-layout analog of [`find_next_hunk_row`]: row index of the next "hunk start" (a
@@ -2132,5 +2460,347 @@ mod tests {
 
         assert_eq!(app.layout, Layout::Inline, "refresh must not reset layout");
         assert_eq!(app.zoom, Zoom::Combined, "refresh must not reset zoom");
+    }
+
+    // ---- M4 staging: hunk identity ---------------------------------------------------------
+
+    /// A modified file whose only two changes are its first and last line, with a dozen unchanged
+    /// lines between — so the two hunks are far enough apart to leave a collapsed gap between
+    /// them (the between-hunks `None` case for the row→hunk mapping).
+    fn two_hunk_fixture() -> Fixture {
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "many.txt",
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n",
+                "ONE\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\nTWENTY\n",
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn hunk_at_display_row_maps_change_rows_to_hunks_and_gap_to_none() {
+        let fixture = two_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let view = app.current_view_ref().unwrap();
+
+        // A gap row between the two hunks maps to no hunk.
+        let gap_row = view
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Gap { .. }))
+            .expect("a collapsed gap sits between the two far-apart hunks");
+        assert_eq!(view.hunk_at_display_row(gap_row), None);
+
+        // The earliest change row belongs to hunk 0, the latest to hunk 1.
+        let first_change = view
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Row(a) if a.old_kind != CellKind::Context))
+            .expect("hunk 0 change row");
+        let last_change = view
+            .display
+            .iter()
+            .rposition(|r| matches!(r, DisplayRow::Row(a) if a.old_kind != CellKind::Context))
+            .expect("hunk 1 change row");
+        assert_eq!(view.hunk_at_display_row(first_change), Some(0));
+        assert_eq!(view.hunk_at_display_row(last_change), Some(1));
+    }
+
+    #[test]
+    fn hunk_at_inline_row_maps_change_rows_to_hunks_and_gap_to_none() {
+        let fixture = two_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let view = app.current_view_ref().unwrap();
+
+        let gap_row = view
+            .inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Gap { .. }))
+            .expect("a collapsed gap sits between the two far-apart hunks");
+        assert_eq!(view.hunk_at_inline_row(gap_row), None);
+
+        let first_change = view
+            .inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Del { .. } | InlineRow::Add { .. }))
+            .expect("hunk 0 change row");
+        let last_change = view
+            .inline
+            .iter()
+            .rposition(|r| matches!(r, InlineRow::Del { .. } | InlineRow::Add { .. }))
+            .expect("hunk 1 change row");
+        assert_eq!(view.hunk_at_inline_row(first_change), Some(0));
+        assert_eq!(view.hunk_at_inline_row(last_change), Some(1));
+    }
+
+    #[test]
+    fn hunk_at_cursor_dispatches_on_layout_and_reports_none_between_hunks() {
+        let fixture = two_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // cursor lands on the first hunk
+        assert_eq!(app.hunk_at_cursor(), Some(0));
+
+        // Park the cursor on the gap row → no hunk under it.
+        let gap_row = app
+            .current_view_ref()
+            .unwrap()
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Gap { .. }))
+            .unwrap();
+        app.cursor = gap_row;
+        assert_eq!(app.hunk_at_cursor(), None);
+    }
+
+    // ---- M4 staging: verbs -----------------------------------------------------------------
+
+    /// A file with three distinct HEAD/index/worktree states — both a staged and an unstaged
+    /// sub-diff, and hunk-patchable (Modified). Same shape the zoom tests use.
+    fn partial_fixture() -> Fixture {
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn stage_hunk_in_unstaged_pane_stages_the_hunk() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // downgrades to a single unstaged pane; cursor on the hunk
+        app.stage_hunk();
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_staged_file("a.txt"));
+        // The worktree copy is untouched by a stage.
+        repo.assert(predicate::repo::workdir_file_equals(
+            "a.txt",
+            "one\nCHANGED\n",
+        ));
+    }
+
+    #[test]
+    fn stage_hunk_in_staged_pane_unstages_the_hunk() {
+        use super::Zoom;
+
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = Zoom::Staged;
+        app.open_current();
+        app.stage_hunk(); // staged pane → unstage direction
+
+        // Unstaging the only staged hunk reverts the index entry to HEAD.
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            "alpha\nbeta\ngamma\n",
+        ));
+    }
+
+    #[test]
+    fn stage_file_in_unstaged_pane_stages_whole_file() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.stage_file();
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_staged_file("a.txt"));
+    }
+
+    #[test]
+    fn stage_file_in_staged_pane_unstages_whole_file() {
+        use super::Zoom;
+
+        // A freshly `git add`ed (Added) file has only a staged sub-diff.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("new.txt", "hello\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = Zoom::Staged;
+        app.open_current();
+        app.stage_file(); // staged pane → unstage; Added file has no HEAD entry, so it goes untracked
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_untracked_file("new.txt"));
+    }
+
+    // ---- M4 staging: discard confirm flow --------------------------------------------------
+
+    #[test]
+    fn discard_hunk_requests_confirm_then_y_reverts_the_worktree() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.discard_hunk();
+
+        // Requesting a confirm must NOT mutate anything yet.
+        assert!(
+            app.pending_confirm.is_some(),
+            "discard must request a confirm"
+        );
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals(
+            "a.txt",
+            "one\nCHANGED\n",
+        ));
+
+        app.resolve_confirm(true);
+        assert!(app.pending_confirm.is_none(), "y must clear the confirm");
+        // Discard reverts the worktree hunk back to the index (== HEAD here).
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
+    }
+
+    #[test]
+    fn discard_confirm_n_cancels_and_leaves_the_worktree_unchanged() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.discard_hunk();
+        app.resolve_confirm(false);
+
+        assert!(app.pending_confirm.is_none(), "n must clear the confirm");
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals(
+            "a.txt",
+            "one\nCHANGED\n",
+        ));
+    }
+
+    #[test]
+    fn discard_file_requests_confirm_then_y_reverts_the_whole_worktree_file() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\nthree\n", "ONE\ntwo\nTHREE\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.discard_file();
+        assert!(app.pending_confirm.is_some());
+
+        app.resolve_confirm(true);
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals(
+            "a.txt",
+            "one\ntwo\nthree\n",
+        ));
+    }
+
+    // ---- M4 staging: refusals --------------------------------------------------------------
+
+    #[test]
+    fn stage_hunk_in_combined_view_refuses_without_touching_the_index() {
+        use super::{Severity, Zoom};
+
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = Zoom::Combined;
+        app.open_current();
+        app.stage_hunk();
+
+        let notice = app.notice.as_ref().expect("combined stage must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("cycle zoom"), "got: {:?}", notice.text);
+        // The index is untouched — still the originally-staged content.
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            "alpha\nBETAEDIT\ngamma\n",
+        ));
+    }
+
+    #[test]
+    fn discard_hunk_in_staged_pane_refuses() {
+        use super::{Severity, Zoom};
+
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = Zoom::Staged;
+        app.open_current();
+        app.discard_hunk();
+
+        assert!(
+            app.pending_confirm.is_none(),
+            "a staged-pane discard must refuse, not request a confirm"
+        );
+        let notice = app.notice.as_ref().expect("staged discard must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("unstaged pane"),
+            "got: {:?}",
+            notice.text
+        );
+    }
+
+    #[test]
+    fn stage_hunk_between_hunks_refuses_with_no_hunk_under_cursor() {
+        use super::Severity;
+
+        let fixture = two_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        // Park the cursor on the gap row between the two hunks.
+        let gap_row = app
+            .current_view_ref()
+            .unwrap()
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Gap { .. }))
+            .unwrap();
+        app.cursor = gap_row;
+        app.stage_hunk();
+
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("between-hunks stage must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("no hunk under cursor"),
+            "got: {:?}",
+            notice.text
+        );
+        // Nothing was staged.
+        let repo = fixture.repo().unwrap();
+        assert!(
+            !predicate::repo::has_staged_file("many.txt").eval(repo),
+            "a refused stage must not touch the index"
+        );
     }
 }
