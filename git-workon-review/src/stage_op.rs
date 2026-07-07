@@ -21,12 +21,16 @@ use crate::error::{ApplyError, ReviewError};
 use crate::model::FileChange;
 use crate::ops;
 use crate::queue::{OpContext, StagingOp};
+use crate::synthesis::LineSelection;
 
 /// A queued staging action over one captured [`FileChange`]: a hunk op when `hunk_idx` is
 /// `Some`, a whole-file op when `None`. The `FileChange` is cloned at enqueue time (the file
 /// list is rebuilt on the next refresh), but the DIRECTION is fixed by `verb` at construction —
 /// M4 uses deterministic pane-role direction (locked decision #1), not the queue's live-index
 /// toggle, so there's no snapshot-staleness to resolve inside `run`.
+///
+/// Line-precise selections do NOT use this type — see [`LineSelectionOp`], which applies a
+/// (possibly multi-hunk) selection as one merged patch rather than per-hunk ops.
 pub struct FileStagingOp {
     file: FileChange,
     hunk_idx: Option<usize>,
@@ -63,6 +67,45 @@ impl StagingOp for FileStagingOp {
             None => ops::apply_file(ctx.repo, &self.file, self.verb),
         };
         result.map_err(|err| map_review_error(err, &self.file.path))
+    }
+}
+
+/// A queued line-selection staging action: applies `verb` to `file`'s selected lines, across
+/// possibly-multiple hunks, as ONE combined patch via [`ops::apply_line_selections`].
+///
+/// Deliberately NOT one [`FileStagingOp`] per hunk: each per-hunk patch is synthesized from the
+/// unstaged (index ↔ worktree) diff, so its line numbers assume every OTHER selected hunk's
+/// change is already present in the file. Draining N independent per-hunk ops against the index
+/// one at a time — which does NOT yet have the other hunks' changes — leaves each later op's
+/// patch header inconsistent with the index's actual state, and libgit2 (strict, no fuzz) rejects
+/// it. [`ops::apply_line_selections`] merges every selected hunk into one patch before applying,
+/// so the whole selection lands in a single, internally-consistent apply.
+pub struct LineSelectionOp {
+    file: FileChange,
+    selections: Vec<(usize, LineSelection)>,
+    verb: StageVerb,
+}
+
+impl LineSelectionOp {
+    pub fn new(file: FileChange, selections: Vec<(usize, LineSelection)>, verb: StageVerb) -> Self {
+        Self {
+            file,
+            selections,
+            verb,
+        }
+    }
+}
+
+impl StagingOp for LineSelectionOp {
+    fn run(&mut self, ctx: &OpContext<'_>) -> Result<(), ApplyError> {
+        ops::apply_line_selections(
+            ctx.repo,
+            ctx.applier,
+            &self.file,
+            &self.selections,
+            self.verb,
+        )
+        .map_err(|err| map_review_error(err, &self.file.path))
     }
 }
 

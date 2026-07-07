@@ -41,6 +41,11 @@ const FG_GUTTER: Color = Color::DarkGray;
 /// Tint blended into the cursor row's background (see [`blend_bg`]) — a cool slate-blue, chosen
 /// to read as "cursor here" without competing with the warm del/add hues above.
 const BG_CURSOR: Color = Color::Rgb(45, 50, 90);
+/// Tint blended into a SELECTED row's background (line selection, `v`) — a muted teal, distinct
+/// from [`BG_CURSOR`]'s slate-blue so a selected-but-not-cursor row reads apart from the cursor
+/// row. The cursor row inside a selection keeps the cursor tint (cursor wins on its own row — see
+/// [`render_pane_sbs`]).
+const BG_SELECTION: Color = Color::Rgb(30, 66, 66);
 
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
@@ -61,23 +66,34 @@ fn blend_bg(base: Option<Color>, tint: Color) -> Color {
     }
 }
 
-/// Apply the cursor row's highlight to an already-built line: blend [`BG_CURSOR`] into every
-/// span's background (see [`blend_bg`]), then pad the line out to `width` with solid tint so the
-/// highlight covers the full row even past the line's own rendered content (a short line, or one
-/// pane of a filler/deleted-file row, would otherwise leave the tail of the row unhighlighted).
-fn apply_cursor_row(mut line: Line<'static>, width: u16) -> Line<'static> {
+/// Blend `tint` into an already-built line's background: mix it into every span's bg (see
+/// [`blend_bg`]), then pad out to `width` with solid tint so the highlight covers the full row even
+/// past the line's own rendered content (a short line, or one pane of a filler/deleted-file row,
+/// would otherwise leave the tail of the row unhighlighted). Shared by the cursor and selection
+/// row washes — they differ only in the tint color.
+fn apply_row_tint(mut line: Line<'static>, width: u16, tint: Color) -> Line<'static> {
     for span in &mut line.spans {
-        let bg = blend_bg(span.style.bg, BG_CURSOR);
+        let bg = blend_bg(span.style.bg, tint);
         span.style = span.style.bg(bg);
     }
     let used = line.width() as u16;
     if used < width {
         line.spans.push(TSpan::styled(
             " ".repeat((width - used) as usize),
-            Style::default().bg(BG_CURSOR),
+            Style::default().bg(tint),
         ));
     }
     line
+}
+
+/// Wash the cursor row with [`BG_CURSOR`].
+fn apply_cursor_row(line: Line<'static>, width: u16) -> Line<'static> {
+    apply_row_tint(line, width, BG_CURSOR)
+}
+
+/// Wash a selected (line-selection) row with [`BG_SELECTION`].
+fn apply_selection_row(line: Line<'static>, width: u16) -> Line<'static> {
+    apply_row_tint(line, width, BG_SELECTION)
 }
 
 /// One resolved (bg, fg) pair for a byte range of a line.
@@ -374,7 +390,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         None => {
-            let text = "j/k scroll  s/S stage  d/D discard  z zoom  w focus  r refresh  q quit";
+            let text = "j/k scroll  v select  s/S stage  d/D discard  z zoom  w focus  q quit";
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(FG_DIM)),
                 area,
@@ -386,11 +402,21 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
 /// Write a gap row's `··· N unchanged lines ···` marker across the FULL body width (both panes
 /// and the divider column) — unlike a per-pane content row, a gap hides the same span on both
 /// sides, so it isn't "about" one side or the other.
-fn render_gap_row(buf: &mut Buffer, area: Rect, y: u16, skipped: usize, is_cursor: bool) {
+fn render_gap_row(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    skipped: usize,
+    is_cursor: bool,
+    is_selected: bool,
+) {
     let msg = format!("··· {skipped} unchanged lines ···");
     let line = Line::from(TSpan::styled(msg, Style::default().fg(FG_DIM)));
+    // Cursor wins over selection on the same row.
     let line = if is_cursor {
         apply_cursor_row(line, area.width)
+    } else if is_selected {
+        apply_selection_row(line, area.width)
     } else {
         line
     };
@@ -419,10 +445,14 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             app.pane_height = area.height as usize;
             let scroll = app.scroll;
             let cursor = Some(app.cursor);
+            // The single pane is the focused one, so it shows any active selection.
+            let selection = app.selection_range();
             match app.layout {
-                AppLayout::Sbs => render_pane_sbs(frame, app, area, idx, role, scroll, cursor),
+                AppLayout::Sbs => {
+                    render_pane_sbs(frame, app, area, idx, role, scroll, cursor, selection)
+                }
                 AppLayout::Inline => {
-                    render_pane_inline(frame, app, area, idx, role, scroll, cursor)
+                    render_pane_inline(frame, app, area, idx, role, scroll, cursor, selection)
                 }
             }
         }
@@ -442,9 +472,14 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
         let role = app.split_focus_role();
         app.pane_height = area.height as usize;
         let (scroll, cursor) = app.pane_render_state(role);
+        let selection = app.selection_range();
         match app.layout {
-            AppLayout::Sbs => render_pane_sbs(frame, app, area, idx, role, scroll, cursor),
-            AppLayout::Inline => render_pane_inline(frame, app, area, idx, role, scroll, cursor),
+            AppLayout::Sbs => {
+                render_pane_sbs(frame, app, area, idx, role, scroll, cursor, selection)
+            }
+            AppLayout::Inline => {
+                render_pane_inline(frame, app, area, idx, role, scroll, cursor, selection)
+            }
         }
         return;
     }
@@ -475,6 +510,11 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
 
     let (u_scroll, u_cursor) = app.pane_render_state(Role::Unstaged);
     let (s_scroll, s_cursor) = app.pane_render_state(Role::Staged);
+    // A selection lives in the focused pane only — the one whose `pane_render_state` yields a
+    // cursor. Show it there, `None` in the unfocused pane.
+    let range = app.selection_range();
+    let u_selection = u_cursor.and(range);
+    let s_selection = s_cursor.and(range);
     match app.layout {
         AppLayout::Sbs => {
             render_pane_sbs(
@@ -485,6 +525,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 Role::Unstaged,
                 u_scroll,
                 u_cursor,
+                u_selection,
             );
             render_pane_sbs(
                 frame,
@@ -494,6 +535,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 Role::Staged,
                 s_scroll,
                 s_cursor,
+                s_selection,
             );
         }
         AppLayout::Inline => {
@@ -505,6 +547,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 Role::Unstaged,
                 u_scroll,
                 u_cursor,
+                u_selection,
             );
             render_pane_inline(
                 frame,
@@ -514,6 +557,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 Role::Staged,
                 s_scroll,
                 s_cursor,
+                s_selection,
             );
         }
     }
@@ -539,6 +583,7 @@ fn render_pane_sbs(
     role: Role,
     scroll: usize,
     cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
 ) {
     let left_w = area.width.saturating_sub(1) / 2;
     let right_w = area.width.saturating_sub(1).saturating_sub(left_w);
@@ -596,9 +641,17 @@ fn render_pane_sbs(
     for (i, row_idx) in (scroll..end).enumerate() {
         let y = area.y + i as u16;
         let is_cursor = cursor == Some(row_idx);
+        let is_selected = selection.is_some_and(|(lo, hi)| row_idx >= lo && row_idx <= hi);
         match &view.display[row_idx] {
             DisplayRow::Gap { skipped } => {
-                render_gap_row(frame.buffer_mut(), area, y, *skipped, is_cursor);
+                render_gap_row(
+                    frame.buffer_mut(),
+                    area,
+                    y,
+                    *skipped,
+                    is_cursor,
+                    is_selected,
+                );
             }
             DisplayRow::Row(row) => {
                 let is_pair = row.is_word_diff_pair();
@@ -630,10 +683,16 @@ fn render_pane_sbs(
                     new_gutter_w,
                     new_area.width as usize,
                 );
+                // Cursor wins over selection on the same row (see [`BG_SELECTION`]).
                 let (old_line, new_line) = if is_cursor {
                     (
                         apply_cursor_row(old_line, old_area.width),
                         apply_cursor_row(new_line, new_area.width),
+                    )
+                } else if is_selected {
+                    (
+                        apply_selection_row(old_line, old_area.width),
+                        apply_selection_row(new_line, new_area.width),
                     )
                 } else {
                     (old_line, new_line)
@@ -733,6 +792,7 @@ fn build_inline_line(
 /// Render one inline pane of `role`'s view for file `idx` into `area`, scrolled to `scroll`. See
 /// [`render_pane_sbs`] for the `cursor`/highlight contract; this is its inline-coordinate-space
 /// analog.
+#[allow(clippy::too_many_arguments)]
 fn render_pane_inline(
     frame: &mut Frame,
     app: &mut App,
@@ -741,6 +801,7 @@ fn render_pane_inline(
     role: Role,
     scroll: usize,
     cursor: Option<usize>,
+    selection: Option<(usize, usize)>,
 ) {
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
@@ -771,9 +832,17 @@ fn render_pane_inline(
     for (i, row_idx) in (scroll..end).enumerate() {
         let y = area.y + i as u16;
         let is_cursor = cursor == Some(row_idx);
+        let is_selected = selection.is_some_and(|(lo, hi)| row_idx >= lo && row_idx <= hi);
         match &view.inline[row_idx] {
             InlineRow::Gap { skipped } => {
-                render_gap_row(frame.buffer_mut(), area, y, *skipped, is_cursor);
+                render_gap_row(
+                    frame.buffer_mut(),
+                    area,
+                    y,
+                    *skipped,
+                    is_cursor,
+                    is_selected,
+                );
             }
             row => {
                 let (old_spans, new_spans) = if row.is_word_diff_pair() {
@@ -788,8 +857,11 @@ fn render_pane_inline(
                 };
                 let line =
                     build_inline_line(view, row, word_spans, mode, old_gutter_w, new_gutter_w);
+                // Cursor wins over selection on the same row (see [`BG_SELECTION`]).
                 let line = if is_cursor {
                     apply_cursor_row(line, area.width)
+                } else if is_selected {
+                    apply_selection_row(line, area.width)
                 } else {
                     line
                 };
@@ -1134,6 +1206,69 @@ mod tests {
             Some(super::BG_CURSOR),
             "expected the cursor row's DIVIDER cell to carry the cursor background, not the \
              default — otherwise the highlight has a seam through the middle"
+        );
+    }
+
+    #[test]
+    fn selected_rows_carry_the_selection_tint_distinct_from_cursor_and_plain_rows() {
+        // Anchor at l10 and put the cursor at l12, so the selection covers l10..=l12. The cursor
+        // (always one endpoint of the range) sits on l12 and wins the wash there; l10 and l11 are
+        // selected-but-not-cursor, showing the pure selection tint over plain context.
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold word here\nl10\nl11\nl12\nl13\nl14\n";
+        let new = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew word here\nl10\nl11\nl12\nl13\nl14\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("small.txt", old, new)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let row_for = |app: &mut App, lineno: usize| {
+            app.current_view_ref()
+                .unwrap()
+                .display
+                .iter()
+                .position(|row| matches!(row, DisplayRow::Row(r) if r.old == Row::Line(lineno)))
+                .unwrap_or_else(|| panic!("l{lineno} row present"))
+        };
+        let l10 = row_for(&mut app, 10);
+        let l12 = row_for(&mut app, 12);
+
+        app.selection_anchor = Some(l10);
+        app.cursor = l12;
+        assert_eq!(app.selection_range(), Some((l10, l12)));
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+        let y_of = |needle: &str| {
+            content
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} visible")) as u16
+        };
+        let sel_y = y_of("l10 "); // selected, not cursor
+        let other_y = y_of("l11 "); // selected, not cursor — same tint as l10
+        let cursor_y = y_of("l12 "); // cursor endpoint of the range — cursor tint wins here
+
+        let bg = |x: u16, y: u16| buf.cell((x, y)).unwrap().style().bg;
+        assert_eq!(
+            bg(1, sel_y),
+            bg(1, other_y),
+            "both selected rows carry the same selection tint"
+        );
+        assert_ne!(
+            bg(1, sel_y),
+            bg(1, cursor_y),
+            "the selection tint must differ from the cursor row's tint"
+        );
+        // And the selection tint is specifically BG_SELECTION blended over plain context (which
+        // has no bg) — i.e. the raw tint, since blend_bg(None, tint) == tint.
+        assert_eq!(
+            bg(1, sel_y),
+            Some(super::BG_SELECTION),
+            "a selected plain-context row shows the raw selection tint"
         );
     }
 
