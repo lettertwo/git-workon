@@ -960,7 +960,9 @@ name = "git-workon-review"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "assert_fs",
  "clap",
+ "clap_complete",
  "crossterm",
  "git-workon-fixture",
  "git-workon-lib",

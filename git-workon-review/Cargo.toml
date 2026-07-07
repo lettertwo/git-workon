@@ -33,6 +33,7 @@ vendored = ["git-workon-lib/vendored", "git2/vendored-libgit2", "git2/vendored-o
 
 [dependencies]
 clap.workspace = true
+clap_complete.workspace = true
 crossterm.workspace = true
 git-workon-lib.workspace = true
 git2.workspace = true
@@ -57,5 +58,6 @@ dist = false
 
 [dev-dependencies]
 assert_cmd.workspace = true
+assert_fs.workspace = true
 git-workon-fixture.workspace = true
 predicates.workspace = true
