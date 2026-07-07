@@ -19,6 +19,10 @@ use crate::highlight::{FgSpan, TsHighlighter};
 use crate::model::{DiffModel, FileChange, FileStatus};
 use crate::wordiff::{word_diff_spans, Span};
 
+/// Minimum rows kept between the cursor and the top/bottom of the pane while scrolling — see
+/// [`App::derive_scroll`].
+const SCROLLOFF: usize = 2;
+
 /// Loaded, aligned, highlighted view of one file's combined diff.
 ///
 /// Full text is read once per side, from whichever source the file's status says still exists:
@@ -44,8 +48,13 @@ pub struct FileView {
     /// any surviving row is unchanged.
     pub display: Vec<DisplayRow>,
     /// Index into [`Self::display`] of the first hunk's first row (or 0 for a file with no
-    /// hunks), for the initial scroll jump.
+    /// hunks), for the initial cursor jump under [`Layout::Sbs`].
     pub first_hunk_row: usize,
+    /// Inline-layout analog of [`Self::first_hunk_row`]: index into [`Self::inline`] instead of
+    /// `display`. A separate field (rather than translating one into the other) because the two
+    /// row vectors track the same content in different shapes — same rationale as the two
+    /// word-span caches below.
+    pub first_inline_hunk_row: usize,
     pub old_hl: Option<Vec<Vec<FgSpan>>>,
     pub new_hl: Option<Vec<Vec<FgSpan>>>,
     /// Lazily computed word-diff spans, keyed by DISPLAY row index — the only coordinate the
@@ -98,6 +107,10 @@ impl FileView {
         let old_hl = ts.highlight_file(old_source_path, &old_text);
         let new_hl = ts.highlight_file(&file.path, &new_text);
         let inline = inline_rows(&display);
+        let first_inline_hunk_row = inline
+            .iter()
+            .position(is_inline_hunk_content_row)
+            .unwrap_or(0);
 
         Self {
             old_text,
@@ -106,6 +119,7 @@ impl FileView {
             new_lines,
             display,
             first_hunk_row,
+            first_inline_hunk_row,
             old_hl,
             new_hl,
             word_spans: HashMap::new(),
@@ -257,6 +271,13 @@ pub struct App {
     pub files: Vec<FileChange>,
     views: Vec<Option<FileView>>,
     pub current: usize,
+    /// Row index, in the ACTIVE layout's coordinate space, of the highlighted navigation
+    /// anchor — THE nav state (locked decision #2 in the M4 plan). `scroll` is derived from
+    /// this every time it moves, via [`Self::derive_scroll`].
+    pub cursor: usize,
+    /// Top-of-viewport row index, in the active layout's space. Read directly by the renderer,
+    /// but never written except by [`Self::derive_scroll`] — every cursor-moving method ends by
+    /// calling it, so `scroll` always reflects the CURRENT `cursor`.
     pub scroll: usize,
     pub pane_height: usize,
     /// Label for the old side of the diff, shown next to a rename's `old_path` in the header.
@@ -276,6 +297,7 @@ impl App {
             files: combined.files,
             views: (0..n).map(|_| None).collect(),
             current: 0,
+            cursor: 0,
             scroll: 0,
             pane_height: 20,
             base_label: "HEAD".to_string(),
@@ -320,18 +342,26 @@ impl App {
         self.views.get(self.current).and_then(|v| v.as_ref())
     }
 
-    /// Jump the scroll position to the current file's first hunk (or the top, for a file with
-    /// no hunks or that isn't loaded yet).
+    /// Jump the cursor to the current file's first hunk (or row 0, for a file with no hunks or
+    /// that isn't loaded yet), then re-derive `scroll`. Reads whichever of `FileView`'s two
+    /// first-hunk fields matches [`Self::layout`] — see [`FileView::first_inline_hunk_row`]'s
+    /// doc comment for why the SBS and inline positions are separate fields, not one translated
+    /// into the other.
     pub fn jump_to_first_hunk(&mut self) {
-        self.scroll = self
+        let layout = self.layout;
+        self.cursor = self
             .views
             .get(self.current)
             .and_then(|v| v.as_ref())
-            .map(|v| v.first_hunk_row)
+            .map(|v| match layout {
+                Layout::Sbs => v.first_hunk_row,
+                Layout::Inline => v.first_inline_hunk_row,
+            })
             .unwrap_or(0);
+        self.derive_scroll();
     }
 
-    /// Load the current file (if not binary) and jump to its first hunk.
+    /// Load the current file (if not binary) and jump the cursor to its first hunk.
     pub fn open_current(&mut self) {
         self.ensure_loaded(self.current);
         self.jump_to_first_hunk();
@@ -366,74 +396,124 @@ impl App {
         self.row_count().saturating_sub(self.pane_height.max(1))
     }
 
-    /// Relative scroll, clamped to `[0, max_scroll()]` — except it never snaps backward past
-    /// the current position when that position is itself beyond `max_scroll()` (e.g. right
-    /// after [`Self::next_hunk_row`]/[`Self::prev_hunk_row`] jumped the hunk to the top of a
-    /// pane taller than the remaining display). A relative scroll past a jump-placed position
-    /// is a no-op in the over-scrolled direction rather than a backward leap; scrolling back the
-    /// other way still works normally.
-    pub fn scroll_by(&mut self, delta: i64) {
-        let max = self.max_scroll() as i64;
-        let cur = self.scroll as i64;
-        self.scroll = (cur + delta).clamp(0, max.max(cur)) as usize;
+    /// Clamp `cursor` into `[0, row_count() - 1]` (or `0` for an empty row list) — used after an
+    /// operation that can leave `cursor` referring to a row the active layout/file no longer has
+    /// (a layout toggle, most notably; see [`Self::toggle_layout`]).
+    fn clamp_cursor(&mut self) {
+        let rows = self.row_count();
+        self.cursor = if rows == 0 {
+            0
+        } else {
+            self.cursor.min(rows - 1)
+        };
     }
 
+    /// Re-derive `scroll` from `cursor` so the cursor stays visible: it keeps `cursor` within
+    /// `[scroll + SCROLLOFF, scroll + pane_height - 1 - SCROLLOFF]` by sliding `scroll` the
+    /// MINIMUM amount needed (never re-centering) — the familiar vim `scrolloff` behavior. Near
+    /// a file edge, where honoring both margins at once isn't possible, the edge wins: the final
+    /// clamp to `[0, max_scroll()]` lets `cursor` reach row 0 or the last row even though the
+    /// margin can't be kept there. Every cursor-moving method ends by calling this — `scroll` is
+    /// otherwise never written directly.
+    fn derive_scroll(&mut self) {
+        let rows = self.row_count();
+        if rows == 0 {
+            self.scroll = 0;
+            return;
+        }
+        let pane_height = self.pane_height.max(1);
+        let cursor = self.cursor.min(rows - 1);
+        let bottom_margin = pane_height.saturating_sub(1).saturating_sub(SCROLLOFF);
+
+        let mut scroll = self.scroll;
+        if cursor < scroll + SCROLLOFF {
+            scroll = cursor.saturating_sub(SCROLLOFF);
+        } else if cursor > scroll + bottom_margin {
+            scroll = cursor.saturating_sub(bottom_margin);
+        }
+        self.scroll = scroll.min(self.max_scroll());
+    }
+
+    /// Move the cursor by `delta` rows, clamped to `[0, row_count() - 1]` (a no-op on an empty
+    /// file list), then re-derive `scroll`. Drives `j`/`k`/arrows (`delta = ±1`) and
+    /// `Ctrl-d`/`Ctrl-u` (`delta = ±pane_height/2`).
+    pub fn move_cursor_by(&mut self, delta: i64) {
+        let rows = self.row_count();
+        if rows == 0 {
+            self.cursor = 0;
+            self.scroll = 0;
+            return;
+        }
+        let max = (rows - 1) as i64;
+        let cur = self.cursor as i64;
+        self.cursor = (cur + delta).clamp(0, max) as usize;
+        self.derive_scroll();
+    }
+
+    /// Move the cursor to row 0 (`g`) and re-derive `scroll`.
     pub fn scroll_top(&mut self) {
-        self.scroll = 0;
+        self.cursor = 0;
+        self.derive_scroll();
     }
 
+    /// Move the cursor to the last row (`G`) and re-derive `scroll`.
     pub fn scroll_bottom(&mut self) {
-        self.scroll = self.max_scroll();
+        let rows = self.row_count();
+        self.cursor = rows.saturating_sub(1);
+        self.derive_scroll();
     }
 
-    /// Scroll to the next hunk-start row after the current scroll position (`]h`). A no-op if
-    /// there is no later hunk, or the current file has no loaded view. Searches [`Self::layout`]'s
-    /// own row vector and coordinate space — `scroll` is an index into `display` under
-    /// [`Layout::Sbs`] but into `inline` under [`Layout::Inline`], and the two disagree on row
-    /// count/position whenever a change block has unequal del/add counts.
+    /// Move the cursor to the next hunk-start row after its current position (`]h`), then
+    /// re-derive `scroll`. A no-op if there is no later hunk, or the current file has no loaded
+    /// view. Searches [`Self::layout`]'s own row vector and coordinate space — `cursor` is an
+    /// index into `display` under [`Layout::Sbs`] but into `inline` under [`Layout::Inline`], and
+    /// the two disagree on row count/position whenever a change block has unequal del/add
+    /// counts.
     pub fn next_hunk_row(&mut self) {
         let Some(view) = self.current_view_ref() else {
             return;
         };
         let next = match self.layout {
-            Layout::Sbs => find_next_hunk_row(&view.display, self.scroll),
-            Layout::Inline => find_next_inline_hunk_row(&view.inline, self.scroll),
+            Layout::Sbs => find_next_hunk_row(&view.display, self.cursor),
+            Layout::Inline => find_next_inline_hunk_row(&view.inline, self.cursor),
         };
         if let Some(row) = next {
-            self.scroll = row;
+            self.cursor = row;
+            self.derive_scroll();
         }
     }
 
-    /// Scroll to the previous hunk-start row before the current scroll position (`[h`). A no-op
-    /// if there is no earlier hunk, or the current file has no loaded view. See
-    /// [`Self::next_hunk_row`] for why the search dispatches on [`Self::layout`].
+    /// Move the cursor to the previous hunk-start row before its current position (`[h`), then
+    /// re-derive `scroll`. A no-op if there is no earlier hunk, or the current file has no loaded
+    /// view. See [`Self::next_hunk_row`] for why the search dispatches on [`Self::layout`].
     pub fn prev_hunk_row(&mut self) {
         let Some(view) = self.current_view_ref() else {
             return;
         };
         let prev = match self.layout {
-            Layout::Sbs => find_prev_hunk_row(&view.display, self.scroll),
-            Layout::Inline => find_prev_inline_hunk_row(&view.inline, self.scroll),
+            Layout::Sbs => find_prev_hunk_row(&view.display, self.cursor),
+            Layout::Inline => find_prev_inline_hunk_row(&view.inline, self.cursor),
         };
         if let Some(row) = prev {
-            self.scroll = row;
+            self.cursor = row;
+            self.derive_scroll();
         }
     }
 
     /// Toggle between side-by-side and inline layouts (`L`). Deliberately does not try to
-    /// re-derive an equivalent `scroll` position for the new layout — the two layouts' row
-    /// vectors track the same underlying content in a different shape, and translating exactly
-    /// isn't worth the complexity for M3; the user re-orients same as they would after a resize.
-    /// It DOES clamp `scroll` to the new layout's `max_scroll()`, though: inline is strictly
-    /// taller than SBS whenever paired del/add blocks exist, so a scroll position picked up
-    /// there (including an over-scrolled hunk-jump position, see [`Self::scroll_by`]) can exceed
-    /// SBS's shorter range.
+    /// re-derive an exactly equivalent `cursor` position for the new layout — the two layouts'
+    /// row vectors track the same underlying content in a different shape, and translating
+    /// exactly isn't worth the complexity for M4; the user re-orients same as they would after a
+    /// resize. It DOES clamp `cursor` to the new layout's `row_count()` (see
+    /// [`Self::clamp_cursor`]) and re-derive `scroll` from it, so the result is always a valid,
+    /// visible position even though it isn't a semantic equivalent of the old one.
     pub fn toggle_layout(&mut self) {
         self.layout = match self.layout {
             Layout::Sbs => Layout::Inline,
             Layout::Inline => Layout::Sbs,
         };
-        self.scroll = self.scroll.min(self.max_scroll());
+        self.clamp_cursor();
+        self.derive_scroll();
     }
 }
 
@@ -681,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn app_next_and_prev_hunk_row_scroll_between_hunks() {
+    fn app_next_and_prev_hunk_row_move_cursor_between_hunks() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .unstaged_file(
@@ -694,38 +774,43 @@ mod tests {
 
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        let first_hunk_row = app.scroll;
+        let first_hunk_row = app.cursor;
 
         app.next_hunk_row();
         assert!(
-            app.scroll > first_hunk_row,
-            "should scroll to the later hunk"
+            app.cursor > first_hunk_row,
+            "should move the cursor to the later hunk"
         );
-        let second_hunk_row = app.scroll;
+        let second_hunk_row = app.cursor;
 
         // No hunk after the last one: no-op.
         app.next_hunk_row();
-        assert_eq!(app.scroll, second_hunk_row);
+        assert_eq!(app.cursor, second_hunk_row);
 
         app.prev_hunk_row();
-        assert_eq!(app.scroll, first_hunk_row);
+        assert_eq!(app.cursor, first_hunk_row);
 
         // No hunk before the first one: no-op.
         app.prev_hunk_row();
-        assert_eq!(app.scroll, first_hunk_row);
+        assert_eq!(app.cursor, first_hunk_row);
     }
 
     #[test]
-    fn scroll_by_does_not_snap_backward_past_a_hunk_jump() {
-        // A small file (fits in the default pane height) with two hunks: `max_scroll() == 0`,
-        // but `next_hunk_row` still jumps `scroll` to the second hunk's row unclamped, leaving
-        // the view over-scrolled relative to `max_scroll()`.
+    fn cursor_move_after_hunk_jump_is_sane_when_whole_file_fits_one_pane() {
+        // A small file (fits in the default pane height) with two hunks: `max_scroll() == 0`.
+        // Under the OLD scroll-primary model (M3), `next_hunk_row` jumped raw `scroll` to the
+        // second hunk's row unclamped, over-scrolling past `max_scroll()`, and `scroll_by` had a
+        // "don't snap backward" carve-out just to keep that over-scrolled position sane on the
+        // very next relative move. The cursor-primary model makes the carve-out unnecessary:
+        // `scroll` is *derived* from `cursor` and `max_scroll()`, so it's simply pinned to 0 for
+        // a file that fits in one pane — there's nothing to snap back from, and `cursor` itself
+        // just moves normally.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .unstaged_file(
                 "small.txt",
-                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
-                "1\nCHANGED\n3\n4\n5\n6\n7\n8\n9\nCHANGED_TOO\n",
+                "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n",
+                "1\nCHANGED\n3\n4\n5\n6\n7\n8\n9\nCHANGED_TOO\n11\n",
             )
             .build()
             .unwrap();
@@ -734,20 +819,125 @@ mod tests {
         app.open_current();
         assert_eq!(app.max_scroll(), 0, "whole file must fit in one pane");
 
+        let first_hunk_cursor = app.cursor;
         app.next_hunk_row();
-        let over_scrolled = app.scroll;
+        let second_hunk_cursor = app.cursor;
         assert!(
-            over_scrolled > 0,
-            "hunk jump should place scroll past max_scroll"
+            second_hunk_cursor > first_hunk_cursor,
+            "hunk jump should move the cursor forward"
+        );
+        assert_eq!(
+            app.scroll, 0,
+            "scroll stays pinned to 0 — the whole file already fits in the pane"
         );
 
-        // `j` (scroll_by(1)) at an over-scrolled position is a no-op, not a backward snap.
-        app.scroll_by(1);
-        assert_eq!(app.scroll, over_scrolled);
+        let last_row = app.current_view_ref().unwrap().display.len() - 1;
 
-        // `k` (scroll_by(-1)) still scrolls up normally.
-        app.scroll_by(-1);
-        assert_eq!(app.scroll, over_scrolled - 1);
+        // `j` (cursor +1) after the hunk jump moves the cursor further, not backward.
+        app.move_cursor_by(1);
+        assert_eq!(app.cursor, (second_hunk_cursor + 1).min(last_row));
+        assert_eq!(app.scroll, 0);
+
+        // `k` (cursor -1) moves back up normally — no special-cased snap needed anymore.
+        app.move_cursor_by(-1);
+        assert_eq!(app.cursor, second_hunk_cursor);
+        assert_eq!(app.scroll, 0);
+    }
+
+    #[test]
+    fn move_cursor_by_clamps_at_file_edges() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("small.txt", "1\n2\n3\n4\n5\n", "1\nCHANGED\n3\n4\n5\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let last_row = app.current_view_ref().unwrap().display.len() - 1;
+
+        app.move_cursor_by(-1000);
+        assert_eq!(app.cursor, 0, "cursor must clamp at row 0, not go negative");
+
+        app.move_cursor_by(1000);
+        assert_eq!(
+            app.cursor, last_row,
+            "cursor must clamp at the last row, not run past it"
+        );
+    }
+
+    #[test]
+    fn derive_scroll_keeps_scrolloff_margin_and_slides_minimally() {
+        // 40 single-line rows, no changes worth hunk-jumping over — this test is purely about
+        // the cursor/scroll follow relationship, not hunk content.
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        app.pane_height = 10;
+        app.cursor = 0;
+        app.scroll = 0;
+
+        // Bottom margin is `pane_height - 1 - SCROLLOFF` = 7: the cursor can move down to row 7
+        // without `scroll` moving at all.
+        app.move_cursor_by(7);
+        assert_eq!(app.cursor, 7);
+        assert_eq!(
+            app.scroll, 0,
+            "scroll must not move before the cursor hits the margin"
+        );
+
+        // One more step crosses the bottom margin: scroll slides by exactly 1, the minimum
+        // needed to keep the cursor `SCROLLOFF` rows from the bottom — not a re-center.
+        app.move_cursor_by(1);
+        assert_eq!(app.cursor, 8);
+        assert_eq!(
+            app.scroll, 1,
+            "scroll should slide by the minimum amount, not re-center"
+        );
+
+        // Scrolling back up mirrors the same margin on the top edge (SCROLLOFF = 2): with
+        // `scroll` at 1, the cursor can move back up to `scroll + SCROLLOFF` = 3 before `scroll`
+        // follows.
+        app.move_cursor_by(-5);
+        assert_eq!(app.cursor, 3);
+        assert_eq!(
+            app.scroll, 1,
+            "scroll must not move while the cursor is still within the top margin"
+        );
+        app.move_cursor_by(-1);
+        assert_eq!(app.cursor, 2);
+        assert_eq!(
+            app.scroll, 0,
+            "scroll should slide back by the minimum amount once the cursor crosses the top margin"
+        );
+    }
+
+    #[test]
+    fn move_cursor_by_on_empty_file_list_does_not_panic() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        assert!(app.files.is_empty(), "fixture must have no dirty files");
+
+        app.move_cursor_by(5);
+        app.move_cursor_by(-5);
+        app.scroll_top();
+        app.scroll_bottom();
+        app.next_hunk_row();
+        app.prev_hunk_row();
+        app.toggle_layout();
+
+        assert_eq!(app.cursor, 0);
+        assert_eq!(app.scroll, 0);
     }
 
     #[test]
@@ -863,10 +1053,11 @@ mod tests {
         let mut app = app_from_fixture(&fixture);
         app.ensure_loaded(0);
         app.layout = Layout::Inline;
+        app.cursor = 0;
         app.scroll = 0;
 
         app.next_hunk_row();
-        let first_block_row = app.scroll;
+        let first_block_row = app.cursor;
         assert!(
             matches!(
                 app.current_view_ref().unwrap().inline[first_block_row],
@@ -876,7 +1067,7 @@ mod tests {
         );
 
         app.next_hunk_row();
-        let second_block_row = app.scroll;
+        let second_block_row = app.cursor;
         assert!(
             second_block_row > first_block_row,
             "should jump to the later change block"
@@ -888,13 +1079,13 @@ mod tests {
 
         app.prev_hunk_row();
         assert_eq!(
-            app.scroll, first_block_row,
+            app.cursor, first_block_row,
             "prev_hunk_row should return to the earlier block"
         );
     }
 
     #[test]
-    fn toggle_layout_clamps_out_of_range_scroll() {
+    fn toggle_layout_clamps_cursor_and_rederives_scroll() {
         use super::Layout;
 
         let fixture = FixtureBuilder::new()
@@ -909,9 +1100,21 @@ mod tests {
         app.pane_height = 2;
         app.scroll_bottom();
         assert!(app.scroll > 0, "inline scroll should be over the SBS max");
+        let inline_last_row = app.cursor;
 
         app.toggle_layout();
         assert_eq!(app.layout, Layout::Sbs, "toggling back returns to Sbs");
+        let sbs_rows = app.current_view_ref().unwrap().display.len();
+        assert!(
+            app.cursor < sbs_rows,
+            "cursor must be clamped into the new (shorter) SBS row range, was {} of {}",
+            app.cursor,
+            sbs_rows
+        );
+        assert!(
+            app.cursor <= inline_last_row,
+            "clamping should only ever pull the cursor down, never push it further out"
+        );
         assert!(
             app.scroll <= app.max_scroll(),
             "scroll must be clamped to the new layout's max_scroll"

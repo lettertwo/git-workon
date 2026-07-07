@@ -50,7 +50,7 @@ pub fn next_event(timeout: Duration) -> io::Result<Option<AppEvent>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Quit,
-    ScrollBy(i64),
+    MoveCursorBy(i64),
     ScrollTop,
     ScrollBottom,
     NextFile,
@@ -77,13 +77,13 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
 
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-        KeyCode::Char('j') | KeyCode::Down => Action::ScrollBy(1),
-        KeyCode::Char('k') | KeyCode::Up => Action::ScrollBy(-1),
+        KeyCode::Char('j') | KeyCode::Down => Action::MoveCursorBy(1),
+        KeyCode::Char('k') | KeyCode::Up => Action::MoveCursorBy(-1),
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Action::ScrollBy((pane_height / 2).max(1) as i64)
+            Action::MoveCursorBy((pane_height / 2).max(1) as i64)
         }
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Action::ScrollBy(-((pane_height / 2).max(1) as i64))
+            Action::MoveCursorBy(-((pane_height / 2).max(1) as i64))
         }
         KeyCode::Char('g') => Action::ScrollTop,
         KeyCode::Char('G') => Action::ScrollBottom,
@@ -106,7 +106,7 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
 fn apply_action(app: &mut App, action: Action) -> bool {
     match action {
         Action::Quit => return true,
-        Action::ScrollBy(delta) => app.scroll_by(delta),
+        Action::MoveCursorBy(delta) => app.move_cursor_by(delta),
         Action::ScrollTop => app.scroll_top(),
         Action::ScrollBottom => app.scroll_bottom(),
         Action::NextFile => app.next_file(),
@@ -205,19 +205,19 @@ mod tests {
         let mut pending = None;
         assert_eq!(
             map_key(&mut pending, key(KeyCode::Char('j')), 20),
-            Action::ScrollBy(1)
+            Action::MoveCursorBy(1)
         );
         assert_eq!(
             map_key(&mut pending, key(KeyCode::Down), 20),
-            Action::ScrollBy(1)
+            Action::MoveCursorBy(1)
         );
         assert_eq!(
             map_key(&mut pending, key(KeyCode::Char('k')), 20),
-            Action::ScrollBy(-1)
+            Action::MoveCursorBy(-1)
         );
         assert_eq!(
             map_key(&mut pending, key(KeyCode::Up), 20),
-            Action::ScrollBy(-1)
+            Action::MoveCursorBy(-1)
         );
     }
 
@@ -226,14 +226,17 @@ mod tests {
         let mut pending = None;
         assert_eq!(
             map_key(&mut pending, ctrl_key('d'), 21),
-            Action::ScrollBy(10)
+            Action::MoveCursorBy(10)
         );
         assert_eq!(
             map_key(&mut pending, ctrl_key('u'), 21),
-            Action::ScrollBy(-10)
+            Action::MoveCursorBy(-10)
         );
         // A pane height of 1 still scrolls by at least one line.
-        assert_eq!(map_key(&mut pending, ctrl_key('d'), 1), Action::ScrollBy(1));
+        assert_eq!(
+            map_key(&mut pending, ctrl_key('d'), 1),
+            Action::MoveCursorBy(1)
+        );
     }
 
     #[test]

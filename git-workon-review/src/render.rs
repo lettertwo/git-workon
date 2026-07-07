@@ -25,6 +25,47 @@ const BG_ADD_STRONG: Color = Color::Rgb(32, 100, 48);
 const FG_DEFAULT: Color = Color::Gray;
 const FG_DIM: Color = Color::DarkGray;
 const FG_GUTTER: Color = Color::DarkGray;
+/// Tint blended into the cursor row's background (see [`blend_bg`]) — a cool slate-blue, chosen
+/// to read as "cursor here" without competing with the warm del/add hues above.
+const BG_CURSOR: Color = Color::Rgb(45, 50, 90);
+
+/// Blend the cursor row's tint into an existing background, so the cursor highlight composites
+/// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
+/// a wash over the whole row, not a mask. `None` (a context/gap cell with no bg span at all)
+/// resolves to the tint directly, since there's nothing to blend against. Non-RGB colors
+/// shouldn't occur here (every bg constant in this module is `Color::Rgb`) but pass through
+/// unblended rather than panicking if one ever does.
+fn blend_bg(base: Option<Color>, tint: Color) -> Color {
+    match (base, tint) {
+        (Some(Color::Rgb(r, g, b)), Color::Rgb(tr, tg, tb)) => {
+            // 60% of the original emphasis, 40% tint — enough to read as a distinct highlight
+            // without washing out del/add/word-diff coloring underneath it.
+            let mix = |c: u8, t: u8| ((u16::from(c) * 3 + u16::from(t) * 2) / 5) as u8;
+            Color::Rgb(mix(r, tr), mix(g, tg), mix(b, tb))
+        }
+        (Some(other), _) => other,
+        (None, tint) => tint,
+    }
+}
+
+/// Apply the cursor row's highlight to an already-built line: blend [`BG_CURSOR`] into every
+/// span's background (see [`blend_bg`]), then pad the line out to `width` with solid tint so the
+/// highlight covers the full row even past the line's own rendered content (a short line, or one
+/// pane of a filler/deleted-file row, would otherwise leave the tail of the row unhighlighted).
+fn apply_cursor_row(mut line: Line<'static>, width: u16) -> Line<'static> {
+    for span in &mut line.spans {
+        let bg = blend_bg(span.style.bg, BG_CURSOR);
+        span.style = span.style.bg(bg);
+    }
+    let used = line.width() as u16;
+    if used < width {
+        line.spans.push(TSpan::styled(
+            " ".repeat((width - used) as usize),
+            Style::default().bg(BG_CURSOR),
+        ));
+    }
+    line
+}
 
 /// One resolved (bg, fg) pair for a byte range of a line.
 struct Segment {
@@ -236,9 +277,14 @@ fn render_footer(frame: &mut Frame, area: Rect) {
 /// Write a gap row's `··· N unchanged lines ···` marker across the FULL body width (both panes
 /// and the divider column) — unlike a per-pane content row, a gap hides the same span on both
 /// sides, so it isn't "about" one side or the other.
-fn render_gap_row(buf: &mut Buffer, area: Rect, y: u16, skipped: usize) {
+fn render_gap_row(buf: &mut Buffer, area: Rect, y: u16, skipped: usize, is_cursor: bool) {
     let msg = format!("··· {skipped} unchanged lines ···");
     let line = Line::from(TSpan::styled(msg, Style::default().fg(FG_DIM)));
+    let line = if is_cursor {
+        apply_cursor_row(line, area.width)
+    } else {
+        line
+    };
     buf.set_line(area.x, y, &line, area.width);
 }
 
@@ -317,9 +363,10 @@ fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
 
     for (i, row_idx) in (scroll..end).enumerate() {
         let y = area.y + i as u16;
+        let is_cursor = row_idx == app.cursor;
         match &view.display[row_idx] {
             DisplayRow::Gap { skipped } => {
-                render_gap_row(frame.buffer_mut(), area, y, *skipped);
+                render_gap_row(frame.buffer_mut(), area, y, *skipped, is_cursor);
             }
             DisplayRow::Row(row) => {
                 let is_pair = row.is_word_diff_pair();
@@ -353,12 +400,31 @@ fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
                     new_gutter_w,
                     new_area.width as usize,
                 );
+                let (old_line, new_line) = if is_cursor {
+                    (
+                        apply_cursor_row(old_line, old_area.width),
+                        apply_cursor_row(new_line, new_area.width),
+                    )
+                } else {
+                    (old_line, new_line)
+                };
                 frame
                     .buffer_mut()
                     .set_line(old_area.x, y, &old_line, old_area.width);
                 frame
                     .buffer_mut()
                     .set_line(new_area.x, y, &new_line, new_area.width);
+                // The divider column was painted once for the whole pane height above, with the
+                // default background; re-tint just this row's divider cell so the cursor wash
+                // covers the full width (panes AND the `│` between them), like `render_gap_row`.
+                if is_cursor {
+                    frame.buffer_mut().set_string(
+                        div_area.x,
+                        y,
+                        "│",
+                        Style::default().fg(FG_DIM).bg(BG_CURSOR),
+                    );
+                }
             }
         }
     }
@@ -459,9 +525,10 @@ fn render_body_inline(frame: &mut Frame, app: &mut App, area: Rect) {
 
     for (i, row_idx) in (scroll..end).enumerate() {
         let y = area.y + i as u16;
+        let is_cursor = row_idx == app.cursor;
         match &view.inline[row_idx] {
             InlineRow::Gap { skipped } => {
-                render_gap_row(frame.buffer_mut(), area, y, *skipped);
+                render_gap_row(frame.buffer_mut(), area, y, *skipped, is_cursor);
             }
             row => {
                 let (old_spans, new_spans) = if row.is_word_diff_pair() {
@@ -475,6 +542,11 @@ fn render_body_inline(frame: &mut Frame, app: &mut App, area: Rect) {
                     _ => &[],
                 };
                 let line = build_inline_line(view, row, word_spans, old_gutter_w, new_gutter_w);
+                let line = if is_cursor {
+                    apply_cursor_row(line, area.width)
+                } else {
+                    line
+                };
                 frame.buffer_mut().set_line(area.x, y, &line, area.width);
             }
         }
@@ -490,6 +562,7 @@ mod tests {
     use git_workon_fixture::prelude::*;
 
     use super::render;
+    use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
 
@@ -736,6 +809,117 @@ mod tests {
             sbs_again_content[row].contains("new word here"),
             "expected toggling back to re-render SBS with del/add on one row, got:\n{}",
             sbs_again_content.join("\n")
+        );
+    }
+
+    #[test]
+    fn cursor_row_carries_a_distinct_bg_tint_in_both_sbs_panes() {
+        // Two plain context rows (l10, l11) well clear of the hunk's own del/add emphasis — the
+        // cursor tint must be visible on its own, not riding on top of an already-colored row.
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold word here\nl10\nl11\nl12\nl13\nl14\n";
+        let new = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew word here\nl10\nl11\nl12\nl13\nl14\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("small.txt", old, new)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        // Move the cursor onto the context row that will render as "l10 " — its display index
+        // is the row whose old-side line number is 10.
+        let cursor_row = app
+            .current_view_ref()
+            .unwrap()
+            .display
+            .iter()
+            .position(|row| matches!(row, DisplayRow::Row(r) if r.old == Row::Line(10)))
+            .expect("l10 row present in the display vector");
+        app.cursor = cursor_row;
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+
+        let cursor_y = content
+            .iter()
+            .position(|line| line.contains("l10 "))
+            .expect("cursor row (l10) visible") as u16;
+        // A DIFFERENT context row, not under the cursor, for comparison — same row "kind"
+        // (plain context) so any bg difference is attributable to the cursor tint alone.
+        let other_y = content
+            .iter()
+            .position(|line| line.contains("l11 "))
+            .expect("comparison context row (l11) visible") as u16;
+
+        // Left (old) pane: gutter column (x=1) is well inside both the gutter and content.
+        let left_cursor_bg = buf.cell((1, cursor_y)).unwrap().style().bg;
+        let left_other_bg = buf.cell((1, other_y)).unwrap().style().bg;
+        assert_ne!(
+            left_cursor_bg, left_other_bg,
+            "expected the cursor row's LEFT pane to carry a background distinct from a \
+             non-cursor context row"
+        );
+
+        // Right (new) pane: same check, at a column past the divider.
+        let left_w = (buf.area.width.saturating_sub(1)) / 2;
+        let right_x = left_w + 2; // skip the divider column, land inside the right pane's gutter
+        let right_cursor_bg = buf.cell((right_x, cursor_y)).unwrap().style().bg;
+        let right_other_bg = buf.cell((right_x, other_y)).unwrap().style().bg;
+        assert_ne!(
+            right_cursor_bg, right_other_bg,
+            "expected the cursor row's RIGHT pane to carry a background distinct from a \
+             non-cursor context row too"
+        );
+
+        // The single `│` divider column between the panes must ALSO carry the cursor wash —
+        // otherwise a dark seam splits the highlight down the middle of every SBS cursor row.
+        let divider_x = left_w;
+        assert_eq!(
+            cell_text(&buf, divider_x, cursor_y),
+            "│",
+            "sanity: located the divider column between the two panes"
+        );
+        assert_eq!(
+            buf.cell((divider_x, cursor_y)).unwrap().style().bg,
+            Some(super::BG_CURSOR),
+            "expected the cursor row's DIVIDER cell to carry the cursor background, not the \
+             default — otherwise the highlight has a seam through the middle"
+        );
+    }
+
+    #[test]
+    fn cursor_row_tint_composites_with_word_diff_emphasis_rather_than_replacing_it() {
+        // The cursor starts on the file's first hunk (a word-diff paired row) after
+        // `open_current` — confirm the strong word-level bg and the whole-line subtle bg on that
+        // SAME row both stay visually distinct from each other even with the cursor tint
+        // layered on top, i.e. the tint composites rather than flattening the existing emphasis.
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold word here\nl10\nl11\nl12\nl13\nl14\n";
+        let new = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew word here\nl10\nl11\nl12\nl13\nl14\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("small.txt", old, new)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+        let changed_row_y = content
+            .iter()
+            .position(|line| line.contains("old word here"))
+            .expect("changed row present") as u16;
+
+        // Gutter width 3 + 1 space = column 4 is where "old" (the changed word) starts; column 8
+        // is the unchanged remainder of the same line ("word here").
+        let word_bg = buf.cell((4, changed_row_y)).unwrap().style().bg;
+        let rest_bg = buf.cell((8, changed_row_y)).unwrap().style().bg;
+        assert_ne!(
+            word_bg, rest_bg,
+            "the cursor tint must not flatten the word-diff strong/subtle distinction on its \
+             own row"
         );
     }
 }
