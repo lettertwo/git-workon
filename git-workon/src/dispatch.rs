@@ -14,7 +14,7 @@
 //! stray `git-workon-list` can never shadow the built-in `list`). An external, if found, shadows
 //! a same-named branch/worktree — `git workon find <name>` remains the explicit escape hatch.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -45,6 +45,34 @@ pub fn find_external(name: &str) -> Option<PathBuf> {
         let candidate = dir.join(&bin_name);
         is_executable(&candidate).then_some(candidate)
     })
+}
+
+/// Enumerate every `git-workon-<suffix>` executable reachable on `$PATH`, returning the sorted set
+/// of `<suffix>` names. Used by the completer to surface external subcommands as top-level
+/// completion candidates (the enumeration counterpart to [`find_external`]'s keyed lookup). Sorted
+/// + deduped so a name earlier on `$PATH` shadowing a later one appears once, deterministically.
+pub fn external_subcommand_names() -> BTreeSet<String> {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return BTreeSet::new();
+    };
+    let mut names = BTreeSet::new();
+    for dir in std::env::split_paths(&path_var) {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let raw = entry.file_name();
+            let Some(file) = raw.to_str() else { continue };
+            let Some(suffix) = file.strip_prefix("git-workon-") else {
+                continue;
+            };
+            if suffix.is_empty() || !is_executable(&entry.path()) {
+                continue;
+            }
+            names.insert(suffix.to_string());
+        }
+    }
+    names
 }
 
 #[cfg(unix)]

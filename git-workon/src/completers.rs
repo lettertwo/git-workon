@@ -69,7 +69,28 @@ pub fn complete_branch_names(current: &OsStr) -> Vec<CompletionCandidate> {
         .collect()
 }
 
+/// Surface `git-workon-*` executables on `$PATH` as top-level subcommands, so `git workon <TAB>`
+/// offers them alongside the built-ins (mirroring `git`'s / `cargo`'s plugin completion). A name
+/// already claimed by a built-in is skipped — the built-in owns it (dispatch enforces the same
+/// precedence). Each is a bare stub `Command`; per-external argument completion (delegating into the
+/// external's own `COMPLETE=` responder) is a separate concern, not wired here.
+fn augment_external_subcommands(cmd: Command) -> Command {
+    let known = crate::dispatch::known_subcommands(&cmd);
+    crate::dispatch::external_subcommand_names()
+        .into_iter()
+        .filter(|name| !known.contains(name))
+        .fold(cmd, |cmd, name| {
+            // `Command::new` needs `&'static str` and clap's `Str` won't take an owned `String`.
+            // Leaking is fine here: `augment` only runs inside the ephemeral `COMPLETE=` completer
+            // process, which emits candidates and exits immediately — the handful of leaked names
+            // live microseconds, never accumulating across invocations.
+            let name: &'static str = String::leak(name);
+            cmd.subcommand(Command::new(name).about("External git-workon subcommand"))
+        })
+}
+
 pub fn augment(cmd: Command) -> Command {
+    let cmd = augment_external_subcommands(cmd);
     cmd.mut_arg("name", |a| {
         a.add(ArgValueCompleter::new(complete_worktree_names))
     })
