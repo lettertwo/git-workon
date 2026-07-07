@@ -13,7 +13,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
-use crate::app::{App, FileView, Layout as AppLayout};
+use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Role};
 use crate::highlight::FgSpan;
 use crate::model::FileStatus;
 use crate::wordiff::Span as WordSpan;
@@ -266,8 +266,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, area: Rect) {
-    let text =
-        "j/k scroll  Ctrl-d/u half-page  g/G top/bottom  ]f/[f file  ]h/[h hunk  L layout  q quit";
+    let text = "j/k scroll  ]f/[f file  ]h/[h hunk  L layout  z zoom  w focus  q quit";
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(FG_DIM)),
         area,
@@ -302,15 +301,135 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     app.ensure_loaded(idx);
-    app.pane_height = area.height as usize;
 
-    match app.layout {
-        AppLayout::Sbs => render_body_sbs(frame, app, area),
-        AppLayout::Inline => render_body_inline(frame, app, area),
+    // The gate re-evaluates the effective zoom for the current file every frame (no caching —
+    // ratatui relayout is free, per locked decision #3).
+    match app.effective_zoom_for(idx) {
+        EffectiveZoom::Single(role) => {
+            app.pane_height = area.height as usize;
+            let scroll = app.scroll;
+            let cursor = Some(app.cursor);
+            match app.layout {
+                AppLayout::Sbs => render_pane_sbs(frame, app, area, idx, role, scroll, cursor),
+                AppLayout::Inline => {
+                    render_pane_inline(frame, app, area, idx, role, scroll, cursor)
+                }
+            }
+        }
+        EffectiveZoom::Split => render_body_split(frame, app, area, idx),
     }
 }
 
-fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
+/// Render the two-pane split: unstaged pane on top, staged on the bottom, each with a dim role
+/// caption, each rendering its role view in the current [`AppLayout`] with its OWN cursor+scroll —
+/// the cursor highlight draws only in the focused pane. The body area splits caption(1) +
+/// unstaged-content + caption(1) + staged-content, with the remainder halved between the two
+/// content panes (even split).
+fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
+    // Too short to fit two captions plus a content line each: fall back to the focused pane alone,
+    // rendered over the whole area, so the user still sees SOMETHING navigable.
+    if area.height < 4 {
+        let role = app.split_focus_role();
+        app.pane_height = area.height as usize;
+        let (scroll, cursor) = app.pane_render_state(role);
+        match app.layout {
+            AppLayout::Sbs => render_pane_sbs(frame, app, area, idx, role, scroll, cursor),
+            AppLayout::Inline => render_pane_inline(frame, app, area, idx, role, scroll, cursor),
+        }
+        return;
+    }
+
+    let content_total = area.height - 2;
+    let top_h = content_total / 2;
+    let bot_h = content_total - top_h;
+
+    let unstaged_caption = Rect::new(area.x, area.y, area.width, 1);
+    let unstaged_content = Rect::new(area.x, area.y + 1, area.width, top_h);
+    let staged_caption = Rect::new(area.x, area.y + 1 + top_h, area.width, 1);
+    let staged_content = Rect::new(area.x, area.y + 2 + top_h, area.width, bot_h);
+
+    // The focused pane owns `pane_height`; the other, `alt_height`. Both scrolls are derived here,
+    // once the (render-time-only) heights are known.
+    let (focused_h, unfocused_h) = if app.split_focus_role() == Role::Unstaged {
+        (top_h, bot_h)
+    } else {
+        (bot_h, top_h)
+    };
+    app.pane_height = focused_h as usize;
+    app.alt_height = unfocused_h as usize;
+    app.derive_scroll();
+    app.derive_alt_scroll();
+
+    render_caption(frame.buffer_mut(), unstaged_caption, "UNSTAGED");
+    render_caption(frame.buffer_mut(), staged_caption, "STAGED");
+
+    let (u_scroll, u_cursor) = app.pane_render_state(Role::Unstaged);
+    let (s_scroll, s_cursor) = app.pane_render_state(Role::Staged);
+    match app.layout {
+        AppLayout::Sbs => {
+            render_pane_sbs(
+                frame,
+                app,
+                unstaged_content,
+                idx,
+                Role::Unstaged,
+                u_scroll,
+                u_cursor,
+            );
+            render_pane_sbs(
+                frame,
+                app,
+                staged_content,
+                idx,
+                Role::Staged,
+                s_scroll,
+                s_cursor,
+            );
+        }
+        AppLayout::Inline => {
+            render_pane_inline(
+                frame,
+                app,
+                unstaged_content,
+                idx,
+                Role::Unstaged,
+                u_scroll,
+                u_cursor,
+            );
+            render_pane_inline(
+                frame,
+                app,
+                staged_content,
+                idx,
+                Role::Staged,
+                s_scroll,
+                s_cursor,
+            );
+        }
+    }
+}
+
+/// Write a split pane's role caption (`── LABEL ──`) across the pane width, styled like the dim
+/// gap-row markers.
+fn render_caption(buf: &mut Buffer, area: Rect, label: &str) {
+    let text = format!("── {label} ──");
+    let line = Line::from(TSpan::styled(text, Style::default().fg(FG_DIM)));
+    buf.set_line(area.x, area.y, &line, area.width);
+}
+
+/// Render one SBS pane of `role`'s view for file `idx` into `area`, scrolled to `scroll`. The
+/// cursor-row highlight draws only when `cursor` is `Some` (the focused pane) and matches a visible
+/// row — a split's unfocused pane passes `None`.
+#[allow(clippy::too_many_arguments)]
+fn render_pane_sbs(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    idx: usize,
+    role: Role,
+    scroll: usize,
+    cursor: Option<usize>,
+) {
     let left_w = area.width.saturating_sub(1) / 2;
     let right_w = area.width.saturating_sub(1).saturating_sub(left_w);
     let hlayout = Layout::default()
@@ -325,15 +444,13 @@ fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
     let div_area = hlayout[1];
     let new_area = hlayout[2];
 
-    let Some(view) = app.current_view_ref() else {
+    let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), old_area);
         return;
     };
     let old_gutter_w = gutter_width(view.old_line_count());
     let new_gutter_w = gutter_width(view.new_line_count());
-    let scroll = app.scroll;
-    let pane_height = app.pane_height;
-    let end = (scroll + pane_height).min(view.display.len());
+    let end = (scroll + area.height as usize).min(view.display.len());
 
     // Phase 1 (mutable): populate the word-span cache for visible paired rows. Phase 2 below
     // re-borrows `app`/`view` immutably to build lines — kept as the same two-phase dance the
@@ -342,7 +459,7 @@ fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
     // borrow checker requires the cache-populating borrow to end before the line-building
     // borrow begins; there's no runtime benefit to trading that compile-time proof for
     // `RefCell` interior mutability here.
-    if let Some(view) = app.current_view() {
+    if let Some(view) = app.role_view_mut(idx, role) {
         for row_idx in scroll..end {
             if matches!(view.display.get(row_idx), Some(DisplayRow::Row(r)) if r.is_word_diff_pair())
             {
@@ -351,7 +468,7 @@ fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let Some(view) = app.current_view_ref() else {
+    let Some(view) = app.role_view_ref(idx, role) else {
         return;
     };
 
@@ -363,7 +480,7 @@ fn render_body_sbs(frame: &mut Frame, app: &mut App, area: Rect) {
 
     for (i, row_idx) in (scroll..end).enumerate() {
         let y = area.y + i as u16;
-        let is_cursor = row_idx == app.cursor;
+        let is_cursor = cursor == Some(row_idx);
         match &view.display[row_idx] {
             DisplayRow::Gap { skipped } => {
                 render_gap_row(frame.buffer_mut(), area, y, *skipped, is_cursor);
@@ -498,20 +615,29 @@ fn build_inline_line(
     Line::from(spans)
 }
 
-fn render_body_inline(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Some(view) = app.current_view_ref() else {
+/// Render one inline pane of `role`'s view for file `idx` into `area`, scrolled to `scroll`. See
+/// [`render_pane_sbs`] for the `cursor`/highlight contract; this is its inline-coordinate-space
+/// analog.
+fn render_pane_inline(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    idx: usize,
+    role: Role,
+    scroll: usize,
+    cursor: Option<usize>,
+) {
+    let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
         return;
     };
     let old_gutter_w = gutter_width(view.old_line_count());
     let new_gutter_w = gutter_width(view.new_line_count());
-    let scroll = app.scroll;
-    let pane_height = app.pane_height;
-    let end = (scroll + pane_height).min(view.inline.len());
+    let end = (scroll + area.height as usize).min(view.inline.len());
 
-    // Same two-phase mutable/immutable dance as `render_body_sbs`, over the inline coordinate
+    // Same two-phase mutable/immutable dance as `render_pane_sbs`, over the inline coordinate
     // space instead.
-    if let Some(view) = app.current_view() {
+    if let Some(view) = app.role_view_mut(idx, role) {
         for row_idx in scroll..end {
             if matches!(view.inline.get(row_idx), Some(r) if r.is_word_diff_pair()) {
                 view.inline_word_spans_for_row(row_idx);
@@ -519,13 +645,13 @@ fn render_body_inline(frame: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let Some(view) = app.current_view_ref() else {
+    let Some(view) = app.role_view_ref(idx, role) else {
         return;
     };
 
     for (i, row_idx) in (scroll..end).enumerate() {
         let y = area.y + i as u16;
-        let is_cursor = row_idx == app.cursor;
+        let is_cursor = cursor == Some(row_idx);
         match &view.inline[row_idx] {
             InlineRow::Gap { skipped } => {
                 render_gap_row(frame.buffer_mut(), area, y, *skipped, is_cursor);
@@ -920,6 +1046,94 @@ mod tests {
             word_bg, rest_bg,
             "the cursor tint must not flatten the word-diff strong/subtle distinction on its \
              own row"
+        );
+    }
+
+    #[test]
+    fn split_renders_both_role_captions_stacked_with_content_in_each_pane() {
+        // A partially-staged file has both a staged (HEAD ↔ index) and an unstaged (index ↔
+        // worktree) sub-diff, so the default split renders two stacked panes.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let buf = render_once(&mut app, 80, 24);
+        let content = buf_lines(&buf);
+
+        let unstaged_cap = content
+            .iter()
+            .position(|line| line.contains("UNSTAGED"))
+            .expect("unstaged caption present");
+        let staged_cap = content
+            .iter()
+            .position(|line| line.contains("STAGED") && !line.contains("UNSTAGED"))
+            .expect("staged caption present");
+        assert!(
+            unstaged_cap < staged_cap,
+            "the unstaged pane's caption must sit above the staged pane's, got:\n{}",
+            content.join("\n")
+        );
+
+        // Both panes actually render their file (the shared context line `alpha` shows up once
+        // per pane) — one below each caption.
+        assert!(
+            content[unstaged_cap + 1..staged_cap]
+                .iter()
+                .any(|line| line.contains("alpha")),
+            "expected file content under the unstaged caption, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content[staged_cap + 1..]
+                .iter()
+                .any(|line| line.contains("alpha")),
+            "expected file content under the staged caption, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn single_pane_zoom_is_identical_to_combined_for_an_unstaged_only_file() {
+        // The common case: a dirty-but-unstaged file. The default split gate downgrades it to a
+        // single unstaged pane, whose view is byte-for-byte the combined view (index == HEAD when
+        // nothing is staged) — so a user who never presses `z` sees exactly the pre-zoom app.
+        let old = "l1\nl2\nl3\nl4\nl5\nold word here\nl7\nl8\nl9\nl10\n";
+        let new = "l1\nl2\nl3\nl4\nl5\nnew word here\nl7\nl8\nl9\nl10\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("small.txt", old, new)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let default_buf = render_once(&mut app, 60, 20);
+
+        // No split chrome leaks into the single-pane render.
+        for line in buf_lines(&default_buf) {
+            assert!(
+                !line.contains("UNSTAGED") && !line.contains("STAGED"),
+                "single-pane render must not show a split caption, got line: {line:?}"
+            );
+        }
+
+        // Explicitly zoom to Combined and re-render — must be pixel-identical.
+        app.cycle_zoom();
+        assert_eq!(app.zoom, crate::app::Zoom::Combined);
+        let combined_buf = render_once(&mut app, 60, 20);
+        assert_eq!(
+            default_buf, combined_buf,
+            "the default (downgraded-to-unstaged) render must match the combined-zoom render \
+             cell-for-cell for an unstaged-only file"
         );
     }
 }
