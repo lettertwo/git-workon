@@ -22,6 +22,7 @@ pub mod file_ops;
 pub mod highlight;
 pub mod model;
 pub mod ops;
+pub mod outline;
 pub mod queue;
 pub mod refresh;
 pub mod render;
