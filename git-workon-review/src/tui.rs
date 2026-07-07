@@ -10,7 +10,8 @@
 //! comparing [`workon_review::refresh::IndexSignature`] and re-diffing in place via
 //! [`App::on_tick`] when it changes. No threads, no `mpsc`, no new deps.
 
-use std::io::{self, Stdout};
+use std::fs::File;
+use std::io::{self, Write};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -255,15 +256,32 @@ fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
     }
 }
 
+/// Open the controlling terminal (`/dev/tty`) for writing, falling back to stdout when there is
+/// none (a pipe/CI with no tty). The TUI renders here rather than to stdout so it stays usable
+/// inside a shell command substitution: the `workon` wrapper function captures `git workon`'s
+/// stdout to `cd` into a printed path, and `git workon review` dispatches to this TUI — if the
+/// alternate screen went to the captured stdout, nothing would reach the terminal and the wrapper
+/// would hang. Writing to `/dev/tty` keeps stdout clean (this mirrors crossterm, which already
+/// reads *input* events from `/dev/tty` on unix). The boxed writer unifies the two branches so the
+/// rest of the lifecycle is one type.
+fn terminal_writer() -> Box<dyn Write> {
+    match File::options().write(true).open("/dev/tty") {
+        Ok(tty) => Box::new(tty),
+        Err(_) => Box::new(io::stdout()),
+    }
+}
+
 /// Install a panic hook that restores the terminal (raw mode off, leave alternate screen) before
 /// the default hook prints the panic — without this, a panic mid-review leaves the user's shell
 /// in alternate-screen raw mode with no visible message. Ported from the spike's
-/// `install_panic_hook`.
+/// `install_panic_hook`. Restores on `/dev/tty` (where the alternate screen was entered), falling
+/// back to stdout — matching [`terminal_writer`].
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let mut out = terminal_writer();
+        let _ = execute!(out, LeaveAlternateScreen);
         default_hook(info);
     }));
 }
@@ -273,9 +291,9 @@ fn install_panic_hook() {
 pub fn run(app: &mut App) -> io::Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
+    let mut out = terminal_writer();
+    execute!(out, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
     let result = event_loop(&mut terminal, app);
@@ -287,7 +305,10 @@ pub fn run(app: &mut App) -> io::Result<()> {
     result
 }
 
-fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
+fn event_loop<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    app: &mut App,
+) -> io::Result<()> {
     let mut pending: Option<char> = None;
     let mut quit = false;
 
