@@ -1,6 +1,7 @@
 mod tui;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::env::CompleteEnv;
 use git2::Repository;
 use miette::{IntoDiagnostic, Result};
 use workon_review::acquire::{diff_changeset, resolve_changesets};
@@ -12,6 +13,11 @@ use workon_review::app::{App, ChangesetView};
 struct Cli {}
 
 fn main() -> Result<()> {
+    // Respond to the `COMPLETE=<shell>` dynamic-completion protocol before anything else — mirrors
+    // git-workon's own entry point. Exits early when `COMPLETE` is set; a no-op otherwise. This is
+    // what lets git-workon delegate `git workon review <TAB>` completion here (M6 CS3).
+    CompleteEnv::with_factory(Cli::command).complete();
+
     Cli::parse();
 
     let repo = Repository::discover(".").into_diagnostic()?;

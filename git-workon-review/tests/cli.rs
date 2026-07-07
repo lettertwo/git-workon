@@ -27,3 +27,23 @@ fn help_shows_usage_and_succeeds() {
         .success()
         .stdout(predicate::str::contains("git-workon-review"));
 }
+
+/// The binary answers the `COMPLETE=<shell>` dynamic-completion protocol (clap_complete's
+/// `CompleteEnv`), so git-workon can delegate `git workon review <TAB>` completion to it (M6 CS3).
+/// The review `Cli` has no args of its own yet, so the completer generates no candidates and exits
+/// 2 ("no completion generated") — but the load-bearing contract is that `COMPLETE` mode
+/// short-circuits into the completer *before* repository discovery or the TUI. Running from an
+/// empty non-repo dir makes that concrete: an unwired binary would instead fail repo discovery;
+/// getting clap_complete's own exit path proves the responder is in place. When M7 gives the
+/// binary a real subcommand (`mcp`), upgrade this to assert that candidate.
+#[test]
+fn responds_to_complete_env_protocol_before_repo_discovery() {
+    let non_repo = assert_fs::TempDir::new().unwrap();
+    let mut cmd = cargo_bin_cmd!("git-workon-review");
+    cmd.env("COMPLETE", "bash")
+        .current_dir(&non_repo)
+        .args(["--", "git-workon-review", ""])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("completion"));
+}
