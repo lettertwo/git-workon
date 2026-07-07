@@ -352,7 +352,16 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Footer priority: a pending discard confirm's prompt (warn-toned) wins over a transient notice,
+/// which wins over the dim hint line.
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if let Some(confirm) = &app.pending_confirm {
+        frame.render_widget(
+            Paragraph::new(confirm.prompt.as_str()).style(Style::default().fg(FG_ERROR)),
+            area,
+        );
+        return;
+    }
     match &app.notice {
         Some(Notice { text, severity }) => {
             let fg = match severity {
@@ -365,8 +374,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         None => {
-            let text =
-                "j/k scroll  ]f/[f file  ]h/[h hunk  L layout  z zoom  w focus  r refresh  q quit";
+            let text = "j/k scroll  s/S stage  d/D discard  z zoom  w focus  r refresh  q quit";
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(FG_DIM)),
                 area,
@@ -1395,6 +1403,37 @@ mod tests {
             buf.cell((0, footer_y)).unwrap().style().fg,
             Some(super::FG_ERROR),
             "expected the error notice to render in the error fg color"
+        );
+    }
+
+    #[test]
+    fn footer_shows_a_pending_confirm_prompt_over_any_notice() {
+        use crate::app::{PendingOp, Severity};
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        // A notice is set, but a pending confirm outranks it on the footer surface.
+        app.notify("some earlier notice", Severity::Info);
+        app.request_confirm(
+            "Discard this hunk from the worktree? (y/n)",
+            PendingOp::DiscardFile { file_idx: 0 },
+        );
+
+        let buf = render_once(&mut app, 80, 10);
+        let footer_y = buf.area.height - 1;
+        let footer: String = (0..buf.area.width)
+            .map(|x| cell_text(&buf, x, footer_y))
+            .collect();
+        assert!(
+            footer.contains("Discard this hunk from the worktree?"),
+            "expected the confirm prompt in the footer, got: {footer:?}"
+        );
+        assert!(
+            !footer.contains("some earlier notice"),
+            "the confirm prompt must take priority over the notice, got: {footer:?}"
         );
     }
 }
