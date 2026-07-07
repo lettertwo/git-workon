@@ -1,6 +1,7 @@
 mod cli;
 mod cmd;
 mod completers;
+mod dispatch;
 mod display;
 mod hooks;
 mod json;
@@ -18,6 +19,8 @@ use crate::json::worktree_to_json;
 
 fn main() -> Result<()> {
     CompleteEnv::with_factory(|| completers::augment(Cli::command())).complete();
+
+    dispatch::try_dispatch(&dispatch::known_subcommands(&Cli::command()));
 
     let mut cli = Cli::parse();
 

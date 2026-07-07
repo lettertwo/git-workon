@@ -2,6 +2,7 @@ pub use crate::{
     assert::{FixtureAssert, IntoFixturePredicate},
     fixture::{CommitBuilder, Fixture},
     fixture_builder::{FixtureBuilder, MetadataFormat, RemoteSource},
+    path_stub::PathStub,
     predicates::{
         BranchPointsToPredicate, HasBranchMetadataPredicate, HasBranchPredicate,
         HasConfigPredicate, HasGraphiteConfigPredicate, HasMetadataParentRevisionPredicate,
