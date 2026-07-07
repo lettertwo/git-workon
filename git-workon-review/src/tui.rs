@@ -58,6 +58,8 @@ enum Action {
     NextHunk,
     PrevHunk,
     ToggleLayout,
+    CycleZoom,
+    ToggleSplitFocus,
     None,
 }
 
@@ -88,6 +90,8 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
         KeyCode::Char('g') => Action::ScrollTop,
         KeyCode::Char('G') => Action::ScrollBottom,
         KeyCode::Char('L') => Action::ToggleLayout,
+        KeyCode::Char('z') => Action::CycleZoom,
+        KeyCode::Char('w') => Action::ToggleSplitFocus,
         KeyCode::Tab => Action::NextFile,
         KeyCode::BackTab => Action::PrevFile,
         KeyCode::Char(']') => {
@@ -114,6 +118,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::NextHunk => app.next_hunk_row(),
         Action::PrevHunk => app.prev_hunk_row(),
         Action::ToggleLayout => app.toggle_layout(),
+        Action::CycleZoom => app.cycle_zoom(),
+        Action::ToggleSplitFocus => app.toggle_split_focus(),
         Action::None => {}
     }
     false
@@ -258,6 +264,19 @@ mod tests {
         assert_eq!(
             map_key(&mut pending, key(KeyCode::Char('L')), 20),
             Action::ToggleLayout
+        );
+    }
+
+    #[test]
+    fn z_and_w_map_to_zoom_and_split_focus() {
+        let mut pending = None;
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('z')), 20),
+            Action::CycleZoom
+        );
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('w')), 20),
+            Action::ToggleSplitFocus
         );
     }
 
