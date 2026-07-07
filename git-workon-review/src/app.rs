@@ -14,7 +14,7 @@ use std::path::Path;
 
 use git2::Repository;
 
-use crate::acquire::WorktreeDiffs;
+use crate::acquire::{diff_uncommitted, WorktreeDiffs};
 use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
 use crate::highlight::{FgSpan, TsHighlighter};
 use crate::model::{DiffModel, FileChange, FileStatus};
@@ -503,23 +503,19 @@ pub struct Notice {
 
 impl App {
     pub fn new(repo: Repository, diffs: WorktreeDiffs) -> Self {
-        let WorktreeDiffs {
-            staged,
-            unstaged,
-            combined,
-        } = diffs;
-        let files = combined.files;
+        let DiffState {
+            files,
+            unstaged_model,
+            staged_model,
+            unstaged_idx,
+            staged_idx,
+        } = DiffState::from(diffs);
         let n = files.len();
-        let unstaged_idx = files
-            .iter()
-            .map(|f| find_role_change(&unstaged, f))
-            .collect();
-        let staged_idx = files.iter().map(|f| find_role_change(&staged, f)).collect();
         Self {
             repo,
             files,
-            unstaged_model: unstaged,
-            staged_model: staged,
+            unstaged_model,
+            staged_model,
             unstaged_idx,
             staged_idx,
             views_combined: (0..n).map(|_| None).collect(),
@@ -538,6 +534,66 @@ impl App {
             split_focus: SplitPane::Unstaged,
             notice: None,
         }
+    }
+
+    /// Re-run [`diff_uncommitted`] and rebuild every diff-derived field in place — the operation
+    /// both a manual refresh (`r`) and (later) a post-staging-op/external-write refresh need. See
+    /// the M4 plan's changeset 5 for the full contract; summarized:
+    ///
+    /// - Rebuilds exactly what [`Self::new`] builds from a fresh [`WorktreeDiffs`]: `files`,
+    ///   `unstaged_model`/`staged_model`, `unstaged_idx`/`staged_idx`, and all three `views_*`
+    ///   (reset to `None` — lazily reloaded, same as a fresh `App`).
+    /// - Does NOT touch `repo` (same handle), `highlighter` (its per-instance grammar cache would
+    ///   have to re-parse every language from scratch if rebuilt), `base_label`, `layout`, or
+    ///   `zoom` (the user's current view mode shouldn't reset just because they pressed `r`, or
+    ///   because a background refresh fired).
+    /// - Preserves position by the current file's PATH: if a file with that path still exists in
+    ///   the rebuilt list, `current` follows it (even if its index moved, e.g. a file alphabetically
+    ///   before it in the old list got fully staged away). If it vanished (fully staged or
+    ///   reverted), `current` clamps into the new list (or `0` if it's now empty).
+    /// - Re-seats the (possibly changed) current file at its first hunk via [`Self::open_current`]
+    ///   — the same path a file switch already uses. This does NOT try to preserve the exact
+    ///   cursor row: the rows under an old cursor position may no longer correspond to the same
+    ///   content once the diff is rebuilt, so jumping to the first hunk (like opening a file fresh)
+    ///   is the only always-valid choice, consistent with how zoom/layout switches already treat
+    ///   cursor position as non-transferable across a reshape.
+    ///
+    /// On a [`diff_uncommitted`] error, leaves all existing state untouched and sets an error
+    /// [`Notice`] instead (via [`Self::notify`]) — a failed refresh must never blank the review.
+    pub fn refresh(&mut self) {
+        let diffs = match diff_uncommitted(&self.repo) {
+            Ok(diffs) => diffs,
+            Err(err) => {
+                self.notify(format!("refresh failed: {err}"), Severity::Error);
+                return;
+            }
+        };
+
+        let current_path = self.files.get(self.current).map(|f| f.path.clone());
+
+        let DiffState {
+            files,
+            unstaged_model,
+            staged_model,
+            unstaged_idx,
+            staged_idx,
+        } = DiffState::from(diffs);
+        let n = files.len();
+
+        self.current = current_path
+            .and_then(|path| files.iter().position(|f| f.path == path))
+            .unwrap_or(if n == 0 { 0 } else { self.current.min(n - 1) });
+
+        self.files = files;
+        self.unstaged_model = unstaged_model;
+        self.staged_model = staged_model;
+        self.unstaged_idx = unstaged_idx;
+        self.staged_idx = staged_idx;
+        self.views_combined = (0..n).map(|_| None).collect();
+        self.views_unstaged = (0..n).map(|_| None).collect();
+        self.views_staged = (0..n).map(|_| None).collect();
+
+        self.open_current();
     }
 
     /// Resolve the [`EffectiveZoom`] for file `idx` this frame: the requested [`Self::zoom`] gated
@@ -991,6 +1047,41 @@ impl App {
     /// Dismiss the current footer notice, if any (a no-op if there isn't one).
     pub fn clear_notice(&mut self) {
         self.notice = None;
+    }
+}
+
+/// The diff-derived pieces [`App::new`] and [`App::refresh`] both build fresh from a
+/// [`WorktreeDiffs`] snapshot — everything EXCEPT the view caches (which the two callers reset
+/// differently sized `None` vectors for) and the navigation/UI state that survives a refresh
+/// (`current`, `cursor`, `layout`, `zoom`, etc. — see [`App::refresh`]'s doc comment).
+struct DiffState {
+    files: Vec<FileChange>,
+    unstaged_model: DiffModel,
+    staged_model: DiffModel,
+    unstaged_idx: Vec<Option<usize>>,
+    staged_idx: Vec<Option<usize>>,
+}
+
+impl From<WorktreeDiffs> for DiffState {
+    fn from(diffs: WorktreeDiffs) -> Self {
+        let WorktreeDiffs {
+            staged,
+            unstaged,
+            combined,
+        } = diffs;
+        let files = combined.files;
+        let unstaged_idx = files
+            .iter()
+            .map(|f| find_role_change(&unstaged, f))
+            .collect();
+        let staged_idx = files.iter().map(|f| find_role_change(&staged, f)).collect();
+        Self {
+            files,
+            unstaged_model: unstaged,
+            staged_model: staged,
+            unstaged_idx,
+            staged_idx,
+        }
     }
 }
 
@@ -1896,5 +1987,150 @@ mod tests {
 
         app.clear_notice();
         assert!(app.notice.is_none(), "clear_notice must clear a set notice");
+    }
+
+    // ---- M4 refresh: in-place re-diff + rebuild -------------------------------------------
+
+    #[test]
+    fn refresh_after_external_worktree_edit_picks_up_the_change() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(!app.current_view_ref().unwrap().new_text().contains("THREE"));
+
+        // Mutate the fixture repo's WORKTREE directly (not this crate's own working tree) — an
+        // edit made outside the TUI, same as a user switching to another editor mid-review.
+        let repo = fixture.repo().unwrap();
+        let workdir = repo.workdir().unwrap();
+        std::fs::write(workdir.join("a.txt"), "one\nCHANGED\nTHREE\n").unwrap();
+
+        app.refresh();
+
+        let view = app
+            .current_view_ref()
+            .expect("current file still has a view after refresh");
+        assert!(
+            view.new_text().contains("THREE"),
+            "refresh must re-read the worktree file, got: {:?}",
+            view.new_text()
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_the_current_file_by_path() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .unstaged_file("b.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.next_file();
+        assert_eq!(app.current, 1, "path-sorted: b.txt is index 1");
+        let path = app.files[app.current].path.clone();
+
+        app.refresh();
+
+        assert_eq!(
+            app.files[app.current].path, path,
+            "refresh must keep tracking the same file by path"
+        );
+    }
+
+    #[test]
+    fn refresh_when_the_current_file_vanished_clamps_without_panicking() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .unstaged_file("b.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.next_file();
+        assert_eq!(app.current, 1, "path-sorted: b.txt is index 1");
+
+        // Revert b.txt's worktree copy back to its committed content, outside the TUI — its dirt
+        // disappears, so the rebuilt file list no longer has an entry for it.
+        let repo = fixture.repo().unwrap();
+        let workdir = repo.workdir().unwrap();
+        std::fs::write(workdir.join("b.txt"), "one\n").unwrap();
+
+        app.refresh();
+
+        assert_eq!(app.files.len(), 1, "only a.txt is still dirty");
+        assert!(
+            app.current < app.files.len(),
+            "current must be clamped in-range, got {}",
+            app.current
+        );
+        assert_eq!(app.files[app.current].path, "a.txt");
+    }
+
+    #[test]
+    fn refresh_failure_leaves_state_intact_and_sets_an_error_notice() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let files_before: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
+
+        // Corrupt the throwaway fixture repo's OWN `.git/HEAD` so `diff_uncommitted`'s
+        // `repo.head()` call fails cheaply — never done against a real working tree.
+        let repo = fixture.repo().unwrap();
+        std::fs::write(repo.path().join("HEAD"), b"garbage-not-a-ref\n").unwrap();
+
+        app.refresh();
+
+        let files_after: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(
+            files_after, files_before,
+            "a failed refresh must leave existing state untouched"
+        );
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("refresh failure must set a notice");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("refresh failed"),
+            "got notice text: {:?}",
+            notice.text
+        );
+    }
+
+    #[test]
+    fn refresh_preserves_zoom_and_layout() {
+        use super::{Layout, Zoom};
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.layout = Layout::Inline;
+        app.zoom = Zoom::Combined;
+
+        app.refresh();
+
+        assert_eq!(app.layout, Layout::Inline, "refresh must not reset layout");
+        assert_eq!(app.zoom, Zoom::Combined, "refresh must not reset zoom");
     }
 }

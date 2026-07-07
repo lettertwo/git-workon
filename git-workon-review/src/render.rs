@@ -365,7 +365,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         None => {
-            let text = "j/k scroll  ]f/[f file  ]h/[h hunk  L layout  z zoom  w focus  q quit";
+            let text =
+                "j/k scroll  ]f/[f file  ]h/[h hunk  L layout  z zoom  w focus  r refresh  q quit";
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(FG_DIM)),
                 area,
