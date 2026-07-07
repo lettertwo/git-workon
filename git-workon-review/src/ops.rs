@@ -1,7 +1,8 @@
 //! Routing: the ONE place (per the M2 design decision) that decides, for a given
 //! [`FileChange`], whether a staging verb goes through the patch-synthesis-and-apply path
 //! (`synthesis.rs`/`apply.rs`) or the whole-file path (`file_ops.rs`). The TUI (M4) calls only
-//! these three functions — it never picks a path itself.
+//! [`apply_hunk`]/[`apply_lines`]/[`apply_line_selections`]/[`apply_file`] — it never picks a
+//! path itself.
 //!
 //! ## The routing table (trap 3)
 //!
@@ -22,15 +23,20 @@
 use git2::Repository;
 
 use crate::apply::{Applier, StageVerb};
-use crate::error::ReviewError;
+use crate::error::{ReviewError, SynthesisError};
 use crate::file_ops;
 use crate::model::{FileChange, FileStatus};
-use crate::synthesis::{partial_hunk_patch, whole_hunk_patch, LineSelection};
+use crate::synthesis::{partial_hunk_patch, whole_hunk_patch, LineSelection, PatchText};
 
 /// Whether `file`'s status/binary-ness can be expressed as a two-sided hunk patch (Modified,
 /// Renamed, or Copied, and not binary) — the routing predicate shared by `apply_hunk` and the
 /// doc comments above.
-fn is_hunk_patchable(file: &FileChange) -> bool {
+///
+/// Also the **line-op eligibility predicate** the TUI pre-validates against before offering
+/// line selection: `apply_lines` REFUSES a non-hunk-patchable file (trap 3, no silent widening),
+/// so the TUI checks this first and shows a "use the whole-file op" notice instead of enqueuing a
+/// doomed line op.
+pub fn is_hunk_patchable(file: &FileChange) -> bool {
     !file.is_binary
         && matches!(
             file.status,
@@ -68,6 +74,10 @@ pub fn apply_hunk(
 /// ([`crate::error::SynthesisError::LineSelectionUnsupported`] /
 /// [`crate::error::SynthesisError::BinaryFile`]), so calling it unconditionally and propagating
 /// its `Result` is both the simplest routing and the correct one.
+///
+/// Single-hunk only — see [`apply_line_selections`] for a selection spanning multiple hunks,
+/// which must NOT be applied as N separate calls to this function (trap 7, see that function's
+/// docs).
 pub fn apply_lines(
     repo: &Repository,
     applier: &dyn Applier,
@@ -79,6 +89,57 @@ pub fn apply_lines(
     let (base, dest, dir) = verb.plan();
     let patch = partial_hunk_patch(file, hunk_idx, sel, base)?;
     applier.apply(repo, &patch, dest, dir)?;
+    Ok(())
+}
+
+/// Apply `verb` to a line-precise selection spanning POSSIBLY MULTIPLE hunks of `file`, as ONE
+/// combined patch (trap 7).
+///
+/// Each `(hunk_idx, LineSelection)` synthesizes its own single-hunk [`PatchText`] via
+/// [`partial_hunk_patch`] (same refusals as [`apply_lines`]: propagated from the FIRST hunk that
+/// fails to synthesize — binary/unsupported-status/out-of-range/empty-selection). Their `.hunks`
+/// are then merged, in ASCENDING `hunk_idx` order, into a single [`PatchText`] sharing the file's
+/// paths/modes (all per-hunk patches synthesize the same ones, since they're all from the same
+/// `file`) — and applied ONCE.
+///
+/// This is NOT equivalent to calling [`apply_lines`] once per hunk: each per-hunk patch is
+/// synthesized from the unstaged (index ↔ worktree) diff, so its hunk header's line numbers
+/// already assume every OTHER selected hunk's change is present too (the worktree has them all).
+/// Applying any single hunk's patch standalone against the index — which has none of the other
+/// hunks yet — leaves the index's actual line numbering inconsistent with what that hunk's header
+/// declares, and libgit2 (strict, no fuzz) rejects the apply. Merging first keeps every selected
+/// hunk's numbering internally consistent within the one patch, exactly as it is in the source
+/// diff, so the whole thing applies cleanly in one shot.
+///
+/// `selections` empty (or every hunk's own selection resolving empty) is the caller's
+/// responsibility to have already refused before enqueuing — this returns
+/// [`SynthesisError::EmptySelection`] as a defensive guard rather than silently no-opping.
+pub fn apply_line_selections(
+    repo: &Repository,
+    applier: &dyn Applier,
+    file: &FileChange,
+    selections: &[(usize, LineSelection)],
+    verb: StageVerb,
+) -> Result<(), ReviewError> {
+    let (base, dest, dir) = verb.plan();
+
+    let mut ordered: Vec<&(usize, LineSelection)> = selections.iter().collect();
+    ordered.sort_by_key(|(hunk_idx, _)| *hunk_idx);
+
+    let mut merged: Option<PatchText> = None;
+    for (hunk_idx, sel) in ordered {
+        let patch = partial_hunk_patch(file, *hunk_idx, sel, base)?;
+        match &mut merged {
+            None => merged = Some(patch),
+            Some(existing) => existing.hunks.extend(patch.hunks),
+        }
+    }
+    let merged = merged.ok_or_else(|| SynthesisError::EmptySelection {
+        path: file.path.clone(),
+        hunk: 0,
+    })?;
+
+    applier.apply(repo, &merged, dest, dir)?;
     Ok(())
 }
 

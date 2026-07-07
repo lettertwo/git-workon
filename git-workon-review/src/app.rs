@@ -9,7 +9,7 @@
 //! handle so it can lazily read blob/worktree content per file as the user navigates to it,
 //! independent of whatever handle acquired the [`DiffModel`] it was built from.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use git2::Repository;
@@ -18,9 +18,11 @@ use crate::acquire::{diff_uncommitted, WorktreeDiffs};
 use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
 use crate::apply::{Git2Applier, StageVerb};
 use crate::highlight::{FgSpan, TsHighlighter};
-use crate::model::{DiffModel, FileChange, FileStatus, Hunk};
-use crate::queue::{OpOutcome, StagingQueue};
-use crate::stage_op::FileStagingOp;
+use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
+use crate::ops;
+use crate::queue::{OpOutcome, StagingOp, StagingQueue};
+use crate::stage_op::{FileStagingOp, LineSelectionOp};
+use crate::synthesis::LineSelection;
 use crate::wordiff::{word_diff_spans, Span};
 
 /// Minimum rows kept between the cursor and the top/bottom of the pane while scrolling — see
@@ -537,13 +539,24 @@ pub struct App {
     /// `y`/`n`/`Esc` to it and IGNORES every other key (a modal capture — see `tui::update`); the
     /// footer shows its prompt in place of the notice/hints.
     pub pending_confirm: Option<Confirm>,
+    /// The anchor row of an active line selection (`v` sets it to the current [`Self::cursor`]),
+    /// or `None` when no selection is active. Lives in the FOCUSED pane's active-layout coordinate
+    /// space, exactly like [`Self::cursor`]: the selected range is
+    /// `[min(anchor, cursor), max(anchor, cursor)]`, so `j`/`k` extend it for free as the cursor
+    /// moves. Cancelled (not translated) whenever the coordinate space reshapes — layout toggle,
+    /// zoom change, file switch, split-focus swap — since a raw row index carries no meaning across
+    /// a reshape.
+    pub selection_anchor: Option<usize>,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
 /// (plus a hunk index for the hunk variant) rather than by a captured closure — an enum stores
-/// cleanly on [`App`] and is resolved against the live diff at `y`-time. Both variants are
-/// discards; line-precise discard is the next changeset (m4-select).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// cleanly on [`App`] and is resolved against the live diff at `y`-time. Every variant is a
+/// discard.
+///
+/// Not `Copy`: [`Self::DiscardLines`] owns a `Vec` of per-hunk [`LineSelection`]s (the selection
+/// snapshot, baked in at `d`-time so the confirm survives the intervening keystrokes).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingOp {
     /// Discard one hunk of the file at `file_idx` from the worktree. `hunk_idx` indexes the
     /// UNSTAGED role's hunks (discard only acts in the unstaged pane), matching where the cursor
@@ -551,6 +564,14 @@ pub enum PendingOp {
     DiscardHunk { file_idx: usize, hunk_idx: usize },
     /// Discard all of the file at `file_idx`'s worktree changes.
     DiscardFile { file_idx: usize },
+    /// Discard a line selection of the file at `file_idx` from the worktree. `selections` is one
+    /// `(hunk_idx, LineSelection)` per overlapped hunk, in the UNSTAGED role's coordinate space
+    /// (discard only acts in the unstaged pane) — the frozen keep-predicate mapping from the
+    /// selection active when the user pressed `d`.
+    DiscardLines {
+        file_idx: usize,
+        selections: Vec<(usize, LineSelection)>,
+    },
 }
 
 /// A pending destructive op plus the scope-stating prompt shown on the footer until answered.
@@ -612,6 +633,7 @@ impl App {
             queue: StagingQueue::new(),
             applier: Git2Applier,
             pending_confirm: None,
+            selection_anchor: None,
         }
     }
 
@@ -874,6 +896,9 @@ impl App {
     /// raw cursor index across a role/zoom switch would be meaningless; jumping to the role's own
     /// first hunk (the same position a fresh file open lands on) is always valid and predictable.
     fn reset_panes(&mut self) {
+        // Any file open / zoom change reshapes the coordinate space an active selection is keyed
+        // in, so drop it (see [`Self::selection_anchor`]).
+        self.selection_anchor = None;
         self.split_focus = SplitPane::Unstaged;
         self.alt = PaneState::default();
         match self.effective_zoom_for(self.current) {
@@ -923,6 +948,9 @@ impl App {
         if self.effective_zoom_for(self.current) != EffectiveZoom::Split {
             return;
         }
+        // The anchor is keyed in the currently-focused pane's coordinate space; switching panes
+        // makes it meaningless, so drop the selection rather than carry a stale index across.
+        self.selection_anchor = None;
         std::mem::swap(&mut self.cursor, &mut self.alt.cursor);
         std::mem::swap(&mut self.scroll, &mut self.alt.scroll);
         std::mem::swap(&mut self.pane_height, &mut self.alt_height);
@@ -1098,6 +1126,11 @@ impl App {
             Layout::Sbs => Layout::Inline,
             Layout::Inline => Layout::Sbs,
         };
+        // The two layouts' row vectors are different coordinate spaces (a paired del/add is one
+        // SBS row but two inline rows), so a selection anchor doesn't translate — cancel it, the
+        // simplest defensible choice (locked decision #8's "press L for per-side precision" flow
+        // starts a fresh selection anyway).
+        self.selection_anchor = None;
         self.clamp_cursor();
         // In a split the flip is global (both panes reflow), so the unfocused pane's cursor needs
         // the same clamp against ITS role's new-layout row count. Its scroll is re-derived at
@@ -1164,7 +1197,15 @@ impl App {
 
     /// Stage (unstaged pane) or unstage (staged pane) the hunk under the cursor (`s`). Refuses on
     /// the combined view, or when the cursor isn't in a hunk.
+    ///
+    /// When a line selection is active, `s` acts on the SELECTION instead
+    /// ([`Self::stage_selection`]) — the hunk under the cursor is irrelevant once the user has
+    /// marked exact lines.
     pub fn stage_hunk(&mut self) {
+        if self.selection_anchor.is_some() {
+            self.stage_selection();
+            return;
+        }
         if self.files.is_empty() {
             return;
         }
@@ -1215,7 +1256,14 @@ impl App {
     /// Request confirmation to discard the hunk under the cursor from the worktree (`d`). Refuses
     /// on the combined view, in a staged pane (discard only reverts worktree changes), or when the
     /// cursor isn't in a hunk. The discard itself runs when the user answers `y`.
+    ///
+    /// When a line selection is active, `d` acts on the SELECTION instead
+    /// ([`Self::discard_selection`]).
     pub fn discard_hunk(&mut self) {
+        if self.selection_anchor.is_some() {
+            self.discard_selection();
+            return;
+        }
         if self.files.is_empty() {
             return;
         }
@@ -1284,6 +1332,10 @@ impl App {
         let Some(confirm) = self.pending_confirm.take() else {
             return;
         };
+        // Answering the modal consumes any active selection either way: its snapshot is already
+        // baked into the `PendingOp` for a line discard, and a lingering highlight after the modal
+        // closes would be confusing. A no-op when nothing is selected.
+        self.selection_anchor = None;
         if !accept {
             return;
         }
@@ -1302,15 +1354,31 @@ impl App {
                 };
                 self.run_op(FileStagingOp::file(file, StageVerb::Discard));
             }
+            PendingOp::DiscardLines {
+                file_idx,
+                selections,
+            } => {
+                // Line discard acts in the unstaged pane, so its selections are keyed against the
+                // unstaged role's sub-`FileChange`.
+                let Some(file) = self.role_change(file_idx, Role::Unstaged).cloned() else {
+                    return;
+                };
+                self.run_op(LineSelectionOp::new(file, selections, StageVerb::Discard));
+            }
         }
     }
 
-    /// Enqueue `op`, drain the queue on the same beat, then act on the outcomes: any failure or
-    /// panic surfaces on the footer and does NOT refresh (the index didn't change as intended); an
-    /// all-`Completed` drain refreshes once, rebuilding the views + attribution from the new index
-    /// (locked decision #5). Only ever one op is in flight, so the queue's trap-4 staleness can't
-    /// arise — the queue is here for its lock-retry and panic isolation.
-    fn run_op(&mut self, op: FileStagingOp) {
+    /// Enqueue `op`, drain the queue on the same beat, then act on the outcome: a failure or panic
+    /// surfaces on the footer and skips the refresh (the index is now in whatever partial state
+    /// the failed op left it in — the user resolves with `r`); a `Completed` drain refreshes,
+    /// rebuilding the views + attribution from the new index (locked decision #5).
+    ///
+    /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]) or a (possibly
+    /// multi-hunk) line selection ([`LineSelectionOp`], which applies as ONE merged patch rather
+    /// than enqueueing one op per hunk — see that type's docs for why splitting is wrong). Either
+    /// way exactly one op is ever in flight, so the queue's trap-4 live-index staleness doesn't
+    /// apply — the queue is here for its lock-retry and panic isolation.
+    fn run_op(&mut self, op: impl StagingOp + 'static) {
         self.queue.enqueue(op);
         // Distinct fields (`queue` mutable, `repo`/`applier` shared) — the borrow checker permits
         // the disjoint borrows in one call, so the queue needn't be taken out and put back.
@@ -1325,6 +1393,244 @@ impl App {
             None => self.refresh(),
         }
     }
+
+    /// Start a line selection anchored at the current cursor (`v`). Refuses (a notice, no anchor
+    /// set) on the combined view or any non-staging role — you can only select lines where you can
+    /// stage them (same gate as the verbs). A no-op on an empty file list.
+    pub fn start_selection(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        if self.staging_role().is_none() {
+            self.notify(
+                "select in the unstaged/staged pane — cycle zoom (z)",
+                Severity::Error,
+            );
+            return;
+        }
+        self.selection_anchor = Some(self.cursor);
+    }
+
+    /// Cancel an active line selection (`Esc`). A no-op when none is active.
+    pub fn cancel_selection(&mut self) {
+        self.selection_anchor = None;
+    }
+
+    /// The inclusive `[lo, hi]` row range of the active selection in the focused pane's active
+    /// layout coordinate space, or `None` when no selection is active. Derived fresh from
+    /// anchor+cursor so `j`/`k` extend it for free.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.selection_anchor?;
+        Some((anchor.min(self.cursor), anchor.max(self.cursor)))
+    }
+
+    /// Map the active selection to one [`LineSelection`] per hunk it overlaps — locked decision
+    /// #8's keep-predicate mapping. Returns `(hunk_idx, LineSelection)` per hunk, ascending by
+    /// `hunk_idx`, keeping only hunks with at least one changed line inside the range (a hunk
+    /// grazed by only context/gap rows is dropped). Empty when there's no selection, no loaded
+    /// focused view, or the range covers only context.
+    ///
+    /// The two layouts differ in what a selected row contributes (locked decision #8):
+    /// - **SBS** row-pair semantics: a selected `AlignedRow` keeps BOTH sides it changes — its Del
+    ///   cell's old line and its Add cell's new line — because a side-by-side row can't split a
+    ///   paired edit (per-side precision is what inline is for).
+    /// - **Inline**: a selected `Del` keeps only its old-side line, an `Add` only its new-side
+    ///   line.
+    ///
+    /// A [`LineSelection`]'s keys are indices into the hunk's `lines` vec, not line numbers, so
+    /// the collected old-del / new-add line numbers are resolved back to `HunkLine` positions via
+    /// the role's own [`FileChange`] — see [`line_selection_for_hunk`].
+    fn selection_line_ops(&self) -> Vec<(usize, LineSelection)> {
+        let Some((lo, hi)) = self.selection_range() else {
+            return Vec::new();
+        };
+        let Some(role) = self.staging_role() else {
+            return Vec::new();
+        };
+        let Some(view) = self.current_view_ref() else {
+            return Vec::new();
+        };
+        let Some(file) = self.role_change(self.current, role) else {
+            return Vec::new();
+        };
+
+        // Per hunk: (selected old-side deletion linenos, selected new-side addition linenos).
+        let mut per_hunk: BTreeMap<usize, (BTreeSet<u32>, BTreeSet<u32>)> = BTreeMap::new();
+        match self.layout {
+            Layout::Sbs => {
+                for r in lo..=hi {
+                    let Some(DisplayRow::Row(row)) = view.display.get(r) else {
+                        continue;
+                    };
+                    let Some(hunk_idx) = view.hunk_at_display_row(r) else {
+                        continue;
+                    };
+                    let entry = per_hunk.entry(hunk_idx).or_default();
+                    if row.old_kind == CellKind::Del {
+                        if let Row::Line(n) = row.old {
+                            entry.0.insert(n as u32);
+                        }
+                    }
+                    if row.new_kind == CellKind::Add {
+                        if let Row::Line(n) = row.new {
+                            entry.1.insert(n as u32);
+                        }
+                    }
+                }
+            }
+            Layout::Inline => {
+                for r in lo..=hi {
+                    let Some(row) = view.inline.get(r) else {
+                        continue;
+                    };
+                    let Some(hunk_idx) = view.hunk_at_inline_row(r) else {
+                        continue;
+                    };
+                    match *row {
+                        InlineRow::Del { old, .. } => {
+                            per_hunk.entry(hunk_idx).or_default().0.insert(old as u32);
+                        }
+                        InlineRow::Add { new, .. } => {
+                            per_hunk.entry(hunk_idx).or_default().1.insert(new as u32);
+                        }
+                        InlineRow::Context { .. } | InlineRow::Gap { .. } => {}
+                    }
+                }
+            }
+        }
+
+        per_hunk
+            .into_iter()
+            .filter_map(|(hunk_idx, (dels, adds))| {
+                let hunk = file.hunks.get(hunk_idx)?;
+                let sel = line_selection_for_hunk(hunk, &dels, &adds);
+                if sel.keep_dels.is_empty() && sel.keep_adds.is_empty() {
+                    None
+                } else {
+                    Some((hunk_idx, sel))
+                }
+            })
+            .collect()
+    }
+
+    /// Stage (unstaged pane) / unstage (staged pane) the active line selection (`s` with a
+    /// selection up). Refuses on the combined view (cycle-zoom notice), on a file no hunk patch
+    /// can express (the modified-file notice — line ops need a two-sided hunk, per
+    /// [`ops::is_hunk_patchable`]), and on a selection that covers no changed lines. Otherwise
+    /// applies every overlapped hunk's kept lines as ONE merged patch via [`LineSelectionOp`]
+    /// (never one op per hunk — see that type's docs), drains once, and clears the selection.
+    fn stage_selection(&mut self) {
+        if self.files.is_empty() {
+            self.cancel_selection();
+            return;
+        }
+        let Some(role) = self.staging_role() else {
+            self.notify(
+                "stage in the unstaged/staged pane — cycle zoom (z)",
+                Severity::Error,
+            );
+            return;
+        };
+        let Some(verb) = Self::verb_for_role(role) else {
+            return;
+        };
+        if !ops::is_hunk_patchable(&self.files[self.current]) {
+            self.notify(
+                "line staging needs a modified file — use s/S for the whole file",
+                Severity::Error,
+            );
+            return;
+        }
+        let selections = self.selection_line_ops();
+        if selections.is_empty() {
+            self.notify("no changed lines in selection", Severity::Error);
+            return;
+        }
+        let Some(file) = self.role_change(self.current, role).cloned() else {
+            return;
+        };
+        self.run_op(LineSelectionOp::new(file, selections, verb));
+        self.cancel_selection();
+    }
+
+    /// Request confirmation to discard the active line selection from the worktree (`d` with a
+    /// selection up). Discard acts only in the unstaged pane; refuses otherwise, on a
+    /// non-hunk-patchable file, or on a selection with no changed lines. The confirm prompt states
+    /// the TRUE scope (total lines across N hunks); the discard runs on `y`.
+    fn discard_selection(&mut self) {
+        if self.files.is_empty() {
+            self.cancel_selection();
+            return;
+        }
+        let Some(role) = self.staging_role() else {
+            self.notify(
+                "stage in the unstaged/staged pane — cycle zoom (z)",
+                Severity::Error,
+            );
+            return;
+        };
+        if role != Role::Unstaged {
+            self.notify("discard acts in the unstaged pane", Severity::Error);
+            return;
+        }
+        if !ops::is_hunk_patchable(&self.files[self.current]) {
+            self.notify(
+                "line staging needs a modified file — use s/S for the whole file",
+                Severity::Error,
+            );
+            return;
+        }
+        let selections = self.selection_line_ops();
+        if selections.is_empty() {
+            self.notify("no changed lines in selection", Severity::Error);
+            return;
+        }
+        let total: usize = selections
+            .iter()
+            .map(|(_, s)| s.keep_dels.len() + s.keep_adds.len())
+            .sum();
+        let hunks = selections.len();
+        let prompt = format!(
+            "Discard {total} line{} across {hunks} hunk{} from the worktree? (y/n)",
+            if total == 1 { "" } else { "s" },
+            if hunks == 1 { "" } else { "s" },
+        );
+        self.request_confirm(
+            prompt,
+            PendingOp::DiscardLines {
+                file_idx: self.current,
+                selections,
+            },
+        );
+    }
+}
+
+/// Resolve a selection's kept old-del / new-add LINE NUMBERS to a [`LineSelection`] — whose keys
+/// are indices into `hunk.lines`, not line numbers (see [`LineSelection`]'s own docs). Walks the
+/// hunk once, keeping each deletion whose `old_lnum` is in `keep_old_dels` and each addition whose
+/// `new_lnum` is in `keep_new_adds`; context lines contribute nothing.
+fn line_selection_for_hunk(
+    hunk: &Hunk,
+    keep_old_dels: &BTreeSet<u32>,
+    keep_new_adds: &BTreeSet<u32>,
+) -> LineSelection {
+    let mut sel = LineSelection::default();
+    for (i, line) in hunk.lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Deletion => {
+                if line.old_lnum.is_some_and(|o| keep_old_dels.contains(&o)) {
+                    sel.keep_dels.insert(i);
+                }
+            }
+            LineKind::Addition => {
+                if line.new_lnum.is_some_and(|n| keep_new_adds.contains(&n)) {
+                    sel.keep_adds.insert(i);
+                }
+            }
+            LineKind::Context => {}
+        }
+    }
+    sel
 }
 
 /// The diff-derived pieces [`App::new`] and [`App::refresh`] both build fresh from a
@@ -2801,6 +3107,405 @@ mod tests {
         assert!(
             !predicate::repo::has_staged_file("many.txt").eval(repo),
             "a refused stage must not touch the index"
+        );
+    }
+
+    // ---- M4 line selection -----------------------------------------------------------------
+
+    /// One hunk with two independent paired changes (line 2 `b`->`B`, line 4 `d`->`D`, one
+    /// context line `c` between them). SBS display rows: 0 ctx, 1 del/add (b/B), 2 ctx, 3 del/add
+    /// (d/D), 4 ctx — so `open_current` lands the cursor on row 1 (the first change).
+    fn two_changes_one_hunk_fixture() -> Fixture {
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "a\nb\nc\nd\ne\n", "a\nB\nc\nD\ne\n")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn line_selection_for_hunk_resolves_linenos_to_hunk_line_indices() {
+        use super::line_selection_for_hunk;
+        use crate::model::{Hunk, HunkLine, LineKind};
+        use std::collections::BTreeSet;
+
+        let line = |kind, content: &str, old, new| HunkLine {
+            kind,
+            content: content.as_bytes().to_vec(),
+            old_lnum: old,
+            new_lnum: new,
+            missing_newline: false,
+        };
+        let hunk = Hunk {
+            old_start: 1,
+            old_count: 5,
+            new_start: 1,
+            new_count: 5,
+            header: b"@@ -1,5 +1,5 @@\n".to_vec(),
+            lines: vec![
+                line(LineKind::Context, "a\n", Some(1), Some(1)),
+                line(LineKind::Deletion, "b\n", Some(2), None),
+                line(LineKind::Addition, "B\n", None, Some(2)),
+                line(LineKind::Deletion, "d\n", Some(4), None),
+                line(LineKind::Addition, "D\n", None, Some(4)),
+            ],
+        };
+        // Keep the b->B change (old-del line 2, new-add line 2), drop the line-4 change: the keep
+        // sets are HUNK-LINE INDICES (1 = the `b` deletion, 2 = the `B` addition), not linenos.
+        let sel = line_selection_for_hunk(&hunk, &BTreeSet::from([2]), &BTreeSet::from([2]));
+        assert_eq!(sel.keep_dels, BTreeSet::from([1]));
+        assert_eq!(sel.keep_adds, BTreeSet::from([2]));
+    }
+
+    #[test]
+    fn sbs_selection_of_a_paired_row_keeps_both_its_del_and_add() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // cursor lands on row 1 (the b->B paired change)
+        app.selection_anchor = Some(app.cursor); // single-row selection
+
+        let ops = app.selection_line_ops();
+        assert_eq!(ops.len(), 1, "one hunk overlapped");
+        let (hunk_idx, sel) = &ops[0];
+        assert_eq!(*hunk_idx, 0);
+        // SBS row-pair semantics (locked decision #8): a paired row keeps BOTH sides.
+        assert_eq!(sel.keep_dels.len(), 1, "SBS keeps the row's deleted line");
+        assert_eq!(sel.keep_adds.len(), 1, "SBS keeps the row's added line too");
+    }
+
+    #[test]
+    fn inline_selection_of_a_del_row_keeps_only_the_del() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.toggle_layout(); // -> inline (a paired change becomes a Del row then an Add row)
+
+        let del_row = app
+            .current_view_ref()
+            .unwrap()
+            .inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Del { old: 2, .. }))
+            .expect("the b-deletion has its own inline Del row");
+        app.cursor = del_row;
+        app.selection_anchor = Some(del_row);
+
+        let ops = app.selection_line_ops();
+        assert_eq!(ops.len(), 1);
+        let (_, sel) = &ops[0];
+        // Inline keeps exactly the one side the selected row shows (locked decision #8).
+        assert_eq!(
+            sel.keep_dels.len(),
+            1,
+            "the selected Del contributes its del"
+        );
+        assert_eq!(sel.keep_adds.len(), 0, "and NOT its paired add");
+    }
+
+    #[test]
+    fn multi_hunk_selection_splits_into_one_line_selection_per_hunk() {
+        let fixture = two_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        // Anchor at the top, sweep the cursor to the last row: the range spans both hunks.
+        app.cursor = 0;
+        app.selection_anchor = Some(0);
+        app.cursor = app.current_view_ref().unwrap().display.len() - 1;
+
+        let ops = app.selection_line_ops();
+        assert_eq!(ops.len(), 2, "two overlapped hunks -> two line selections");
+        assert_eq!(ops[0].0, 0, "ascending hunk order");
+        assert_eq!(ops[1].0, 1);
+        assert!(
+            ops.iter()
+                .all(|(_, s)| !s.keep_dels.is_empty() || !s.keep_adds.is_empty()),
+            "each entry carries at least one changed line"
+        );
+    }
+
+    #[test]
+    fn context_only_selection_yields_no_line_ops() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        // Row 0 is the leading context line `a`.
+        app.cursor = 0;
+        app.selection_anchor = Some(0);
+        assert!(
+            app.selection_line_ops().is_empty(),
+            "a context-only selection maps to no line ops"
+        );
+    }
+
+    #[test]
+    fn stage_selection_stages_only_the_selected_lines_of_a_multi_change_hunk() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // cursor on the first change row (b->B)
+        app.start_selection(); // anchor there -> single-row selection
+        app.stage_hunk(); // routes to the selection stage
+
+        assert!(
+            app.notice.is_none(),
+            "a clean line stage sets no error notice"
+        );
+        assert!(
+            app.selection_anchor.is_none(),
+            "the selection clears after applying"
+        );
+        let repo = fixture.repo().unwrap();
+        // ONLY the b->B change landed in the index; d->D is still just in the worktree.
+        repo.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            "a\nB\nc\nd\ne\n",
+        ));
+        repo.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            "a\nB\nc\nD\ne\n",
+        ));
+        repo.assert(predicate::repo::has_unstaged_file("f.txt"));
+    }
+
+    #[test]
+    fn discard_selection_confirm_states_scope_then_y_reverts_only_selected_lines() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection(); // first change (b->B) only
+        app.discard_hunk(); // routes to the selection discard
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("line discard requests a confirm");
+        // True-scope message: 1 del + 1 add kept = 2 lines, in 1 hunk.
+        assert!(
+            confirm.prompt.contains("Discard 2 lines across 1 hunk"),
+            "got: {:?}",
+            confirm.prompt
+        );
+        // Nothing reverted until `y`.
+        fixture.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            "a\nB\nc\nD\ne\n",
+        ));
+
+        app.resolve_confirm(true);
+        assert!(
+            app.selection_anchor.is_none(),
+            "answering clears the selection"
+        );
+        // Only the selected b->B change reverted in the worktree; d->D stays.
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            "a\nb\nc\nD\ne\n",
+        ));
+    }
+
+    #[test]
+    fn discard_selection_confirm_n_leaves_the_worktree_unchanged() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection();
+        app.discard_hunk();
+        app.resolve_confirm(false);
+
+        assert!(app.pending_confirm.is_none(), "n clears the confirm");
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            "a\nB\nc\nD\ne\n",
+        ));
+    }
+
+    /// Two well-separated hunks in one file. The FIRST (earlier) hunk is a net +2 lines (a
+    /// modification plus two insertions), so its change shifts every later line number in
+    /// whichever text already contains it. A per-hunk patch is synthesized against the FULL
+    /// unstaged (index ↔ worktree) diff, so hunk 2's header numbers already assume hunk 1's +2
+    /// shift is present — draining hunk 1 and hunk 2 as two SEPARATE applies against the index
+    /// (which starts with neither hunk's change) leaves hunk 2's patch inconsistent with
+    /// whatever the index actually contains at that point, and libgit2 (strict, no fuzz) rejects
+    /// it regardless of which hunk goes first. Merging both hunks into ONE patch (ascending
+    /// order, exactly as they appear in the source diff) keeps the numbering internally
+    /// consistent, so the whole selection applies in a single shot — see
+    /// [`crate::ops::apply_line_selections`].
+    fn two_hunks_net_shift_fixture() -> Fixture {
+        let committed: String = (1..=20).map(|n| format!("L{n}\n")).collect();
+        let mut worktree = String::from("L1\nL2X\nINS_A\nINS_B\n");
+        for n in 3..=17 {
+            worktree.push_str(&format!("L{n}\n"));
+        }
+        worktree.push_str("L18X\nL19\nL20\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &committed, &worktree)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn line_stage_across_two_hunks_applies_both_despite_the_earlier_hunks_line_shift() {
+        let fixture = two_hunks_net_shift_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        // Select the whole file (both hunks and the gap between them), then stage the selection.
+        app.cursor = 0;
+        app.start_selection();
+        app.scroll_bottom(); // cursor -> last display row
+        app.stage_hunk(); // active selection -> stage_selection over both hunks
+
+        assert!(
+            app.notice.is_none(),
+            "both hunks must stage cleanly; got notice: {:?}",
+            app.notice
+        );
+        assert!(
+            app.selection_anchor.is_none(),
+            "selection clears after apply"
+        );
+        // Both changes landed in the index in ONE apply: it now equals the worktree in full.
+        let repo = fixture.repo().unwrap();
+        let worktree = std::fs::read_to_string(repo.workdir().unwrap().join("f.txt")).unwrap();
+        repo.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            worktree.as_str(),
+        ));
+    }
+
+    #[test]
+    fn line_discard_across_two_hunks_reverts_both_despite_the_earlier_hunks_line_shift() {
+        // Mirrors the stage tripwire above for the DISCARD verb (worktree -> index, reversed): a
+        // multi-hunk line discard must also merge into one patch rather than one apply per hunk.
+        let fixture = two_hunks_net_shift_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.cursor = 0;
+        app.start_selection();
+        app.scroll_bottom();
+        app.discard_hunk(); // active selection -> discard_selection over both hunks
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("multi-hunk line discard requests a confirm");
+        assert!(
+            confirm.prompt.contains("hunks"),
+            "expected the true-scope prompt to name multiple hunks, got: {:?}",
+            confirm.prompt
+        );
+
+        app.resolve_confirm(true);
+        assert!(
+            app.notice.is_none(),
+            "both hunks must discard cleanly in one apply; got notice: {:?}",
+            app.notice
+        );
+        assert!(
+            app.selection_anchor.is_none(),
+            "selection clears after resolving the confirm"
+        );
+
+        // Both changes reverted in the worktree in ONE apply: it now equals HEAD in full.
+        let repo = fixture.repo().unwrap();
+        let head: String = (1..=20).map(|n| format!("L{n}\n")).collect();
+        repo.assert(predicate::repo::workdir_file_equals("f.txt", head.as_str()));
+    }
+
+    #[test]
+    fn line_stage_on_untracked_file_refuses_with_modified_file_message() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("new.txt", "x\ny\nz\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection(); // untracked file has an unstaged change, so selection is allowed
+        app.stage_hunk();
+
+        let notice = app.notice.as_ref().expect("line staging must refuse here");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("line staging needs a modified file"),
+            "got: {:?}",
+            notice.text
+        );
+        let repo = fixture.repo().unwrap();
+        assert!(
+            !predicate::repo::has_staged_file("new.txt").eval(repo),
+            "a refused line stage must not touch the index"
+        );
+    }
+
+    #[test]
+    fn line_stage_of_context_only_selection_refuses() {
+        use super::Severity;
+
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cursor = 0; // leading context row
+        app.start_selection();
+        app.stage_hunk();
+
+        let notice = app.notice.as_ref().expect("context-only stage must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("no changed lines in selection"),
+            "got: {:?}",
+            notice.text
+        );
+        let repo = fixture.repo().unwrap();
+        assert!(!predicate::repo::has_staged_file("f.txt").eval(repo));
+    }
+
+    #[test]
+    fn start_selection_in_combined_view_refuses() {
+        use super::{Severity, Zoom};
+
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = Zoom::Combined;
+        app.open_current();
+        app.start_selection();
+
+        assert!(
+            app.selection_anchor.is_none(),
+            "the combined view has no staging direction, so selection is refused"
+        );
+        let notice = app.notice.as_ref().expect("combined selection must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("cycle zoom"), "got: {:?}", notice.text);
+    }
+
+    #[test]
+    fn cancel_and_layout_toggle_both_clear_an_active_selection() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+        app.cancel_selection();
+        assert!(
+            app.selection_anchor.is_none(),
+            "cancel clears the selection"
+        );
+
+        // A layout toggle reshapes the coordinate space, so it also cancels.
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+        app.toggle_layout();
+        assert!(
+            app.selection_anchor.is_none(),
+            "toggling layout cancels the selection"
         );
     }
 }

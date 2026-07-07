@@ -65,6 +65,7 @@ enum Action {
     StageFile,
     DiscardHunk,
     DiscardFile,
+    StartSelection,
     None,
 }
 
@@ -102,6 +103,7 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
         KeyCode::Char('S') => Action::StageFile,
         KeyCode::Char('d') => Action::DiscardHunk,
         KeyCode::Char('D') => Action::DiscardFile,
+        KeyCode::Char('v') => Action::StartSelection,
         KeyCode::Tab => Action::NextFile,
         KeyCode::BackTab => Action::PrevFile,
         KeyCode::Char(']') => {
@@ -135,6 +137,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::StageFile => app.stage_file(),
         Action::DiscardHunk => app.discard_hunk(),
         Action::DiscardFile => app.discard_file(),
+        Action::StartSelection => app.start_selection(),
         Action::None => {}
     }
     false
@@ -149,9 +152,19 @@ fn apply_action(app: &mut App, action: Action) -> bool {
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
 ///
-/// A pending discard confirm captures the keyboard FIRST (before the notice clear and the normal
-/// key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal that
-/// neither clears the notice nor runs a normal action while it's up.
+/// Esc precedence (highest first): a pending discard confirm > an active line selection > the
+/// normal key map (where Esc quits). Concretely:
+///
+/// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
+///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
+///    that neither clears the notice nor runs a normal action while it's up.
+/// 2. Otherwise, with an active line selection, Esc CANCELS the selection instead of quitting (`q`
+///    still quits). Other keys fall through to the normal map — `j`/`k` extend the selection,
+///    `s`/`d` act on it.
+/// 3. Otherwise the normal map applies, where Esc (like `q`) quits.
+///
+/// A `Key` event clears any showing footer notice before applying its own action (cases 2 and 3);
+/// the confirm modal (case 1) deliberately does not.
 fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
@@ -162,6 +175,11 @@ fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
                 }
                 _ => {}
             }
+            false
+        }
+        AppEvent::Key(key) if app.selection_anchor.is_some() && key.code == KeyCode::Esc => {
+            app.clear_notice();
+            app.cancel_selection();
             false
         }
         AppEvent::Key(key) => {
@@ -508,6 +526,56 @@ mod tests {
         assert_eq!(
             map_key(&mut pending, ctrl_key('d'), 20),
             Action::MoveCursorBy(10)
+        );
+    }
+
+    #[test]
+    fn v_maps_to_start_selection() {
+        let mut pending = None;
+        assert_eq!(
+            map_key(&mut pending, key(KeyCode::Char('v')), 20),
+            Action::StartSelection
+        );
+    }
+
+    #[test]
+    fn esc_precedence_confirm_over_selection_over_quit() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let mut pending = None;
+
+        // Lowest precedence: with neither a confirm nor a selection up, Esc quits.
+        assert!(
+            update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Esc))),
+            "Esc quits when nothing modal is active"
+        );
+
+        // Middle precedence: an active selection makes Esc cancel the selection (not quit).
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+        let quit = update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Esc)));
+        assert!(!quit, "Esc must not quit while a selection is active");
+        assert!(
+            app.selection_anchor.is_none(),
+            "Esc cancels the active selection"
+        );
+
+        // Highest precedence: a pending confirm captures Esc as a cancel, even with a selection up.
+        app.start_selection();
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+        let quit = update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Esc)));
+        assert!(!quit, "Esc must not quit while a confirm is pending");
+        assert!(
+            app.pending_confirm.is_none(),
+            "the confirm arm consumes Esc first"
         );
     }
 
