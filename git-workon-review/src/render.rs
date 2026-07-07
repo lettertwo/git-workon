@@ -17,6 +17,7 @@ use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role
 use crate::attribute::Attribution;
 use crate::highlight::FgSpan;
 use crate::model::FileStatus;
+use crate::outline::OutlineItem;
 use crate::wordiff::Span as WordSpan;
 
 const BG_DEL_SUBTLE: Color = Color::Rgb(60, 24, 24);
@@ -49,6 +50,16 @@ const BG_SELECTION: Color = Color::Rgb(30, 66, 66);
 /// Warning tone for the winbar's needs-restack marker (locked decision #9) — an amber, distinct
 /// from [`FG_ERROR`]'s red: a stale-parent changeset is a heads-up to `gt restack`, not a failure.
 const FG_WARN: Color = Color::Rgb(214, 158, 46);
+/// Tone for the outline's "this is the lib-marked `current` changeset" marker (locked decision
+/// #9's outline half) — a green, distinct from every other marker color in this module so
+/// "current" reads unambiguously at a glance.
+const FG_CURRENT: Color = Color::Rgb(96, 200, 128);
+/// Cursor tint for the outline pane while it is OPEN but NOT focused — a dimmer wash than
+/// [`BG_CURSOR`] so the outline's remembered position stays legible without competing with the
+/// diff's own (focused) cursor row for visual weight.
+const BG_OUTLINE_CURSOR_UNFOCUSED: Color = Color::Rgb(35, 38, 55);
+/// Fixed column width of the outline side pane (locked design: "~35 cols").
+const OUTLINE_WIDTH: u16 = 35;
 
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
@@ -348,7 +359,105 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_header(frame, app, header_area);
     render_footer(frame, app, footer_area);
-    render_body(frame, app, body_area);
+
+    if app.outline_open() {
+        let hlayout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(OUTLINE_WIDTH),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(body_area);
+        let outline_area = hlayout[0];
+        let div_area = hlayout[1];
+        let diff_area = hlayout[2];
+        render_outline(frame, app, outline_area);
+        for y in div_area.y..div_area.y + div_area.height {
+            frame
+                .buffer_mut()
+                .set_string(div_area.x, y, "│", Style::default().fg(FG_DIM));
+        }
+        render_body(frame, app, diff_area);
+    } else {
+        // Closed: the diff takes the full body width — the exact M4 look (locked design).
+        render_body(frame, app, body_area);
+    }
+}
+
+/// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
+/// carry the changeset's position marker (green ● for `cs.current`) and needs-restack glyph
+/// (amber ⚠, [`FG_WARN`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
+/// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
+/// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
+/// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
+/// diff's [`App::cursor`]) gets [`BG_CURSOR`] while the outline has focus, or the dimmer
+/// [`BG_OUTLINE_CURSOR_UNFOCUSED`] while it's merely open (so the remembered position stays
+/// legible even after focus returns to the diff).
+fn render_outline(frame: &mut Frame, app: &App, area: Rect) {
+    let items = app.outline_items();
+    let cursor = app.outline_cursor();
+    let focused = app.outline_focused();
+
+    let visible_h = area.height as usize;
+    let scroll = if visible_h == 0 {
+        0
+    } else if cursor >= visible_h {
+        cursor + 1 - visible_h
+    } else {
+        0
+    };
+
+    let buf = frame.buffer_mut();
+    for row in 0..area.height {
+        let item_idx = scroll + row as usize;
+        let y = area.y + row;
+        let Some(item) = items.get(item_idx) else {
+            continue;
+        };
+        let is_cursor = item_idx == cursor;
+        let line = build_outline_line(item);
+        let line = if is_cursor && focused {
+            apply_cursor_row(line, area.width)
+        } else if is_cursor {
+            apply_row_tint(line, area.width, BG_OUTLINE_CURSOR_UNFOCUSED)
+        } else {
+            line
+        };
+        buf.set_line(area.x, y, &line, area.width);
+    }
+}
+
+/// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
+/// marker rules.
+fn build_outline_line(item: &OutlineItem) -> Line<'static> {
+    match item {
+        OutlineItem::Header {
+            label,
+            current,
+            needs_restack,
+            ..
+        } => {
+            let marker = if *current { "\u{25CF} " } else { "  " };
+            let mut spans = vec![TSpan::styled(
+                marker.to_string(),
+                Style::default().fg(FG_CURRENT),
+            )];
+            spans.push(TSpan::styled(
+                label.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            if *needs_restack {
+                spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
+            }
+            Line::from(spans)
+        }
+        OutlineItem::File { path, status, .. } => {
+            let glyph = status.glyph();
+            let text = format!("  {glyph} {path}");
+            Line::from(TSpan::styled(text, Style::default().fg(FG_DEFAULT)))
+        }
+    }
 }
 
 /// The current file's label for the top status row: its path, or a rename's `old @ base ->
@@ -442,9 +551,14 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         None => {
-            // A committed changeset is locked to the combined view (locked decision #2) — `z`
-            // zoom and `w` split-focus have nothing to act on, so drop them from the hint.
-            let text = if app.is_committed() {
+            // While the outline has focus, only outline-relevant keys act (locked design) — the
+            // diff-editing hint would be actively misleading, so show the outline's own hint
+            // instead.
+            let text = if app.outline_focused() {
+                "j/k move  Enter jump  i mode  o unfocus  Esc unfocus  q quit"
+            } else if app.is_committed() {
+                // A committed changeset is locked to the combined view (locked decision #2) — `z`
+                // zoom and `w` split-focus have nothing to act on, so drop them from the hint.
                 "j/k scroll  v select  s/S stage  d/D discard  q quit"
             } else {
                 "j/k scroll  v select  s/S stage  d/D discard  z zoom  w focus  q quit"
@@ -1854,6 +1968,172 @@ mod tests {
             !dim_adds.contains(&add_bg),
             "a committed changeset has no staged/unstaged split to color by — it must never \
              render the dim 'already staged' pair, got {add_bg:?}"
+        );
+    }
+
+    // ── M5 CS3: outline side pane ───────────────────────────────────────────────
+
+    /// Every outline test renders at this width so the pane's fixed 35-col + 1-col-divider
+    /// layout is unambiguous: columns `0..35` are the outline, `35` the divider, `36..` the
+    /// diff.
+    const OUTLINE_TEST_WIDTH: u16 = 80;
+
+    fn outline_row(buf: &Buffer, y: u16) -> String {
+        (0..35).map(|x| cell_text(buf, x, y)).collect()
+    }
+
+    #[test]
+    fn outline_pane_renders_headers_when_open_and_disappears_when_closed() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(
+            app.outline_open(),
+            "a two-changeset stack must default-open the outline"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            content.iter().any(|row| row.contains("Add a")),
+            "expected the outline's Stack-mode header row for cs-a (rendered by its title), \
+             got:\n{}",
+            content.join("\n")
+        );
+
+        // Default state is open+unfocused, so a single `o` closes it (see
+        // `App::toggle_outline`'s cycle).
+        app.toggle_outline();
+        assert!(!app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            !content.iter().any(|row| row.contains("Add a")),
+            "closing the outline must stop rendering its rows, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_absent_for_a_lone_changeset() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        assert!(!app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // The diff's own content (the M4 full-width look) must reach all the way to the left
+        // edge — column 0 — rather than starting past a 36-column outline+divider offset.
+        let row1: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 1)).collect();
+        assert!(
+            row1.contains("a.txt") || row1.trim().is_empty() || row1.contains("one"),
+            "sanity: body row must be diff content, not outline chrome, got: {row1:?}"
+        );
+        assert_ne!(
+            cell_text(&buf, 35, 1),
+            "│",
+            "a closed outline must not draw its divider column"
+        );
+    }
+
+    #[test]
+    fn outline_header_current_marker_uses_the_current_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b is `current`
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .position(|r| r.contains('\u{25CF}'))
+            .expect("current marker present in the outline");
+        let marker_x = content[row].find('\u{25CF}').unwrap() as u16;
+        assert_eq!(
+            buf.cell((marker_x, row as u16)).unwrap().style().fg,
+            Some(super::FG_CURRENT),
+            "expected the outline's current marker to carry FG_CURRENT"
+        );
+    }
+
+    #[test]
+    fn outline_header_restack_marker_carries_the_warning_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b needs_restack: true
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .position(|r| r.contains('\u{26A0}'))
+            .expect("restack marker present in the outline");
+        let marker_x = content[row].find('\u{26A0}').unwrap() as u16;
+        assert_eq!(
+            buf.cell((marker_x, row as u16)).unwrap().style().fg,
+            Some(super::FG_WARN),
+            "expected the outline's restack glyph to carry FG_WARN"
+        );
+    }
+
+    #[test]
+    fn outline_cursor_row_carries_cursor_background_when_focused() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        // Default is open+unfocused; two toggles: close, then reopen (which focuses).
+        app.toggle_outline();
+        app.toggle_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let cursor_y = 1 + app.outline_cursor() as u16;
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        assert_eq!(
+            buf.cell((2, cursor_y)).unwrap().style().bg,
+            Some(super::BG_CURSOR),
+            "expected the outline's cursor row to carry BG_CURSOR while focused"
+        );
+    }
+
+    #[test]
+    fn outline_flat_mode_dedupes_paths_across_the_stack() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.outline_cycle_mode(); // Stack -> Flat
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Flat);
+
+        let items = app.outline_items();
+        let paths: Vec<&str> = items
+            .iter()
+            .map(|it| match it {
+                crate::outline::OutlineItem::File { path, .. } => path.as_str(),
+                crate::outline::OutlineItem::Header { .. } => {
+                    panic!("Flat mode must not emit header rows")
+                }
+            })
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            paths.len(),
+            sorted.len(),
+            "every path must appear exactly once in Flat mode, got: {paths:?}"
         );
     }
 }

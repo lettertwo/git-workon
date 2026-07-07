@@ -21,6 +21,7 @@ use crate::apply::{Git2Applier, StageVerb};
 use crate::highlight::{FgSpan, TsHighlighter};
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
+use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::stage_op::{FileStagingOp, LineSelectionOp};
@@ -439,6 +440,19 @@ pub fn effective_zoom(
     }
 }
 
+/// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
+/// than the diff) currently has keyboard focus, its own cursor (an index into
+/// [`App::outline_items`]'s row list — a wholly separate coordinate space from [`App::cursor`]),
+/// and which [`OutlineMode`] it's rendering. Lives directly on [`App`] (unlike the per-changeset
+/// diff state) since it's small and there's only ever one outline for the whole review session.
+#[derive(Debug, Clone)]
+pub struct OutlineState {
+    pub open: bool,
+    pub focused: bool,
+    pub cursor: usize,
+    pub mode: OutlineMode,
+}
+
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
 /// staged role. Focus decides which pane owns [`App::cursor`]/[`App::scroll`] and where the cursor
 /// highlight draws; `w` toggles it.
@@ -536,6 +550,25 @@ impl ChangesetView {
     pub fn file_count(&self) -> usize {
         self.diff.files.len()
     }
+
+    /// This changeset's combined file list — `App::outline_items` reads this to build the
+    /// outline's rows without reaching into [`Self::diff`] directly (private to this module).
+    pub fn files(&self) -> &[FileChange] {
+        &self.diff.files
+    }
+
+    /// This changeset's file `idx`'s [`crate::outline::StagedStatus`] for the outline's status
+    /// column, derived from the same unstaged/staged membership maps [`effective_zoom`] gates
+    /// on. A committed changeset's maps are always all-`None` (see
+    /// [`DiffState::from_committed`]), so this naturally resolves every one of its files to
+    /// [`crate::outline::StagedStatus::None`] with no committed-specific branch — the outline's
+    /// "status column only for the uncommitted changeset" requirement falls out of that, rather
+    /// than being checked explicitly here.
+    pub fn staged_status(&self, idx: usize) -> crate::outline::StagedStatus {
+        let has_unstaged = self.diff.unstaged_idx.get(idx).copied().flatten().is_some();
+        let has_staged = self.diff.staged_idx.get(idx).copied().flatten().is_some();
+        crate::outline::StagedStatus::from_flags(has_unstaged, has_staged)
+    }
 }
 
 /// Review session state: the active changeset's file list, per-file lazily loaded views, and
@@ -620,6 +653,12 @@ pub struct App {
     /// synchronous poll-on-`Tick`, no threads). See [`Self::on_tick`] and
     /// [`Self::coordinated_refresh`].
     refresh_coordinator: RefreshCoordinator,
+    /// The outline side pane's state — see [`OutlineState`]'s doc comment. Initialized by
+    /// [`Self::from_changesets`] to open-when-`len() > 1`/unfocused/[`OutlineMode::default`]
+    /// (the "decided without interview" default in the M5 plan), and repositioned (never
+    /// rebuilt-from-scratch — `open`/`focused`/`mode` persist, like [`Self::layout`]/
+    /// [`Self::zoom`]) by every diff-initiated nav and by [`Self::refresh`].
+    outline: OutlineState,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -707,6 +746,16 @@ impl App {
         );
         let current_cs = current_cs_index(&changesets);
         let base_label = base_label_for(&changesets[current_cs].cs);
+        // Default-open when the stack has more than one changeset (the M5 plan's
+        // "decided without interview" default — preserves the M4 full-width look for a lone
+        // uncommitted changeset), unfocused (the diff keeps initial keyboard focus so the user
+        // can start reading immediately), Stack mode (shows the structure M5 exists to surface).
+        let outline = OutlineState {
+            open: changesets.len() > 1,
+            focused: false,
+            cursor: 0,
+            mode: OutlineMode::default(),
+        };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
         // diff, so the FIRST `Tick` doesn't see an "unseen" signature and spuriously re-diff an
@@ -720,7 +769,7 @@ impl App {
             let ticket = refresh_coordinator.begin();
             refresh_coordinator.complete(ticket, sig);
         }
-        Self {
+        let mut app = Self {
             repo,
             changesets,
             current_cs,
@@ -741,7 +790,14 @@ impl App {
             pending_confirm: None,
             selection_anchor: None,
             refresh_coordinator,
-        }
+            outline,
+        };
+        // Position the outline cursor on the changeset/file the lib marked `current` (the same
+        // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
+        // than leaving it at its default `0` — in Stack mode row `0` is a HEADER, not the current
+        // file, whenever the current changeset isn't the first in the stack.
+        app.sync_outline_to_current();
+        app
     }
 
     /// The current `.git/index`'s cheap fingerprint (mtime + size), or `None` if the read fails —
@@ -917,6 +973,10 @@ impl App {
             .unwrap_or(if n == 0 { 0 } else { self.current.min(n - 1) });
 
         self.open_current();
+        // The rebuilt changeset list can resize/reorder the outline's row list out from under
+        // its cursor — reposition it, same as every other diff-initiated nav (does NOT touch
+        // `outline.open`/`focused`/`mode`, which persist across a refresh like `layout`/`zoom`).
+        self.sync_outline_to_current();
     }
 
     /// Resolve the [`EffectiveZoom`] for file `idx` this frame: the requested [`Self::zoom`] gated
@@ -1243,6 +1303,13 @@ impl App {
     /// #5): at the active changeset's last file, this advances `current_cs` and lands on the NEXT
     /// changeset's first file, rather than wrapping within the active changeset. Clamps (does NOT
     /// wrap) at the very last file of the very last changeset.
+    ///
+    /// A DIFF-initiated nav entry point (as opposed to `switch_changeset`/`goto_changeset`, which
+    /// also serve the OUTLINE's own jumps) — repositions the outline cursor to follow via
+    /// [`Self::sync_outline_to_current`] at the end. This is the sync-follow discipline's echo
+    /// break (see that method's doc comment): only the diff-initiated entry points call it, so an
+    /// outline-initiated jump (which sets [`OutlineState::cursor`] itself before calling
+    /// `switch_changeset`/`goto_changeset` directly) never re-triggers it.
     pub fn next_file(&mut self) {
         if self.cur().diff.files.is_empty() {
             return;
@@ -1254,12 +1321,14 @@ impl App {
             self.switch_changeset(self.current_cs + 1, 0);
         }
         // Else: already at the stack's very last file — clamp, no-op.
+        self.sync_outline_to_current();
     }
 
     /// Retreat to the previous file (`[f`/BackTab), continuously across the whole stack — the
     /// mirror of [`Self::next_file`]. At the active changeset's first file, drops into the
     /// PREVIOUS changeset's LAST file. Clamps (does NOT wrap) at the very first file of the very
-    /// first changeset.
+    /// first changeset. See [`Self::next_file`]'s doc comment for why this calls
+    /// [`Self::sync_outline_to_current`] at the end.
     pub fn prev_file(&mut self) {
         if self.cur().diff.files.is_empty() {
             return;
@@ -1273,25 +1342,194 @@ impl App {
             self.switch_changeset(target, last);
         }
         // Else: already at the stack's very first file — clamp, no-op.
+        self.sync_outline_to_current();
     }
 
-    /// Jump to changeset `target`'s first file (`]c`/`[c`, and any future outline click-to-jump).
-    /// Clamps into `[0, changeset_count() - 1]` — never wraps.
+    /// Jump to changeset `target`'s first file (`]c`/`[c`, and the outline's own header-row
+    /// jump). Clamps into `[0, changeset_count() - 1]` — never wraps. Deliberately does NOT call
+    /// [`Self::sync_outline_to_current`] itself (see [`Self::next_file`]'s doc comment) — the
+    /// outline's own header-row jump ([`Self::outline_confirm`]) calls it explicitly afterward
+    /// instead, since this method is shared with that outline-initiated path.
     pub fn goto_changeset(&mut self, target: usize) {
         self.switch_changeset(target, 0);
     }
 
-    /// Jump to the next changeset's first file (`]c`). A no-op at the last changeset.
+    /// Jump to the next changeset's first file (`]c`). A no-op at the last changeset. A
+    /// DIFF-initiated entry point — see [`Self::next_file`]'s doc comment on the sync-follow
+    /// discipline.
     pub fn next_changeset(&mut self) {
         if self.current_cs + 1 < self.changesets.len() {
             self.goto_changeset(self.current_cs + 1);
         }
+        self.sync_outline_to_current();
     }
 
-    /// Jump to the previous changeset's first file (`[c`). A no-op at the first changeset.
+    /// Jump to the previous changeset's first file (`[c`). A no-op at the first changeset. See
+    /// [`Self::next_file`]'s doc comment on the sync-follow discipline.
     pub fn prev_changeset(&mut self) {
         if self.current_cs > 0 {
             self.goto_changeset(self.current_cs - 1);
+        }
+        self.sync_outline_to_current();
+    }
+
+    // ── Outline side pane (CS3) ─────────────────────────────────────────────────
+
+    /// Snapshot every reviewed changeset into [`OutlineChangeset`]/[`OutlineFile`] and build the
+    /// current [`OutlineMode`]'s row list — the outline cursor's index space, and the source of
+    /// truth `render.rs` draws from. Rebuilt fresh on every call (cheap: a small stack times a
+    /// handful of files each, no caching, same posture as [`Self::effective_zoom_for`]) rather
+    /// than cached on `App`, so it's never stale across a mode toggle, a nav, or a refresh.
+    pub fn outline_items(&self) -> Vec<OutlineItem> {
+        let snapshot: Vec<OutlineChangeset> = self
+            .changesets
+            .iter()
+            .map(|v| OutlineChangeset {
+                label: v.cs.title.clone().unwrap_or_else(|| v.cs.name.clone()),
+                current: v.cs.current,
+                needs_restack: v.cs.needs_restack,
+                files: v
+                    .files()
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, f)| OutlineFile {
+                        path: f.path.clone(),
+                        status: v.staged_status(idx),
+                    })
+                    .collect(),
+            })
+            .collect();
+        outline::build_items(&snapshot, self.outline.mode)
+    }
+
+    pub fn outline_open(&self) -> bool {
+        self.outline.open
+    }
+
+    pub fn outline_focused(&self) -> bool {
+        self.outline.focused
+    }
+
+    pub fn outline_cursor(&self) -> usize {
+        self.outline.cursor
+    }
+
+    pub fn outline_mode(&self) -> OutlineMode {
+        self.outline.mode
+    }
+
+    /// `o`: a three-state cycle — closed -> open+focused -> open+unfocused (focus back on the
+    /// diff, pane stays visible) -> closed. Opening always grabs focus (per the locked design);
+    /// the middle -> closed transition ("o while the outline is open but the diff has focus
+    /// closes it") isn't explicitly specified in the plan but is the natural completion of the
+    /// cycle, kept simple rather than adding a separate "close" key.
+    pub fn toggle_outline(&mut self) {
+        if !self.outline.open {
+            self.outline.open = true;
+            self.outline.focused = true;
+            self.sync_outline_to_current();
+        } else if self.outline.focused {
+            self.outline.focused = false;
+        } else {
+            self.outline.open = false;
+        }
+    }
+
+    /// Return focus to the diff without closing the outline (`Esc` while the outline has focus —
+    /// `tui::update` routes it here instead of quitting, per the locked design's "Esc must still
+    /// not quit when the outline has focus").
+    pub fn outline_unfocus(&mut self) {
+        self.outline.focused = false;
+    }
+
+    /// `i` while the outline has focus: cycle [`OutlineMode`], then reposition the cursor onto
+    /// the row matching the current diff position in the NEW mode's row list (the row layout
+    /// just changed shape, so the raw index would otherwise point at an unrelated row).
+    pub fn outline_cycle_mode(&mut self) {
+        self.outline.mode = self.outline.mode.cycle();
+        self.sync_outline_to_current();
+    }
+
+    /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
+    /// clamped into the current row list. Landing on a FILE row jumps the diff there
+    /// immediately (outline -> diff, per the locked design); landing on a HEADER row does NOT
+    /// jump — only [`Self::outline_confirm`] (`Enter`) jumps from a header, since a header's
+    /// "first file" isn't necessarily where a `j`/`k` scan through the stack should keep
+    /// stopping the diff. This calls [`Self::switch_changeset`] directly (not `next_file`/
+    /// `goto_changeset`), so it does NOT re-trigger [`Self::sync_outline_to_current`] — see that
+    /// method's doc comment for why only the DIFF-initiated entry points do.
+    pub fn outline_move_by(&mut self, delta: i64) {
+        let items = self.outline_items();
+        if items.is_empty() {
+            self.outline.cursor = 0;
+            return;
+        }
+        let max = (items.len() - 1) as i64;
+        let cur = self.outline.cursor as i64;
+        let new_idx = (cur + delta).clamp(0, max) as usize;
+        self.outline.cursor = new_idx;
+        if let OutlineItem::File {
+            cs_idx, file_idx, ..
+        } = &items[new_idx]
+        {
+            self.switch_changeset(*cs_idx, *file_idx);
+        }
+    }
+
+    /// `Enter` while the outline has focus: jump the diff to the row under the outline cursor (a
+    /// file row jumps straight there; a header row jumps to that changeset's first file — the
+    /// one case [`Self::outline_move_by`] deliberately does NOT do on a bare cursor move), then
+    /// return focus to the diff.
+    pub fn outline_confirm(&mut self) {
+        let items = self.outline_items();
+        match items.get(self.outline.cursor) {
+            Some(OutlineItem::File {
+                cs_idx, file_idx, ..
+            }) => self.switch_changeset(*cs_idx, *file_idx),
+            Some(OutlineItem::Header { cs_idx, .. }) => {
+                let cs_idx = *cs_idx;
+                self.goto_changeset(cs_idx);
+                // `goto_changeset` is the shared outline/diff core and deliberately does not
+                // self-sync (see its doc comment) — this outline-initiated call syncs explicitly
+                // so the cursor follows off the header row onto the file it just jumped to.
+                self.sync_outline_to_current();
+            }
+            None => {}
+        }
+        self.outline.focused = false;
+    }
+
+    /// Reposition (never rebuild/refocus) the outline cursor onto the row matching the CURRENT
+    /// diff changeset+file, or clamp it into bounds if no such row exists (e.g. Flat mode
+    /// deduped the current file's changeset out of the list). The sync-follow discipline's echo
+    /// break: called ONLY from the diff-initiated nav entry points (`next_file`/`prev_file`/
+    /// `next_changeset`/`prev_changeset`/`refresh`, plus the two outline actions that explicitly
+    /// opt in after a header jump) — never from `switch_changeset`/`goto_changeset` themselves,
+    /// since those are the shared core an OUTLINE-initiated jump also calls, and an
+    /// outline-initiated jump has already set [`OutlineState::cursor`] to the row the user
+    /// selected. If this ran unconditionally inside `switch_changeset`, an outline `j`/`k` move
+    /// past a HEADER row (which never calls `switch_changeset`, so nothing would resync) would
+    /// be fine, but any accidental future call site wired into the shared core would instantly
+    /// stomp a manually-positioned outline cursor back onto the diff's last position — the exact
+    /// oscillation the prototype's `_suppress_sync` flag existed to prevent. Keeping the sync
+    /// calls only at the diff-facing entry points achieves the same break without needing a
+    /// mutable suppression flag on `App`.
+    fn sync_outline_to_current(&mut self) {
+        let items = self.outline_items();
+        if items.is_empty() {
+            self.outline.cursor = 0;
+            return;
+        }
+        if let Some(idx) = items.iter().position(|it| {
+            matches!(
+                it,
+                OutlineItem::File { cs_idx, file_idx, .. }
+                    if *cs_idx == self.current_cs && *file_idx == self.current
+            )
+        }) {
+            self.outline.cursor = idx;
+        } else {
+            self.outline.cursor = self.outline.cursor.min(items.len() - 1);
         }
     }
 
@@ -2173,6 +2411,7 @@ mod tests {
     use super::{find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, EffectiveZoom, Role};
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::model::FileStatus;
+    use crate::outline::{OutlineItem, OutlineMode, StagedStatus};
 
     #[test]
     fn combined_files_arrive_path_sorted() {
@@ -4399,5 +4638,335 @@ mod tests {
             "got: {:?}",
             notice.text
         );
+    }
+
+    // ── M5 CS3: outline side pane ───────────────────────────────────────────────
+
+    /// A committed changeset (`base..head`, one file, not current) beneath an uncommitted
+    /// changeset (one untracked file, current) — the mix the outline's "status column only for
+    /// the uncommitted changeset" test needs, hand-built the same way as every other M5 test in
+    /// this module (`Changeset` literal + `diff_changeset` + `ChangesetView::from_changeset_diff`
+    /// for BOTH sources — the acquisition router handles either).
+    fn committed_and_uncommitted_stack() -> App {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("base.txt", "b\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("c1.txt", "c1\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        std::fs::write(repo.workdir().unwrap().join("u1.txt"), "u1\n").unwrap();
+
+        let committed = Changeset {
+            name: "committed".to_string(),
+            source: ChangesetSource::Committed { base, head },
+            title: Some("Committed work".to_string()),
+            current: false,
+            needs_restack: false,
+        };
+        let uncommitted = Changeset {
+            name: "uncommitted".to_string(),
+            source: ChangesetSource::Uncommitted,
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_c = ChangesetView::from_changeset_diff(
+            committed.clone(),
+            crate::acquire::diff_changeset(repo, &committed).unwrap(),
+        );
+        let view_u = ChangesetView::from_changeset_diff(
+            uncommitted.clone(),
+            crate::acquire::diff_changeset(repo, &uncommitted).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_c, view_u]);
+        app.open_current();
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "opens on the uncommitted layer (its current: true)"
+        );
+        app
+    }
+
+    #[test]
+    fn outline_default_open_for_a_multi_changeset_stack_closed_for_a_lone_changeset() {
+        let multi = two_committed_changesets_two_and_one_files();
+        assert!(
+            multi.outline_open(),
+            "a stack of more than one changeset must default-open the outline"
+        );
+        assert!(
+            !multi.outline_focused(),
+            "the diff keeps initial focus even though the outline defaults open"
+        );
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let lone = app_from_fixture(&fixture);
+        assert!(
+            !lone.outline_open(),
+            "a lone uncommitted changeset must keep the M4 full-width look (outline closed)"
+        );
+    }
+
+    #[test]
+    fn toggle_outline_cycles_closed_open_focused_open_unfocused_closed() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        // Force a known starting state regardless of the default.
+        while app.outline_open() {
+            app.toggle_outline();
+        }
+        assert!(!app.outline_open());
+
+        app.toggle_outline();
+        assert!(
+            app.outline_open() && app.outline_focused(),
+            "opening focuses"
+        );
+
+        app.toggle_outline();
+        assert!(
+            app.outline_open() && !app.outline_focused(),
+            "toggling while focused returns focus to the diff without closing"
+        );
+
+        app.toggle_outline();
+        assert!(
+            !app.outline_open(),
+            "toggling again while open-but-unfocused closes the pane"
+        );
+    }
+
+    #[test]
+    fn outline_cycle_mode_switches_between_flat_and_stack() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        let start = app.outline_mode();
+
+        app.outline_cycle_mode();
+        assert_ne!(app.outline_mode(), start);
+
+        app.outline_cycle_mode();
+        assert_eq!(
+            app.outline_mode(),
+            start,
+            "cycling twice returns to the start"
+        );
+    }
+
+    #[test]
+    fn stack_mode_outline_items_carry_current_and_restack_markers() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("r.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mid = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("mid")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("b.txt", "b\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            source: ChangesetSource::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "cs-b".to_string(),
+            source: ChangesetSource::Committed { base: mid, head },
+            title: None,
+            current: true,
+            needs_restack: true,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::from_changeset_diff(
+            cs_b.clone(),
+            crate::acquire::diff_changeset(repo, &cs_b).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.outline.mode = OutlineMode::Stack;
+
+        let items = app.outline_items();
+        assert_eq!(
+            items[0],
+            OutlineItem::Header {
+                cs_idx: 0,
+                label: "cs-a".to_string(),
+                current: false,
+                needs_restack: false,
+            }
+        );
+        let header_b = items
+            .iter()
+            .find(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b header present");
+        assert_eq!(
+            header_b,
+            &OutlineItem::Header {
+                cs_idx: 1,
+                label: "cs-b".to_string(),
+                current: true,
+                needs_restack: true,
+            }
+        );
+    }
+
+    #[test]
+    fn staged_status_column_only_populated_for_the_uncommitted_changesets_files() {
+        let mut app = committed_and_uncommitted_stack();
+        app.outline.mode = OutlineMode::Stack;
+        let items = app.outline_items();
+
+        let committed_file = items
+            .iter()
+            .find(|it| matches!(it, OutlineItem::File { path, .. } if path == "c1.txt"))
+            .expect("committed changeset's file row present");
+        assert_eq!(
+            committed_file,
+            &OutlineItem::File {
+                cs_idx: 0,
+                file_idx: 0,
+                path: "c1.txt".to_string(),
+                status: StagedStatus::None,
+            },
+            "a committed changeset's file must carry no staged-ness status"
+        );
+
+        let uncommitted_file = items
+            .iter()
+            .find(|it| matches!(it, OutlineItem::File { path, .. } if path == "u1.txt"))
+            .expect("uncommitted changeset's file row present");
+        assert!(
+            !matches!(uncommitted_file, OutlineItem::File { status: StagedStatus::None, .. }),
+            "the untracked uncommitted file must carry a real staged-ness status, got: {uncommitted_file:?}"
+        );
+    }
+
+    #[test]
+    fn outline_move_by_on_a_file_row_jumps_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Flat;
+        app.outline.cursor = 0;
+        assert_eq!(app.current_cs(), 0);
+        assert_eq!(app.current, 0);
+
+        // Flat mode: a1.txt, a2.txt, b1.txt — moving to index 2 must land the diff on b1.txt in
+        // cs-b.
+        app.outline_move_by(2);
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "the outline jump must switch changeset"
+        );
+        assert_eq!(app.files()[app.current].path, "b1.txt");
+    }
+
+    #[test]
+    fn outline_move_by_on_a_header_row_does_not_jump_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.cursor = 0; // cs-a's header row
+        let cs_before = app.current_cs();
+        let file_before = app.current;
+
+        // Header rows sit at indices 0 (cs-a) and 3 (cs-b) in Stack mode (header, a1, a2,
+        // header). Move onto the cs-b header without landing on a file row in between.
+        app.outline_move_by(3);
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (cs_before, file_before),
+            "landing the outline cursor on a header row must not move the diff"
+        );
+    }
+
+    #[test]
+    fn outline_confirm_on_a_header_row_jumps_to_its_first_file_and_returns_focus() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 3; // cs-b's header row
+
+        app.outline_confirm();
+
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "Enter on a header must jump to that changeset"
+        );
+        assert_eq!(app.current, 0, "...landing on its FIRST file");
+        assert!(
+            !app.outline_focused(),
+            "confirming returns focus to the diff"
+        );
+    }
+
+    #[test]
+    fn diff_initiated_nav_syncs_the_outline_cursor_without_stealing_focus() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        assert!(!app.outline_focused(), "diff keeps focus at construction");
+
+        app.next_changeset();
+        assert!(
+            !app.outline_focused(),
+            "a diff-initiated nav must never steal focus from the diff to the outline"
+        );
+        let items = app.outline_items();
+        assert_eq!(
+            items[app.outline_cursor()],
+            OutlineItem::File {
+                cs_idx: 1,
+                file_idx: 0,
+                path: "b1.txt".to_string(),
+                status: StagedStatus::None,
+            },
+            "the outline cursor must follow the diff's new position"
+        );
+    }
+
+    #[test]
+    fn closing_the_outline_restores_full_width_diff_rendering() {
+        // A render-level assertion belongs in render.rs's own tests; this just pins the state
+        // contract `render::render` reads (`outline_open`), so a regression there is caught at
+        // the state layer too.
+        let mut app = two_committed_changesets_two_and_one_files();
+        // Default state is open+unfocused (locked design), so a single `o` here hits the
+        // "open, diff has focus" branch of the cycle, which closes the pane.
+        assert!(app.outline_open() && !app.outline_focused());
+        app.toggle_outline();
+        assert!(!app.outline_open());
     }
 }
