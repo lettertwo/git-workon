@@ -348,8 +348,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let idx = app.current + 1;
-    let n = app.files.len();
-    let label = match app.files.get(app.current) {
+    let n = app.files().len();
+    let label = match app.files().get(app.current) {
         Some(f) if f.status == FileStatus::Renamed || f.status == FileStatus::Copied => {
             format!(
                 "{} @ {} -> {}",
@@ -424,14 +424,14 @@ fn render_gap_row(
 }
 
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
-    if app.files.is_empty() {
+    if app.files().is_empty() {
         frame.render_widget(Paragraph::new("(no changes)"), area);
         return;
     }
 
     let idx = app.current;
-    if app.files[idx].is_binary {
-        let msg = format!("[Binary file: {}]", app.files[idx].path);
+    if app.files()[idx].is_binary {
+        let msg = format!("[Binary file: {}]", app.files()[idx].path);
         frame.render_widget(Paragraph::new(msg).style(Style::default().fg(FG_DIM)), area);
         return;
     }

@@ -13,8 +13,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use git2::Repository;
+use workon::{Changeset, ChangesetSource};
 
-use crate::acquire::{diff_uncommitted, WorktreeDiffs};
+use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
 use crate::apply::{Git2Applier, StageVerb};
 use crate::highlight::{FgSpan, TsHighlighter};
@@ -292,6 +293,26 @@ impl FileView {
     }
 }
 
+/// The tree a COMBINED-role [`FileView`]'s old side reads from (see [`FileView::load`]'s role
+/// table): the changeset's `base` commit for a committed changeset, or the live `HEAD` for the
+/// uncommitted layer — the only case M2–M4 ever had, and what [`App::base_label`] already
+/// names. A committed changeset's combined role is `base..head` (there is no staged/unstaged
+/// split to disagree with it — see [`DiffState::from_committed`]), so the old side must read
+/// `base`'s blob, not whatever `HEAD` happens to be right now.
+///
+/// A free function (not an `App` method) so its returned [`git2::Tree`] borrows only `repo`,
+/// not all of `App` — a `&self` method here would make the borrow checker treat the tree as
+/// blocking every OTHER field access (e.g. `&mut self.highlighter`) for its whole lifetime, even
+/// though the two never actually conflict.
+fn old_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2::Tree<'_>> {
+    match source {
+        ChangesetSource::Committed { base, .. } => {
+            repo.find_commit(base).and_then(|c| c.tree()).ok()
+        }
+        ChangesetSource::Uncommitted => repo.head().and_then(|h| h.peel_to_tree()).ok(),
+    }
+}
+
 fn read_head_blob(repo: &Repository, tree: &git2::Tree<'_>, path: &str) -> String {
     tree.get_path(Path::new(path))
         .and_then(|entry| entry.to_object(repo))
@@ -464,30 +485,75 @@ fn derive_scroll_value(
     scroll.min(max_scroll)
 }
 
-/// Review session state: the combined diff's file list, per-file lazily loaded views, and
+/// One changeset's diff state: its [`workon::Changeset`] descriptor (name, source, restack
+/// status), the [`DiffState`] acquired for it, and its own per-file, per-role lazily built
+/// [`FileView`] caches — the same three `views_*` vectors [`App`] held directly through M4,
+/// now scoped per changeset since M5 reviews more than one at a time.
+///
+/// A committed changeset's [`Self::diff`] has empty staged/unstaged sub-models (see
+/// [`DiffState::from_committed`]), which is enough on its own to render it read-only: the
+/// existing [`effective_zoom`] gate collapses `Split`/`Unstaged`/`Staged` to
+/// [`EffectiveZoom::Single(Role::Combined)`] whenever both sub-diffs are absent — no
+/// committed-specific rendering code needed for M5's spine (mode-aware staging refusal/zoom
+/// lock are `m5-changeset-nav`).
+pub struct ChangesetView {
+    pub cs: Changeset,
+    diff: DiffState,
+    /// Per-file, per-role lazily built views (parallel to [`DiffState::files`]). A slot stays
+    /// `None` until first access; a role slot ALSO stays `None` forever when that file has no
+    /// change in that role (see [`App::ensure_role_loaded`]).
+    views_combined: Vec<Option<FileView>>,
+    views_unstaged: Vec<Option<FileView>>,
+    views_staged: Vec<Option<FileView>>,
+}
+
+impl ChangesetView {
+    fn new(cs: Changeset, diff: DiffState) -> Self {
+        let n = diff.files.len();
+        Self {
+            cs,
+            diff,
+            views_combined: (0..n).map(|_| None).collect(),
+            views_unstaged: (0..n).map(|_| None).collect(),
+            views_staged: (0..n).map(|_| None).collect(),
+        }
+    }
+
+    /// Build the [`ChangesetView`] for `cs` from its acquired [`ChangesetDiff`] (see
+    /// [`crate::acquire::diff_changeset`]) — the router from "how was this changeset diffed" to
+    /// the uniform [`DiffState`] shape every [`ChangesetView`] carries.
+    pub fn from_changeset_diff(cs: Changeset, diff: ChangesetDiff) -> Self {
+        let diff = match diff {
+            ChangesetDiff::Committed(model) => DiffState::from_committed(model),
+            ChangesetDiff::Uncommitted(diffs) => DiffState::from(diffs),
+        };
+        Self::new(cs, diff)
+    }
+
+    /// Number of files this changeset's diff touches — `App::new_uncommitted`'s "nothing to
+    /// review" check (and its `main.rs` stack analog) read this rather than reaching into
+    /// [`Self::diff`] directly, which stays private to this module.
+    pub fn file_count(&self) -> usize {
+        self.diff.files.len()
+    }
+}
+
+/// Review session state: the active changeset's file list, per-file lazily loaded views, and
 /// navigation/scroll state. One long-lived [`TsHighlighter`] lives here (not per file) — its
 /// language-config cache is keyed per-instance, so a fresh highlighter per file would rebuild
 /// every grammar config on every navigation.
 pub struct App {
     repo: Repository,
-    /// The combined diff's files. git2 enumerates these in path order (verified in
-    /// `tests`), so "current file index" is a stable alphabetical position, not an
-    /// arrival/discovery order that could reshuffle under the user. The file LIST stays
-    /// combined-driven even in split/zoom modes — only the rendered rows change per role.
-    pub files: Vec<FileChange>,
-    /// The unstaged (index ↔ worktree) sub-diff, and, parallel to [`Self::files`],
-    /// [`Self::unstaged_idx`] mapping each combined file to its index here (or `None` when that
-    /// file has no unstaged change). The staged pair mirrors it.
-    unstaged_model: DiffModel,
-    staged_model: DiffModel,
-    unstaged_idx: Vec<Option<usize>>,
-    staged_idx: Vec<Option<usize>>,
-    /// Per-file, per-role lazily built views (parallel to [`Self::files`]). A slot stays `None`
-    /// until first access; a role slot ALSO stays `None` forever when that file has no change in
-    /// that role (see [`Self::ensure_role_loaded`]).
-    views_combined: Vec<Option<FileView>>,
-    views_unstaged: Vec<Option<FileView>>,
-    views_staged: Vec<Option<FileView>>,
+    /// One [`ChangesetView`] per reviewable changeset — the Graphite stack, or a single
+    /// synthetic uncommitted changeset when no stack is active (see
+    /// [`crate::acquire::resolve_changesets`]) — in base → head order. Everything that used to
+    /// be App-level diff state (`files`, the staged/unstaged sub-models + index maps, and the
+    /// three `views_*` lazy caches) now lives on the ACTIVE entry's [`ChangesetView`]; read it
+    /// through [`Self::cur`]/[`Self::cur_mut`] rather than indexing this directly.
+    changesets: Vec<ChangesetView>,
+    /// Index into [`Self::changesets`] of the active changeset. M5 changeset-nav (`]c`/`[c`)
+    /// will move this; M5's spine (this changeset) only ever sets it at construction/refresh.
+    current_cs: usize,
     pub current: usize,
     /// Row index, in the ACTIVE layout's coordinate space, of the highlighted navigation
     /// anchor — THE nav state (locked decision #2 in the M4 plan). In a split this is the
@@ -604,45 +670,65 @@ pub struct Notice {
 }
 
 impl App {
+    /// Build an [`App`] reviewing a single uncommitted changeset — the M2–M4 shape, and still
+    /// what a non-Graphite (or clean-Graphite-tip) repo degrades to under M5's auto-detect
+    /// (locked decision #7): a one-element [`Self::changesets`], `current_cs = 0`,
+    /// `base_label = "HEAD"`. `test_support::app_from_fixture` and every existing M2–M4 test
+    /// build through this constructor unchanged.
     pub fn new(repo: Repository, diffs: WorktreeDiffs) -> Self {
-        let DiffState {
-            files,
-            unstaged_model,
-            staged_model,
-            unstaged_idx,
-            staged_idx,
-        } = DiffState::from(diffs);
-        let n = files.len();
+        let name = repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().ok().map(str::to_string))
+            .unwrap_or_default();
+        let cs = Changeset {
+            name,
+            source: ChangesetSource::Uncommitted,
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::new(cs, DiffState::from(diffs));
+        Self::from_changesets(repo, vec![view])
+    }
+
+    /// Build an [`App`] over an already-diffed changeset stack — `main.rs`'s entry point for
+    /// both the Graphite-stack and single-uncommitted-changeset cases (the latter goes through
+    /// [`Self::new`] instead, which is the same thing for a one-element stack). Opens on
+    /// whichever changeset the lib marked `current` (locked decision #6: "honor lib `current`,
+    /// first file"), falling back to index `0` if none is marked. An empty `changesets` panics —
+    /// `main.rs` and [`Self::new`] never call this with one.
+    pub fn from_changesets(repo: Repository, changesets: Vec<ChangesetView>) -> Self {
+        assert!(
+            !changesets.is_empty(),
+            "App::from_changesets requires at least one changeset"
+        );
+        let current_cs = current_cs_index(&changesets);
+        let base_label = base_label_for(&changesets[current_cs].cs);
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
         // diff, so the FIRST `Tick` doesn't see an "unseen" signature and spuriously re-diff an
-        // index that hasn't actually changed since `App::new` read it. `begin`/`complete` with no
+        // index that hasn't actually changed since construction. `begin`/`complete` with no
         // refresh in between is just a way to prime `last_signature` through the same API a real
         // refresh uses — there's nothing to commit/supersede here, only one coordinator exists. If
         // the initial read fails (e.g. a repo with no index file yet), leave it unseeded: the
         // first tick will see a "new" signature and refresh once, which is harmless — cheaper than
-        // threading an extra error path through `new`.
+        // threading an extra error path through construction.
         if let Ok(sig) = IndexSignature::read(repo.path()) {
             let ticket = refresh_coordinator.begin();
             refresh_coordinator.complete(ticket, sig);
         }
         Self {
             repo,
-            files,
-            unstaged_model,
-            staged_model,
-            unstaged_idx,
-            staged_idx,
-            views_combined: (0..n).map(|_| None).collect(),
-            views_unstaged: (0..n).map(|_| None).collect(),
-            views_staged: (0..n).map(|_| None).collect(),
+            changesets,
+            current_cs,
             current: 0,
             cursor: 0,
             scroll: 0,
             pane_height: 20,
             alt: PaneState::default(),
             alt_height: 20,
-            base_label: "HEAD".to_string(),
+            base_label,
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
             zoom: Zoom::default(),
@@ -700,21 +786,59 @@ impl App {
         }
     }
 
-    /// Re-run [`diff_uncommitted`] and rebuild every diff-derived field in place — the operation
-    /// both a manual refresh (`r`) and (later) a post-staging-op/external-write refresh need. See
-    /// the M4 plan's changeset 5 for the full contract; summarized:
+    /// The active changeset's view — every read site that used to reach an App-level diff field
+    /// directly now goes through this (or [`Self::cur_mut`]).
+    fn cur(&self) -> &ChangesetView {
+        &self.changesets[self.current_cs]
+    }
+
+    /// Mutable analog of [`Self::cur`].
+    fn cur_mut(&mut self) -> &mut ChangesetView {
+        &mut self.changesets[self.current_cs]
+    }
+
+    /// The active changeset's combined file list — `render.rs` and tests read this instead of
+    /// the old `pub files` field, which moved onto [`ChangesetView`] (see [`Self::cur`]).
+    pub fn files(&self) -> &[FileChange] {
+        &self.cur().diff.files
+    }
+
+    /// Index into the reviewed stack of the active changeset — read by tests asserting the
+    /// [`Self::from_changesets`]/[`Self::refresh`] "honor lib `current`" rule (locked decision
+    /// #6); changeset-nav (`]c`/`[c`) will add a setter in `m5-changeset-nav`.
+    pub fn current_cs(&self) -> usize {
+        self.current_cs
+    }
+
+    /// The active changeset's descriptor (name, source, restack status) — read by tests
+    /// asserting which changeset [`Self::current_cs`] landed on.
+    pub fn current_changeset(&self) -> &Changeset {
+        &self.cur().cs
+    }
+
+    /// Number of changesets in the reviewed stack — `1` for a non-Graphite (or
+    /// clean-Graphite-tip) repo, per locked decision #7.
+    pub fn changeset_count(&self) -> usize {
+        self.changesets.len()
+    }
+
+    /// Re-run [`crate::acquire::resolve_changesets`] against the CURRENT `HEAD` branch and
+    /// rebuild every [`ChangesetView`] from scratch — the operation both a manual refresh (`r`)
+    /// and (later) a post-staging-op/external-write refresh need. Re-assembling (not just
+    /// re-diffing the active changeset) matters because a restack can change the stack's
+    /// topology, not just its diffs.
     ///
-    /// - Rebuilds exactly what [`Self::new`] builds from a fresh [`WorktreeDiffs`]: `files`,
-    ///   `unstaged_model`/`staged_model`, `unstaged_idx`/`staged_idx`, and all three `views_*`
-    ///   (reset to `None` — lazily reloaded, same as a fresh `App`).
-    /// - Does NOT touch `repo` (same handle), `highlighter` (its per-instance grammar cache would
-    ///   have to re-parse every language from scratch if rebuilt), `base_label`, `layout`, or
-    ///   `zoom` (the user's current view mode shouldn't reset just because they pressed `r`, or
-    ///   because a background refresh fired).
-    /// - Preserves position by the current file's PATH: if a file with that path still exists in
-    ///   the rebuilt list, `current` follows it (even if its index moved, e.g. a file alphabetically
-    ///   before it in the old list got fully staged away). If it vanished (fully staged or
-    ///   reverted), `current` clamps into the new list (or `0` if it's now empty).
+    /// - Rebuilds [`Self::changesets`] and [`Self::base_label`] in place. Does NOT touch `repo`
+    ///   (same handle), `highlighter` (its per-instance grammar cache would have to re-parse
+    ///   every language from scratch if rebuilt), `layout`, or `zoom` (the user's current view
+    ///   mode shouldn't reset just because they pressed `r`, or because a background refresh
+    ///   fired).
+    /// - Preserves the active changeset by NAME: if a changeset with that name still exists in
+    ///   the rebuilt stack, `current_cs` follows it; otherwise it falls back to whichever
+    ///   changeset the lib now reports as `current`, or index `0`.
+    /// - Preserves file position by PATH within the (possibly different) active changeset, same
+    ///   rule M4 used: `current` follows the path if it still exists, else clamps into the new
+    ///   list (or `0` if empty).
     /// - Re-seats the (possibly changed) current file at its first hunk via [`Self::open_current`]
     ///   — the same path a file switch already uses. This does NOT try to preserve the exact
     ///   cursor row: the rows under an old cursor position may no longer correspond to the same
@@ -722,40 +846,63 @@ impl App {
     ///   is the only always-valid choice, consistent with how zoom/layout switches already treat
     ///   cursor position as non-transferable across a reshape.
     ///
-    /// On a [`diff_uncommitted`] error, leaves all existing state untouched and sets an error
+    /// On any assembly/diff error, leaves all existing state untouched and sets an error
     /// [`Notice`] instead (via [`Self::notify`]) — a failed refresh must never blank the review.
     pub fn refresh(&mut self) {
-        let diffs = match diff_uncommitted(&self.repo) {
-            Ok(diffs) => diffs,
+        let Some(head_branch) = self
+            .repo
+            .head()
+            .ok()
+            .and_then(|h| h.shorthand().ok().map(str::to_string))
+        else {
+            self.notify("refresh failed: no current branch", Severity::Error);
+            return;
+        };
+
+        let changesets = match crate::acquire::resolve_changesets(&self.repo, &head_branch) {
+            Ok(cs) => cs,
             Err(err) => {
                 self.notify(format!("refresh failed: {err}"), Severity::Error);
                 return;
             }
         };
 
-        let current_path = self.files.get(self.current).map(|f| f.path.clone());
+        let mut views = Vec::with_capacity(changesets.len());
+        for cs in changesets {
+            match crate::acquire::diff_changeset(&self.repo, &cs) {
+                Ok(diff) => views.push(ChangesetView::from_changeset_diff(cs, diff)),
+                Err(err) => {
+                    self.notify(format!("refresh failed: {err}"), Severity::Error);
+                    return;
+                }
+            }
+        }
+        // `resolve_changesets` always returns at least one changeset (a lone Uncommitted entry
+        // when no stack is active), but stay defensive rather than index an empty `Vec` below.
+        if views.is_empty() {
+            self.notify("refresh failed: no changesets to review", Severity::Error);
+            return;
+        }
 
-        let DiffState {
-            files,
-            unstaged_model,
-            staged_model,
-            unstaged_idx,
-            staged_idx,
-        } = DiffState::from(diffs);
-        let n = files.len();
+        let prev_cs_name = self.cur().cs.name.clone();
+        let current_path = self
+            .cur()
+            .diff
+            .files
+            .get(self.current)
+            .map(|f| f.path.clone());
 
+        self.current_cs = views
+            .iter()
+            .position(|v| v.cs.name == prev_cs_name)
+            .unwrap_or_else(|| current_cs_index(&views));
+        self.base_label = base_label_for(&views[self.current_cs].cs);
+        self.changesets = views;
+
+        let n = self.cur().diff.files.len();
         self.current = current_path
-            .and_then(|path| files.iter().position(|f| f.path == path))
+            .and_then(|path| self.cur().diff.files.iter().position(|f| f.path == path))
             .unwrap_or(if n == 0 { 0 } else { self.current.min(n - 1) });
-
-        self.files = files;
-        self.unstaged_model = unstaged_model;
-        self.staged_model = staged_model;
-        self.unstaged_idx = unstaged_idx;
-        self.staged_idx = staged_idx;
-        self.views_combined = (0..n).map(|_| None).collect();
-        self.views_unstaged = (0..n).map(|_| None).collect();
-        self.views_staged = (0..n).map(|_| None).collect();
 
         self.open_current();
     }
@@ -764,9 +911,29 @@ impl App {
     /// against that file's available sub-diffs and stageability. Cheap (three lookups + the pure
     /// [`effective_zoom`]) — re-evaluated per file per frame, no caching (locked decision #3).
     pub(crate) fn effective_zoom_for(&self, idx: usize) -> EffectiveZoom {
-        let can_stage = self.files.get(idx).map(|f| !f.is_binary).unwrap_or(false);
-        let has_unstaged = self.unstaged_idx.get(idx).copied().flatten().is_some();
-        let has_staged = self.staged_idx.get(idx).copied().flatten().is_some();
+        let can_stage = self
+            .cur()
+            .diff
+            .files
+            .get(idx)
+            .map(|f| !f.is_binary)
+            .unwrap_or(false);
+        let has_unstaged = self
+            .cur()
+            .diff
+            .unstaged_idx
+            .get(idx)
+            .copied()
+            .flatten()
+            .is_some();
+        let has_staged = self
+            .cur()
+            .diff
+            .staged_idx
+            .get(idx)
+            .copied()
+            .flatten()
+            .is_some();
         effective_zoom(self.zoom, has_unstaged, has_staged, can_stage)
     }
 
@@ -785,20 +952,21 @@ impl App {
     /// [`crate::attribute::Attribution`] for the combined role each frame — see that module's
     /// docs for why the two sub-roles' hunks (not the combined ones) are the attribution source.
     pub(crate) fn role_change(&self, idx: usize, role: Role) -> Option<&FileChange> {
+        let diff = &self.cur().diff;
         match role {
-            Role::Combined => self.files.get(idx),
-            Role::Unstaged => self
+            Role::Combined => diff.files.get(idx),
+            Role::Unstaged => diff
                 .unstaged_idx
                 .get(idx)
                 .copied()
                 .flatten()
-                .map(|mi| &self.unstaged_model.files[mi]),
-            Role::Staged => self
+                .map(|mi| &diff.unstaged_model.files[mi]),
+            Role::Staged => diff
                 .staged_idx
                 .get(idx)
                 .copied()
                 .flatten()
-                .map(|mi| &self.staged_model.files[mi]),
+                .map(|mi| &diff.staged_model.files[mi]),
         }
     }
 
@@ -819,18 +987,20 @@ impl App {
     }
 
     fn views_for(&self, role: Role) -> &[Option<FileView>] {
+        let cur = self.cur();
         match role {
-            Role::Combined => &self.views_combined,
-            Role::Unstaged => &self.views_unstaged,
-            Role::Staged => &self.views_staged,
+            Role::Combined => &cur.views_combined,
+            Role::Unstaged => &cur.views_unstaged,
+            Role::Staged => &cur.views_staged,
         }
     }
 
     fn views_for_mut(&mut self, role: Role) -> &mut [Option<FileView>] {
+        let cur = self.cur_mut();
         match role {
-            Role::Combined => &mut self.views_combined,
-            Role::Unstaged => &mut self.views_unstaged,
-            Role::Staged => &mut self.views_staged,
+            Role::Combined => &mut cur.views_combined,
+            Role::Unstaged => &mut cur.views_unstaged,
+            Role::Staged => &mut cur.views_staged,
         }
     }
 
@@ -870,19 +1040,19 @@ impl App {
     fn ensure_role_loaded(&mut self, idx: usize, role: Role) {
         let model_idx = match role {
             Role::Combined => {
-                let Some(file) = self.files.get(idx) else {
+                let Some(file) = self.cur().diff.files.get(idx) else {
                     return;
                 };
                 if file.is_binary {
                     return;
                 }
-                if self.views_combined.get(idx).map(Option::is_some) != Some(false) {
+                if self.cur().views_combined.get(idx).map(Option::is_some) != Some(false) {
                     return;
                 }
                 None
             }
-            Role::Unstaged => self.unstaged_idx.get(idx).copied().flatten(),
-            Role::Staged => self.staged_idx.get(idx).copied().flatten(),
+            Role::Unstaged => self.cur().diff.unstaged_idx.get(idx).copied().flatten(),
+            Role::Staged => self.cur().diff.staged_idx.get(idx).copied().flatten(),
         };
 
         if role != Role::Combined {
@@ -893,8 +1063,8 @@ impl App {
                 return; // already loaded (or slot absent)
             }
             let file = match role {
-                Role::Unstaged => &self.unstaged_model.files[mi],
-                Role::Staged => &self.staged_model.files[mi],
+                Role::Unstaged => self.cur().diff.unstaged_model.files[mi].clone(),
+                Role::Staged => self.cur().diff.staged_model.files[mi].clone(),
                 Role::Combined => unreachable!(),
             };
             if file.is_binary {
@@ -902,32 +1072,41 @@ impl App {
             }
             // Build the view in a block so `head_tree` (which borrows `self.repo`) drops before
             // the `views_for_mut` reborrow — same reason the combined path below can assign a
-            // direct field while `head_tree` is live but this method-call path cannot.
+            // direct field while `head_tree` is live but this method-call path cannot. `file` is
+            // cloned out of `self.cur()` for the same reason: `FileView::load` needs `&self.repo`
+            // and `&mut self.highlighter` at once, which a borrow still anchored in `self.cur()`
+            // would conflict with.
             let view = {
                 // Re-peeled per call, same rationale as the combined path below.
                 let Ok(head_tree) = self.repo.head().and_then(|h| h.peel_to_tree()) else {
                     return;
                 };
-                FileView::load(&self.repo, &head_tree, file, role, &mut self.highlighter)
+                FileView::load(&self.repo, &head_tree, &file, role, &mut self.highlighter)
             };
             self.views_for_mut(role)[idx] = Some(view);
             return;
         }
 
         // Combined role.
-        // Re-peeled per call rather than cached on `App`: HEAD can move between file loads and the
-        // tree is cheap to re-peel.
-        let Ok(head_tree) = self.repo.head().and_then(|h| h.peel_to_tree()) else {
+        // Re-peeled per call rather than cached on `App`: for the uncommitted layer `HEAD` can
+        // move between file loads, and the tree is cheap to re-peel either way.
+        // `self.cur().cs.source` is `Copy`, so reading it here borrows `self` only for this
+        // sub-expression — `head_tree` itself ends up borrowing `self.repo` alone (via the free
+        // `old_side_tree_for`), leaving `&mut self.highlighter` free below. A method tied to
+        // `&self` would instead have bound the tree's lifetime to all of `self`.
+        let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.source) else {
             return;
         };
+        let file = self.cur().diff.files[idx].clone();
         let view = FileView::load(
             &self.repo,
             &head_tree,
-            &self.files[idx],
+            &file,
             Role::Combined,
             &mut self.highlighter,
         );
-        self.views_combined[idx] = Some(view);
+        drop(head_tree);
+        self.cur_mut().views_combined[idx] = Some(view);
     }
 
     pub fn current_view(&mut self) -> Option<&mut FileView> {
@@ -1025,18 +1204,19 @@ impl App {
     }
 
     pub fn next_file(&mut self) {
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             return;
         }
-        self.current = (self.current + 1) % self.files.len();
+        self.current = (self.current + 1) % self.cur().diff.files.len();
         self.open_current();
     }
 
     pub fn prev_file(&mut self) {
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             return;
         }
-        self.current = (self.current + self.files.len() - 1) % self.files.len();
+        self.current =
+            (self.current + self.cur().diff.files.len() - 1) % self.cur().diff.files.len();
         self.open_current();
     }
 
@@ -1269,7 +1449,7 @@ impl App {
             self.stage_selection();
             return;
         }
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             return;
         }
         let Some(role) = self.staging_role() else {
@@ -1297,7 +1477,7 @@ impl App {
     /// Stage (unstaged pane) or unstage (staged pane) the whole current file (`S`) — ignores the
     /// cursor. Refuses on the combined view.
     pub fn stage_file(&mut self) {
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             return;
         }
         let Some(role) = self.staging_role() else {
@@ -1312,7 +1492,7 @@ impl App {
         };
         // A whole-file op routes on path + status only ([`crate::ops::apply_file`]), which the
         // combined file carries authoritatively (e.g. Untracked-ness for a discard).
-        let file = self.files[self.current].clone();
+        let file = self.cur().diff.files[self.current].clone();
         self.run_op(FileStagingOp::file(file, verb));
     }
 
@@ -1327,7 +1507,7 @@ impl App {
             self.discard_selection();
             return;
         }
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             return;
         }
         let Some(role) = self.staging_role() else {
@@ -1357,7 +1537,7 @@ impl App {
     /// Request confirmation to discard the whole current file's worktree changes (`D`). Refuses on
     /// the combined view or in a staged pane; the discard runs on `y`.
     pub fn discard_file(&mut self) {
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             return;
         }
         let Some(role) = self.staging_role() else {
@@ -1371,7 +1551,7 @@ impl App {
             self.notify("discard acts in the unstaged pane", Severity::Error);
             return;
         }
-        let path = self.files[self.current].path.clone();
+        let path = self.cur().diff.files[self.current].path.clone();
         self.request_confirm(
             format!("Discard all changes to `{path}`? (y/n)"),
             PendingOp::DiscardFile {
@@ -1412,7 +1592,7 @@ impl App {
                 self.run_op(FileStagingOp::hunk(file, hunk_idx, StageVerb::Discard));
             }
             PendingOp::DiscardFile { file_idx } => {
-                let Some(file) = self.files.get(file_idx).cloned() else {
+                let Some(file) = self.cur().diff.files.get(file_idx).cloned() else {
                     return;
                 };
                 self.run_op(FileStagingOp::file(file, StageVerb::Discard));
@@ -1461,7 +1641,7 @@ impl App {
     /// set) on the combined view or any non-staging role — you can only select lines where you can
     /// stage them (same gate as the verbs). A no-op on an empty file list.
     pub fn start_selection(&mut self) {
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             return;
         }
         if self.staging_role().is_none() {
@@ -1583,7 +1763,7 @@ impl App {
     /// applies every overlapped hunk's kept lines as ONE merged patch via [`LineSelectionOp`]
     /// (never one op per hunk — see that type's docs), drains once, and clears the selection.
     fn stage_selection(&mut self) {
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             self.cancel_selection();
             return;
         }
@@ -1597,7 +1777,7 @@ impl App {
         let Some(verb) = Self::verb_for_role(role) else {
             return;
         };
-        if !ops::is_hunk_patchable(&self.files[self.current]) {
+        if !ops::is_hunk_patchable(&self.cur().diff.files[self.current]) {
             self.notify(
                 "line staging needs a modified file — use s/S for the whole file",
                 Severity::Error,
@@ -1621,7 +1801,7 @@ impl App {
     /// non-hunk-patchable file, or on a selection with no changed lines. The confirm prompt states
     /// the TRUE scope (total lines across N hunks); the discard runs on `y`.
     fn discard_selection(&mut self) {
-        if self.files.is_empty() {
+        if self.cur().diff.files.is_empty() {
             self.cancel_selection();
             return;
         }
@@ -1636,7 +1816,7 @@ impl App {
             self.notify("discard acts in the unstaged pane", Severity::Error);
             return;
         }
-        if !ops::is_hunk_patchable(&self.files[self.current]) {
+        if !ops::is_hunk_patchable(&self.cur().diff.files[self.current]) {
             self.notify(
                 "line staging needs a modified file — use s/S for the whole file",
                 Severity::Error,
@@ -1696,10 +1876,10 @@ fn line_selection_for_hunk(
     sel
 }
 
-/// The diff-derived pieces [`App::new`] and [`App::refresh`] both build fresh from a
-/// [`WorktreeDiffs`] snapshot — everything EXCEPT the view caches (which the two callers reset
-/// differently sized `None` vectors for) and the navigation/UI state that survives a refresh
-/// (`current`, `cursor`, `layout`, `zoom`, etc. — see [`App::refresh`]'s doc comment).
+/// The diff-derived pieces one [`ChangesetView`] carries — everything EXCEPT the view caches
+/// (which [`ChangesetView::new`] and [`App::refresh`] reset to freshly-sized `None` vectors) and
+/// the App-level navigation/UI state that survives a refresh (`current`, `cursor`, `layout`,
+/// `zoom`, etc. — see [`App::refresh`]'s doc comment).
 struct DiffState {
     files: Vec<FileChange>,
     unstaged_model: DiffModel,
@@ -1728,6 +1908,45 @@ impl From<WorktreeDiffs> for DiffState {
             unstaged_idx,
             staged_idx,
         }
+    }
+}
+
+impl DiffState {
+    /// Build a [`DiffState`] for a COMMITTED changeset's [`DiffModel`] (`base..head`, already
+    /// diffed by [`crate::acquire::diff_committed`]) — there is no staged/unstaged split for a
+    /// committed range, so both sub-models are empty and every index map entry is `None`. This
+    /// alone is enough to render the changeset read-only: [`effective_zoom`] collapses
+    /// `Split`/`Unstaged`/`Staged` to [`EffectiveZoom::Single(Role::Combined)`] whenever both
+    /// sub-diffs are absent, so no committed-specific rendering path is needed for M5's spine.
+    fn from_committed(model: DiffModel) -> Self {
+        let n = model.files.len();
+        Self {
+            files: model.files,
+            unstaged_model: DiffModel { files: Vec::new() },
+            staged_model: DiffModel { files: Vec::new() },
+            unstaged_idx: (0..n).map(|_| None).collect(),
+            staged_idx: (0..n).map(|_| None).collect(),
+        }
+    }
+}
+
+/// Index of the changeset the lib marked `current` (locked decision #6), or `0` if none is —
+/// the shared rule [`App::from_changesets`] uses to open, and [`App::refresh`] falls back to
+/// when the previously-active changeset's name no longer exists after a re-assembly.
+fn current_cs_index(changesets: &[ChangesetView]) -> usize {
+    changesets.iter().position(|v| v.cs.current).unwrap_or(0)
+}
+
+/// [`App::base_label`] for the changeset that would become active — a committed changeset's
+/// base rev (7-char short-sha), or `"HEAD"` for the uncommitted layer (worktree ↔ `HEAD`,
+/// unchanged from M2–M4).
+fn base_label_for(cs: &Changeset) -> String {
+    match cs.source {
+        ChangesetSource::Committed { base, .. } => {
+            let full = base.to_string();
+            full.chars().take(7).collect()
+        }
+        ChangesetSource::Uncommitted => "HEAD".to_string(),
     }
 }
 
@@ -1871,10 +2090,12 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use git2::Repository;
     use git_workon_fixture::prelude::*;
+    use workon::{Changeset, ChangesetSource};
 
     use super::test_support::app_from_fixture;
-    use super::{find_next_hunk_row, find_prev_hunk_row, Role};
+    use super::{find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, EffectiveZoom, Role};
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::model::FileStatus;
 
@@ -1889,7 +2110,7 @@ mod tests {
             .unwrap();
 
         let app = app_from_fixture(&fixture);
-        let paths: Vec<&str> = app.files.iter().map(|f| f.path.as_str()).collect();
+        let paths: Vec<&str> = app.files().iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, vec!["a_tracked.txt", "m_mid.txt", "z_new.txt"]);
     }
 
@@ -1917,7 +2138,7 @@ mod tests {
             .unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        assert_eq!(app.files[0].status, FileStatus::Added);
+        assert_eq!(app.files()[0].status, FileStatus::Added);
         app.ensure_loaded(0);
         let view = app.current_view_ref().unwrap();
         assert_eq!(view.old_text(), "");
@@ -1933,7 +2154,7 @@ mod tests {
             .unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        assert_eq!(app.files[0].status, FileStatus::Deleted);
+        assert_eq!(app.files()[0].status, FileStatus::Deleted);
         app.ensure_loaded(0);
         let view = app.current_view_ref().unwrap();
         assert_eq!(view.old_text(), "bye\n");
@@ -1952,9 +2173,9 @@ mod tests {
         std::fs::rename(workdir.join("old_name.txt"), workdir.join("new_name.txt")).unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        assert_eq!(app.files.len(), 1);
-        assert_eq!(app.files[0].status, FileStatus::Renamed);
-        assert_eq!(app.files[0].old_path.as_deref(), Some("old_name.txt"));
+        assert_eq!(app.files().len(), 1);
+        assert_eq!(app.files()[0].status, FileStatus::Renamed);
+        assert_eq!(app.files()[0].old_path.as_deref(), Some("old_name.txt"));
         app.ensure_loaded(0);
         let view = app.current_view_ref().unwrap();
         assert_eq!(view.old_text(), "same content\n");
@@ -1974,7 +2195,7 @@ mod tests {
         std::fs::write(repo.workdir().unwrap().join("bin.dat"), [0u8, 1, 2, 0, 3]).unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        assert!(app.files[0].is_binary);
+        assert!(app.files()[0].is_binary);
         app.ensure_loaded(0);
         assert!(app.current_view_ref().is_none());
     }
@@ -2208,7 +2429,7 @@ mod tests {
             .unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        assert!(app.files.is_empty(), "fixture must have no dirty files");
+        assert!(app.files().is_empty(), "fixture must have no dirty files");
 
         app.move_cursor_by(5);
         app.move_cursor_by(-5);
@@ -2731,12 +2952,13 @@ mod tests {
         app.open_current();
         app.next_file();
         assert_eq!(app.current, 1, "path-sorted: b.txt is index 1");
-        let path = app.files[app.current].path.clone();
+        let path = app.files()[app.current].path.clone();
 
         app.refresh();
 
         assert_eq!(
-            app.files[app.current].path, path,
+            app.files()[app.current].path,
+            path,
             "refresh must keep tracking the same file by path"
         );
     }
@@ -2763,13 +2985,13 @@ mod tests {
 
         app.refresh();
 
-        assert_eq!(app.files.len(), 1, "only a.txt is still dirty");
+        assert_eq!(app.files().len(), 1, "only a.txt is still dirty");
         assert!(
-            app.current < app.files.len(),
+            app.current < app.files().len(),
             "current must be clamped in-range, got {}",
             app.current
         );
-        assert_eq!(app.files[app.current].path, "a.txt");
+        assert_eq!(app.files()[app.current].path, "a.txt");
     }
 
     #[test]
@@ -2784,7 +3006,7 @@ mod tests {
 
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        let files_before: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
+        let files_before: Vec<String> = app.files().iter().map(|f| f.path.clone()).collect();
 
         // Corrupt the throwaway fixture repo's OWN `.git/HEAD` so `diff_uncommitted`'s
         // `repo.head()` call fails cheaply — never done against a real working tree.
@@ -2793,7 +3015,7 @@ mod tests {
 
         app.refresh();
 
-        let files_after: Vec<String> = app.files.iter().map(|f| f.path.clone()).collect();
+        let files_after: Vec<String> = app.files().iter().map(|f| f.path.clone()).collect();
         assert_eq!(
             files_after, files_before,
             "a failed refresh must leave existing state untouched"
@@ -3697,5 +3919,166 @@ mod tests {
             app.selection_anchor.is_none(),
             "toggling layout cancels the selection"
         );
+    }
+
+    // ── M5 CS1: the changeset-stack spine ─────────────────────────────────────
+
+    #[test]
+    fn single_uncommitted_changeset_matches_m4_shape() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let app = app_from_fixture(&fixture);
+        assert_eq!(
+            app.changeset_count(),
+            1,
+            "a non-Graphite repo degrades to a single synthetic changeset"
+        );
+        assert_eq!(app.current_cs(), 0);
+        assert_eq!(app.base_label, "HEAD");
+        assert!(matches!(
+            app.current_changeset().source,
+            ChangesetSource::Uncommitted
+        ));
+    }
+
+    #[test]
+    fn committed_changeset_view_has_empty_sub_diffs_and_renders_read_only() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("a.txt", "one\n")
+            .create("first")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("a.txt", "one\nCHANGED\n")
+            .create("second")
+            .unwrap();
+
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "main".to_string(),
+            source: ChangesetSource::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).expect("diff_changeset");
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+        assert_eq!(view.file_count(), 1);
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+
+        assert_eq!(app.files().len(), 1);
+        assert_eq!(
+            app.effective_zoom_for(0),
+            EffectiveZoom::Single(Role::Combined),
+            "empty staged/unstaged sub-models collapse every zoom to combined-only, for free"
+        );
+
+        // Read-only follows from the natural collapse above: no committed-specific gate needed.
+        app.stage_hunk();
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("staging must refuse on a combined-only (committed) changeset");
+        assert!(notice.text.contains("cycle zoom"), "got: {:?}", notice.text);
+    }
+
+    #[test]
+    fn base_label_is_committed_changeset_base_short_sha() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("a.txt", "one\n")
+            .create("first")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("a.txt", "two\n")
+            .create("second")
+            .unwrap();
+
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "main".to_string(),
+            source: ChangesetSource::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).expect("diff_changeset");
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let app = App::from_changesets(owned, vec![view]);
+
+        assert_eq!(app.base_label, base.to_string()[..7].to_string());
+    }
+
+    #[test]
+    fn current_cs_honors_lib_current_flag() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("a.txt", "one\n")
+            .create("first")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("a.txt", "two\n")
+            .create("second")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        // Deliberately NOT current — listed first, so a naive "open index 0" would pick it.
+        let not_current = Changeset {
+            name: "not-current".to_string(),
+            source: ChangesetSource::Committed { base, head: base },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let current = Changeset {
+            name: "current".to_string(),
+            source: ChangesetSource::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+
+        let not_current_view = ChangesetView::from_changeset_diff(
+            not_current.clone(),
+            crate::acquire::diff_changeset(repo, &not_current).unwrap(),
+        );
+        let current_view = ChangesetView::from_changeset_diff(
+            current.clone(),
+            crate::acquire::diff_changeset(repo, &current).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let app = App::from_changesets(owned, vec![not_current_view, current_view]);
+
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "must open on the lib-marked current entry"
+        );
+        assert_eq!(app.current_changeset().name, "current");
     }
 }
