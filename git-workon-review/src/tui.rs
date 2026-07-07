@@ -2,9 +2,13 @@
 //!
 //! Ported loop shape from the `review-tui-spike` prototype's `main.rs` (`install_panic_hook`,
 //! raw-mode + alternate-screen setup, `draw -> quit-check -> next_event -> update`), adapted to
-//! read events through [`next_event`] rather than calling crossterm directly from the loop: M4
-//! swaps `next_event`'s internals for an mpsc channel fed by watcher threads without changing
-//! the loop shape or [`AppEvent`]'s shape.
+//! read events through [`next_event`] rather than calling crossterm directly from the loop.
+//!
+//! M4's index watcher (locked decision #4) does NOT swap `next_event`'s internals for a
+//! channel-fed watcher thread, despite an earlier note here suggesting that direction — the
+//! locked decision is a synchronous poll on the existing `Tick` (every `next_event` timeout),
+//! comparing [`workon_review::refresh::IndexSignature`] and re-diffing in place via
+//! [`App::on_tick`] when it changes. No threads, no `mpsc`, no new deps.
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -19,9 +23,9 @@ use ratatui::Terminal;
 use workon_review::app::App;
 use workon_review::render;
 
-/// One event the review loop reacts to. `next_event`'s crossterm-specific mapping is the only
-/// piece M4 will replace (for an mpsc channel fed by a file-watcher thread) — the loop and this
-/// enum stay the same shape.
+/// One event the review loop reacts to. `Tick` is now also the index-watcher's poll beat (see the
+/// module doc's note on locked decision #4) — `next_event`'s mapping and this enum otherwise stay
+/// the shape M3 built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppEvent {
     Key(KeyEvent),
@@ -132,7 +136,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::ToggleLayout => app.toggle_layout(),
         Action::CycleZoom => app.cycle_zoom(),
         Action::ToggleSplitFocus => app.toggle_split_focus(),
-        Action::Refresh => app.refresh(),
+        Action::Refresh => app.coordinated_refresh(),
         Action::StageHunk => app.stage_hunk(),
         Action::StageFile => app.stage_file(),
         Action::DiscardHunk => app.discard_hunk(),
@@ -143,9 +147,9 @@ fn apply_action(app: &mut App, action: Action) -> bool {
     false
 }
 
-/// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize and
-/// Tick are no-ops today — ratatui re-measures `body_area` every frame regardless, and Tick
-/// exists for M4's periodic-refresh consumers, not M3's read-only loop.
+/// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize is a
+/// no-op — ratatui re-measures `body_area` every frame regardless. Tick drives
+/// [`App::on_tick`], the M4 index watcher's poll (see the module doc).
 ///
 /// A `Key` event clears any showing footer notice BEFORE applying the key's own action, so a
 /// notice stays visible until the user's next keystroke — that same keystroke both dismisses the
@@ -186,7 +190,11 @@ fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
             app.clear_notice();
             apply_action(app, map_key(pending, key, app.pane_height))
         }
-        AppEvent::Resize(_, _) | AppEvent::Tick => false,
+        AppEvent::Tick => {
+            app.on_tick();
+            false
+        }
+        AppEvent::Resize(_, _) => false,
     }
 }
 
@@ -501,6 +509,30 @@ mod tests {
             app.notice.is_some(),
             "a Resize event must not clear a notice"
         );
+    }
+
+    #[test]
+    fn tick_event_through_update_calls_on_tick_without_panicking() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let mut pending = None;
+
+        // A plain Tick with nothing changed externally must be a safe no-op wired all the way
+        // through `update` — the smoke test for M4's index-watcher hookup (the substantive
+        // signature-change/echo-suppression assertions live in `app.rs`'s own `on_tick` tests,
+        // which have direct access to its private state).
+        let quit = update(&mut app, &mut pending, AppEvent::Tick);
+
+        assert!(!quit, "Tick must never quit the loop");
+        assert_eq!(app.files.len(), 1);
+        assert_eq!(app.files[0].path, "a.txt");
     }
 
     #[test]

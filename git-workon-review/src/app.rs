@@ -21,6 +21,7 @@ use crate::highlight::{FgSpan, TsHighlighter};
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
+use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::stage_op::{FileStagingOp, LineSelectionOp};
 use crate::synthesis::LineSelection;
 use crate::wordiff::{word_diff_spans, Span};
@@ -547,6 +548,10 @@ pub struct App {
     /// zoom change, file switch, split-focus swap — since a raw row index carries no meaning across
     /// a reshape.
     pub selection_anchor: Option<usize>,
+    /// Trap-4/5 livelock/interlock state for the M4 index watcher (locked decision #4: a
+    /// synchronous poll-on-`Tick`, no threads). See [`Self::on_tick`] and
+    /// [`Self::coordinated_refresh`].
+    refresh_coordinator: RefreshCoordinator,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -608,6 +613,19 @@ impl App {
             staged_idx,
         } = DiffState::from(diffs);
         let n = files.len();
+        let mut refresh_coordinator = RefreshCoordinator::new();
+        // Seed the coordinator with the index signature as it stands right after this initial
+        // diff, so the FIRST `Tick` doesn't see an "unseen" signature and spuriously re-diff an
+        // index that hasn't actually changed since `App::new` read it. `begin`/`complete` with no
+        // refresh in between is just a way to prime `last_signature` through the same API a real
+        // refresh uses — there's nothing to commit/supersede here, only one coordinator exists. If
+        // the initial read fails (e.g. a repo with no index file yet), leave it unseeded: the
+        // first tick will see a "new" signature and refresh once, which is harmless — cheaper than
+        // threading an extra error path through `new`.
+        if let Ok(sig) = IndexSignature::read(repo.path()) {
+            let ticket = refresh_coordinator.begin();
+            refresh_coordinator.complete(ticket, sig);
+        }
         Self {
             repo,
             files,
@@ -634,6 +652,51 @@ impl App {
             applier: Git2Applier,
             pending_confirm: None,
             selection_anchor: None,
+            refresh_coordinator,
+        }
+    }
+
+    /// The current `.git/index`'s cheap fingerprint (mtime + size), or `None` if the read fails —
+    /// tolerated rather than propagated, since a transient read error (e.g. a concurrent git
+    /// process mid-write) must not crash the TUI or wedge the tick loop; the next tick just tries
+    /// again. `repo.path()` is the `.git` directory itself, which [`IndexSignature::read`] expects.
+    fn index_signature(&self) -> Option<IndexSignature> {
+        IndexSignature::read(self.repo.path()).ok()
+    }
+
+    /// Refresh wrapped with [`RefreshCoordinator`] bookkeeping — the entry point every refresh
+    /// trigger (manual `r`, and the post-staging-op drain) must go through instead of calling
+    /// [`Self::refresh`] directly, so `last_signature` stays current and a `Tick` right after
+    /// doesn't mistake our own write for an external one (trap 5's echo-suppression).
+    ///
+    /// The signature is read AFTER `self.refresh()` runs, not before: `refresh`'s own diffing can
+    /// itself touch the index's stat cache (see [`RefreshCoordinator::complete`]'s doc comment for
+    /// why the post-completion signature, not the pre-refresh one, is the one that must be
+    /// recorded). If the post-refresh read fails, `last_signature` simply isn't updated this
+    /// round — the next tick will see a "new" signature and refresh again, which is a harmless
+    /// extra re-diff, not a crash.
+    pub fn coordinated_refresh(&mut self) {
+        let ticket = self.refresh_coordinator.begin();
+        self.refresh();
+        if let Some(sig) = self.index_signature() {
+            self.refresh_coordinator.complete(ticket, sig);
+        }
+    }
+
+    /// The periodic `Tick` hook (locked decision #4: sync poll, no threads/channels). Reads the
+    /// current index signature and, if [`RefreshCoordinator::note_index_event`] says it's a
+    /// genuinely new, unseen state with no staging op in flight, runs a [`Self::coordinated_refresh`].
+    /// A failed signature read is a silent no-op (tolerated, see [`Self::index_signature`]) — the
+    /// next tick just tries again.
+    pub fn on_tick(&mut self) {
+        let Some(sig) = self.index_signature() else {
+            return;
+        };
+        if self
+            .refresh_coordinator
+            .note_index_event(sig, self.queue.len())
+        {
+            self.coordinated_refresh();
         }
     }
 
@@ -1390,7 +1453,7 @@ impl App {
         });
         match failure {
             Some(message) => self.notify(message, Severity::Error),
-            None => self.refresh(),
+            None => self.coordinated_refresh(),
         }
     }
 
@@ -1811,7 +1874,7 @@ mod tests {
     use git_workon_fixture::prelude::*;
 
     use super::test_support::app_from_fixture;
-    use super::{find_next_hunk_row, find_prev_hunk_row};
+    use super::{find_next_hunk_row, find_prev_hunk_row, Role};
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::model::FileStatus;
 
@@ -2766,6 +2829,133 @@ mod tests {
 
         assert_eq!(app.layout, Layout::Inline, "refresh must not reset layout");
         assert_eq!(app.zoom, Zoom::Combined, "refresh must not reset zoom");
+    }
+
+    // ---- M4 index watcher (`on_tick`) -------------------------------------------------------
+
+    /// Stage `path` in the fixture's index, exactly as an external `git add` would — the write
+    /// [`App::on_tick`] is meant to notice, since [`crate::refresh::IndexSignature`] only
+    /// fingerprints `.git/index` (not the worktree; see that module's docs for why the watcher is
+    /// index-only, not a general filesystem watcher).
+    fn stage_externally(fixture: &Fixture, path: &str) {
+        let repo = fixture.repo().unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new(path)).unwrap();
+        index.write().unwrap();
+    }
+
+    #[test]
+    fn on_tick_after_external_index_change_rebuilds_the_view() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(
+            app.role_change(app.current, Role::Staged).is_none(),
+            "a.txt starts unstaged only"
+        );
+
+        // An external `git add` — nothing this process did — changes `.git/index`'s signature.
+        stage_externally(&fixture, "a.txt");
+
+        app.on_tick();
+
+        assert!(
+            app.role_change(app.current, Role::Staged).is_some(),
+            "on_tick must pick up the externally staged change"
+        );
+        assert!(
+            app.role_change(app.current, Role::Unstaged).is_none(),
+            "a.txt is now fully staged, no unstaged sub-diff remains"
+        );
+    }
+
+    #[test]
+    fn on_tick_with_unchanged_index_does_not_refresh() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        // `start_selection` is a marker a refresh always clears (`reset_panes`, called from
+        // `open_current` at the end of every refresh, zeroes `selection_anchor`) — if it survives
+        // a tick, no refresh ran.
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+
+        app.on_tick();
+        app.on_tick();
+
+        assert!(
+            app.selection_anchor.is_some(),
+            "an unchanged index must not trigger a refresh"
+        );
+    }
+
+    #[test]
+    fn on_tick_right_after_new_does_not_spuriously_refresh_the_initial_seed() {
+        // `App::new` seeds the coordinator with the index signature as it stood at construction
+        // time, so the FIRST tick — with nothing having changed since — must not treat that
+        // baseline as a "new" external event.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+
+        app.on_tick();
+
+        assert!(
+            app.selection_anchor.is_some(),
+            "the seeded initial signature must suppress a spurious first-tick refresh"
+        );
+    }
+
+    #[test]
+    fn on_tick_immediately_after_a_staging_op_does_not_double_refresh() {
+        // The whole point of recording the POST-refresh signature in `coordinated_refresh`: our
+        // own staging write's echo must not look like a fresh external change to the very next
+        // tick.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.stage_file();
+        assert!(
+            app.role_change(app.current, Role::Staged).is_some(),
+            "stage_file must have staged the whole file"
+        );
+
+        // Marker: a refresh clears `selection_anchor` via `reset_panes`; `stage_file`'s own
+        // `coordinated_refresh` already ran and cleared it once (fine, unobserved). Set a fresh
+        // marker afterward so the NEXT tick's (non-)refresh is what's under test.
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+
+        app.on_tick();
+
+        assert!(
+            app.selection_anchor.is_some(),
+            "the post-op signature recorded by coordinated_refresh must suppress the echo, \
+             so this tick must not refresh again"
+        );
     }
 
     // ---- M4 staging: hunk identity ---------------------------------------------------------
