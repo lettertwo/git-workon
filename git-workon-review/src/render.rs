@@ -14,6 +14,7 @@ use ratatui::Frame;
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Role};
+use crate::attribute::Attribution;
 use crate::highlight::FgSpan;
 use crate::model::FileStatus;
 use crate::wordiff::Span as WordSpan;
@@ -22,6 +23,15 @@ const BG_DEL_SUBTLE: Color = Color::Rgb(60, 24, 24);
 const BG_DEL_STRONG: Color = Color::Rgb(120, 40, 40);
 const BG_ADD_SUBTLE: Color = Color::Rgb(20, 48, 24);
 const BG_ADD_STRONG: Color = Color::Rgb(32, 100, 48);
+/// Dim/desaturated variants of the del/add pair, for staged-ness attribution (locked decision
+/// #7): visibly less vivid than the plain pair but still red-tinted, so a staged change reads as
+/// "already handled" without disappearing into plain context.
+const BG_DEL_STAGED_SUBTLE: Color = Color::Rgb(42, 26, 28);
+const BG_DEL_STAGED_STRONG: Color = Color::Rgb(64, 38, 40);
+/// Dim/desaturated variants of the add pair — green-tinted counterpart of
+/// [`BG_DEL_STAGED_SUBTLE`]/[`BG_DEL_STAGED_STRONG`].
+const BG_ADD_STAGED_SUBTLE: Color = Color::Rgb(24, 34, 26);
+const BG_ADD_STAGED_STRONG: Color = Color::Rgb(34, 50, 38);
 const FG_DEFAULT: Color = Color::Gray;
 const FG_DIM: Color = Color::DarkGray;
 const FG_GUTTER: Color = Color::DarkGray;
@@ -125,6 +135,80 @@ fn gutter_width(max_lineno: usize) -> usize {
     max_lineno.to_string().len().max(3)
 }
 
+/// How a rendered pane resolves a changed cell's (subtle, strong) background pair — one per
+/// [`Role`] (locked decision #7): the combined view is the only one that needs a per-cell lookup,
+/// since it's the only role that fuses staged and unstaged content into one set of rows.
+#[derive(Clone, Copy)]
+enum AttributionMode<'a> {
+    /// Combined view: look up each cell's staged-ness in the given [`Attribution`], built fresh
+    /// for the current file this frame (see [`combined_attribution`]).
+    Attributed(&'a Attribution),
+    /// Unstaged zoom pane: every changed cell IS the not-yet-staged set — render bright,
+    /// unconditionally (today's plain colors).
+    Plain,
+    /// Staged zoom pane (single-zoom or the split's bottom pane): every changed cell IS already
+    /// staged — render dim, unconditionally.
+    StagedUniform,
+}
+
+/// Build the current file's [`Attribution`] when rendering the combined role, `None` for the
+/// unstaged/staged roles (which don't need a per-cell lookup — see [`AttributionMode`]). Computed
+/// fresh from the sub-models on every call rather than cached on `App`: cheap (O(hunk lines) on
+/// one file) and always correct even if the index changes between frames (the M4 watcher's
+/// concern, not this one's, but the cost of getting it wrong is a stale color).
+fn combined_attribution(app: &App, idx: usize, role: Role) -> Option<Attribution> {
+    if role != Role::Combined {
+        return None;
+    }
+    let unstaged = app.role_change(idx, Role::Unstaged);
+    let staged = app.role_change(idx, Role::Staged);
+    Some(Attribution::build(unstaged, staged))
+}
+
+/// Resolve the [`AttributionMode`] to render `role` with, given the (possibly absent, for
+/// non-combined roles) [`Attribution`] built by [`combined_attribution`].
+fn attribution_mode(role: Role, attribution: &Option<Attribution>) -> AttributionMode<'_> {
+    match role {
+        Role::Combined => AttributionMode::Attributed(
+            attribution
+                .as_ref()
+                .expect("combined_attribution always builds one for Role::Combined"),
+        ),
+        Role::Unstaged => AttributionMode::Plain,
+        Role::Staged => AttributionMode::StagedUniform,
+    }
+}
+
+/// The (subtle, strong) background pair for a Del cell at `old_lnum`, given `mode`.
+fn del_bg_pair(mode: AttributionMode, old_lnum: u32) -> (Color, Color) {
+    match mode {
+        AttributionMode::Plain => (BG_DEL_SUBTLE, BG_DEL_STRONG),
+        AttributionMode::StagedUniform => (BG_DEL_STAGED_SUBTLE, BG_DEL_STAGED_STRONG),
+        AttributionMode::Attributed(attribution) => {
+            if attribution.del_is_staged(old_lnum) {
+                (BG_DEL_STAGED_SUBTLE, BG_DEL_STAGED_STRONG)
+            } else {
+                (BG_DEL_SUBTLE, BG_DEL_STRONG)
+            }
+        }
+    }
+}
+
+/// The (subtle, strong) background pair for an Add cell at `new_lnum`, given `mode`.
+fn add_bg_pair(mode: AttributionMode, new_lnum: u32) -> (Color, Color) {
+    match mode {
+        AttributionMode::Plain => (BG_ADD_SUBTLE, BG_ADD_STRONG),
+        AttributionMode::StagedUniform => (BG_ADD_STAGED_SUBTLE, BG_ADD_STAGED_STRONG),
+        AttributionMode::Attributed(attribution) => {
+            if attribution.add_is_unstaged(new_lnum) {
+                (BG_ADD_SUBTLE, BG_ADD_STRONG)
+            } else {
+                (BG_ADD_STAGED_SUBTLE, BG_ADD_STAGED_STRONG)
+            }
+        }
+    }
+}
+
 /// Which side of the aligned pair a pane line is being built for — determines which of
 /// [`FileView`]'s two parallel (text, highlight) sources to read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,8 +272,7 @@ fn build_pane_line(
     kind: CellKind,
     word_spans: &[WordSpan],
     is_word_pair: bool,
-    subtle_bg: Color,
-    strong_bg: Color,
+    mode: AttributionMode,
     gutter_w: usize,
     content_w: usize,
 ) -> Line<'static> {
@@ -213,7 +296,8 @@ fn build_pane_line(
             let mut spans = vec![TSpan::styled(gutter, Style::default().fg(FG_GUTTER))];
 
             let emphasis = match kind {
-                CellKind::Del | CellKind::Add => Some((subtle_bg, strong_bg)),
+                CellKind::Del => Some(del_bg_pair(mode, n as u32)),
+                CellKind::Add => Some(add_bg_pair(mode, n as u32)),
                 CellKind::Context | CellKind::Filler => None,
             };
             spans.extend(content_spans(text, hl, emphasis, word_spans, is_word_pair));
@@ -452,6 +536,11 @@ fn render_pane_sbs(
     let new_gutter_w = gutter_width(view.new_line_count());
     let end = (scroll + area.height as usize).min(view.display.len());
 
+    // Built once per frame, not per row/cached on `App` — see `combined_attribution`'s doc
+    // comment. `None` for non-combined roles, which don't need it.
+    let attribution = combined_attribution(app, idx, role);
+    let mode = attribution_mode(role, &attribution);
+
     // Phase 1 (mutable): populate the word-span cache for visible paired rows. Phase 2 below
     // re-borrows `app`/`view` immutably to build lines — kept as the same two-phase dance the
     // spike used (see app.rs's `word_spans_for_row`/`peek_word_spans` split) rather than
@@ -500,8 +589,7 @@ fn render_pane_sbs(
                     row.old_kind,
                     &old_words,
                     is_pair,
-                    BG_DEL_SUBTLE,
-                    BG_DEL_STRONG,
+                    mode,
                     old_gutter_w,
                     old_area.width as usize,
                 );
@@ -512,8 +600,7 @@ fn render_pane_sbs(
                     row.new_kind,
                     &new_words,
                     is_pair,
-                    BG_ADD_SUBTLE,
-                    BG_ADD_STRONG,
+                    mode,
                     new_gutter_w,
                     new_area.width as usize,
                 );
@@ -567,6 +654,7 @@ fn build_inline_line(
     view: &FileView,
     row: &InlineRow,
     word_spans: &[WordSpan],
+    mode: AttributionMode,
     old_gutter_w: usize,
     new_gutter_w: usize,
 ) -> Line<'static> {
@@ -605,10 +693,11 @@ fn build_inline_line(
     let mut spans = vec![TSpan::styled(gutter, Style::default().fg(FG_GUTTER))];
 
     let is_word_pair = row.is_word_diff_pair();
-    // `kind` is always Del/Add/Context here — inline has no Filler rows.
+    // `kind` is always Del/Add/Context here — inline has no Filler rows. `old_opt`/`new_opt`
+    // carry the exact lineno each kind is documented to have (see this fn's own match above).
     let emphasis = match kind {
-        CellKind::Del => Some((BG_DEL_SUBTLE, BG_DEL_STRONG)),
-        CellKind::Add => Some((BG_ADD_SUBTLE, BG_ADD_STRONG)),
+        CellKind::Del => old_opt.map(|n| del_bg_pair(mode, n as u32)),
+        CellKind::Add => new_opt.map(|n| add_bg_pair(mode, n as u32)),
         CellKind::Context | CellKind::Filler => None,
     };
     spans.extend(content_spans(text, hl, emphasis, word_spans, is_word_pair));
@@ -634,6 +723,10 @@ fn render_pane_inline(
     let old_gutter_w = gutter_width(view.old_line_count());
     let new_gutter_w = gutter_width(view.new_line_count());
     let end = (scroll + area.height as usize).min(view.inline.len());
+
+    // See `render_pane_sbs`'s identical comment — built once per frame, not cached on `App`.
+    let attribution = combined_attribution(app, idx, role);
+    let mode = attribution_mode(role, &attribution);
 
     // Same two-phase mutable/immutable dance as `render_pane_sbs`, over the inline coordinate
     // space instead.
@@ -667,7 +760,8 @@ fn render_pane_inline(
                     InlineRow::Add { .. } => &new_spans,
                     _ => &[],
                 };
-                let line = build_inline_line(view, row, word_spans, old_gutter_w, new_gutter_w);
+                let line =
+                    build_inline_line(view, row, word_spans, mode, old_gutter_w, new_gutter_w);
                 let line = if is_cursor {
                     apply_cursor_row(line, area.width)
                 } else {
@@ -687,7 +781,10 @@ mod tests {
 
     use git_workon_fixture::prelude::*;
 
-    use super::render;
+    use super::{
+        render, BG_ADD_STAGED_STRONG, BG_ADD_STAGED_SUBTLE, BG_ADD_STRONG, BG_ADD_SUBTLE,
+        BG_DEL_STAGED_STRONG, BG_DEL_STAGED_SUBTLE, BG_DEL_STRONG, BG_DEL_SUBTLE,
+    };
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
@@ -1134,6 +1231,105 @@ mod tests {
             default_buf, combined_buf,
             "the default (downgraded-to-unstaged) render must match the combined-zoom render \
              cell-for-cell for an unstaged-only file"
+        );
+    }
+
+    #[test]
+    fn combined_view_colors_a_staged_change_dim_and_an_unstaged_change_bright() {
+        // A partially-staged file with two independent word changes: line 2 was already staged
+        // (committed -> staged both carry the change), line 4 is still only in the worktree
+        // (staged -> workdir carries it, index doesn't). The combined view (HEAD <-> worktree)
+        // fuses both into one set of rows — attribution must tell them apart: line 2's change
+        // should render with the dim (staged) pair, line 4's with the bright (not-yet-staged)
+        // pair, on BOTH the Del (old) and Add (new) side of each row (the add/del asymmetry:
+        // Del keys off the staged sub-diff, Add off the unstaged sub-diff).
+        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
+        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
+        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", committed, staged, workdir)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cycle_zoom(); // Split -> Combined
+        assert_eq!(app.zoom, crate::app::Zoom::Combined);
+        // Park the cursor on the file's first (context) row so its highlight tint doesn't blend
+        // into either changed row's background and muddy the color comparison below.
+        app.cursor = 0;
+        app.derive_scroll();
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+
+        let staged_row = content
+            .iter()
+            .position(|line| line.contains("old word here"))
+            .expect("staged change's old-side text visible");
+        let unstaged_row = content
+            .iter()
+            .position(|line| line.contains("old4 word four"))
+            .expect("unstaged change's old-side text visible");
+
+        // Old (left) pane, first content column after the gutter — always carries SOME del
+        // emphasis on a changed row, subtle or strong depending on the word-diff split, but
+        // always from the dim family for a staged row and the bright family for an unstaged one.
+        let old_content_x = 4; // gutter width 3 + 1 space, same convention as the other tests
+        let staged_del_bg = buf
+            .cell((old_content_x, staged_row as u16))
+            .unwrap()
+            .style()
+            .bg;
+        let unstaged_del_bg = buf
+            .cell((old_content_x, unstaged_row as u16))
+            .unwrap()
+            .style()
+            .bg;
+
+        let dim_dels = [Some(BG_DEL_STAGED_SUBTLE), Some(BG_DEL_STAGED_STRONG)];
+        let bright_dels = [Some(BG_DEL_SUBTLE), Some(BG_DEL_STRONG)];
+        assert!(
+            dim_dels.contains(&staged_del_bg),
+            "expected the staged row's Del side to use the dim pair, got {staged_del_bg:?}"
+        );
+        assert!(
+            bright_dels.contains(&unstaged_del_bg),
+            "expected the unstaged row's Del side to use the bright pair, got {unstaged_del_bg:?}"
+        );
+        assert_ne!(
+            staged_del_bg, unstaged_del_bg,
+            "staged and unstaged Del rows must render with visibly distinct backgrounds"
+        );
+
+        // New (right) pane: same rows carry "new word here" / "new4 word four" respectively.
+        let left_w = (buf.area.width.saturating_sub(1)) / 2;
+        let new_content_x = left_w + 1 + 4; // divider + gutter width 3 + 1 space
+        let staged_add_bg = buf
+            .cell((new_content_x, staged_row as u16))
+            .unwrap()
+            .style()
+            .bg;
+        let unstaged_add_bg = buf
+            .cell((new_content_x, unstaged_row as u16))
+            .unwrap()
+            .style()
+            .bg;
+
+        let dim_adds = [Some(BG_ADD_STAGED_SUBTLE), Some(BG_ADD_STAGED_STRONG)];
+        let bright_adds = [Some(BG_ADD_SUBTLE), Some(BG_ADD_STRONG)];
+        assert!(
+            dim_adds.contains(&staged_add_bg),
+            "expected the staged row's Add side to use the dim pair, got {staged_add_bg:?}"
+        );
+        assert!(
+            bright_adds.contains(&unstaged_add_bg),
+            "expected the unstaged row's Add side to use the bright pair, got {unstaged_add_bg:?}"
+        );
+        assert_ne!(
+            staged_add_bg, unstaged_add_bg,
+            "staged and unstaged Add rows must render with visibly distinct backgrounds"
         );
     }
 }

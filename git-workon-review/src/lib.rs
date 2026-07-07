@@ -16,6 +16,7 @@ pub mod acquire;
 pub mod align;
 pub mod app;
 pub mod apply;
+pub mod attribute;
 pub mod error;
 pub mod file_ops;
 pub mod highlight;

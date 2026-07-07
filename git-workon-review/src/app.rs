@@ -536,6 +536,29 @@ impl App {
         }
     }
 
+    /// The sub-[`FileChange`] backing file `idx`'s `role` view: `self.files[idx]` itself for
+    /// [`Role::Combined`], or the matching entry in the unstaged/staged model (`None` if that
+    /// role has no change for this file). Used by the renderer to build a fresh
+    /// [`crate::attribute::Attribution`] for the combined role each frame — see that module's
+    /// docs for why the two sub-roles' hunks (not the combined ones) are the attribution source.
+    pub(crate) fn role_change(&self, idx: usize, role: Role) -> Option<&FileChange> {
+        match role {
+            Role::Combined => self.files.get(idx),
+            Role::Unstaged => self
+                .unstaged_idx
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|mi| &self.unstaged_model.files[mi]),
+            Role::Staged => self
+                .staged_idx
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|mi| &self.staged_model.files[mi]),
+        }
+    }
+
     /// The role of the currently focused split pane (or the pane that WOULD be focused). See
     /// [`Self::split_focus`].
     pub(crate) fn split_focus_role(&self) -> Role {
