@@ -494,8 +494,8 @@ fn derive_scroll_value(
 /// [`DiffState::from_committed`]), which is enough on its own to render it read-only: the
 /// existing [`effective_zoom`] gate collapses `Split`/`Unstaged`/`Staged` to
 /// [`EffectiveZoom::Single(Role::Combined)`] whenever both sub-diffs are absent — no
-/// committed-specific rendering code needed for M5's spine (mode-aware staging refusal/zoom
-/// lock are `m5-changeset-nav`).
+/// committed-specific rendering code needed for M5's spine (the mode-aware staging refusal and
+/// zoom lock riding this natural collapse are [`App::is_committed`]'s targeted guards).
 pub struct ChangesetView {
     pub cs: Changeset,
     diff: DiffState,
@@ -551,8 +551,10 @@ pub struct App {
     /// three `views_*` lazy caches) now lives on the ACTIVE entry's [`ChangesetView`]; read it
     /// through [`Self::cur`]/[`Self::cur_mut`] rather than indexing this directly.
     changesets: Vec<ChangesetView>,
-    /// Index into [`Self::changesets`] of the active changeset. M5 changeset-nav (`]c`/`[c`)
-    /// will move this; M5's spine (this changeset) only ever sets it at construction/refresh.
+    /// Index into [`Self::changesets`] of the active changeset. Moved by continuous file nav
+    /// crossing a changeset boundary ([`Self::next_file`]/[`Self::prev_file`]) and by explicit
+    /// changeset nav ([`Self::next_changeset`]/[`Self::prev_changeset`]/[`Self::goto_changeset`]),
+    /// besides construction/refresh.
     current_cs: usize,
     pub current: usize,
     /// Row index, in the ACTIVE layout's coordinate space, of the highlighted navigation
@@ -805,7 +807,8 @@ impl App {
 
     /// Index into the reviewed stack of the active changeset — read by tests asserting the
     /// [`Self::from_changesets`]/[`Self::refresh`] "honor lib `current`" rule (locked decision
-    /// #6); changeset-nav (`]c`/`[c`) will add a setter in `m5-changeset-nav`.
+    /// #6), and by changeset-nav's own tests ([`Self::next_changeset`]/[`Self::prev_changeset`]/
+    /// [`Self::goto_changeset`]).
     pub fn current_cs(&self) -> usize {
         self.current_cs
     }
@@ -820,6 +823,15 @@ impl App {
     /// clean-Graphite-tip) repo, per locked decision #7.
     pub fn changeset_count(&self) -> usize {
         self.changesets.len()
+    }
+
+    /// Whether the ACTIVE changeset is a committed range (`base..head`) rather than the
+    /// uncommitted worktree layer — derived from [`workon::ChangesetSource`] on every call rather
+    /// than cached (locked decision #2's "derive, don't store" mode gate). Drives every
+    /// committed-mode guard: the mode-aware staging refusal, skipping combined attribution (no
+    /// staged/unstaged sets exist to color by), and locking zoom to combined.
+    pub fn is_committed(&self) -> bool {
+        matches!(self.cur().cs.source, ChangesetSource::Committed { .. })
     }
 
     /// Re-run [`crate::acquire::resolve_changesets`] against the CURRENT `HEAD` branch and
@@ -1173,6 +1185,16 @@ impl App {
     /// persists across file navigation; both panes reset to their first hunks so `cursor`/`scroll`
     /// are always valid for the now-active view(s).
     pub fn cycle_zoom(&mut self) {
+        // A committed changeset has no staged/unstaged split to zoom into — lock zoom to combined
+        // (locked decision #2) rather than cycling into a state `effective_zoom` immediately
+        // collapses back anyway.
+        if self.is_committed() {
+            self.notify(
+                "changeset is committed — combined view only",
+                Severity::Info,
+            );
+            return;
+        }
         self.zoom = match self.zoom {
             Zoom::Split => Zoom::Combined,
             Zoom::Combined => Zoom::Unstaged,
@@ -1203,21 +1225,74 @@ impl App {
         self.derive_scroll();
     }
 
+    /// Reshape onto changeset `target` (clamped into range), landing on file `file_idx` of ITS
+    /// list (clamped into range, `0` if empty) — the shared core of every changeset switch
+    /// (continuous file nav crossing a boundary, and `]c`/`[c`). A coordinate-space reshape
+    /// exactly like a plain file switch (cursor/scroll/selection reset via `open_current`), plus
+    /// re-deriving `base_label` for the newly active changeset (each changeset can have its own
+    /// base rev — see [`base_label_for`]).
+    fn switch_changeset(&mut self, target: usize, file_idx: usize) {
+        self.current_cs = target.min(self.changesets.len().saturating_sub(1));
+        self.base_label = base_label_for(&self.cur().cs);
+        let n = self.cur().diff.files.len();
+        self.current = if n == 0 { 0 } else { file_idx.min(n - 1) };
+        self.open_current();
+    }
+
+    /// Advance to the next file (`]f`/Tab), continuously across the whole stack (locked decision
+    /// #5): at the active changeset's last file, this advances `current_cs` and lands on the NEXT
+    /// changeset's first file, rather than wrapping within the active changeset. Clamps (does NOT
+    /// wrap) at the very last file of the very last changeset.
     pub fn next_file(&mut self) {
         if self.cur().diff.files.is_empty() {
             return;
         }
-        self.current = (self.current + 1) % self.cur().diff.files.len();
-        self.open_current();
+        if self.current + 1 < self.cur().diff.files.len() {
+            self.current += 1;
+            self.open_current();
+        } else if self.current_cs + 1 < self.changesets.len() {
+            self.switch_changeset(self.current_cs + 1, 0);
+        }
+        // Else: already at the stack's very last file — clamp, no-op.
     }
 
+    /// Retreat to the previous file (`[f`/BackTab), continuously across the whole stack — the
+    /// mirror of [`Self::next_file`]. At the active changeset's first file, drops into the
+    /// PREVIOUS changeset's LAST file. Clamps (does NOT wrap) at the very first file of the very
+    /// first changeset.
     pub fn prev_file(&mut self) {
         if self.cur().diff.files.is_empty() {
             return;
         }
-        self.current =
-            (self.current + self.cur().diff.files.len() - 1) % self.cur().diff.files.len();
-        self.open_current();
+        if self.current > 0 {
+            self.current -= 1;
+            self.open_current();
+        } else if self.current_cs > 0 {
+            let target = self.current_cs - 1;
+            let last = self.changesets[target].diff.files.len().saturating_sub(1);
+            self.switch_changeset(target, last);
+        }
+        // Else: already at the stack's very first file — clamp, no-op.
+    }
+
+    /// Jump to changeset `target`'s first file (`]c`/`[c`, and any future outline click-to-jump).
+    /// Clamps into `[0, changeset_count() - 1]` — never wraps.
+    pub fn goto_changeset(&mut self, target: usize) {
+        self.switch_changeset(target, 0);
+    }
+
+    /// Jump to the next changeset's first file (`]c`). A no-op at the last changeset.
+    pub fn next_changeset(&mut self) {
+        if self.current_cs + 1 < self.changesets.len() {
+            self.goto_changeset(self.current_cs + 1);
+        }
+    }
+
+    /// Jump to the previous changeset's first file (`[c`). A no-op at the first changeset.
+    pub fn prev_changeset(&mut self) {
+        if self.current_cs > 0 {
+            self.goto_changeset(self.current_cs - 1);
+        }
     }
 
     /// Row count of file `idx`'s `role` view in the active layout's space (0 if absent/unloaded).
@@ -1438,6 +1513,27 @@ impl App {
         }
     }
 
+    /// Mode-aware refusal notice for a staging verb / line-selection start that only makes sense
+    /// outside the combined view — i.e. every call site below whose `staging_role()`/
+    /// `staging_role().is_none()` guard failed (locked decision #2's "targeted guard"). A
+    /// committed changeset is ALWAYS combined-only (no staged/unstaged split exists to zoom
+    /// into — see [`Self::is_committed`]), so telling the user to "cycle zoom" there is actively
+    /// wrong; state the real reason instead. `verb` ("stage"/"select") keeps each call site's
+    /// original non-committed wording.
+    fn notify_combined_refusal(&mut self, verb: &str) {
+        if self.is_committed() {
+            self.notify(
+                "changeset is already committed — nothing to stage",
+                Severity::Error,
+            );
+        } else {
+            self.notify(
+                format!("{verb} in the unstaged/staged pane — cycle zoom (z)"),
+                Severity::Error,
+            );
+        }
+    }
+
     /// Stage (unstaged pane) or unstage (staged pane) the hunk under the cursor (`s`). Refuses on
     /// the combined view, or when the cursor isn't in a hunk.
     ///
@@ -1453,10 +1549,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify(
-                "stage in the unstaged/staged pane — cycle zoom (z)",
-                Severity::Error,
-            );
+            self.notify_combined_refusal("stage");
             return;
         };
         let Some(verb) = Self::verb_for_role(role) else {
@@ -1481,10 +1574,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify(
-                "stage in the unstaged/staged pane — cycle zoom (z)",
-                Severity::Error,
-            );
+            self.notify_combined_refusal("stage");
             return;
         };
         let Some(verb) = Self::verb_for_role(role) else {
@@ -1511,10 +1601,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify(
-                "stage in the unstaged/staged pane — cycle zoom (z)",
-                Severity::Error,
-            );
+            self.notify_combined_refusal("stage");
             return;
         };
         if role != Role::Unstaged {
@@ -1541,10 +1628,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify(
-                "stage in the unstaged/staged pane — cycle zoom (z)",
-                Severity::Error,
-            );
+            self.notify_combined_refusal("stage");
             return;
         };
         if role != Role::Unstaged {
@@ -1645,10 +1729,7 @@ impl App {
             return;
         }
         if self.staging_role().is_none() {
-            self.notify(
-                "select in the unstaged/staged pane — cycle zoom (z)",
-                Severity::Error,
-            );
+            self.notify_combined_refusal("select");
             return;
         }
         self.selection_anchor = Some(self.cursor);
@@ -1768,10 +1849,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify(
-                "stage in the unstaged/staged pane — cycle zoom (z)",
-                Severity::Error,
-            );
+            self.notify_combined_refusal("stage");
             return;
         };
         let Some(verb) = Self::verb_for_role(role) else {
@@ -1806,10 +1884,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify(
-                "stage in the unstaged/staged pane — cycle zoom (z)",
-                Severity::Error,
-            );
+            self.notify_combined_refusal("stage");
             return;
         };
         if role != Role::Unstaged {
@@ -3985,13 +4060,20 @@ mod tests {
             "empty staged/unstaged sub-models collapse every zoom to combined-only, for free"
         );
 
-        // Read-only follows from the natural collapse above: no committed-specific gate needed.
+        // Read-only follows from the natural collapse above; the refusal MESSAGE is
+        // committed-mode-aware (m5-changeset-nav locked decision #2) — a plain "already
+        // committed" notice, not the uncommitted "cycle zoom" hint (there's no zoom that would
+        // help here).
         app.stage_hunk();
         let notice = app
             .notice
             .as_ref()
             .expect("staging must refuse on a combined-only (committed) changeset");
-        assert!(notice.text.contains("cycle zoom"), "got: {:?}", notice.text);
+        assert!(
+            notice.text.contains("already committed"),
+            "got: {:?}",
+            notice.text
+        );
     }
 
     #[test]
@@ -4080,5 +4162,242 @@ mod tests {
             "must open on the lib-marked current entry"
         );
         assert_eq!(app.current_changeset().name, "current");
+    }
+
+    // ── M5 CS2: continuous nav, changeset nav, committed-mode guards ─────────
+
+    /// A two-committed-changeset stack for CS2's nav tests, hand-built the same way as the M5 CS1
+    /// tests above: `cs-a` (`root..mid`, TWO files — `a1.txt`/`a2.txt`) then `cs-b` (`mid..head`,
+    /// ONE file — `b1.txt`), opening on `cs-a`'s first file. The two-file first changeset lets a
+    /// test distinguish "advance within a changeset" from "cross into the next changeset" at its
+    /// boundary, rather than every `next_file` immediately crossing.
+    fn two_committed_changesets_two_and_one_files() -> App {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mid = fixture
+            .commit("main")
+            .file("a1.txt", "a1\n")
+            .file("a2.txt", "a2\n")
+            .create("mid")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("b1.txt", "b1\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            source: ChangesetSource::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "cs-b".to_string(),
+            source: ChangesetSource::Committed { base: mid, head },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::from_changeset_diff(
+            cs_b.clone(),
+            crate::acquire::diff_changeset(repo, &cs_b).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.open_current();
+        assert_eq!(app.current_cs(), 0, "opens on cs-a (its current: true)");
+        assert_eq!(app.files().len(), 2, "cs-a has two files");
+        app
+    }
+
+    #[test]
+    fn next_file_advances_within_a_changeset_before_crossing_into_the_next() {
+        let mut app = two_committed_changesets_two_and_one_files();
+
+        app.next_file();
+        assert_eq!(app.current_cs(), 0, "still inside cs-a");
+        assert_eq!(app.current, 1);
+        assert_eq!(app.files()[app.current].path, "a2.txt");
+
+        app.next_file();
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "advancing past cs-a's last file crosses into cs-b"
+        );
+        assert_eq!(app.current, 0, "lands on cs-b's FIRST file");
+        assert_eq!(app.files()[0].path, "b1.txt");
+    }
+
+    #[test]
+    fn next_file_clamps_at_the_last_file_of_the_last_changeset() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.goto_changeset(1);
+        assert_eq!(app.current_cs(), 1);
+        assert_eq!(app.current, 0);
+
+        app.next_file();
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "the stack's very last file must clamp, not wrap to changeset 0"
+        );
+        assert_eq!(app.current, 0);
+    }
+
+    #[test]
+    fn prev_file_crosses_backward_into_the_previous_changesets_last_file() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.goto_changeset(1);
+        assert_eq!(app.current_cs(), 1);
+        assert_eq!(app.current, 0);
+
+        app.prev_file();
+        assert_eq!(
+            app.current_cs(),
+            0,
+            "retreating past cs-b's first file crosses back into cs-a"
+        );
+        assert_eq!(app.current, 1, "lands on cs-a's LAST file, not its first");
+        assert_eq!(app.files()[1].path, "a2.txt");
+    }
+
+    #[test]
+    fn prev_file_clamps_at_the_first_file_of_the_first_changeset() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        assert_eq!(app.current_cs(), 0);
+        assert_eq!(app.current, 0);
+
+        app.prev_file();
+        assert_eq!(
+            app.current_cs(),
+            0,
+            "the stack's very first file must clamp, not wrap to the last changeset"
+        );
+        assert_eq!(app.current, 0);
+    }
+
+    #[test]
+    fn bracket_c_jumps_to_the_adjacent_changesets_first_file() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        // Start mid-file so the jump is visibly to file 0, not just "whatever was current".
+        app.current = 1;
+
+        app.next_changeset();
+        assert_eq!(app.current_cs(), 1);
+        assert_eq!(app.current, 0, "]c always lands on the FIRST file");
+        assert_eq!(app.files()[0].path, "b1.txt");
+
+        app.next_changeset();
+        assert_eq!(app.current_cs(), 1, "]c clamps at the last changeset");
+
+        app.prev_changeset();
+        assert_eq!(app.current_cs(), 0);
+        assert_eq!(app.current, 0);
+
+        app.prev_changeset();
+        assert_eq!(app.current_cs(), 0, "[c clamps at the first changeset");
+    }
+
+    #[test]
+    fn switching_changeset_updates_base_label() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        let cs_a_label = app.base_label.clone();
+
+        app.goto_changeset(1);
+        assert_ne!(
+            app.base_label, cs_a_label,
+            "cs-a and cs-b have different base revisions"
+        );
+    }
+
+    #[test]
+    fn is_committed_true_for_a_committed_changeset_false_for_uncommitted() {
+        let committed = two_committed_changesets_two_and_one_files();
+        assert!(committed.is_committed());
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let uncommitted = app_from_fixture(&fixture);
+        assert!(!uncommitted.is_committed());
+    }
+
+    #[test]
+    fn cycle_zoom_is_a_no_op_on_a_committed_changeset() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        let zoom_before = app.zoom;
+
+        app.cycle_zoom();
+
+        assert_eq!(
+            app.zoom, zoom_before,
+            "z must not change the requested zoom on a committed changeset"
+        );
+        assert!(
+            app.notice.is_some(),
+            "z should still surface a notice explaining why it's a no-op"
+        );
+    }
+
+    #[test]
+    fn staging_verbs_refuse_with_a_committed_specific_message() {
+        let mut app = two_committed_changesets_two_and_one_files();
+
+        app.stage_file();
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("stage_file must refuse on a committed changeset");
+        assert!(
+            notice.text.contains("already committed"),
+            "got: {:?}",
+            notice.text
+        );
+
+        app.clear_notice();
+        app.discard_file();
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("discard_file must refuse on a committed changeset");
+        assert!(
+            notice.text.contains("already committed"),
+            "got: {:?}",
+            notice.text
+        );
+
+        app.clear_notice();
+        app.start_selection();
+        assert!(app.selection_anchor.is_none());
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("start_selection must refuse on a committed changeset");
+        assert!(
+            notice.text.contains("already committed"),
+            "got: {:?}",
+            notice.text
+        );
     }
 }

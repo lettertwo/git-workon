@@ -61,6 +61,8 @@ enum Action {
     PrevFile,
     NextHunk,
     PrevHunk,
+    NextChangeset,
+    PrevChangeset,
     ToggleLayout,
     CycleZoom,
     ToggleSplitFocus,
@@ -83,6 +85,8 @@ fn map_key(pending: &mut Option<char>, key: KeyEvent, pane_height: usize) -> Act
             ('[', KeyCode::Char('f')) => Action::PrevFile,
             (']', KeyCode::Char('h')) => Action::NextHunk,
             ('[', KeyCode::Char('h')) => Action::PrevHunk,
+            (']', KeyCode::Char('c')) => Action::NextChangeset,
+            ('[', KeyCode::Char('c')) => Action::PrevChangeset,
             _ => Action::None,
         };
     }
@@ -133,6 +137,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::PrevFile => app.prev_file(),
         Action::NextHunk => app.next_hunk_row(),
         Action::PrevHunk => app.prev_hunk_row(),
+        Action::NextChangeset => app.next_changeset(),
+        Action::PrevChangeset => app.prev_changeset(),
         Action::ToggleLayout => app.toggle_layout(),
         Action::CycleZoom => app.cycle_zoom(),
         Action::ToggleSplitFocus => app.toggle_split_focus(),
