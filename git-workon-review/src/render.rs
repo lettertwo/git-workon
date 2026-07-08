@@ -9,13 +9,15 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as TSpan};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role, Severity};
 use crate::attribute::Attribution;
+use crate::config::View;
 use crate::highlight::FgSpan;
+use crate::keymap::{footer_hint, help_sections, Keymap};
 use crate::model::FileStatus;
 use crate::outline::OutlineItem;
 use crate::wordiff::Span as WordSpan;
@@ -341,8 +343,11 @@ fn build_pane_line(
     }
 }
 
-/// Render one frame: header, SBS body, footer.
-pub fn render(frame: &mut Frame, app: &mut App) {
+/// Render one frame: header, SBS body, footer, and (when [`App::help_visible`]) the `?` overlay
+/// on top of everything else. `keymap` is the resolved, possibly-rebound keymap — the footer hint
+/// and help overlay render its ACTUAL bindings (see [`crate::keymap::footer_hint`]/
+/// [`crate::keymap::help_sections`]), never a hardcoded key string.
+pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap) {
     let area = frame.area();
     let vlayout = Layout::default()
         .direction(Direction::Vertical)
@@ -358,7 +363,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let footer_area = vlayout[2];
 
     render_header(frame, app, header_area);
-    render_footer(frame, app, footer_area);
+    render_footer(frame, app, footer_area, keymap);
 
     if app.outline_open() {
         let hlayout = Layout::default()
@@ -383,6 +388,68 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // Closed: the diff takes the full body width — the exact M4 look (locked design).
         render_body(frame, app, body_area);
     }
+
+    if app.help_visible {
+        render_help_overlay(frame, app, keymap, area);
+    }
+}
+
+/// Compute a centered `percent_x` × `percent_y` sub-rect of `area` — the standard ratatui popup
+/// pattern (two nested percentage splits).
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+/// The `?` help overlay (CS3): a centered, bordered modal listing the focused view's + global
+/// bindings, from the resolved `keymap` (never hardcoded — see [`crate::keymap::help_sections`]).
+/// Focused view = outline when the outline pane has focus, else diff. [`Clear`] wipes the popup
+/// area first so the diff content underneath doesn't show through the gaps between glyphs.
+fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect) {
+    let focused = if app.outline_focused() {
+        View::Outline
+    } else {
+        View::Diff
+    };
+    let sections = help_sections(keymap, focused);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for section in &sections {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(TSpan::styled(
+            section.title,
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        for entry in &section.entries {
+            lines.push(Line::from(format!(
+                "  {:<10} {}",
+                entry.keys, entry.description
+            )));
+        }
+    }
+
+    let popup_area = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Help (?/q/Esc to close) ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
 /// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
@@ -570,8 +637,9 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Footer priority: a pending discard confirm's prompt (warn-toned) wins over a transient notice,
-/// which wins over the dim hint line.
-fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+/// which wins over the curated hint line (CS3) — a notice TEMPORARILY REPLACES the hint rather
+/// than adding a second row; it clears on the user's next keypress (`tui::update`).
+fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap) {
     if let Some(confirm) = &app.pending_confirm {
         frame.render_widget(
             Paragraph::new(confirm.prompt.as_str()).style(Style::default().fg(FG_ERROR)),
@@ -592,17 +660,15 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => {
             // While the outline has focus, only outline-relevant keys act (locked design) — the
-            // diff-editing hint would be actively misleading, so show the outline's own hint
-            // instead.
-            let text = if app.outline_focused() {
-                "j/k move  Enter jump  i mode  o unfocus  Esc unfocus  q quit"
-            } else if app.is_committed() {
-                // A committed changeset is locked to the combined view (locked decision #2) — `z`
-                // zoom and `w` split-focus have nothing to act on, so drop them from the hint.
-                "j/k scroll  v select  s/S stage  d/D discard  q quit"
+            // diff-editing hint would be actively misleading, so show the outline's own curated
+            // hint instead. Built from the resolved `keymap`, never a hardcoded key string, so a
+            // rebind shows here too (see [`crate::keymap::footer_hint`]).
+            let focused = if app.outline_focused() {
+                View::Outline
             } else {
-                "j/k scroll  v select  s/S stage  d/D discard  z zoom  w focus  q quit"
+                View::Diff
             };
+            let text = footer_hint(keymap, focused);
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(FG_DIM)),
                 area,
@@ -1098,11 +1164,16 @@ mod tests {
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
+    use crate::keymap::Keymap;
 
+    /// Render one frame against the default (unrebound) keymap — the vast majority of `render.rs`
+    /// tests don't care about keybindings at all. Tests that DO (the footer/overlay content tests)
+    /// build their own [`Keymap`] and call [`render`] directly instead.
     fn render_once(app: &mut App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, app)).unwrap();
+        let keymap = Keymap::defaults();
+        terminal.draw(|f| render(f, app, &keymap)).unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -1721,8 +1792,65 @@ mod tests {
             .map(|x| cell_text(&buf, x, footer_y))
             .collect();
         assert!(
-            footer.contains("j/k scroll"),
-            "expected the hint string in the footer, got: {footer:?}"
+            footer.contains("j/k move") && footer.contains("? help"),
+            "expected the curated diff hint string in the footer, got: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_shows_the_outline_hint_when_the_outline_has_focus() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        // A lone uncommitted changeset never auto-opens the outline (M4 default) — force it open
+        // + focused so `render_footer` takes the outline-focused branch.
+        app.toggle_outline();
+        assert!(app.outline_focused());
+
+        let buf = render_once(&mut app, 80, 10);
+        let footer_y = buf.area.height - 1;
+        let footer: String = (0..buf.area.width)
+            .map(|x| cell_text(&buf, x, footer_y))
+            .collect();
+        assert!(
+            footer.contains("open") && footer.contains("mode") && footer.contains("? help"),
+            "expected the curated outline hint string in the footer, got: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_renders_a_rebound_key_not_the_default() {
+        use crate::config::RawBinding;
+        use crate::config::View as CfgView;
+        use crate::keymap::Keymap;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        assert!(app.notice.is_none());
+
+        let keymap = Keymap::from_bindings(&[RawBinding {
+            view: CfgView::Diff,
+            action: "stage-hunk".to_string(),
+            keys: "x".to_string(),
+        }]);
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, &mut app, &keymap)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+
+        let footer_y = buf.area.height - 1;
+        let footer: String = (0..buf.area.width)
+            .map(|x| cell_text(&buf, x, footer_y))
+            .collect();
+        assert!(
+            footer.contains("x stage") && !footer.contains("s stage"),
+            "expected the REBOUND key in the footer, got: {footer:?}"
         );
     }
 

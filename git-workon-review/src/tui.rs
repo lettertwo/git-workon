@@ -56,6 +56,7 @@ pub fn next_event(timeout: Duration) -> io::Result<Option<AppEvent>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Quit,
+    ToggleHelp,
     MoveCursorBy(i64),
     ScrollTop,
     ScrollBottom,
@@ -91,6 +92,7 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
     match command {
         Command::Quit => Action::Quit,
         Command::ToggleOutline => Action::ToggleOutline,
+        Command::ToggleHelp => Action::ToggleHelp,
         Command::CursorDown => Action::MoveCursorBy(1),
         Command::CursorUp => Action::MoveCursorBy(-1),
         Command::HalfPageDown => Action::MoveCursorBy(half_page),
@@ -163,6 +165,7 @@ fn map_key(
 fn apply_action(app: &mut App, action: Action) -> bool {
     match action {
         Action::Quit => return true,
+        Action::ToggleHelp => app.toggle_help(),
         Action::MoveCursorBy(delta) => app.move_cursor_by(delta),
         Action::ScrollTop => app.scroll_top(),
         Action::ScrollBottom => app.scroll_bottom(),
@@ -200,23 +203,29 @@ fn apply_action(app: &mut App, action: Action) -> bool {
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
 ///
-/// Esc precedence (highest first): a pending discard confirm > the outline having focus > an
-/// active line selection > the normal key map (where Esc quits). Concretely:
+/// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
+/// outline having focus > an active line selection > the normal key map (where Esc quits).
+/// Concretely:
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
 ///    that neither clears the notice nor runs a normal action while it's up.
-/// 2. Otherwise, while the outline pane has focus, Esc returns focus to the diff (via the normal
+/// 2. Otherwise, the help overlay (`?`) captures the keyboard next, mirroring the confirm modal's
+///    swallow: `?`/`q`/`Esc` close it, every other key is a no-op (nothing on the diff behind it
+///    reacts). Ranked just below the confirm modal — in practice the two are never up
+///    together, since opening help doesn't run through a confirm, but the confirm winning keeps
+///    a destructive prompt from ever being silently dismissed by a stray overlay key.
+/// 3. Otherwise, while the outline pane has focus, Esc returns focus to the diff (via the normal
 ///    map's `outline_focused` branch — see [`map_key`]) rather than quitting or falling into the
 ///    selection-cancel case below (locked design: "Esc must still not quit when the outline has
 ///    focus"). The selection-Esc arm below is guarded to defer to this case.
-/// 3. Otherwise, with an active line selection, Esc CANCELS the selection instead of quitting (`q`
+/// 4. Otherwise, with an active line selection, Esc CANCELS the selection instead of quitting (`q`
 ///    still quits). Other keys fall through to the normal map — `j`/`k` extend the selection,
 ///    `s`/`d` act on it.
-/// 4. Otherwise the normal map applies, where Esc (like `q`) quits.
+/// 5. Otherwise the normal map applies, where Esc (like `q`) quits.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 2-4); the
-/// confirm modal (case 1) deliberately does not.
+/// A `Key` event clears any showing footer notice before applying its own action (cases 3-5); the
+/// confirm and help modals (cases 1-2) deliberately do not.
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
@@ -225,6 +234,13 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     app.resolve_confirm(false)
                 }
+                _ => {}
+            }
+            false
+        }
+        AppEvent::Key(key) if app.help_visible => {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => app.toggle_help(),
                 _ => {}
             }
             false
@@ -311,7 +327,7 @@ fn event_loop<W: Write>(
     let mut quit = false;
 
     loop {
-        terminal.draw(|f| render::render(f, app))?;
+        terminal.draw(|f| render::render(f, app, keymap))?;
 
         if quit {
             return Ok(());
@@ -991,6 +1007,134 @@ mod tests {
         assert!(
             !app.outline_focused(),
             "Enter returns focus to the diff after jumping"
+        );
+    }
+
+    // ── CS3: help overlay ───────────────────────────────────────────────────
+
+    #[test]
+    fn question_mark_opens_the_help_overlay() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert!(!app.help_visible);
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('?'))),
+        );
+        assert!(app.help_visible, "? opens the help overlay");
+    }
+
+    #[test]
+    fn while_help_is_open_other_keys_are_swallowed() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        app.toggle_help();
+        assert!(app.help_visible);
+        let cursor_before = app.cursor;
+
+        // `j` would normally move the cursor — while help is up it must be a pure no-op, exactly
+        // like the pending-confirm modal's swallow.
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        );
+
+        assert!(!quit);
+        assert!(
+            app.help_visible,
+            "an unrelated key must not close the overlay"
+        );
+        assert_eq!(
+            app.cursor, cursor_before,
+            "a swallowed key must not run its normal action"
+        );
+    }
+
+    #[test]
+    fn question_mark_q_and_esc_all_close_the_help_overlay() {
+        use git_workon_fixture::prelude::*;
+
+        for close_key in [
+            key(KeyCode::Char('?')),
+            key(KeyCode::Char('q')),
+            key(KeyCode::Esc),
+        ] {
+            let fixture = FixtureBuilder::new()
+                .config("core.autocrlf", "false")
+                .build()
+                .unwrap();
+            let mut app = app_from_fixture(&fixture);
+            let km = Keymap::defaults();
+            let mut pending: Vec<KeyPress> = Vec::new();
+
+            app.toggle_help();
+            assert!(app.help_visible);
+
+            let quit = update(&mut app, &km, &mut pending, AppEvent::Key(close_key));
+
+            assert!(!quit, "closing help must not also quit the app");
+            assert!(
+                !app.help_visible,
+                "{close_key:?} must close the help overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pending_confirm_still_wins_over_an_open_help_overlay() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        app.toggle_help();
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+
+        // `y` while BOTH modals are up must resolve the confirm (case 1 wins per `update`'s
+        // documented precedence), not close help or fall through to a normal action.
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('y'))),
+        );
+
+        assert!(
+            app.pending_confirm.is_none(),
+            "the confirm modal must capture y first"
+        );
+        assert!(
+            app.help_visible,
+            "the confirm arm must not have touched help_visible"
         );
     }
 }
