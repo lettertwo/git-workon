@@ -37,6 +37,7 @@ clap_complete.workspace = true
 crossterm.workspace = true
 git-workon-lib.workspace = true
 git2.workspace = true
+libc.workspace = true
 miette.workspace = true
 ratatui.workspace = true
 similar.workspace = true

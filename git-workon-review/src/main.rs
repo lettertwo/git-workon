@@ -6,8 +6,9 @@ use git2::Repository;
 use miette::{IntoDiagnostic, Result};
 use workon_review::acquire::{diff_changeset, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
-use workon_review::config::ReviewConfig;
+use workon_review::config::{self, ReviewConfig};
 use workon_review::keymap::Keymap;
+use workon_review::terminal_query;
 use workon_review::theme::Palette;
 
 /// A TUI for reviewing changesets
@@ -56,12 +57,15 @@ fn main() -> Result<()> {
     };
 
     // Resolve the palette selection the same way, before `repo` moves — a config-read error
-    // degrades to dark rather than aborting the review (CS5); `Palette::for_theme` handles the
-    // parsed-selection cases (including `Auto`'s CS6-deferred fallback to dark).
-    let theme = ReviewConfig::new(&repo)
-        .theme()
-        .map(Palette::for_theme)
-        .unwrap_or_else(|_| Palette::dark());
+    // degrades to dark rather than aborting the review (CS5). `Auto` runs the terminal-derivation
+    // probe (CS6), which needs the controlling tty and so lives outside the pure `theme.rs`; it is
+    // bounded by a hard timeout and always yields a curated fallback on a silent/hostile terminal,
+    // never a hang. `Dark`/`Light` stay CS5's I/O-free `for_theme` path.
+    let theme = match ReviewConfig::new(&repo).theme() {
+        Ok(config::Theme::Auto) => terminal_query::detect_auto_palette(),
+        Ok(selection) => Palette::for_theme(selection),
+        Err(_) => Palette::dark(),
+    };
 
     // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,
     // before `repo` moves — CS7. `view_config` reads into an owned `RawViewConfig`, so no

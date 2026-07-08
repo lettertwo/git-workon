@@ -89,6 +89,22 @@ stays authored.
   the curated scheme chosen by background luminance if `OSC 11` answered, else `dark`.
   tmux/screen/ssh non-response is handled by the timeout, never a hang.
 
+**CS6 refinement — the diff-bg tints stay curated, only the scheme is derived.** In
+implementation, `auto` derives the base16 **scheme** (the 16 slots → syntax + monochrome ramp)
+from the terminal, but the **diff/cursor/selection tints stay curated by luminance** rather than
+derived from the probed accents (`Palette::from_terminal`: syntax = `SYNTAX_SLOTS` over the probed
+`Base16`; tints = `Palette::dark()`'s or `Palette::light()`'s tint fields, chosen by the luminance
+of the probed `base00`). Two reasons the earlier "derive tints from `base08`/`base0B`" plan was
+narrowed: (1) dark-tint derivation is unsolved (see the corrected Primitive section — a convex
+blend toward a dark `base00` can't reproduce the hand-tuned washes, and a probed *dark* terminal
+hits exactly that), and (2) deriving washes from an arbitrary terminal's accent is unpredictable
+across the range of real terminal palettes. The value of `auto` — **code colors matching the
+terminal** — is fully delivered by the probed syntax slots, which curated tints don't compromise;
+the diff washes were already hand-tuned per luminance, so borrowing them loses nothing. The six
+ANSI-less slots are still synthesized as above; `parse` → `build_base16` → `from_terminal` → the
+`palette_for_auto` fallback decision are all pure and unit-tested, with only the timed `/dev/tty`
+read left untested (see `terminal_query.rs`).
+
 ## Consequences
 
 - Light/dark ships as curated base16 schemes now; **terminal-derivation is first-class from
