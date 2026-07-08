@@ -20,35 +20,23 @@ use crate::highlight::FgSpan;
 use crate::keymap::{footer_hint, help_sections, Keymap};
 use crate::model::FileStatus;
 use crate::outline::OutlineItem;
+use crate::theme::Theme;
 use crate::wordiff::Span as WordSpan;
 
-const BG_DEL_SUBTLE: Color = Color::Rgb(60, 24, 24);
-const BG_DEL_STRONG: Color = Color::Rgb(120, 40, 40);
-const BG_ADD_SUBTLE: Color = Color::Rgb(20, 48, 24);
-const BG_ADD_STRONG: Color = Color::Rgb(32, 100, 48);
-/// Dim/desaturated variants of the del/add pair, for staged-ness attribution (locked decision
-/// #7): visibly less vivid than the plain pair but still red-tinted, so a staged change reads as
-/// "already handled" without disappearing into plain context.
-const BG_DEL_STAGED_SUBTLE: Color = Color::Rgb(42, 26, 28);
-const BG_DEL_STAGED_STRONG: Color = Color::Rgb(64, 38, 40);
-/// Dim/desaturated variants of the add pair — green-tinted counterpart of
-/// [`BG_DEL_STAGED_SUBTLE`]/[`BG_DEL_STAGED_STRONG`].
-const BG_ADD_STAGED_SUBTLE: Color = Color::Rgb(24, 34, 26);
-const BG_ADD_STAGED_STRONG: Color = Color::Rgb(34, 50, 38);
+// The on-tint colors (diff add/del gradient + staged variants, cursor/selection washes, and syntax
+// foreground) now come from a [`Theme`] threaded through render (ADR-029). The chrome colors below
+// stay ANSI-named / const here: they never sit on a tint, so they inherit the terminal palette and
+// self-adapt light/dark, independent of the theme (the hybrid boundary — see the `theme` module).
+
+/// Default foreground for diff text that carries no syntax highlight — an ANSI gray that inherits
+/// the terminal palette (chrome, not on-tint). Syntax-highlighted text resolves its fg from the
+/// [`Theme`] instead (see [`compose_segments`]).
 const FG_DEFAULT: Color = Color::Gray;
 const FG_DIM: Color = Color::DarkGray;
 /// Footer text color for an [`Severity::Error`] [`Notice`] — a clearly-red tone that reads on
 /// both light and dark terminal themes.
 const FG_ERROR: Color = Color::Rgb(220, 60, 60);
 const FG_GUTTER: Color = Color::DarkGray;
-/// Tint blended into the cursor row's background (see [`blend_bg`]) — a cool slate-blue, chosen
-/// to read as "cursor here" without competing with the warm del/add hues above.
-const BG_CURSOR: Color = Color::Rgb(45, 50, 90);
-/// Tint blended into a SELECTED row's background (line selection, `v`) — a muted teal, distinct
-/// from [`BG_CURSOR`]'s slate-blue so a selected-but-not-cursor row reads apart from the cursor
-/// row. The cursor row inside a selection keeps the cursor tint (cursor wins on its own row — see
-/// [`render_pane_sbs`]).
-const BG_SELECTION: Color = Color::Rgb(30, 66, 66);
 /// Warning tone for the winbar's needs-restack marker (locked decision #9) — an amber, distinct
 /// from [`FG_ERROR`]'s red: a stale-parent changeset is a heads-up to `gt restack`, not a failure.
 const FG_WARN: Color = Color::Rgb(214, 158, 46);
@@ -56,10 +44,6 @@ const FG_WARN: Color = Color::Rgb(214, 158, 46);
 /// #9's outline half) — a green, distinct from every other marker color in this module so
 /// "current" reads unambiguously at a glance.
 const FG_CURRENT: Color = Color::Rgb(96, 200, 128);
-/// Cursor tint for the outline pane while it is OPEN but NOT focused — a dimmer wash than
-/// [`BG_CURSOR`] so the outline's remembered position stays legible without competing with the
-/// diff's own (focused) cursor row for visual weight.
-const BG_OUTLINE_CURSOR_UNFOCUSED: Color = Color::Rgb(35, 38, 55);
 
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
@@ -100,14 +84,14 @@ fn apply_row_tint(mut line: Line<'static>, width: u16, tint: Color) -> Line<'sta
     line
 }
 
-/// Wash the cursor row with [`BG_CURSOR`].
-fn apply_cursor_row(line: Line<'static>, width: u16) -> Line<'static> {
-    apply_row_tint(line, width, BG_CURSOR)
+/// Wash the cursor row with the theme's cursor tint.
+fn apply_cursor_row(line: Line<'static>, width: u16, theme: &Theme) -> Line<'static> {
+    apply_row_tint(line, width, theme.cursor_bg)
 }
 
-/// Wash a selected (line-selection) row with [`BG_SELECTION`].
-fn apply_selection_row(line: Line<'static>, width: u16) -> Line<'static> {
-    apply_row_tint(line, width, BG_SELECTION)
+/// Wash a selected (line-selection) row with the theme's selection tint.
+fn apply_selection_row(line: Line<'static>, width: u16, theme: &Theme) -> Line<'static> {
+    apply_row_tint(line, width, theme.selection_bg)
 }
 
 /// One resolved (bg, fg) pair for a byte range of a line.
@@ -119,11 +103,14 @@ struct Segment {
 }
 
 /// Merge background-role spans and syntax fg spans into a flat list of non-overlapping
-/// segments covering `[0, len)`.
+/// segments covering `[0, len)`. A syntax span carries only its capture index; its color is
+/// resolved HERE against `theme` (ADR-029's render-time resolution) — a segment with no covering
+/// syntax span falls back to [`FG_DEFAULT`].
 fn compose_segments(
     len: usize,
     bg_spans: &[(usize, usize, Color)],
     fg_spans: Option<&Vec<FgSpan>>,
+    theme: &Theme,
 ) -> Vec<Segment> {
     let mut boundaries: Vec<usize> = vec![0, len];
     for (s, e, _) in bg_spans {
@@ -157,7 +144,7 @@ fn compose_segments(
             .map(|(_, _, c)| *c);
         let fg = fg_spans
             .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
-            .map(|s| s.color)
+            .map(|s| theme.syntax(s.capture))
             .unwrap_or(FG_DEFAULT);
         segments.push(Segment { start, end, bg, fg });
     }
@@ -214,31 +201,37 @@ fn attribution_mode(role: Role, attribution: &Option<Attribution>) -> Attributio
     }
 }
 
-/// The (subtle, strong) background pair for a Del cell at `old_lnum`, given `mode`.
-fn del_bg_pair(mode: AttributionMode, old_lnum: u32) -> (Color, Color) {
+/// The (subtle, strong) background pair for a Del cell at `old_lnum`, given `mode`, resolved from
+/// `theme`'s bright vs. staged Del tints.
+fn del_bg_pair(mode: AttributionMode, old_lnum: u32, theme: &Theme) -> (Color, Color) {
+    let bright = (theme.del_subtle, theme.del_strong);
+    let staged = (theme.del_staged_subtle, theme.del_staged_strong);
     match mode {
-        AttributionMode::Plain => (BG_DEL_SUBTLE, BG_DEL_STRONG),
-        AttributionMode::StagedUniform => (BG_DEL_STAGED_SUBTLE, BG_DEL_STAGED_STRONG),
+        AttributionMode::Plain => bright,
+        AttributionMode::StagedUniform => staged,
         AttributionMode::Attributed(attribution) => {
             if attribution.del_is_staged(old_lnum) {
-                (BG_DEL_STAGED_SUBTLE, BG_DEL_STAGED_STRONG)
+                staged
             } else {
-                (BG_DEL_SUBTLE, BG_DEL_STRONG)
+                bright
             }
         }
     }
 }
 
-/// The (subtle, strong) background pair for an Add cell at `new_lnum`, given `mode`.
-fn add_bg_pair(mode: AttributionMode, new_lnum: u32) -> (Color, Color) {
+/// The (subtle, strong) background pair for an Add cell at `new_lnum`, given `mode`, resolved from
+/// `theme`'s bright vs. staged Add tints.
+fn add_bg_pair(mode: AttributionMode, new_lnum: u32, theme: &Theme) -> (Color, Color) {
+    let bright = (theme.add_subtle, theme.add_strong);
+    let staged = (theme.add_staged_subtle, theme.add_staged_strong);
     match mode {
-        AttributionMode::Plain => (BG_ADD_SUBTLE, BG_ADD_STRONG),
-        AttributionMode::StagedUniform => (BG_ADD_STAGED_SUBTLE, BG_ADD_STAGED_STRONG),
+        AttributionMode::Plain => bright,
+        AttributionMode::StagedUniform => staged,
         AttributionMode::Attributed(attribution) => {
             if attribution.add_is_unstaged(new_lnum) {
-                (BG_ADD_SUBTLE, BG_ADD_STRONG)
+                bright
             } else {
-                (BG_ADD_STAGED_SUBTLE, BG_ADD_STAGED_STRONG)
+                staged
             }
         }
     }
@@ -266,6 +259,7 @@ fn content_spans(
     emphasis: Option<(Color, Color)>,
     word_spans: &[WordSpan],
     is_word_pair: bool,
+    theme: &Theme,
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
     if let Some((subtle_bg, strong_bg)) = emphasis {
@@ -280,7 +274,7 @@ fn content_spans(
         }
     }
 
-    let segments = compose_segments(text.len(), &bg_spans, hl);
+    let segments = compose_segments(text.len(), &bg_spans, hl, theme);
     let mut spans = Vec::with_capacity(segments.len().max(1));
     if segments.is_empty() && !text.is_empty() {
         spans.push(TSpan::styled(
@@ -310,6 +304,7 @@ fn build_pane_line(
     mode: AttributionMode,
     gutter_w: usize,
     content_w: usize,
+    theme: &Theme,
 ) -> Line<'static> {
     match row {
         Row::Filler => {
@@ -331,11 +326,18 @@ fn build_pane_line(
             let mut spans = vec![TSpan::styled(gutter, Style::default().fg(FG_GUTTER))];
 
             let emphasis = match kind {
-                CellKind::Del => Some(del_bg_pair(mode, n as u32)),
-                CellKind::Add => Some(add_bg_pair(mode, n as u32)),
+                CellKind::Del => Some(del_bg_pair(mode, n as u32, theme)),
+                CellKind::Add => Some(add_bg_pair(mode, n as u32, theme)),
                 CellKind::Context | CellKind::Filler => None,
             };
-            spans.extend(content_spans(text, hl, emphasis, word_spans, is_word_pair));
+            spans.extend(content_spans(
+                text,
+                hl,
+                emphasis,
+                word_spans,
+                is_word_pair,
+                theme,
+            ));
             Line::from(spans)
         }
     }
@@ -344,8 +346,10 @@ fn build_pane_line(
 /// Render one frame: header, SBS body, footer, and (when [`App::help_visible`]) the `?` overlay
 /// on top of everything else. `keymap` is the resolved, possibly-rebound keymap — the footer hint
 /// and help overlay render its ACTUAL bindings (see [`crate::keymap::footer_hint`]/
-/// [`crate::keymap::help_sections`]), never a hardcoded key string.
-pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap) {
+/// [`crate::keymap::help_sections`]), never a hardcoded key string. `theme` is the resolved
+/// (CS4: always dark) on-tint palette — see [`crate::theme`]; the diff body, syntax foreground,
+/// and cursor/selection washes all resolve their colors against it at paint time.
+pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Theme) {
     let area = frame.area();
     let vlayout = Layout::default()
         .direction(Direction::Vertical)
@@ -375,16 +379,16 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap) {
         let outline_area = hlayout[0];
         let div_area = hlayout[1];
         let diff_area = hlayout[2];
-        render_outline(frame, app, outline_area);
+        render_outline(frame, app, outline_area, theme);
         for y in div_area.y..div_area.y + div_area.height {
             frame
                 .buffer_mut()
                 .set_string(div_area.x, y, "│", Style::default().fg(FG_DIM));
         }
-        render_body(frame, app, diff_area);
+        render_body(frame, app, diff_area, theme);
     } else {
         // Closed: the diff takes the full body width — the exact M4 look (locked design).
-        render_body(frame, app, body_area);
+        render_body(frame, app, body_area, theme);
     }
 
     if app.help_visible {
@@ -456,10 +460,10 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
 /// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
 /// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
-/// diff's [`App::cursor`]) gets [`BG_CURSOR`] while the outline has focus, or the dimmer
-/// [`BG_OUTLINE_CURSOR_UNFOCUSED`] while it's merely open (so the remembered position stays
+/// diff's [`App::cursor`]) gets the theme's cursor tint while the outline has focus, or the dimmer
+/// [`Theme::outline_cursor_unfocused_bg`] while it's merely open (so the remembered position stays
 /// legible even after focus returns to the diff).
-fn render_outline(frame: &mut Frame, app: &App, area: Rect) {
+fn render_outline(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let items = app.outline_items();
     let cursor = app.outline_cursor();
     let focused = app.outline_focused();
@@ -483,9 +487,9 @@ fn render_outline(frame: &mut Frame, app: &App, area: Rect) {
         let is_cursor = item_idx == cursor;
         let line = build_outline_line(item);
         let line = if is_cursor && focused {
-            apply_cursor_row(line, area.width)
+            apply_cursor_row(line, area.width, theme)
         } else if is_cursor {
-            apply_row_tint(line, area.width, BG_OUTLINE_CURSOR_UNFOCUSED)
+            apply_row_tint(line, area.width, theme.outline_cursor_unfocused_bg)
         } else {
             line
         };
@@ -685,21 +689,22 @@ fn render_gap_row(
     skipped: usize,
     is_cursor: bool,
     is_selected: bool,
+    theme: &Theme,
 ) {
     let msg = format!("··· {skipped} unchanged lines ···");
     let line = Line::from(TSpan::styled(msg, Style::default().fg(FG_DIM)));
     // Cursor wins over selection on the same row.
     let line = if is_cursor {
-        apply_cursor_row(line, area.width)
+        apply_cursor_row(line, area.width, theme)
     } else if is_selected {
-        apply_selection_row(line, area.width)
+        apply_selection_row(line, area.width, theme)
     } else {
         line
     };
     buf.set_line(area.x, y, &line, area.width);
 }
 
-fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
+fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) {
     if app.files().is_empty() {
         frame.render_widget(Paragraph::new("(no changes)"), area);
         return;
@@ -724,15 +729,15 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
             // The single pane is the focused one, so it shows any active selection.
             let selection = app.selection_range();
             match app.layout {
-                AppLayout::Sbs => {
-                    render_pane_sbs(frame, app, area, idx, role, scroll, cursor, selection)
-                }
-                AppLayout::Inline => {
-                    render_pane_inline(frame, app, area, idx, role, scroll, cursor, selection)
-                }
+                AppLayout::Sbs => render_pane_sbs(
+                    frame, app, area, idx, role, scroll, cursor, selection, theme,
+                ),
+                AppLayout::Inline => render_pane_inline(
+                    frame, app, area, idx, role, scroll, cursor, selection, theme,
+                ),
             }
         }
-        EffectiveZoom::Split => render_body_split(frame, app, area, idx),
+        EffectiveZoom::Split => render_body_split(frame, app, area, idx, theme),
     }
 }
 
@@ -741,7 +746,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
 /// the cursor highlight draws only in the focused pane. The body area splits caption(1) +
 /// unstaged-content + caption(1) + staged-content, with the remainder halved between the two
 /// content panes (even split).
-fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
+fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, theme: &Theme) {
     // Too short to fit two captions plus a content line each: fall back to the focused pane alone,
     // rendered over the whole area, so the user still sees SOMETHING navigable.
     if area.height < 4 {
@@ -750,12 +755,12 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
         let (scroll, cursor) = app.pane_render_state(role);
         let selection = app.selection_range();
         match app.layout {
-            AppLayout::Sbs => {
-                render_pane_sbs(frame, app, area, idx, role, scroll, cursor, selection)
-            }
-            AppLayout::Inline => {
-                render_pane_inline(frame, app, area, idx, role, scroll, cursor, selection)
-            }
+            AppLayout::Sbs => render_pane_sbs(
+                frame, app, area, idx, role, scroll, cursor, selection, theme,
+            ),
+            AppLayout::Inline => render_pane_inline(
+                frame, app, area, idx, role, scroll, cursor, selection, theme,
+            ),
         }
         return;
     }
@@ -802,6 +807,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 u_scroll,
                 u_cursor,
                 u_selection,
+                theme,
             );
             render_pane_sbs(
                 frame,
@@ -812,6 +818,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 s_scroll,
                 s_cursor,
                 s_selection,
+                theme,
             );
         }
         AppLayout::Inline => {
@@ -824,6 +831,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 u_scroll,
                 u_cursor,
                 u_selection,
+                theme,
             );
             render_pane_inline(
                 frame,
@@ -834,6 +842,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize) {
                 s_scroll,
                 s_cursor,
                 s_selection,
+                theme,
             );
         }
     }
@@ -860,6 +869,7 @@ fn render_pane_sbs(
     scroll: usize,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
+    theme: &Theme,
 ) {
     let left_w = area.width.saturating_sub(1) / 2;
     let right_w = area.width.saturating_sub(1).saturating_sub(left_w);
@@ -927,6 +937,7 @@ fn render_pane_sbs(
                     *skipped,
                     is_cursor,
                     is_selected,
+                    theme,
                 );
             }
             DisplayRow::Row(row) => {
@@ -947,6 +958,7 @@ fn render_pane_sbs(
                     mode,
                     old_gutter_w,
                     old_area.width as usize,
+                    theme,
                 );
                 let new_line = build_pane_line(
                     view,
@@ -958,17 +970,18 @@ fn render_pane_sbs(
                     mode,
                     new_gutter_w,
                     new_area.width as usize,
+                    theme,
                 );
-                // Cursor wins over selection on the same row (see [`BG_SELECTION`]).
+                // Cursor wins over selection on the same row (see [`Theme::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
                     (
-                        apply_cursor_row(old_line, old_area.width),
-                        apply_cursor_row(new_line, new_area.width),
+                        apply_cursor_row(old_line, old_area.width, theme),
+                        apply_cursor_row(new_line, new_area.width, theme),
                     )
                 } else if is_selected {
                     (
-                        apply_selection_row(old_line, old_area.width),
-                        apply_selection_row(new_line, new_area.width),
+                        apply_selection_row(old_line, old_area.width, theme),
+                        apply_selection_row(new_line, new_area.width, theme),
                     )
                 } else {
                     (old_line, new_line)
@@ -987,7 +1000,7 @@ fn render_pane_sbs(
                         div_area.x,
                         y,
                         "│",
-                        Style::default().fg(FG_DIM).bg(BG_CURSOR),
+                        Style::default().fg(FG_DIM).bg(theme.cursor_bg),
                     );
                 }
             }
@@ -1018,6 +1031,7 @@ fn build_inline_line(
     mode: AttributionMode,
     old_gutter_w: usize,
     new_gutter_w: usize,
+    theme: &Theme,
 ) -> Line<'static> {
     let (old_opt, new_opt, text, hl, kind) = match *row {
         InlineRow::Context { old, new } => (
@@ -1057,11 +1071,18 @@ fn build_inline_line(
     // `kind` is always Del/Add/Context here — inline has no Filler rows. `old_opt`/`new_opt`
     // carry the exact lineno each kind is documented to have (see this fn's own match above).
     let emphasis = match kind {
-        CellKind::Del => old_opt.map(|n| del_bg_pair(mode, n as u32)),
-        CellKind::Add => new_opt.map(|n| add_bg_pair(mode, n as u32)),
+        CellKind::Del => old_opt.map(|n| del_bg_pair(mode, n as u32, theme)),
+        CellKind::Add => new_opt.map(|n| add_bg_pair(mode, n as u32, theme)),
         CellKind::Context | CellKind::Filler => None,
     };
-    spans.extend(content_spans(text, hl, emphasis, word_spans, is_word_pair));
+    spans.extend(content_spans(
+        text,
+        hl,
+        emphasis,
+        word_spans,
+        is_word_pair,
+        theme,
+    ));
     Line::from(spans)
 }
 
@@ -1078,6 +1099,7 @@ fn render_pane_inline(
     scroll: usize,
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
+    theme: &Theme,
 ) {
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
@@ -1118,6 +1140,7 @@ fn render_pane_inline(
                     *skipped,
                     is_cursor,
                     is_selected,
+                    theme,
                 );
             }
             row => {
@@ -1131,13 +1154,20 @@ fn render_pane_inline(
                     InlineRow::Add { .. } => &new_spans,
                     _ => &[],
                 };
-                let line =
-                    build_inline_line(view, row, word_spans, mode, old_gutter_w, new_gutter_w);
-                // Cursor wins over selection on the same row (see [`BG_SELECTION`]).
+                let line = build_inline_line(
+                    view,
+                    row,
+                    word_spans,
+                    mode,
+                    old_gutter_w,
+                    new_gutter_w,
+                    theme,
+                );
+                // Cursor wins over selection on the same row (see [`Theme::selection_bg`]).
                 let line = if is_cursor {
-                    apply_cursor_row(line, area.width)
+                    apply_cursor_row(line, area.width, theme)
                 } else if is_selected {
-                    apply_selection_row(line, area.width)
+                    apply_selection_row(line, area.width, theme)
                 } else {
                     line
                 };
@@ -1155,23 +1185,24 @@ mod tests {
 
     use git_workon_fixture::prelude::*;
 
-    use super::{
-        render, BG_ADD_STAGED_STRONG, BG_ADD_STAGED_SUBTLE, BG_ADD_STRONG, BG_ADD_SUBTLE,
-        BG_DEL_STAGED_STRONG, BG_DEL_STAGED_SUBTLE, BG_DEL_STRONG, BG_DEL_SUBTLE,
-    };
+    use super::render;
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
     use crate::keymap::Keymap;
+    use crate::theme::Theme;
 
-    /// Render one frame against the default (unrebound) keymap — the vast majority of `render.rs`
-    /// tests don't care about keybindings at all. Tests that DO (the footer/overlay content tests)
-    /// build their own [`Keymap`] and call [`render`] directly instead.
+    /// Render one frame against the default (unrebound) keymap and the dark theme — the vast
+    /// majority of `render.rs` tests don't care about keybindings and only ever ran dark. Tests
+    /// that DO care about bindings (the footer/overlay content tests) build their own [`Keymap`]
+    /// and call [`render`] directly instead. Color assertions resolve through [`Theme::dark`], so
+    /// they pin the exact dark values the refactor must preserve (ADR-029's pixel-identity gate).
     fn render_once(app: &mut App, width: u16, height: u16) -> Buffer {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let keymap = Keymap::defaults();
-        terminal.draw(|f| render(f, app, &keymap)).unwrap();
+        let theme = Theme::dark();
+        terminal.draw(|f| render(f, app, &keymap, &theme)).unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -1484,7 +1515,7 @@ mod tests {
         );
         assert_eq!(
             buf.cell((divider_x, cursor_y)).unwrap().style().bg,
-            Some(super::BG_CURSOR),
+            Some(Theme::dark().cursor_bg),
             "expected the cursor row's DIVIDER cell to carry the cursor background, not the \
              default — otherwise the highlight has a seam through the middle"
         );
@@ -1548,7 +1579,7 @@ mod tests {
         // has no bg) — i.e. the raw tint, since blend_bg(None, tint) == tint.
         assert_eq!(
             bg(1, sel_y),
-            Some(super::BG_SELECTION),
+            Some(Theme::dark().selection_bg),
             "a selected plain-context row shows the raw selection tint"
         );
     }
@@ -1730,8 +1761,9 @@ mod tests {
             .style()
             .bg;
 
-        let dim_dels = [Some(BG_DEL_STAGED_SUBTLE), Some(BG_DEL_STAGED_STRONG)];
-        let bright_dels = [Some(BG_DEL_SUBTLE), Some(BG_DEL_STRONG)];
+        let t = Theme::dark();
+        let dim_dels = [Some(t.del_staged_subtle), Some(t.del_staged_strong)];
+        let bright_dels = [Some(t.del_subtle), Some(t.del_strong)];
         assert!(
             dim_dels.contains(&staged_del_bg),
             "expected the staged row's Del side to use the dim pair, got {staged_del_bg:?}"
@@ -1759,8 +1791,8 @@ mod tests {
             .style()
             .bg;
 
-        let dim_adds = [Some(BG_ADD_STAGED_SUBTLE), Some(BG_ADD_STAGED_STRONG)];
-        let bright_adds = [Some(BG_ADD_SUBTLE), Some(BG_ADD_STRONG)];
+        let dim_adds = [Some(t.add_staged_subtle), Some(t.add_staged_strong)];
+        let bright_adds = [Some(t.add_subtle), Some(t.add_strong)];
         assert!(
             dim_adds.contains(&staged_add_bg),
             "expected the staged row's Add side to use the dim pair, got {staged_add_bg:?}"
@@ -1839,7 +1871,10 @@ mod tests {
 
         let backend = TestBackend::new(80, 10);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|f| render(f, &mut app, &keymap)).unwrap();
+        let theme = Theme::dark();
+        terminal
+            .draw(|f| render(f, &mut app, &keymap, &theme))
+            .unwrap();
         let buf = terminal.backend().buffer().clone();
 
         let footer_y = buf.area.height - 1;
@@ -2123,8 +2158,9 @@ mod tests {
         let new_content_x = left_w + 1 + 4; // divider + gutter width 3 + 1 space
         let add_bg = buf.cell((new_content_x, row_y)).unwrap().style().bg;
 
-        let bright_adds = [Some(BG_ADD_SUBTLE), Some(BG_ADD_STRONG)];
-        let dim_adds = [Some(BG_ADD_STAGED_SUBTLE), Some(BG_ADD_STAGED_STRONG)];
+        let t = Theme::dark();
+        let bright_adds = [Some(t.add_subtle), Some(t.add_strong)];
+        let dim_adds = [Some(t.add_staged_subtle), Some(t.add_staged_strong)];
         assert!(
             bright_adds.contains(&add_bg),
             "expected a committed changeset's Add cell to render the plain (bright) pair, \
@@ -2268,8 +2304,8 @@ mod tests {
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
         assert_eq!(
             buf.cell((2, cursor_y)).unwrap().style().bg,
-            Some(super::BG_CURSOR),
-            "expected the outline's cursor row to carry BG_CURSOR while focused"
+            Some(Theme::dark().cursor_bg),
+            "expected the outline's cursor row to carry the cursor tint while focused"
         );
     }
 
