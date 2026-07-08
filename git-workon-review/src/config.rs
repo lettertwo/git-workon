@@ -94,6 +94,17 @@ pub struct RawBinding {
     pub keys: String,
 }
 
+/// The four CS7 view-config settings, read raw (unset → `None`) and owned — see
+/// [`ReviewConfig::view_config`]. Validation (range/enum checks) and default fallback are
+/// [`crate::app::App::apply_view_config`]'s job, same division as [`RawBinding`]/CS2.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawViewConfig {
+    pub outline_width: Option<i64>,
+    pub outline_mode: Option<String>,
+    pub diff_layout: Option<String>,
+    pub diff_zoom: Option<String>,
+}
+
 /// Decompose a fully-qualified config variable name (as returned by
 /// [`git2::ConfigEntry::name`]) into its (view, action) components, per ADR-034's grammar:
 /// bare `workon.review.bind.<action>` is the global keymap; `workon.review.<view>.bind.<action>`
@@ -200,6 +211,22 @@ impl<'repo> ReviewConfig<'repo> {
     /// Get `workon.review.diff.zoom`, raw. `None` if unset.
     pub fn diff_zoom(&self) -> Result<Option<String>, git2::Error> {
         self.get_view_string(View::Diff, "zoom")
+    }
+
+    /// Read all four CS7 view-config settings at once into an owned [`RawViewConfig`],
+    /// collapsing a config-read error to `None` — same as every other getter here, `App`'s
+    /// resolution (`App::apply_view_config`) treats an unset setting and a failed read
+    /// identically (both apply the current hardcoded default). Exists so `main.rs` can read
+    /// view config into an owned value BEFORE `repo` moves into `App` (mirroring how the
+    /// keymap/theme are resolved before the move), rather than holding a `ReviewConfig<'repo>`
+    /// (which borrows `repo`) alongside the `App` that owns it.
+    pub fn view_config(&self) -> RawViewConfig {
+        RawViewConfig {
+            outline_width: self.outline_width().ok().flatten(),
+            outline_mode: self.outline_mode().ok().flatten(),
+            diff_layout: self.diff_layout().ok().flatten(),
+            diff_zoom: self.diff_zoom().ok().flatten(),
+        }
     }
 
     /// Build the `workon.review.<view>.<setting>` key for a view setting (never a `.bind.`

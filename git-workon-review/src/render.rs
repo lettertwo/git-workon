@@ -60,8 +60,6 @@ const FG_CURRENT: Color = Color::Rgb(96, 200, 128);
 /// [`BG_CURSOR`] so the outline's remembered position stays legible without competing with the
 /// diff's own (focused) cursor row for visual weight.
 const BG_OUTLINE_CURSOR_UNFOCUSED: Color = Color::Rgb(35, 38, 55);
-/// Fixed column width of the outline side pane (locked design: "~35 cols").
-const OUTLINE_WIDTH: u16 = 35;
 
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
@@ -369,7 +367,7 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap) {
         let hlayout = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(OUTLINE_WIDTH),
+                Constraint::Length(app.outline_width()),
                 Constraint::Length(1),
                 Constraint::Min(1),
             ])

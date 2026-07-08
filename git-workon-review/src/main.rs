@@ -54,16 +54,31 @@ fn main() -> Result<()> {
         Err(_) => Keymap::defaults(),
     };
 
+    // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,
+    // before `repo` moves — CS7. `view_config` reads into an owned `RawViewConfig`, so no
+    // borrow of `repo` survives past this statement (unlike a bare `ReviewConfig<'repo>`, which
+    // would still be borrowing `repo` when `App::from_changesets` tries to move it below).
+    let view_config = ReviewConfig::new(&repo).view_config();
+
     // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here after
     // acquisition is done borrowing it. `App::from_changesets` opens on whichever changeset the
     // lib marked `current` (locked decision #6).
     let mut app = App::from_changesets(repo, views);
+
+    // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
+    // only set the raw layout/zoom/mode/width fields, and `open_current` is what derives
+    // `cursor`/`scroll` fresh from whichever settings just landed (see each setter's doc
+    // comment).
+    let view_config_warnings = app.apply_view_config(&view_config);
     app.open_current();
 
-    // A misconfigured keybinding is non-fatal: show the collected warnings as a startup notice
-    // (cleared on the first keypress, like any notice) and run with the defaults for those keys.
-    if !keymap.warnings().is_empty() {
-        app.notify(keymap.warnings().join("; "), Severity::Error);
+    // A misconfigured keybinding or view-config setting is non-fatal: show the collected
+    // warnings as a startup notice (cleared on the first keypress, like any notice) and run with
+    // the defaults for those keys/settings.
+    let mut warnings = keymap.warnings().to_vec();
+    warnings.extend(view_config_warnings);
+    if !warnings.is_empty() {
+        app.notify(warnings.join("; "), Severity::Error);
     }
 
     tui::run(&mut app, &keymap).into_diagnostic()?;
