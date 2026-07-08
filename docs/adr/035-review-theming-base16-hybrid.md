@@ -29,10 +29,21 @@ is spec-conformant.
 - **On a tint → base16 truecolor (theme-controlled):** diff add/del subtle/strong + staged
   variants, cursor, selection, and **syntax**. Contrast is guaranteed because foreground and
   background come from the *same* scheme.
-- **Chrome, not on a tint → ANSI-named (`Color::Gray`/`DarkGray`/…):** gutter, borders,
-  footer, dim labels, status. These inherit the terminal palette, self-adapt light/dark, and
-  are **probe-independent** (work even when terminal-derivation fails). Half already are
-  ANSI-named today.
+- **Chrome (default text, dim labels, gutter/dividers) + the canvas background →
+  base16-ramp-controlled (revised post-CS6):** originally these were ANSI-named
+  (`Color::Gray`/`DarkGray`) and the canvas was never painted, on the theory that inheriting
+  the terminal's own bg/fg would self-adapt for free. In practice this broke explicit
+  `light`/`dark` selections outright — the terminal's own (often dark) bg/fg bled straight
+  through a "light" theme, since nothing ever painted over it. Fixed: `Palette::background`
+  (base00)/`foreground` (base05)/`dim` (base03)/`gutter` (base04) are now real palette
+  fields, and `render()` paints the whole frame with `background` first when
+  `Palette::paint_canvas` is set. `dark()`/`light()` set `paint_canvas: true` — a curated
+  theme now fully controls the look, canvas included. `from_terminal` (`auto`) still derives
+  these four straight from the probed terminal colors — so it matches the terminal exactly,
+  as before — but sets `paint_canvas: false`, since `auto`'s base00 *is* the terminal's own
+  background; painting over it would flatten terminal transparency/background images for no
+  gain. The probe-failure fallback (`dark()`/`light()`) paints normally. Chrome that is
+  never a theme knob (error/warn/current-marker) stays ANSI/const in `render.rs`, unchanged.
 
 **Primitive — the theme is a base16 scheme.** A `Palette` holds the 16 slots
 (base00–07 mono ramp + base08–0F accents). Syntax uses the accents via the existing

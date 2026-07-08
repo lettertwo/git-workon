@@ -6,12 +6,18 @@
 //! CS5 adds [`Palette::light`] and wires [`crate::config::Theme`] to pick between them; CS6 adds the
 //! terminal-derivation probe for `auto`.
 //!
-//! ## Hybrid boundary (ADR-035)
+//! ## Hybrid boundary (ADR-035, revised)
 //! Colors that sit ON a tinted background — the diff add/del gradient, its staged variants, the
 //! cursor/selection washes, and syntax foreground — are theme-controlled base16 truecolor and live
-//! here. Chrome that is NOT on a tint (gutter, dividers, footer, dim labels, status markers) stays
-//! ANSI-named / const in [`crate::render`] so it self-adapts to the terminal palette and is
-//! probe-independent. This module deliberately holds only the on-tint half.
+//! here, as before. The canvas background and chrome FOREGROUND (default text, dim labels, the
+//! gutter) are now ALSO palette-ramp-controlled ([`Palette::background`]/[`Palette::foreground`]/
+//! [`Palette::dim`]/[`Palette::gutter`]), so a curated (`light`/`dark`) theme fully controls the
+//! look instead of bleeding the terminal's own bg/fg through. `auto` ([`Palette::from_terminal`])
+//! still derives these four from the probed terminal colors — so it matches the terminal exactly —
+//! and leaves [`Palette::paint_canvas`] `false` so a transparent/backgrounded terminal isn't
+//! painted over; the curated schemes and the probe's curated fallback set it `true`. Semantic
+//! chrome that is never on a tint and never a theme knob — error/warn/current-marker colors — stays
+//! ANSI/const in [`crate::render`] (`FG_ERROR`/`FG_WARN`/`FG_CURRENT`), unaffected by this boundary.
 
 use ratatui::style::Color;
 
@@ -184,6 +190,23 @@ pub struct Palette {
     pub selection_bg: Color,
     /// Cursor wash for the outline pane while OPEN but NOT focused — dimmer than [`Palette::cursor_bg`].
     pub outline_cursor_unfocused_bg: Color,
+
+    /// The screen/canvas background (base00) — painted by [`crate::render::render`] when
+    /// [`Palette::paint_canvas`] is set, so a curated theme's background actually shows instead of
+    /// the terminal's own.
+    pub background: Color,
+    /// Default text foreground (base05) — resolved by [`crate::render`] wherever text carries no
+    /// syntax highlight.
+    pub foreground: Color,
+    /// Dim/comment-toned foreground (base03) — dim labels, gap markers, split captions.
+    pub dim: Color,
+    /// Gutter/divider foreground (base04) — line-number gutters and pane dividers.
+    pub gutter: Color,
+    /// Whether [`crate::render::render`] should paint the whole frame with [`Palette::background`]
+    /// before drawing panes. `true` for the curated [`Palette::dark`]/[`Palette::light`] schemes
+    /// (and the probe's curated fallback); `false` for [`Palette::from_terminal`], so `auto`
+    /// preserves the terminal's own background (transparency, images) rather than flattening it.
+    pub paint_canvas: bool,
 }
 
 impl Palette {
@@ -210,6 +233,11 @@ impl Palette {
             cursor_bg: Color::Rgb(45, 50, 90),
             selection_bg: Color::Rgb(30, 66, 66),
             outline_cursor_unfocused_bg: Color::Rgb(35, 38, 55),
+            background: base.slot(0),
+            foreground: base.slot(5),
+            dim: base.slot(3),
+            gutter: base.slot(4),
+            paint_canvas: true,
         }
     }
 
@@ -254,6 +282,11 @@ impl Palette {
             cursor_bg: tint_toward(blue, base00, CURSOR),
             selection_bg: tint_toward(cyan, base00, CURSOR),
             outline_cursor_unfocused_bg: tint_toward(blue, base00, OUTLINE_CURSOR_UNFOCUSED),
+            background: base.slot(0),
+            foreground: base.slot(5),
+            dim: base.slot(3),
+            gutter: base.slot(4),
+            paint_canvas: true,
         }
     }
 
@@ -285,6 +318,17 @@ impl Palette {
             cursor_bg: curated.cursor_bg,
             selection_bg: curated.selection_bg,
             outline_cursor_unfocused_bg: curated.outline_cursor_unfocused_bg,
+            // Derived straight from the probed terminal scheme (NOT the curated fallback) — this
+            // is the whole point of `auto`: chrome that matches the terminal's own colors.
+            background: base.slot(0),
+            foreground: base.slot(5),
+            dim: base.slot(3),
+            gutter: base.slot(4),
+            // Unlike the curated schemes, `auto` must NOT paint over the terminal's own
+            // background — base00 here IS the probed terminal bg, so painting a solid canvas
+            // would defeat terminal transparency/background images for no benefit (the probed
+            // fg/dim/gutter already match the inherited bg, since they came from the same probe).
+            paint_canvas: false,
         }
     }
 
@@ -351,6 +395,33 @@ mod tests {
         assert_eq!(t.cursor_bg, Color::Rgb(45, 50, 90));
         assert_eq!(t.selection_bg, Color::Rgb(30, 66, 66));
         assert_eq!(t.outline_cursor_unfocused_bg, Color::Rgb(35, 38, 55));
+    }
+
+    #[test]
+    fn dark_chrome_fields_match_the_eighties_dark_ramp_and_paint_the_canvas() {
+        // `dark()`'s canvas/chrome must come from the SAME ramp `Palette::dark`'s syntax/tints
+        // already use (base00/base03/base04/base05), and must paint (a curated theme fully
+        // controls the look — see the theme module's revised hybrid-boundary doc comment).
+        let t = Palette::dark();
+        assert_eq!(t.background, Color::Rgb(0x2d, 0x2d, 0x2d)); // base00
+        assert_eq!(t.foreground, Color::Rgb(0xd3, 0xd0, 0xc8)); // base05
+        assert_eq!(t.dim, Color::Rgb(0x74, 0x73, 0x69)); // base03
+        assert_eq!(t.gutter, Color::Rgb(0xa0, 0x9f, 0x93)); // base04
+        assert!(t.paint_canvas);
+    }
+
+    #[test]
+    fn light_background_is_high_luminance_and_foreground_is_low_luminance() {
+        // A real light theme: a near-white canvas with dark text on it, and it must paint (an
+        // unpainted canvas would let the terminal's own dark bg bleed through, the exact bug this
+        // fix addresses).
+        let t = Palette::light();
+        assert_eq!(t.background, Color::Rgb(0xfa, 0xfa, 0xfa)); // base00
+        assert_eq!(t.foreground, Color::Rgb(0x38, 0x3a, 0x42)); // base05
+        assert_eq!(t.dim, Color::Rgb(0xa0, 0xa1, 0xa7)); // base03
+        assert_eq!(t.gutter, Color::Rgb(0x69, 0x6c, 0x77)); // base04
+        assert!(luminance(t.background) > luminance(t.foreground));
+        assert!(t.paint_canvas);
     }
 
     fn rgb(color: Color) -> (u8, u8, u8) {
@@ -487,6 +558,20 @@ mod tests {
         assert_eq!(palette.selection_bg, light.selection_bg);
         // ...and NOT dark's, confirming the luminance branch flipped.
         assert_ne!(palette.del_subtle, Palette::dark().del_subtle);
+    }
+
+    #[test]
+    fn from_terminal_takes_chrome_from_the_probed_scheme_and_does_not_paint() {
+        // `auto`'s canvas/chrome must come from the PROBED scheme (so it matches the terminal),
+        // and must NOT paint — the terminal's own background stays, preserving transparency (see
+        // the theme module's revised hybrid-boundary doc comment).
+        let probed = probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a));
+        let palette = Palette::from_terminal(probed);
+        assert_eq!(palette.background, probed.slot(0));
+        assert_eq!(palette.foreground, probed.slot(5));
+        assert_eq!(palette.dim, probed.slot(3));
+        assert_eq!(palette.gutter, probed.slot(4));
+        assert!(!palette.paint_canvas);
     }
 
     #[test]
