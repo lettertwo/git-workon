@@ -24,7 +24,7 @@ use ratatui::Terminal;
 use workon_review::app::App;
 use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
 use workon_review::render;
-use workon_review::theme::Theme;
+use workon_review::theme::Palette;
 
 /// One event the review loop reacts to. `Tick` is now also the index-watcher's poll beat (see the
 /// module doc's note on locked decision #4) — `next_event`'s mapping and this enum otherwise stay
@@ -302,7 +302,7 @@ fn install_panic_hook() {
 
 /// Run the review TUI's terminal lifecycle and main loop against `app`. Callers must have
 /// already loaded the initial file (`app.open_current()`) before calling this.
-pub fn run(app: &mut App, keymap: &Keymap, theme: &Theme) -> io::Result<()> {
+pub fn run(app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut out = terminal_writer();
@@ -323,7 +323,7 @@ fn event_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     app: &mut App,
     keymap: &Keymap,
-    theme: &Theme,
+    theme: &Palette,
 ) -> io::Result<()> {
     let mut pending: Vec<KeyPress> = Vec::new();
     let mut quit = false;

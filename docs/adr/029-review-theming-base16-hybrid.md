@@ -34,7 +34,7 @@ is spec-conformant.
   are **probe-independent** (work even when terminal-derivation fails). Half already are
   ANSI-named today.
 
-**Primitive — the theme is a base16 scheme.** A `Theme` holds the 16 slots
+**Primitive — the theme is a base16 scheme.** A `Palette` holds the 16 slots
 (base00–07 mono ramp + base08–0F accents). Syntax uses the accents via the existing
 capture→slot template.
 
@@ -44,7 +44,7 @@ derivation is luminance-dependent, not a single "blend toward base00" (corrected
 - **Dark (base00 dark):** the shipped M3–M5 tints are more saturated/darker than *any* convex
   blend of an accent toward a dark base00 can produce (their green/blue channels sit *below*
   base00's). A blend toward a dark base00 also yields muddy mid-tones, not punchy washes. So
-  the **dark tints are held explicit** in `Theme::dark()` (byte-identical to M3–M5, per the
+  the **dark tints are held explicit** in `Palette::dark()` (byte-identical to M3–M5, per the
   pixel-identity gate). Deriving them would require scaling the accent toward *black* plus a
   desaturation step, not a base00 blend — not worth reverse-engineering the hand-tuned values.
 - **Light (base00 light) and terminal-derived:** blending an accent toward a *light* base00
@@ -60,7 +60,7 @@ stays authored.
   `config.configure()` and is theme-invariant.
 - `FgSpan` carries the **capture index** (semantic role), not a resolved `Color`. The
   highlight phase (`highlight.rs:283`) records the index instead of looking up a color.
-- Render resolves `index → Color` against the active `Theme` (`theme.slot[idx]`), in the
+- Render resolves `index → Color` against the active `Palette` (`palette.slot[idx]`), in the
   same place it resolves diff tints and cursor/selection. One theme-application site;
   syntax and background contrast are reasoned about together.
 - Consequence: the expensive tree-sitter pass is theme-free and cacheable — a theme switch
@@ -93,7 +93,7 @@ stays authored.
 
 - Light/dark ships as curated base16 schemes now; **terminal-derivation is first-class from
   the start**, not deferred. `auto` never has to change meaning later.
-- Because color resolves late as `theme.slot[idx]`, the slot *source* is pluggable — a future
+- Because color resolves late as `palette.slot[idx]`, the slot *source* is pluggable — a future
   user-supplied base16 scheme (`theme = <name>` / a scheme file, the deferred
   "user-configurable colors" tier) is additive, no renderer change.
 - The OSC probe is the single most terminal-fragile component; its blast radius is contained
@@ -101,9 +101,9 @@ stays authored.
   never a hang or a broken palette.
 - Adding a syntax capture = adding it to `HIGHLIGHT_NAMES` + the capture→slot template; it is
   automatically themed by every scheme.
-- `render.rs` and `highlight.rs` both change: the `const` palette becomes a `Theme` threaded
+- `render.rs` and `highlight.rs` both change: the `const` palette becomes a `Palette` threaded
   to render; `FgSpan` loses its `Color` field in favor of a capture index. Existing render
-  tests that assert concrete colors must resolve through a fixed test `Theme`.
+  tests that assert concrete colors must resolve through a fixed test `Palette`.
 
 ## References
 

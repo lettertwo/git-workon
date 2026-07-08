@@ -8,7 +8,7 @@ use workon_review::acquire::{diff_changeset, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::ReviewConfig;
 use workon_review::keymap::Keymap;
-use workon_review::theme::Theme;
+use workon_review::theme::Palette;
 
 /// A TUI for reviewing changesets
 #[derive(Debug, Parser)]
@@ -55,6 +55,14 @@ fn main() -> Result<()> {
         Err(_) => Keymap::defaults(),
     };
 
+    // Resolve the palette selection the same way, before `repo` moves — a config-read error
+    // degrades to dark rather than aborting the review (CS5); `Palette::for_theme` handles the
+    // parsed-selection cases (including `Auto`'s CS6-deferred fallback to dark).
+    let theme = ReviewConfig::new(&repo)
+        .theme()
+        .map(Palette::for_theme)
+        .unwrap_or_else(|_| Palette::dark());
+
     // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,
     // before `repo` moves — CS7. `view_config` reads into an owned `RawViewConfig`, so no
     // borrow of `repo` survives past this statement (unlike a bare `ReviewConfig<'repo>`, which
@@ -81,11 +89,6 @@ fn main() -> Result<()> {
     if !warnings.is_empty() {
         app.notify(warnings.join("; "), Severity::Error);
     }
-
-    // CS4 is dark-only and unconditional — a pure refactor with no user-visible change. CS5 wires
-    // `ReviewConfig::theme()` (config `Theme::{Auto,Dark,Light}`) to pick the palette here; CS6
-    // adds the terminal-derivation probe for `auto`.
-    let theme = Theme::dark();
 
     tui::run(&mut app, &keymap, &theme).into_diagnostic()?;
 
