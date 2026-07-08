@@ -5,7 +5,9 @@ use clap_complete::env::CompleteEnv;
 use git2::Repository;
 use miette::{IntoDiagnostic, Result};
 use workon_review::acquire::{diff_changeset, resolve_changesets};
-use workon_review::app::{App, ChangesetView};
+use workon_review::app::{App, ChangesetView, Severity};
+use workon_review::config::ReviewConfig;
+use workon_review::keymap::Keymap;
 
 /// A TUI for reviewing changesets
 #[derive(Debug, Parser)]
@@ -44,13 +46,27 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Resolve the keymap from git config once at startup, BEFORE `repo` moves into `App`
+    // (ADR-028). A failed config read degrades to the registry defaults rather than aborting the
+    // review. Collision/unknown-action warnings surface through the footer notice below.
+    let keymap = match ReviewConfig::new(&repo).bindings() {
+        Ok(bindings) => Keymap::from_bindings(&bindings),
+        Err(_) => Keymap::defaults(),
+    };
+
     // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here after
     // acquisition is done borrowing it. `App::from_changesets` opens on whichever changeset the
     // lib marked `current` (locked decision #6).
     let mut app = App::from_changesets(repo, views);
     app.open_current();
 
-    tui::run(&mut app).into_diagnostic()?;
+    // A misconfigured keybinding is non-fatal: show the collected warnings as a startup notice
+    // (cleared on the first keypress, like any notice) and run with the defaults for those keys.
+    if !keymap.warnings().is_empty() {
+        app.notify(keymap.warnings().join("; "), Severity::Error);
+    }
+
+    tui::run(&mut app, &keymap).into_diagnostic()?;
 
     Ok(())
 }
