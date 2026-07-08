@@ -24,19 +24,15 @@ use crate::theme::Palette;
 use crate::wordiff::Span as WordSpan;
 
 // The on-tint colors (diff add/del gradient + staged variants, cursor/selection washes, and syntax
-// foreground) now come from a [`Palette`] threaded through render (ADR-029). The chrome colors below
-// stay ANSI-named / const here: they never sit on a tint, so they inherit the terminal palette and
-// self-adapt light/dark, independent of the theme (the hybrid boundary — see the `theme` module).
+// foreground) come from a [`Palette`] threaded through render (ADR-029). The canvas background and
+// default/dim/gutter chrome foreground ALSO now come from the palette (`theme.background`/
+// `theme.foreground`/`theme.dim`/`theme.gutter`) — see the theme module's revised hybrid-boundary
+// doc comment — so a curated theme fully controls the look. Only semantic chrome that is never a
+// theme knob (error/warn/current-marker) stays ANSI-named / const below.
 
-/// Default foreground for diff text that carries no syntax highlight — an ANSI gray that inherits
-/// the terminal palette (chrome, not on-tint). Syntax-highlighted text resolves its fg from the
-/// [`Palette`] instead (see [`compose_segments`]).
-const FG_DEFAULT: Color = Color::Gray;
-const FG_DIM: Color = Color::DarkGray;
 /// Footer text color for an [`Severity::Error`] [`Notice`] — a clearly-red tone that reads on
 /// both light and dark terminal themes.
 const FG_ERROR: Color = Color::Rgb(220, 60, 60);
-const FG_GUTTER: Color = Color::DarkGray;
 /// Warning tone for the winbar's needs-restack marker (locked decision #9) — an amber, distinct
 /// from [`FG_ERROR`]'s red: a stale-parent changeset is a heads-up to `gt restack`, not a failure.
 const FG_WARN: Color = Color::Rgb(214, 158, 46);
@@ -105,7 +101,7 @@ struct Segment {
 /// Merge background-role spans and syntax fg spans into a flat list of non-overlapping
 /// segments covering `[0, len)`. A syntax span carries only its capture index; its color is
 /// resolved HERE against `theme` (ADR-029's render-time resolution) — a segment with no covering
-/// syntax span falls back to [`FG_DEFAULT`].
+/// syntax span falls back to [`Palette::foreground`].
 fn compose_segments(
     len: usize,
     bg_spans: &[(usize, usize, Color)],
@@ -145,7 +141,7 @@ fn compose_segments(
         let fg = fg_spans
             .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
             .map(|s| theme.syntax(s.capture))
-            .unwrap_or(FG_DEFAULT);
+            .unwrap_or(theme.foreground);
         segments.push(Segment { start, end, bg, fg });
     }
     segments
@@ -279,7 +275,7 @@ fn content_spans(
     if segments.is_empty() && !text.is_empty() {
         spans.push(TSpan::styled(
             text.to_string(),
-            Style::default().fg(FG_DEFAULT),
+            Style::default().fg(theme.foreground),
         ));
     }
     for seg in segments {
@@ -309,7 +305,7 @@ fn build_pane_line(
     match row {
         Row::Filler => {
             let pattern: String = "╱".repeat(content_w + gutter_w + 1);
-            Line::from(TSpan::styled(pattern, Style::default().fg(FG_DIM)))
+            Line::from(TSpan::styled(pattern, Style::default().fg(theme.dim)))
         }
         Row::Line(n) => {
             let text = match side {
@@ -323,7 +319,7 @@ fn build_pane_line(
             .and_then(|v| v.get(n - 1));
 
             let gutter = format!("{n:>gutter_w$} ");
-            let mut spans = vec![TSpan::styled(gutter, Style::default().fg(FG_GUTTER))];
+            let mut spans = vec![TSpan::styled(gutter, Style::default().fg(theme.gutter))];
 
             let emphasis = match kind {
                 CellKind::Del => Some(del_bg_pair(mode, n as u32, theme)),
@@ -347,10 +343,24 @@ fn build_pane_line(
 /// on top of everything else. `keymap` is the resolved, possibly-rebound keymap — the footer hint
 /// and help overlay render its ACTUAL bindings (see [`crate::keymap::footer_hint`]/
 /// [`crate::keymap::help_sections`]), never a hardcoded key string. `theme` is the resolved
-/// (CS4: always dark) on-tint palette — see [`crate::theme`]; the diff body, syntax foreground,
-/// and cursor/selection washes all resolve their colors against it at paint time.
+/// on-tint palette — see [`crate::theme`]; the diff body, syntax foreground, and cursor/selection
+/// washes all resolve their colors against it at paint time, as do the canvas background and the
+/// default/dim/gutter chrome foreground (ADR-029, revised).
 pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette) {
     let area = frame.area();
+
+    // Paint the whole screen with the theme's background FIRST — a curated theme (light/dark)
+    // controls the canvas outright; `auto` leaves `paint_canvas` false so the terminal's own
+    // background (and any transparency) shows through instead. Everything drawn below only sets
+    // `fg` (never `bg`) unless it's specifically painting a tint, so this base coat survives under
+    // plain text and is overridden cleanly by the diff-tint/cursor/selection washes.
+    if theme.paint_canvas {
+        frame.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
+    }
+
     let vlayout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -364,8 +374,8 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
     let body_area = vlayout[1];
     let footer_area = vlayout[2];
 
-    render_header(frame, app, header_area);
-    render_footer(frame, app, footer_area, keymap);
+    render_header(frame, app, header_area, theme);
+    render_footer(frame, app, footer_area, keymap, theme);
 
     if app.outline_open() {
         let hlayout = Layout::default()
@@ -383,7 +393,7 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
         for y in div_area.y..div_area.y + div_area.height {
             frame
                 .buffer_mut()
-                .set_string(div_area.x, y, "│", Style::default().fg(FG_DIM));
+                .set_string(div_area.x, y, "│", Style::default().fg(theme.dim));
         }
         render_body(frame, app, diff_area, theme);
     } else {
@@ -485,7 +495,7 @@ fn render_outline(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
             continue;
         };
         let is_cursor = item_idx == cursor;
-        let line = build_outline_line(item);
+        let line = build_outline_line(item, theme);
         let line = if is_cursor && focused {
             apply_cursor_row(line, area.width, theme)
         } else if is_cursor {
@@ -519,7 +529,7 @@ fn tree_prefix(guides: &[bool]) -> String {
 
 /// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
 /// marker rules.
-fn build_outline_line(item: &OutlineItem) -> Line<'static> {
+fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
     match item {
         OutlineItem::Header {
             label,
@@ -534,7 +544,9 @@ fn build_outline_line(item: &OutlineItem) -> Line<'static> {
             )];
             spans.push(TSpan::styled(
                 label.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.foreground)
+                    .add_modifier(Modifier::BOLD),
             ));
             if *needs_restack {
                 spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
@@ -545,7 +557,9 @@ fn build_outline_line(item: &OutlineItem) -> Line<'static> {
             let text = format!("{}{name}/", tree_prefix(guides));
             Line::from(TSpan::styled(
                 text,
-                Style::default().fg(FG_DIM).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(theme.dim)
+                    .add_modifier(Modifier::ITALIC),
             ))
         }
         OutlineItem::File {
@@ -564,7 +578,7 @@ fn build_outline_line(item: &OutlineItem) -> Line<'static> {
                 tree_prefix(guides)
             };
             let text = format!("{prefix}{glyph} {path}");
-            Line::from(TSpan::styled(text, Style::default().fg(FG_DEFAULT)))
+            Line::from(TSpan::styled(text, Style::default().fg(theme.foreground)))
         }
     }
 }
@@ -591,16 +605,20 @@ fn current_file_label(app: &App) -> String {
 /// changeset-aware winbar (locked decision #8) once the stack has more than one changeset — the
 /// winbar's own `[i/n]` is the CHANGESET counter, so showing both here would render two different
 /// counters under the same bracket notation. Never both at once.
-fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+fn render_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     if app.changeset_count() > 1 {
-        render_winbar(frame, app, area);
+        render_winbar(frame, app, area, theme);
         return;
     }
     let idx = app.current + 1;
     let n = app.files().len();
     let text = format!("[{idx}/{n}] {}", current_file_label(app));
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(text).style(
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
         area,
     );
 }
@@ -610,7 +628,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 /// stack and `fidx/nfiles` the active file's position within it. Only reached when
 /// [`App::changeset_count`] > 1 (see [`render_header`]) — a lone uncommitted changeset never
 /// shows this, keeping the M4 full-width look.
-fn render_winbar(frame: &mut Frame, app: &App, area: Rect) {
+fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
@@ -618,7 +636,9 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut spans = vec![TSpan::styled(
         format!("[{i}/{n}] {title}"),
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
     )];
     // A boolean-driven glyph + color (locked decision #9), not a title-string suffix — distinct
     // from the plain title so a stale-parent changeset reads as a heads-up at a glance.
@@ -632,7 +652,9 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect) {
     let nfiles = app.files().len();
     spans.push(TSpan::styled(
         format!("  —  {} ({fidx}/{nfiles})", current_file_label(app)),
-        Style::default().add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
@@ -641,7 +663,7 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect) {
 /// Footer priority: a pending discard confirm's prompt (warn-toned) wins over a transient notice,
 /// which wins over the curated hint line (CS3) — a notice TEMPORARILY REPLACES the hint rather
 /// than adding a second row; it clears on the user's next keypress (`tui::update`).
-fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap) {
+fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, theme: &Palette) {
     if let Some(confirm) = &app.pending_confirm {
         frame.render_widget(
             Paragraph::new(confirm.prompt.as_str()).style(Style::default().fg(FG_ERROR)),
@@ -653,7 +675,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap) {
         Some(Notice { text, severity }) => {
             let fg = match severity {
                 Severity::Error => FG_ERROR,
-                Severity::Info => FG_DEFAULT,
+                Severity::Info => theme.foreground,
             };
             frame.render_widget(
                 Paragraph::new(text.as_str()).style(Style::default().fg(fg)),
@@ -672,7 +694,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap) {
             };
             let text = footer_hint(keymap, focused);
             frame.render_widget(
-                Paragraph::new(text).style(Style::default().fg(FG_DIM)),
+                Paragraph::new(text).style(Style::default().fg(theme.dim)),
                 area,
             );
         }
@@ -692,7 +714,7 @@ fn render_gap_row(
     theme: &Palette,
 ) {
     let msg = format!("··· {skipped} unchanged lines ···");
-    let line = Line::from(TSpan::styled(msg, Style::default().fg(FG_DIM)));
+    let line = Line::from(TSpan::styled(msg, Style::default().fg(theme.dim)));
     // Cursor wins over selection on the same row.
     let line = if is_cursor {
         apply_cursor_row(line, area.width, theme)
@@ -713,7 +735,10 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     let idx = app.current;
     if app.files()[idx].is_binary {
         let msg = format!("[Binary file: {}]", app.files()[idx].path);
-        frame.render_widget(Paragraph::new(msg).style(Style::default().fg(FG_DIM)), area);
+        frame.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(theme.dim)),
+            area,
+        );
         return;
     }
 
@@ -786,8 +811,8 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     app.derive_scroll();
     app.derive_alt_scroll();
 
-    render_caption(frame.buffer_mut(), unstaged_caption, "UNSTAGED");
-    render_caption(frame.buffer_mut(), staged_caption, "STAGED");
+    render_caption(frame.buffer_mut(), unstaged_caption, "UNSTAGED", theme);
+    render_caption(frame.buffer_mut(), staged_caption, "STAGED", theme);
 
     let (u_scroll, u_cursor) = app.pane_render_state(Role::Unstaged);
     let (s_scroll, s_cursor) = app.pane_render_state(Role::Staged);
@@ -850,9 +875,9 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
 
 /// Write a split pane's role caption (`── LABEL ──`) across the pane width, styled like the dim
 /// gap-row markers.
-fn render_caption(buf: &mut Buffer, area: Rect, label: &str) {
+fn render_caption(buf: &mut Buffer, area: Rect, label: &str, theme: &Palette) {
     let text = format!("── {label} ──");
-    let line = Line::from(TSpan::styled(text, Style::default().fg(FG_DIM)));
+    let line = Line::from(TSpan::styled(text, Style::default().fg(theme.dim)));
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
@@ -921,7 +946,7 @@ fn render_pane_sbs(
     for y in area.y..area.y + area.height {
         frame
             .buffer_mut()
-            .set_string(div_area.x, y, "│", Style::default().fg(FG_DIM));
+            .set_string(div_area.x, y, "│", Style::default().fg(theme.dim));
     }
 
     for (i, row_idx) in (scroll..end).enumerate() {
@@ -1000,7 +1025,7 @@ fn render_pane_sbs(
                         div_area.x,
                         y,
                         "│",
-                        Style::default().fg(FG_DIM).bg(theme.cursor_bg),
+                        Style::default().fg(theme.dim).bg(theme.cursor_bg),
                     );
                 }
             }
@@ -1065,7 +1090,7 @@ fn build_inline_line(
         gutter_field(old_opt, old_gutter_w),
         gutter_field(new_opt, new_gutter_w)
     );
-    let mut spans = vec![TSpan::styled(gutter, Style::default().fg(FG_GUTTER))];
+    let mut spans = vec![TSpan::styled(gutter, Style::default().fg(theme.gutter))];
 
     let is_word_pair = row.is_word_diff_pair();
     // `kind` is always Del/Add/Context here — inline has no Filler rows. `old_opt`/`new_opt`
@@ -1203,6 +1228,16 @@ mod tests {
         let keymap = Keymap::defaults();
         let theme = Palette::dark();
         terminal.draw(|f| render(f, app, &keymap, &theme)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Like [`render_once`] but with a caller-chosen theme — for the canvas-paint tests, which
+    /// need to compare `light` vs `dark` (not just always-dark).
+    fn render_once_themed(app: &mut App, width: u16, height: u16, theme: &Palette) -> Buffer {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let keymap = Keymap::defaults();
+        terminal.draw(|f| render(f, app, &keymap, theme)).unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -2419,6 +2454,118 @@ mod tests {
             "expected row 3 to be src/a.txt, indented under src/ with its own last-child '└─' \
              guide, got:\n{}",
             content.join("\n")
+        );
+    }
+
+    // ── theming fix: canvas paint ────────────────────────────────────────────────
+
+    #[test]
+    fn light_theme_paints_the_canvas_with_the_light_background() {
+        // The bug this fix addresses: `workon.review.theme light` still showed the terminal's own
+        // (usually dark) bg/fg because the canvas was never painted. A body cell untouched by any
+        // diff/cursor/selection tint (e.g. a blank row past the end of a short file) must carry
+        // the theme's OWN background, not `None`/the terminal default.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let theme = Palette::light();
+        let buf = render_once_themed(&mut app, 40, 10, &theme);
+
+        // Row 1 (below the header, no files loaded — "(no changes)" placeholder) is plain canvas:
+        // no tint should have painted over it.
+        let canvas_cell = buf.cell((30, 5)).unwrap();
+        assert_eq!(
+            canvas_cell.style().bg,
+            Some(theme.background),
+            "expected an untinted body cell to carry the light theme's painted canvas background"
+        );
+    }
+
+    #[test]
+    fn header_text_carries_the_theme_foreground_not_the_terminal_default() {
+        // Regression (stack-review): render_header/render_winbar drew BOLD text with no `.fg()`,
+        // so on a curated theme whose polarity differs from the terminal the top bar rendered in
+        // the terminal's default fg over the painted canvas — invisible (light-on-light for
+        // `theme=light` in a dark terminal). The header must carry the theme's own foreground.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let theme = Palette::light();
+        let buf = render_once_themed(&mut app, 40, 10, &theme);
+
+        // Cell (0,0) is the header's leading '[' — a real glyph in the top status bar.
+        let header_cell = buf.cell((0, 0)).unwrap();
+        assert_eq!(
+            header_cell.style().fg,
+            Some(theme.foreground),
+            "header text must use the theme foreground to stay visible on the painted canvas"
+        );
+    }
+
+    #[test]
+    fn dark_theme_paints_the_canvas_with_the_dark_background() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let theme = Palette::dark();
+        let buf = render_once_themed(&mut app, 40, 10, &theme);
+
+        let canvas_cell = buf.cell((30, 5)).unwrap();
+        assert_eq!(
+            canvas_cell.style().bg,
+            Some(theme.background),
+            "expected an untinted body cell to carry the dark theme's painted canvas background"
+        );
+    }
+
+    #[test]
+    fn cursor_row_tint_still_shows_over_a_painted_canvas() {
+        // The canvas paint must not mask the per-row tint compositing (cursor/diff washes) —
+        // a cursor row must still show the theme's cursor tint, not the flat canvas color.
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold word here\nl10\nl11\nl12\nl13\nl14\n";
+        let new = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew word here\nl10\nl11\nl12\nl13\nl14\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("small.txt", old, new)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let theme = Palette::light();
+
+        let cursor_row = app
+            .current_view_ref()
+            .unwrap()
+            .display
+            .iter()
+            .position(|row| matches!(row, DisplayRow::Row(r) if r.old == Row::Line(10)))
+            .expect("l10 row present in the display vector");
+        app.cursor = cursor_row;
+
+        let buf = render_once_themed(&mut app, 60, 20, &theme);
+        let content = buf_lines(&buf);
+        let cursor_y = content
+            .iter()
+            .position(|line| line.contains("l10 "))
+            .expect("cursor row (l10) visible") as u16;
+
+        let cursor_bg = buf.cell((1, cursor_y)).unwrap().style().bg;
+        assert_eq!(
+            cursor_bg,
+            Some(theme.cursor_bg),
+            "expected the cursor row to carry the theme's cursor tint over the painted canvas"
+        );
+        assert_ne!(
+            cursor_bg,
+            Some(theme.background),
+            "the cursor tint must be visually distinct from the flat painted canvas"
         );
     }
 }
