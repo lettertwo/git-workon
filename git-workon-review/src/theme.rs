@@ -84,7 +84,7 @@ impl Base16 {
 /// describes for a LIGHT base00: blending an accent toward a light background yields a pale,
 /// correctly-hued wash (the dark scheme can't use this — see [`Palette::dark`]'s doc comment for
 /// why dark tints are held explicit instead). Non-RGB colors pass through unblended.
-fn tint_toward(color: Color, base: Color, ratio: f32) -> Color {
+pub(crate) fn tint_toward(color: Color, base: Color, ratio: f32) -> Color {
     match (color, base) {
         (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) => {
             let lerp =
@@ -92,6 +92,19 @@ fn tint_toward(color: Color, base: Color, ratio: f32) -> Color {
             Color::Rgb(lerp(r1, r2), lerp(g1, g2), lerp(b1, b2))
         }
         _ => color,
+    }
+}
+
+/// Whether a background color reads as "light" — a sum-of-channels luminance proxy (matching the
+/// reasoning in this module's tests) with the midpoint of the `0..=765` range as the threshold.
+/// Used to pick which curated scheme's diff/cursor tints a probed or fallback theme borrows
+/// (CS6): a probed dark background reuses [`Palette::dark`]'s hand-tuned tints, a light one reuses
+/// [`Palette::light`]'s derived washes. A non-RGB color (never produced by the OSC probe) reads as
+/// dark.
+pub(crate) fn is_light_background(color: Color) -> bool {
+    match color {
+        Color::Rgb(r, g, b) => r as u32 + g as u32 + b as u32 > 382,
+        _ => false,
     }
 }
 
@@ -244,6 +257,37 @@ impl Palette {
         }
     }
 
+    /// A scheme derived from the terminal's own colors (ADR-035's `auto`, CS6). The 16 base16
+    /// slots come from the probed [`Base16`] (built from the terminal's ANSI palette + background;
+    /// see [`crate::terminal_query`]), so **syntax matches the terminal**. The diff/cursor tints,
+    /// however, stay **curated by background luminance** rather than derived from the probed
+    /// accents — the CS6 refinement of ADR-035: dark-tint derivation is unsolved (see
+    /// [`Palette::dark`]) and deriving washes from an arbitrary terminal's accent is
+    /// unpredictable, whereas the value of terminal-derivation — code colors matching the
+    /// terminal — is fully delivered by the probed syntax slots. A probed dark background borrows
+    /// [`Palette::dark`]'s tints, a light one [`Palette::light`]'s.
+    pub fn from_terminal(base: Base16) -> Self {
+        let curated = if is_light_background(base.slot(0)) {
+            Palette::light()
+        } else {
+            Palette::dark()
+        };
+        Palette {
+            syntax: SYNTAX_SLOTS.iter().map(|&s| base.slot(s)).collect(),
+            del_subtle: curated.del_subtle,
+            del_strong: curated.del_strong,
+            add_subtle: curated.add_subtle,
+            add_strong: curated.add_strong,
+            del_staged_subtle: curated.del_staged_subtle,
+            del_staged_strong: curated.del_staged_strong,
+            add_staged_subtle: curated.add_staged_subtle,
+            add_staged_strong: curated.add_staged_strong,
+            cursor_bg: curated.cursor_bg,
+            selection_bg: curated.selection_bg,
+            outline_cursor_unfocused_bg: curated.outline_cursor_unfocused_bg,
+        }
+    }
+
     /// The syntax foreground for a capture index (position in
     /// [`crate::highlight::HIGHLIGHT_NAMES`]). This is the render-time resolution the whole
     /// mechanism turns on: [`crate::highlight::FgSpan`] carries the index, the renderer resolves
@@ -253,15 +297,17 @@ impl Palette {
         self.syntax[capture]
     }
 
-    /// Resolve the on-tint palette for a `workon.review.theme` selection (ADR-035/CS5). `Auto`
-    /// falls back to dark for now — CS6 adds the terminal-derivation probe that gives `Auto` its
-    /// real meaning. A config-read error is the caller's concern (see `main.rs`): this function
-    /// only handles a successfully-parsed selection.
+    /// Resolve the on-tint palette for a `workon.review.theme` selection (ADR-035/CS5) — the
+    /// **I/O-free** cases. `Light`/`Dark` return their curated schemes. `Auto` is the terminal
+    /// probe's job ([`crate::terminal_query::detect_auto_palette`], CS6), which needs tty access
+    /// this pure function can't have; `main.rs` routes `Auto` there and only falls through to this
+    /// function's dark result if it declines to probe. A config-read error is likewise the
+    /// caller's concern (see `main.rs`): this handles only a successfully-parsed selection.
     pub fn for_theme(theme: crate::config::Theme) -> Self {
         match theme {
             crate::config::Theme::Light => Self::light(),
             crate::config::Theme::Dark => Self::dark(),
-            crate::config::Theme::Auto => Self::dark(), // CS6: terminal-derive
+            crate::config::Theme::Auto => Self::dark(), // probe lives in main.rs/terminal_query
         }
     }
 }
@@ -383,6 +429,72 @@ mod tests {
         assert_eq!(color("function"), Color::Rgb(0x40, 0x78, 0xf2)); // base0D blue
         assert_eq!(color("number"), Color::Rgb(0xd7, 0x5f, 0x00)); // base09 orange
         assert_eq!(color("variable"), Color::Rgb(0x38, 0x3a, 0x42)); // base05 fg
+    }
+
+    /// A synthetic probed scheme with a distinct value in every slot and the given `base00`, so a
+    /// test can assert `from_terminal`'s syntax slots came from the probed scheme (not a curated
+    /// one) and read the base00 luminance branch.
+    fn probed_base16(base00: Color) -> Base16 {
+        let mut slots = [Color::Rgb(0, 0, 0); 16];
+        for (i, slot) in slots.iter_mut().enumerate() {
+            // A unique, recognizable color per slot: R channel = slot index * 16.
+            *slot = Color::Rgb((i as u8) * 16, 0x20, 0x40);
+        }
+        slots[0] = base00;
+        Base16 { slots }
+    }
+
+    #[test]
+    fn from_terminal_takes_syntax_from_the_probed_scheme() {
+        let probed = probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a)); // dark bg
+        let palette = Palette::from_terminal(probed);
+        // keyword → base0E (slot 14): the probed scheme's slot, NOT a curated palette's.
+        assert_eq!(
+            palette.syntax(capture_index("keyword").unwrap()),
+            probed.slot(14)
+        );
+        assert_eq!(
+            palette.syntax(capture_index("string").unwrap()),
+            probed.slot(11) // base0B
+        );
+        assert_ne!(
+            palette.syntax(capture_index("keyword").unwrap()),
+            Palette::dark().syntax(capture_index("keyword").unwrap())
+        );
+    }
+
+    #[test]
+    fn from_terminal_with_a_dark_background_borrows_darks_curated_tints() {
+        let palette = Palette::from_terminal(probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a)));
+        let dark = Palette::dark();
+        assert_eq!(palette.del_subtle, dark.del_subtle);
+        assert_eq!(palette.add_strong, dark.add_strong);
+        assert_eq!(palette.cursor_bg, dark.cursor_bg);
+        assert_eq!(palette.selection_bg, dark.selection_bg);
+        assert_eq!(
+            palette.outline_cursor_unfocused_bg,
+            dark.outline_cursor_unfocused_bg
+        );
+    }
+
+    #[test]
+    fn from_terminal_with_a_light_background_borrows_lights_curated_tints() {
+        let palette = Palette::from_terminal(probed_base16(Color::Rgb(0xf5, 0xf5, 0xf5)));
+        let light = Palette::light();
+        assert_eq!(palette.del_subtle, light.del_subtle);
+        assert_eq!(palette.add_strong, light.add_strong);
+        assert_eq!(palette.cursor_bg, light.cursor_bg);
+        assert_eq!(palette.selection_bg, light.selection_bg);
+        // ...and NOT dark's, confirming the luminance branch flipped.
+        assert_ne!(palette.del_subtle, Palette::dark().del_subtle);
+    }
+
+    #[test]
+    fn is_light_background_splits_on_the_luminance_midpoint() {
+        assert!(is_light_background(Base16::ONE_LIGHT.slot(0)));
+        assert!(!is_light_background(Base16::EIGHTIES_DARK.slot(0)));
+        // A non-RGB color (never produced by the probe) reads as dark.
+        assert!(!is_light_background(Color::Gray));
     }
 
     #[test]

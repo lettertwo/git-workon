@@ -968,6 +968,7 @@ dependencies = [
  "git-workon-fixture",
  "git-workon-lib",
  "git2",
+ "libc",
  "miette",
  "predicates",
  "ratatui",

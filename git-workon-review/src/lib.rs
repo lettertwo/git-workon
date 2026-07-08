@@ -30,5 +30,6 @@ pub mod refresh;
 pub mod render;
 pub mod stage_op;
 pub mod synthesis;
+pub mod terminal_query;
 pub mod theme;
 pub mod wordiff;
