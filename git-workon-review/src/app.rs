@@ -97,11 +97,14 @@ impl FileView {
     /// render one revision on one side and a different one on the other:
     /// - old side: [`Role::Combined`]/[`Role::Staged`] read the `HEAD` blob; [`Role::Unstaged`]
     ///   reads the INDEX blob (unstaged is index ↔ worktree).
-    /// - new side: [`Role::Combined`]/[`Role::Unstaged`] read the worktree file;
-    ///   [`Role::Staged`] reads the INDEX blob (staged is `HEAD` ↔ index).
+    /// - new side: [`Role::Combined`]/[`Role::Unstaged`] read the worktree file when `new_tree`
+    ///   is `None` (the uncommitted layer); for a committed changeset `new_tree` is the changeset's
+    ///   `head` commit tree, whose blob is read instead (its new side is `base..head`, not the
+    ///   current worktree). [`Role::Staged`] reads the INDEX blob (staged is `HEAD` ↔ index).
     fn load(
         repo: &Repository,
         head_tree: &git2::Tree<'_>,
+        new_tree: Option<&git2::Tree<'_>>,
         file: &FileChange,
         role: Role,
         ts: &mut TsHighlighter,
@@ -118,7 +121,10 @@ impl FileView {
         let new_text = match file.status {
             FileStatus::Deleted => String::new(),
             _ => match role {
-                Role::Combined | Role::Unstaged => read_workdir_file(repo, &file.path),
+                Role::Combined | Role::Unstaged => match new_tree {
+                    Some(tree) => read_head_blob(repo, tree, &file.path),
+                    None => read_workdir_file(repo, &file.path),
+                },
                 Role::Staged => read_index_blob(repo, &file.path),
             },
         };
@@ -312,6 +318,24 @@ fn old_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2:
             repo.find_commit(base).and_then(|c| c.tree()).ok()
         }
         ChangesetSource::Uncommitted => repo.head().and_then(|h| h.peel_to_tree()).ok(),
+    }
+}
+
+/// The tree a COMBINED-role [`FileView`]'s NEW side reads from (see [`FileView::load`]'s role
+/// table): the changeset's `head` commit for a committed changeset, or `None` for the uncommitted
+/// layer — where `None` means "read the worktree", the only new-side source M2–M4 ever had. A
+/// committed changeset's combined role is `base..head`, so its new side must read `head`'s blob,
+/// not the current worktree (which for an OLDER committed changeset differs from `head` and would
+/// break the align invariant against the `base..head` hunks). The mirror of [`old_side_tree_for`].
+///
+/// A free function for the same borrow-checker reason as [`old_side_tree_for`]: the returned
+/// [`git2::Tree`] borrows only `repo`, leaving `&mut self.highlighter` free at the call site.
+fn new_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2::Tree<'_>> {
+    match source {
+        ChangesetSource::Committed { head, .. } => {
+            repo.find_commit(head).and_then(|c| c.tree()).ok()
+        }
+        ChangesetSource::Uncommitted => None,
     }
 }
 
@@ -1213,7 +1237,17 @@ impl App {
                 let Ok(head_tree) = self.repo.head().and_then(|h| h.peel_to_tree()) else {
                     return;
                 };
-                FileView::load(&self.repo, &head_tree, &file, role, &mut self.highlighter)
+                // Non-Combined roles are uncommitted-only (committed changesets have empty
+                // staged/unstaged sub-models), so the new side always stays worktree/index —
+                // `None` here preserves that exactly.
+                FileView::load(
+                    &self.repo,
+                    &head_tree,
+                    None,
+                    &file,
+                    role,
+                    &mut self.highlighter,
+                )
             };
             self.views_for_mut(role)[idx] = Some(view);
             return;
@@ -1229,15 +1263,22 @@ impl App {
         let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.source) else {
             return;
         };
+        // New-side source mirrors the old side: `None` (worktree) for the uncommitted layer,
+        // the changeset's `head` tree for a committed changeset. Same free-fn borrow dance as
+        // `old_side_tree_for` — both trees borrow only `self.repo`, so `&mut self.highlighter`
+        // stays free for `FileView::load`.
+        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.source);
         let file = self.cur().diff.files[idx].clone();
         let view = FileView::load(
             &self.repo,
             &head_tree,
+            new_tree.as_ref(),
             &file,
             Role::Combined,
             &mut self.highlighter,
         );
         drop(head_tree);
+        drop(new_tree);
         self.cur_mut().views_combined[idx] = Some(view);
     }
 
@@ -4719,6 +4760,88 @@ mod tests {
             "the stack's very first file must clamp, not wrap to the last changeset"
         );
         assert_eq!(app.current, 0);
+    }
+
+    /// Regression: navigating to an OLDER committed changeset and loading its combined view must
+    /// source the new side from that changeset's `head` commit tree, not the current worktree. The
+    /// same file `f.txt` is touched by both changesets, so `cs-a`'s head (`mid`) content differs
+    /// from the worktree (which holds `head`'s content). Before the `new_side_tree_for` fix the new
+    /// side read the worktree, whose line count disagreed with `cs-a`'s `base..head` hunks and
+    /// tripped the align invariant (align.rs:165 "trailing context ... must be equal length"). No
+    /// color pinning needed: `new_text()` returns the raw blob text, not highlighted spans.
+    #[test]
+    fn older_committed_changesets_new_side_reads_its_head_tree_not_the_worktree() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("f.txt", "one\n")
+            .create("root")
+            .unwrap();
+        // cs-a (root..mid) adds "two" to f.txt — its head-tree copy is "one\ntwo\n".
+        let mid = fixture
+            .commit("main")
+            .file("f.txt", "one\ntwo\n")
+            .create("mid")
+            .unwrap();
+        // cs-b (mid..head) adds "three" — so the checked-out worktree copy is "one\ntwo\nthree\n",
+        // three lines, which must NOT be what cs-a's combined new side reads.
+        let head = fixture
+            .commit("main")
+            .file("f.txt", "one\ntwo\nthree\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            source: ChangesetSource::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "cs-b".to_string(),
+            source: ChangesetSource::Committed { base: mid, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::from_changeset_diff(
+            cs_b.clone(),
+            crate::acquire::diff_changeset(repo, &cs_b).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.open_current();
+        assert_eq!(app.current_cs(), 1, "opens on cs-b (its current: true)");
+
+        // Navigate back to the older changeset and load its combined view. Pre-fix this panics at
+        // align.rs:165; post-fix it loads cleanly.
+        app.prev_changeset();
+        assert_eq!(app.current_cs(), 0, "prev lands on cs-a");
+        let view = app.current_view().expect("cs-a's combined view must load");
+
+        assert_eq!(
+            view.new_text(),
+            "one\ntwo\n",
+            "new side must read cs-a's head (mid) blob, not the worktree copy"
+        );
+        assert_ne!(
+            view.new_text(),
+            "one\ntwo\nthree\n",
+            "new side must NOT read the worktree (which holds cs-b's head content)"
+        );
     }
 
     #[test]
