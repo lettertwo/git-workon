@@ -15,13 +15,13 @@ pub const MAX_HIGHLIGHT_LINES: usize = 20_000;
 
 /// Foreground syntax span for a single line: a byte range and the semantic *capture index* —
 /// the position in [`HIGHLIGHT_NAMES`] of the capture that covers it. The color is resolved at
-/// render time against the active [`crate::theme::Theme`] (ADR-035), NOT baked in here: the
+/// render time against the active [`crate::theme::Palette`] (ADR-035), NOT baked in here: the
 /// tree-sitter pass is theme-free and cacheable, and a theme switch recolors by re-rendering.
 #[derive(Debug, Clone)]
 pub struct FgSpan {
     pub start: usize,
     pub end: usize,
-    /// Index into [`HIGHLIGHT_NAMES`]; resolve via [`crate::theme::Theme::syntax`].
+    /// Index into [`HIGHLIGHT_NAMES`]; resolve via [`crate::theme::Palette::syntax`].
     pub capture: usize,
 }
 
