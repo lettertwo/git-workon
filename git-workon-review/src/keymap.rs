@@ -38,6 +38,7 @@ pub enum Command {
     // Global (active in every view).
     Quit,
     ToggleOutline,
+    ToggleHelp,
     // Diff view.
     CursorDown,
     CursorUp,
@@ -101,6 +102,13 @@ pub static REGISTRY: &[Registered] = &[
         name: "toggle-outline",
         default_keys: "o",
         description: "Toggle the outline pane / focus",
+    },
+    Registered {
+        command: Command::ToggleHelp,
+        view: View::Global,
+        name: "toggle-help",
+        default_keys: "?",
+        description: "Toggle the help overlay",
     },
     // ── Diff view ────────────────────────────────────────────────────────────
     Registered {
@@ -624,6 +632,137 @@ fn build_context(
     out
 }
 
+/// One row of the `?` help overlay: an action's resolved key label (space-joined alternatives,
+/// e.g. `"tab ]f"`) and its registry description. Built by [`help_sections`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpEntry {
+    pub keys: String,
+    pub description: &'static str,
+}
+
+/// One titled group of [`HelpEntry`] rows in the help overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpSection {
+    pub title: &'static str,
+    pub entries: Vec<HelpEntry>,
+}
+
+/// Build the help overlay's content for `focused` (the view with keyboard focus — [`View::Diff`]
+/// or [`View::Outline`]; never [`View::Global`]): a "Global" section, then the focused view's own
+/// section, each listing only BOUND actions (an action with no resolved keys — user-unbound — is
+/// skipped, per CS3). Pure and `Keymap`-driven — the display never hardcodes a key string, so a
+/// rebind shows here automatically.
+pub fn help_sections(keymap: &Keymap, focused: View) -> Vec<HelpSection> {
+    vec![
+        HelpSection {
+            title: "Global",
+            entries: entries_for_view(keymap, View::Global),
+        },
+        HelpSection {
+            title: view_label_title(focused),
+            entries: entries_for_view(keymap, focused),
+        },
+    ]
+}
+
+fn entries_for_view(keymap: &Keymap, view: View) -> Vec<HelpEntry> {
+    REGISTRY
+        .iter()
+        .filter(|entry| entry.view == view)
+        .filter_map(|entry| {
+            let seqs = keymap.keys_for(entry.command);
+            if seqs.is_empty() {
+                return None;
+            }
+            let keys = seqs
+                .iter()
+                .map(|seq| render_seq(seq))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(HelpEntry {
+                keys,
+                description: entry.description,
+            })
+        })
+        .collect()
+}
+
+fn view_label_title(view: View) -> &'static str {
+    match view {
+        View::Global => "Global",
+        View::Diff => "Diff",
+        View::Outline => "Outline",
+    }
+}
+
+/// The resolved key label for the FIRST alternative bound to `command` (for the curated footer
+/// hint, which only has room for one key per action), or `None` when unbound.
+fn primary_key(keymap: &Keymap, command: Command) -> Option<String> {
+    keymap.keys_for(command).first().map(|seq| render_seq(seq))
+}
+
+/// One curated footer entry: a resolved key label paired with a short verb, or an up/down PAIR
+/// collapsed to a single `down/up verb` entry (e.g. `j/k move`) when both resolve.
+enum HintItem {
+    One(Command, &'static str),
+    Pair(Command, Command, &'static str),
+}
+
+fn render_hint_item(keymap: &Keymap, item: &HintItem) -> Option<String> {
+    match item {
+        HintItem::One(command, label) => {
+            primary_key(keymap, *command).map(|k| format!("{k} {label}"))
+        }
+        HintItem::Pair(down, up, label) => {
+            match (primary_key(keymap, *down), primary_key(keymap, *up)) {
+                (Some(d), Some(u)) => Some(format!("{d}/{u} {label}")),
+                (Some(d), None) => Some(format!("{d} {label}")),
+                (None, Some(u)) => Some(format!("{u} {label}")),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// The diff view's curated footer hint set (locked design in CS3): nav, stage/discard, outline,
+/// help, quit — ~5-7 entries picked to make the tool feel learnable, not an exhaustive list.
+const DIFF_HINTS: &[HintItem] = &[
+    HintItem::Pair(Command::CursorDown, Command::CursorUp, "move"),
+    HintItem::One(Command::StageHunk, "stage"),
+    HintItem::One(Command::DiscardHunk, "discard"),
+    HintItem::One(Command::ToggleOutline, "outline"),
+    HintItem::One(Command::ToggleHelp, "help"),
+    HintItem::One(Command::Quit, "quit"),
+];
+
+/// The outline view's curated footer hint set (locked design in CS3).
+const OUTLINE_HINTS: &[HintItem] = &[
+    HintItem::Pair(Command::OutlineDown, Command::OutlineUp, "move"),
+    HintItem::One(Command::OutlineConfirm, "open"),
+    HintItem::One(Command::OutlineCycleMode, "mode"),
+    HintItem::One(Command::ToggleOutline, "outline"),
+    HintItem::One(Command::ToggleHelp, "help"),
+    HintItem::One(Command::Quit, "quit"),
+];
+
+/// Build the persistent, always-visible footer hint string for `focused` ([`View::Diff`] or
+/// [`View::Outline`]; never [`View::Global`]) from the resolved `keymap` — never a hardcoded key
+/// string, so a rebind shows here too. A notice temporarily replaces this in the footer (the
+/// caller's job, see `render::render_footer`); an unbound curated action is simply dropped from
+/// the string rather than leaving a stale/wrong key visible.
+pub fn footer_hint(keymap: &Keymap, focused: View) -> String {
+    let items: &[HintItem] = match focused {
+        View::Diff => DIFF_HINTS,
+        View::Outline => OUTLINE_HINTS,
+        View::Global => &[],
+    };
+    items
+        .iter()
+        .filter_map(|item| render_hint_item(keymap, item))
+        .collect::<Vec<_>>()
+        .join("  \u{b7}  ")
+}
+
 /// The config action name for a command (for collision warnings) — its registry `name`.
 fn command_label(command: Command) -> &'static str {
     REGISTRY
@@ -920,5 +1059,106 @@ mod tests {
             ),
             Dispatch::Command(Command::StageHunk)
         );
+    }
+
+    // ── CS3: help overlay / footer hint builders ────────────────────────────
+
+    #[test]
+    fn help_sections_groups_global_and_the_focused_view_only() {
+        let km = Keymap::defaults();
+        let sections = help_sections(&km, View::Diff);
+
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].title, "Global");
+        assert_eq!(sections[1].title, "Diff");
+        // Outline-only actions never leak into the diff-focused overlay.
+        assert!(!sections.iter().any(|s| s
+            .entries
+            .iter()
+            .any(|e| e.description.contains("outline cursor"))));
+
+        let outline_sections = help_sections(&km, View::Outline);
+        assert_eq!(outline_sections[1].title, "Outline");
+    }
+
+    #[test]
+    fn help_sections_skip_an_unbound_action() {
+        let km = Keymap::from_bindings(&[RawBinding {
+            view: View::Diff,
+            action: "stage-hunk".to_string(),
+            keys: String::new(),
+        }]);
+        let sections = help_sections(&km, View::Diff);
+        let diff = &sections[1];
+        assert!(
+            !diff
+                .entries
+                .iter()
+                .any(|e| e.description.contains("Stage the hunk")),
+            "an unbound action must not appear in the help overlay"
+        );
+    }
+
+    #[test]
+    fn help_sections_render_a_rebound_key_not_the_default() {
+        let km = Keymap::from_bindings(&[RawBinding {
+            view: View::Diff,
+            action: "stage-hunk".to_string(),
+            keys: "x".to_string(),
+        }]);
+        let sections = help_sections(&km, View::Diff);
+        let diff = &sections[1];
+        let stage_row = diff
+            .entries
+            .iter()
+            .find(|e| e.description.contains("Stage the hunk"))
+            .expect("stage-hunk row present");
+        assert_eq!(stage_row.keys, "x", "the overlay must show the REBOUND key");
+    }
+
+    #[test]
+    fn footer_hint_renders_the_curated_diff_entries() {
+        let km = Keymap::defaults();
+        let hint = footer_hint(&km, View::Diff);
+        assert!(hint.contains("j/k move"), "got: {hint:?}");
+        assert!(hint.contains("s stage"), "got: {hint:?}");
+        assert!(hint.contains("d discard"), "got: {hint:?}");
+        assert!(hint.contains("o outline"), "got: {hint:?}");
+        assert!(hint.contains("? help"), "got: {hint:?}");
+        assert!(hint.contains("q quit"), "got: {hint:?}");
+    }
+
+    #[test]
+    fn footer_hint_renders_the_curated_outline_entries() {
+        let km = Keymap::defaults();
+        let hint = footer_hint(&km, View::Outline);
+        assert!(hint.contains("j/k move"), "got: {hint:?}");
+        assert!(hint.contains("enter open"), "got: {hint:?}");
+        assert!(hint.contains("i mode"), "got: {hint:?}");
+    }
+
+    #[test]
+    fn footer_hint_renders_a_rebound_key_not_the_default() {
+        let km = Keymap::from_bindings(&[RawBinding {
+            view: View::Diff,
+            action: "stage-hunk".to_string(),
+            keys: "x".to_string(),
+        }]);
+        let hint = footer_hint(&km, View::Diff);
+        assert!(hint.contains("x stage"), "got: {hint:?}");
+        assert!(!hint.contains("s stage"), "got: {hint:?}");
+    }
+
+    #[test]
+    fn footer_hint_drops_an_unbound_curated_action_rather_than_a_stale_key() {
+        let km = Keymap::from_bindings(&[RawBinding {
+            view: View::Diff,
+            action: "stage-hunk".to_string(),
+            keys: String::new(),
+        }]);
+        let hint = footer_hint(&km, View::Diff);
+        assert!(!hint.contains("stage"), "got: {hint:?}");
+        // The rest of the curated set is unaffected.
+        assert!(hint.contains("d discard"), "got: {hint:?}");
     }
 }

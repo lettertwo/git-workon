@@ -659,6 +659,10 @@ pub struct App {
     /// rebuilt-from-scratch — `open`/`focused`/`mode` persist, like [`Self::layout`]/
     /// [`Self::zoom`]) by every diff-initiated nav and by [`Self::refresh`].
     outline: OutlineState,
+    /// Whether the `?` help overlay is showing (CS3). While `true`, `tui::update` intercepts
+    /// every key as a modal (mirroring [`Self::pending_confirm`]'s capture) — see its doc comment
+    /// for the precedence between the two modals.
+    pub help_visible: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -791,6 +795,7 @@ impl App {
             selection_anchor: None,
             refresh_coordinator,
             outline,
+            help_visible: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1433,6 +1438,13 @@ impl App {
         } else {
             self.outline.open = false;
         }
+    }
+
+    /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
+    /// view currently has keyboard focus (see `render::render_help_overlay`), so there is no
+    /// extra state to reposition here, unlike [`Self::toggle_outline`]'s three-state cycle.
+    pub fn toggle_help(&mut self) {
+        self.help_visible = !self.help_visible;
     }
 
     /// Return focus to the diff without closing the outline (`Esc` while the outline has focus —
@@ -4751,6 +4763,18 @@ mod tests {
             !app.outline_open(),
             "toggling again while open-but-unfocused closes the pane"
         );
+    }
+
+    #[test]
+    fn toggle_help_flips_help_visible() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        assert!(!app.help_visible, "help is closed by default");
+
+        app.toggle_help();
+        assert!(app.help_visible, "toggle_help opens it");
+
+        app.toggle_help();
+        assert!(!app.help_visible, "toggle_help closes it again");
     }
 
     #[test]
