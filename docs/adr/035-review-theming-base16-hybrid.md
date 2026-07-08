@@ -36,10 +36,24 @@ is spec-conformant.
 
 **Primitive — the theme is a base16 scheme.** A `Theme` holds the 16 slots
 (base00–07 mono ramp + base08–0F accents). Syntax uses the accents via the existing
-capture→slot template. Diff-bg tints are **derived**, not authored: blend base08
-(red / spec "Diff Deleted") and base0B (green / spec "Diff Inserted") toward base00 (bg)
-using the existing `tint_toward` helper (`render.rs`). Syntax and diff tints therefore come
-from one scheme and stay coordinated by construction.
+capture→slot template.
+
+Diff-bg tints ideally come from base08 (red / spec "Diff Deleted") and base0B (green / spec
+"Diff Inserted") and the scheme background, so syntax and tints stay coordinated. **But the
+derivation is luminance-dependent, not a single "blend toward base00" (corrected in CS4):**
+- **Dark (base00 dark):** the shipped M3–M5 tints are more saturated/darker than *any* convex
+  blend of an accent toward a dark base00 can produce (their green/blue channels sit *below*
+  base00's). A blend toward a dark base00 also yields muddy mid-tones, not punchy washes. So
+  the **dark tints are held explicit** in `Theme::dark()` (byte-identical to M3–M5, per the
+  pixel-identity gate). Deriving them would require scaling the accent toward *black* plus a
+  desaturation step, not a base00 blend — not worth reverse-engineering the hand-tuned values.
+- **Light (base00 light) and terminal-derived:** blending an accent toward a *light* base00
+  gives the correct pale tint, so the `tint_toward` derivation applies there (CS5/CS6). A
+  terminal-derived theme on a *dark* background hits the same problem as dark and needs the
+  toward-black+desaturate construction — a CS6 concern.
+
+Net: the scheme-coordinated derivation is real but must branch on background luminance; dark
+stays authored.
 
 **Mechanism — resolve color at render time, not in the highlight phase.**
 - `HIGHLIGHT_NAMES` stays global/const: it defines the capture *index space* bound by

@@ -8,6 +8,7 @@ use workon_review::acquire::{diff_changeset, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::ReviewConfig;
 use workon_review::keymap::Keymap;
+use workon_review::theme::Theme;
 
 /// A TUI for reviewing changesets
 #[derive(Debug, Parser)]
@@ -81,7 +82,12 @@ fn main() -> Result<()> {
         app.notify(warnings.join("; "), Severity::Error);
     }
 
-    tui::run(&mut app, &keymap).into_diagnostic()?;
+    // CS4 is dark-only and unconditional — a pure refactor with no user-visible change. CS5 wires
+    // `ReviewConfig::theme()` (config `Theme::{Auto,Dark,Light}`) to pick the palette here; CS6
+    // adds the terminal-derivation probe for `auto`.
+    let theme = Theme::dark();
+
+    tui::run(&mut app, &keymap, &theme).into_diagnostic()?;
 
     Ok(())
 }
