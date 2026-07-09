@@ -1210,8 +1210,12 @@ impl App {
     }
 
     /// Read-only access to file `idx`'s already-loaded [`FileView`] for `role` (`None` if the role
-    /// has no change for the file, or it isn't loaded yet).
-    pub(crate) fn role_view_ref(&self, idx: usize, role: Role) -> Option<&FileView> {
+    /// has no change for the file, or it isn't loaded yet). `pub` (not `pub(crate)`) so the
+    /// separate `git-workon-review` bin crate's `tui.rs` tests can assert a file was — or, more
+    /// importantly, was NOT — loaded without visiting it (CS2's event-coalescing regression
+    /// test); read-only and does not touch `open_current`/`ensure_loaded`/`outline_move_by`'s
+    /// eager-load semantics.
+    pub fn role_view_ref(&self, idx: usize, role: Role) -> Option<&FileView> {
         self.views_for(role).get(idx).and_then(|v| v.as_ref())
     }
 
