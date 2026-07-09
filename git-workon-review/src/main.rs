@@ -57,16 +57,30 @@ fn main() -> Result<()> {
     // terminal. Carrying the `Result` until the run call preserves exactly that — the error
     // surfaces at the same logical point it always did. Splash failures on an acquired terminal
     // are cosmetic (the run call will surface anything real) and deliberately ignored.
-    let mut tui = tui::Tui::acquire();
-    if let Ok(tui) = tui.as_mut() {
+    //
+    // A PR source skips the early takeover entirely (`None` until after resolution): resolving
+    // a PR fetches over the network, and auth-git2 may interactively PROMPT on the controlling
+    // terminal for an ssh passphrase or https credentials when no agent/helper answers — inside
+    // raw-mode alternate screen that prompt would stair-step over the splash and leave the user
+    // typing blind. Those launches keep the pre-CS5 ordering: prompt (if any) on the normal
+    // screen, terminal taken right after resolution.
+    let source = cli.source.as_deref().map(Source::classify);
+    let mut tui = if matches!(source, Some(Source::Pr(_))) {
+        None
+    } else {
+        Some(tui::Tui::acquire())
+    };
+    if let Some(Ok(tui)) = tui.as_mut() {
         let _ = tui.splash("resolving changesets…");
     }
 
-    let source = cli.source.as_deref().map(Source::classify);
     let changesets = match &source {
         None => resolve_changesets(&repo, &branch).into_diagnostic()?,
         Some(source) => resolve_source(&repo, &branch, source.clone()).into_diagnostic()?,
     };
+
+    // The PR path's resolution (and any credential prompting) is done — take the terminal now.
+    let mut tui = tui.unwrap_or_else(tui::Tui::acquire);
 
     if let Ok(tui) = tui.as_mut() {
         let noun = if changesets.len() == 1 {
