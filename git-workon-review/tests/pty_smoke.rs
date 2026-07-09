@@ -22,6 +22,9 @@
 
 #![cfg(unix)]
 
+mod pty_support;
+use pty_support::spawn_review;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -43,24 +46,6 @@ fn auto_theme_fixture() -> Fixture {
         .unstaged_file("file.txt", "a\nb\nc\n", "a\nCHANGED\nc\n")
         .build()
         .expect("fixture")
-}
-
-/// Spawn the review binary in a PTY sized like a real terminal (an unsized PTY is 0×0 and
-/// ratatui draws nothing), cwd'd into the fixture's worktree.
-fn spawn_review(fixture: &Fixture) -> Session<OsProcess, OsStream> {
-    let repo = fixture.repo().expect("fixture repo");
-    let workdir = repo.workdir().expect("fixture workdir").to_path_buf();
-
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_git-workon-review"));
-    cmd.current_dir(workdir).env("TERM", "xterm-256color");
-
-    let mut session = expectrl::Session::spawn(cmd).expect("spawn in PTY");
-    session
-        .get_process_mut()
-        .set_window_size(120, 40)
-        .expect("size PTY");
-    session.set_expect_timeout(Some(Duration::from_secs(15)));
-    session
 }
 
 /// Play a well-behaved answering terminal: reply to all 16 `OSC 4` color queries plus
