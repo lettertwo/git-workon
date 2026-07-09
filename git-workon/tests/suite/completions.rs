@@ -165,6 +165,27 @@ fn tab_after_review_subcommand_delegates_to_review_binary_completer() {
     );
 }
 
+/// Security regression: only `DELEGATED_EXTERNALS` (`completers.rs`) are re-invoked under the
+/// `COMPLETE=` protocol. A non-allowlisted external is a plain user script that has no idea what
+/// `COMPLETE` means — it would just run for real on every TAB press, its normal stdout misread as
+/// completion candidates and its side effects fired. `PathStub::command`'s canned script prints
+/// distinctive `arg:`/`cwd:` lines to stdout when executed; asserting those never appear (and the
+/// process still exits cleanly, falling through to the stub top-level candidate) proves the stub
+/// was never invoked.
+#[test]
+fn tab_after_non_allowlisted_external_does_not_execute_it() {
+    let stub = PathStub::new().unwrap().command("greet").unwrap();
+
+    let candidates = bash_candidates(&stub.path(), &["git-workon", "greet", ""], 2);
+
+    assert!(
+        candidates
+            .iter()
+            .all(|c| !c.starts_with("arg:") && !c.starts_with("cwd:")),
+        "non-allowlisted external must never be executed for completion: {candidates:?}"
+    );
+}
+
 #[test]
 fn external_subcommand_does_not_shadow_a_builtin_in_completion() {
     // A `git-workon-list` stub must not produce a duplicate `list` candidate — the built-in owns

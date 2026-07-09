@@ -93,6 +93,18 @@ fn augment_external_subcommands(cmd: Command) -> Command {
         })
 }
 
+/// First-party externals known to speak the `clap_complete` `COMPLETE=` responder protocol.
+///
+/// Delegation (below) has to *execute* the external to get its completions — there is no way to
+/// probe "does this binary support `COMPLETE=`" without running it, and a plain user script (the
+/// external-subcommand surface explicitly supports those; see `dispatch.rs` and the
+/// `PathStub::command` tests) ignores `COMPLETE` entirely and just runs, turning a TAB press into
+/// an arbitrary side-effecting execution with its normal stdout misread as completion candidates.
+/// ADR-036 only promises this delegation for the review binary, so the allowlist starts there.
+/// A future git-config allowlist (`workon.*`, ADR-006) can let users opt other externals in
+/// deliberately — extend this list (or make it configurable) when that lands.
+const DELEGATED_EXTERNALS: &[&str] = &["review"];
+
 /// Sub-delegate `git-workon <ext> <words...><TAB>` completion to `git-workon-<ext>`'s own
 /// `COMPLETE=<shell>` responder — the M6 CS3-deferred seam, wired here per ADR-036 CS5.
 ///
@@ -106,20 +118,22 @@ fn augment_external_subcommands(cmd: Command) -> Command {
 /// It re-derives the shell's word list and completion index the same way `clap_complete`'s own
 /// bash/elvish adapters do (`_CLAP_COMPLETE_INDEX`; zsh/fish don't set that var and always mean
 /// "the last word", so that's the fallback). If the first non-flag word after the program name
-/// resolves to a `git-workon-<name>` executable on `$PATH` (and isn't a known built-in — a
-/// built-in's own `Cli` already completes itself) *and* the word actually being completed sits
-/// after it, this re-invokes that executable under the identical protocol: the leading
-/// `<program-name> <ext>` words collapse into one placeholder word (`git-workon-<ext>`, mirroring
-/// how the external is invoked for real by `dispatch::try_dispatch`) and the completion index
-/// shifts down by however many leading words were collapsed away. The external's stdout — already
-/// shell-formatted by its own `CompleteEnv` responder — is copied through verbatim, and this
-/// process exits with the external's exit code.
+/// names a subcommand in `DELEGATED_EXTERNALS` (see its doc comment for why delegation is gated at
+/// all) that also resolves to a `git-workon-<name>` executable on `$PATH` (and isn't a known
+/// built-in — a built-in's own `Cli` already completes itself) *and* the word actually being
+/// completed sits after it, this re-invokes that executable under the identical protocol: the
+/// leading `<program-name> <ext>` words collapse into one placeholder word (`git-workon-<ext>`,
+/// mirroring how the external is invoked for real by `dispatch::try_dispatch`) and the completion
+/// index shifts down by however many leading words were collapsed away. Stdin is nulled for the
+/// delegated process — an external that prompts on stdin must not be able to block the user's
+/// shell on a TAB press. The external's stdout — already shell-formatted by its own `CompleteEnv`
+/// responder — is copied through verbatim, and this process exits with the external's exit code.
 ///
 /// A no-op (returns without printing or exiting) whenever `COMPLETE` isn't set, there's no word
 /// after the program name, the completing index lands on the subcommand slot itself (that's
 /// still a top-level candidate list, not a delegation target), the leading word is a known
-/// built-in, or nothing matching is found on `$PATH` — every one of those falls through to
-/// `CompleteEnv`'s normal dispatch in `main`.
+/// built-in, the leading word isn't in `DELEGATED_EXTERNALS`, or nothing matching is found on
+/// `$PATH` — every one of those falls through to `CompleteEnv`'s normal dispatch in `main`.
 pub fn try_delegate_external_completion() {
     let Some(shell) = std::env::var_os("COMPLETE") else {
         return;
@@ -163,6 +177,9 @@ pub fn try_delegate_external_completion() {
     if known.contains(name) {
         return; // a built-in owns this name; its own Cli completes it
     }
+    if !DELEGATED_EXTERNALS.contains(&name) {
+        return; // protocol support isn't known/promised for this external; don't execute it
+    }
     let Some(exe) = crate::dispatch::find_external(name) else {
         return; // no matching external on PATH
     };
@@ -174,6 +191,7 @@ pub fn try_delegate_external_completion() {
     let output = std::process::Command::new(&exe)
         .env("COMPLETE", &shell)
         .env("_CLAP_COMPLETE_INDEX", delegated_index.to_string())
+        .stdin(std::process::Stdio::null())
         .arg("--")
         .args(&delegated_words)
         .output();
