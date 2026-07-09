@@ -1427,19 +1427,40 @@ impl App {
 
     /// Load the current file's needed views and reset both panes to their first hunks.
     ///
-    /// In [`Self::defer_loads`] mode this does NOT load: it marks the open pending and resets the
-    /// panes anyway (the cursor falls back to row 0 for the still-unloaded view, via
-    /// [`Self::role_first_hunk`]'s `unwrap_or(0)` — harmless, since the body renders a placeholder
-    /// until [`Self::complete_pending_open`] runs). Outside defer mode this is exactly today's
-    /// eager behavior.
+    /// In [`Self::defer_loads`] mode a file whose views are NOT yet cached does not load here:
+    /// the open is marked pending and the panes reset anyway (the cursor falls back to row 0
+    /// for the still-unloaded view, via [`Self::role_first_hunk`]'s `unwrap_or(0)` — harmless,
+    /// since the body renders a placeholder until [`Self::complete_pending_open`] runs). A file
+    /// whose views ARE cached takes the eager path even in defer mode: `ensure_loaded` is a
+    /// pure cache hit there, and deferring would only trade an instantly-renderable diff for a
+    /// placeholder flash lasting the debounce window — revisiting a file is the most common
+    /// navigation of all, and it must render immediately. Outside defer mode this is exactly
+    /// the pre-defer eager behavior.
     pub fn open_current(&mut self) {
-        if self.defer_loads {
+        if self.defer_loads && !self.current_views_cached() {
             self.open_pending = true;
             self.reset_panes();
             return;
         }
         self.ensure_loaded(self.current);
         self.reset_panes();
+    }
+
+    /// Whether the view(s) the current file's effective zoom needs are already cached, making a
+    /// deferred open pointless (`ensure_loaded` would be a cache hit). Split checks EITHER pane:
+    /// a role with no change for the file stays legitimately `None` forever (see
+    /// [`Self::ensure_role_loaded`]), so requiring both would defer a one-role file every time.
+    /// A partially-cached split (one loadable pane in, one missing) takes the eager path and
+    /// loads the single missing pane synchronously — one file, cheap, and consistent with the
+    /// both-`None` gate the render placeholder uses.
+    fn current_views_cached(&self) -> bool {
+        match self.effective_zoom_for(self.current) {
+            EffectiveZoom::Single(role) => self.role_view_ref(self.current, role).is_some(),
+            EffectiveZoom::Split => {
+                self.role_view_ref(self.current, Role::Unstaged).is_some()
+                    || self.role_view_ref(self.current, Role::Staged).is_some()
+            }
+        }
     }
 
     /// Complete a deferred open, if one is pending: load the current file's needed views, then
@@ -2937,6 +2958,39 @@ mod tests {
         assert_eq!(deferred_view.old_text(), eager_view.old_text());
         assert_eq!(deferred_view.new_text(), eager_view.new_text());
         assert_eq!(deferred_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn revisiting_a_cached_file_reopens_eagerly_without_a_pending_window() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "1\n2\n3\n", "1\nA\n3\n")
+            .unstaged_file("b.txt", "1\n2\n3\n", "1\nB\n3\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current(); // a.txt: uncached — defers
+        assert!(app.open_pending(), "an uncached file defers its open");
+        app.complete_pending_open();
+
+        app.current = 1;
+        app.open_current(); // b.txt: uncached — defers
+        assert!(app.open_pending(), "a different uncached file still defers");
+        app.complete_pending_open();
+
+        app.current = 0;
+        app.open_current(); // back to a.txt: cached — must NOT defer
+        assert!(
+            !app.open_pending(),
+            "revisiting a cached file must reopen eagerly — a pending window here would \
+             flash the loading placeholder over an instantly-renderable diff"
+        );
+        assert!(
+            app.current_view_ref().is_some(),
+            "the cached view is available the moment the open returns"
+        );
     }
 
     #[test]
