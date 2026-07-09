@@ -12,6 +12,16 @@ Terms used throughout the `git-workon` codebase. Implementation details do not b
 
 **Status filter** — a flag (`--dirty`, `--clean`, `--ahead`, `--behind`, `--gone`) that narrows a `list` or `find` result to worktrees in a specific state. Filters select **worktrees**: each check queries the working tree or branch-tracking state of a checked-out worktree. A metadata-only stack diff (`◯`) has no working tree and can never satisfy a status filter; it is excluded from any filtered result. See also: `StatusFilter`, `WorktreeDescriptor::is_dirty()`.
 
+## Review
+
+**Changeset** — one reviewable unit in the review TUI: a node in a stack, a single inferred commit, or the uncommitted layer. Ordered base → head when part of a stack. See also: `workon::Changeset`.
+
+**Changeset span** — what a changeset covers: a resolved commit range (`base..head`) or the uncommitted working tree + index. _Avoid_: "changeset source" (renamed; "source" is the review-source concept below).
+
+**Review source** — the user's answer to "review *what?*": auto-detect (no argument), the `stack` keyword, the `uncommitted` keyword, a ref, a range, or a PR reference. Exact bare keywords win over same-named refs; a qualified spelling (`refs/heads/stack`) escapes. See also: [ADR-036](docs/adr/036-review-source-grammar.md).
+
+**Uncommitted layer** — the synthetic changeset spanning the dirty working tree + index. Appears in a review only when the review is focused where `HEAD` actually is, since uncommitted changes diff against `HEAD`.
+
 ## Prune Candidate Reasons
 
 **BranchDeleted** — the local branch ref for the worktree no longer exists in the repository. Always a prune candidate regardless of flags.
