@@ -1,4 +1,4 @@
-.PHONY: install install-dev install-man install-hooks build test fmt clippy
+.PHONY: install install-dev install-man install-hooks build test smoke fmt clippy
 
 PREFIX ?= /usr/local
 
@@ -24,6 +24,12 @@ build:
 
 test:
 	cargo test --workspace
+
+# PTY smoke tests (ignored by default: wall-clock-bound and load-sensitive).
+# Spawns the review binary under a pseudo-terminal and plays the terminal's
+# side of the theme=auto probe conversation; see tests/pty_smoke.rs.
+smoke:
+	cargo test -p git-workon-review --test pty_smoke -- --ignored
 
 fmt:
 	cargo fmt
