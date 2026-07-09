@@ -20,7 +20,9 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::Terminal;
+use ratatui::style::{Modifier, Style};
+use ratatui::widgets::Paragraph;
+use ratatui::{Frame, Terminal};
 use workon_review::app::App;
 use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
 use workon_review::render;
@@ -524,27 +526,84 @@ fn install_panic_hook() {
     }));
 }
 
-/// Run the review TUI's terminal lifecycle and main loop against `app`. Callers must have already
-/// called `app.open_current()` before calling this — under CS4's deferred-load mode
-/// (`app.set_defer_loads(true)`, `main.rs`'s default) that call marks the open PENDING rather than
-/// loading eagerly, so the first frame shows CS4's placeholder for one `OPEN_DEBOUNCE` window
-/// instead of blocking startup on the initial file's load; a caller that never turned defer mode
-/// on gets today's eager behavior unchanged.
-pub fn run(app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
-    install_panic_hook();
-    enable_raw_mode()?;
-    let mut out = terminal_writer();
-    execute!(out, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(out);
-    let mut terminal = Terminal::new(backend)?;
+/// The acquired terminal: raw mode on, alternate screen entered, panic hook installed.
+///
+/// Owning this as a value (rather than the old take-the-terminal-inside-`run` flow) is what lets
+/// `main` show a splash frame BEFORE changeset acquisition — the terminal is live from the first
+/// milliseconds of the launch, so resolve/diff work happens behind visible feedback instead of a
+/// dead prompt. Restoration is idempotent and runs on [`Tui::restore`] or on drop, so every early
+/// exit from `main` — "nothing to review", a `?`-propagated acquisition error — puts the shell
+/// back before anything is printed to it.
+pub struct Tui {
+    terminal: Terminal<CrosstermBackend<Box<dyn Write>>>,
+    restored: bool,
+}
 
-    let result = event_loop(&mut terminal, app, keymap, theme);
+impl Tui {
+    /// Take over the terminal now: install the panic hook, enable raw mode, enter the alternate
+    /// screen. Call this before any slow launch work so [`Tui::splash`] can show it.
+    pub fn acquire() -> io::Result<Self> {
+        install_panic_hook();
+        enable_raw_mode()?;
+        let mut out = terminal_writer();
+        execute!(out, EnterAlternateScreen)?;
+        let backend = CrosstermBackend::new(out);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self {
+            terminal,
+            restored: false,
+        })
+    }
 
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    /// Draw a one-line launch-activity frame (e.g. `resolving changesets…`). Deliberately
+    /// theme-free (`DIM` modifier, no palette colors): it renders before the theme is resolved —
+    /// resolving the theme first would put the up-to-800ms `theme=auto` terminal probe back in
+    /// front of the first visible frame, defeating the point.
+    pub fn splash(&mut self, msg: &str) -> io::Result<()> {
+        self.terminal.draw(|f| draw_splash(f, msg))?;
+        Ok(())
+    }
 
-    result
+    /// Run the main loop against `app`, then restore the terminal. Callers must have already
+    /// called `app.open_current()` — under CS4's deferred-load mode (`app.set_defer_loads(true)`,
+    /// `main.rs`'s default) that call marks the open PENDING rather than loading eagerly, so the
+    /// first frame shows CS4's placeholder for one `OPEN_DEBOUNCE` window instead of blocking on
+    /// the initial file's load; a caller that never turned defer mode on gets eager behavior.
+    pub fn run(&mut self, app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
+        let result = event_loop(&mut self.terminal, app, keymap, theme);
+        let restored = self.restore();
+        result.and(restored)
+    }
+
+    /// Put the terminal back (raw mode off, leave the alternate screen, cursor shown). Idempotent
+    /// — a second call (including the one [`Drop`] always makes) is a no-op, so explicit callers
+    /// (the "nothing to review" exit, which must restore BEFORE its `eprintln`) and the drop
+    /// backstop coexist without double-restoring.
+    pub fn restore(&mut self) -> io::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        disable_raw_mode()?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        self.terminal.show_cursor()
+    }
+}
+
+impl Drop for Tui {
+    /// Backstop restore for every exit path that doesn't call [`Tui::restore`] explicitly — most
+    /// importantly `main`'s `?` returns between `acquire` and `run`, whose errors miette prints
+    /// only after locals drop; without this they would print into the alternate screen.
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+/// Render the splash frame's widget tree — split from [`Tui::splash`] so tests can drive it
+/// against a `TestBackend` frame without acquiring a real terminal.
+fn draw_splash(frame: &mut Frame<'_>, msg: &str) {
+    let para = Paragraph::new(msg).style(Style::default().add_modifier(Modifier::DIM));
+    frame.render_widget(para, frame.area());
 }
 
 /// CS4's input-idle window: how long the loop waits with no new input before running a pending
@@ -1871,5 +1930,25 @@ mod tests {
         let repo_eager = fixture_eager.repo().unwrap();
         repo_deferred.assert(predicate::repo::has_staged_file("a.txt"));
         repo_eager.assert(predicate::repo::has_staged_file("a.txt"));
+    }
+
+    // ── CS5: launch splash ────────────────────────────────────────────────────
+
+    #[test]
+    fn splash_renders_the_message() {
+        let backend = ratatui::backend::TestBackend::new(40, 3);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_splash(f, "resolving changesets…"))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let top_row: String = (0..buffer.area.width)
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(
+            top_row.contains("resolving changesets…"),
+            "splash frame must show the launch-activity message, got: {top_row:?}"
+        );
     }
 }

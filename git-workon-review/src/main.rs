@@ -46,12 +46,36 @@ fn main() -> Result<()> {
     // `source` is kept (not just the resolved changesets) so it can be handed to `App` below —
     // `App::refresh` re-runs THIS same ask on every refresh rather than downgrading to
     // auto-detect (M7 CS2 fix).
+    // CS5: take the terminal and show launch activity BEFORE acquisition — resolve/diff can take
+    // a noticeable moment on a deep stack (or a PR source that hits the network), and until this
+    // point the launch left the terminal dead until acquisition finished. `Tui`'s Drop restores
+    // the terminal, so every `?` below puts the shell back before miette prints its error.
+    //
+    // An acquire FAILURE (no controlling tty — CI, a test harness, a bare pipe) is deferred, not
+    // propagated here: pre-CS5 the terminal was only taken inside the run call, so a tty-less
+    // "nothing to review" launch printed its message and exited 0 without ever needing a
+    // terminal. Carrying the `Result` until the run call preserves exactly that — the error
+    // surfaces at the same logical point it always did. Splash failures on an acquired terminal
+    // are cosmetic (the run call will surface anything real) and deliberately ignored.
+    let mut tui = tui::Tui::acquire();
+    if let Ok(tui) = tui.as_mut() {
+        let _ = tui.splash("resolving changesets…");
+    }
+
     let source = cli.source.as_deref().map(Source::classify);
     let changesets = match &source {
         None => resolve_changesets(&repo, &branch).into_diagnostic()?,
         Some(source) => resolve_source(&repo, &branch, source.clone()).into_diagnostic()?,
     };
 
+    if let Ok(tui) = tui.as_mut() {
+        let noun = if changesets.len() == 1 {
+            "changeset"
+        } else {
+            "changesets"
+        };
+        let _ = tui.splash(&format!("diffing {} {noun}…", changesets.len()));
+    }
     let diffs = diff_changesets(&repo, &changesets).into_diagnostic()?;
     let views: Vec<ChangesetView> = changesets
         .into_iter()
@@ -66,6 +90,12 @@ fn main() -> Result<()> {
     // exit 0 (ADR-030), never a `views` list handed to `App::from_changesets`, which panics on
     // empty input.
     if views.is_empty() || (views.len() == 1 && views[0].file_count() == 0) {
+        // Restore the terminal BEFORE printing (CS5): the message must land on the normal
+        // screen, not vanish with the alternate one. A tty-less launch has no terminal to
+        // restore — the message prints exactly as it did pre-CS5.
+        if let Ok(tui) = tui.as_mut() {
+            tui.restore().into_diagnostic()?;
+        }
         // Name the source when one was given (CS3) — a bare `nothing to review` would leave a
         // typo'd-but-empty range like `v1..v1` looking indistinguishable from the no-arg case.
         match cli.source.as_deref() {
@@ -139,7 +169,11 @@ fn main() -> Result<()> {
     if probed {
         terminal_query::flush_pending_tty_input();
     }
-    tui::run(&mut app, &keymap, &theme).into_diagnostic()?;
+    // A deferred acquire failure surfaces HERE — the same logical point (running the TUI) it
+    // surfaced at before CS5 moved the terminal takeover to the top of the launch.
+    tui.into_diagnostic()?
+        .run(&mut app, &keymap, &theme)
+        .into_diagnostic()?;
 
     Ok(())
 }
