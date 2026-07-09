@@ -809,7 +809,7 @@ mod tests {
     /// `app_from_fixture`'s doc comment above for why the helpers can't be shared directly).
     fn two_committed_changesets_app(fixture: &git_workon_fixture::fixture::Fixture) -> App {
         use git2::Repository;
-        use workon::{Changeset, ChangesetSource};
+        use workon::{Changeset, ChangesetSpan};
         use workon_review::acquire::diff_changeset;
         use workon_review::app::ChangesetView;
 
@@ -832,7 +832,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -842,7 +842,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: true,
             needs_restack: false,

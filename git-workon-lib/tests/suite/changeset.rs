@@ -1,7 +1,7 @@
 use git_workon_fixture::prelude::*;
 use std::error::Error;
 use workon::{
-    assemble_changesets, ChangesetError, ChangesetSource, StackError, StackModel, WorkonError,
+    assemble_changesets, ChangesetError, ChangesetSpan, StackError, StackModel, WorkonError,
 };
 
 // ── both-format parameterization (see tests/stack.rs) ────────────────────────
@@ -64,8 +64,8 @@ fn graphite_linear_order_current_and_titles(format: MetadataFormat) -> Result<()
     assert_eq!(current, vec!["b"]);
 
     let b_cs = changesets.iter().find(|c| c.name == "b").unwrap();
-    match b_cs.source {
-        ChangesetSource::Committed { base, head } => {
+    match b_cs.span {
+        ChangesetSpan::Committed { base, head } => {
             assert_eq!(base, a_tip, "b's base must be a's recorded parent tip");
             assert_eq!(head, b_tip, "b's head must be its live tip");
         }
@@ -120,8 +120,8 @@ fn graphite_all_at_one_commit_base_equals_head(
 
     let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
     assert_eq!(changesets.len(), 1);
-    match changesets[0].source {
-        ChangesetSource::Committed { base, head } => {
+    match changesets[0].span {
+        ChangesetSpan::Committed { base, head } => {
             assert_eq!(base, head, "no divergence yet: base must equal head")
         }
         _ => panic!("expected Committed"),
@@ -216,8 +216,8 @@ fn trap7_spans_stale_branch_revision_to_live_head(
     let repo = fixture.repo()?;
     let changesets = assemble_changesets(repo, "feat-a", StackModel::Graphite)?;
     assert_eq!(changesets.len(), 1);
-    match changesets[0].source {
-        ChangesetSource::Committed { base, head } => {
+    match changesets[0].span {
+        ChangesetSpan::Committed { base, head } => {
             assert_eq!(
                 base, main_tip,
                 "base must be the recorded parentBranchRevision"
@@ -340,8 +340,8 @@ fn needs_restack_false_with_empty_parent_revision_and_merge_base_fallback(
     let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
     assert_eq!(changesets.len(), 1);
     assert!(!changesets[0].needs_restack);
-    match changesets[0].source {
-        ChangesetSource::Committed { base, head } => {
+    match changesets[0].span {
+        ChangesetSpan::Committed { base, head } => {
             assert_eq!(head, a_tip);
             assert_eq!(base, main_tip, "merge-base fallback resolves to main's tip");
         }
@@ -450,7 +450,7 @@ fn uncommitted_layer_absent_on_clean_tree(format: MetadataFormat) -> Result<(), 
     let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
     assert_eq!(changesets.len(), 1);
     assert!(changesets[0].current);
-    assert_ne!(changesets[0].source, ChangesetSource::Uncommitted);
+    assert_ne!(changesets[0].span, ChangesetSpan::Uncommitted);
     Ok(())
 }
 both_formats!(uncommitted_layer_absent_on_clean_tree);
@@ -464,7 +464,7 @@ fn assert_uncommitted_inserted_after_current(
     assert_eq!(changesets.len(), 2);
     assert_eq!(changesets[0].name, current_branch);
     assert!(!changesets[0].current, "branch node must drop current");
-    assert_eq!(changesets[1].source, ChangesetSource::Uncommitted);
+    assert_eq!(changesets[1].span, ChangesetSpan::Uncommitted);
     assert_eq!(changesets[1].name, current_branch);
     assert!(changesets[1].current, "Uncommitted takes current");
     Ok(())
@@ -541,11 +541,8 @@ fn git_inference_two_commits_oldest_first() -> Result<(), Box<dyn Error>> {
         "name is an 8-hex abbreviated id"
     );
 
-    match (&changesets[0].source, &changesets[1].source) {
-        (
-            ChangesetSource::Committed { head: h0, .. },
-            ChangesetSource::Committed { base: b1, .. },
-        ) => {
+    match (&changesets[0].span, &changesets[1].span) {
+        (ChangesetSpan::Committed { head: h0, .. }, ChangesetSpan::Committed { base: b1, .. }) => {
             assert_eq!(*h0, first, "first commit's head is its own oid");
             assert_eq!(*b1, *h0, "second's base is first's head");
         }
@@ -567,7 +564,7 @@ fn git_inference_dirty_tree_appends_uncommitted_as_current() -> Result<(), Box<d
     let changesets = assemble_changesets(repo, "main", StackModel::Git)?;
     assert_eq!(changesets.len(), 2);
     assert!(!changesets[0].current);
-    assert_eq!(changesets[1].source, ChangesetSource::Uncommitted);
+    assert_eq!(changesets[1].span, ChangesetSpan::Uncommitted);
     assert!(changesets[1].current);
     Ok(())
 }

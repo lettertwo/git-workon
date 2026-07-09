@@ -6,7 +6,7 @@
 //! git2 diffs and then a [`DiffModel`].
 
 use git2::{DiffFindOptions, DiffOptions, Oid, Repository};
-use workon::{assemble_changesets, Changeset, ChangesetSource, StackModel};
+use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel};
 
 use crate::error::DiffError;
 use crate::model::DiffModel;
@@ -26,7 +26,7 @@ pub struct WorktreeDiffs {
 
 /// Diff `HEAD`'s tree against the index (staged), the index against the working tree
 /// (unstaged), and `HEAD`'s tree against the working tree directly (combined), for a
-/// [`ChangesetSource::Uncommitted`] changeset.
+/// [`ChangesetSpan::Uncommitted`] changeset.
 ///
 /// The unstaged and combined sides both set `include_untracked`/`recurse_untracked_dirs`/
 /// `show_untracked_content` so untracked files carry real content in the model (git2 gives
@@ -76,7 +76,7 @@ pub fn diff_uncommitted(repo: &Repository) -> Result<WorktreeDiffs, DiffError> {
     })
 }
 
-/// Diff `base`'s tree against `head`'s tree, for a [`ChangesetSource::Committed`] changeset —
+/// Diff `base`'s tree against `head`'s tree, for a [`ChangesetSpan::Committed`] changeset —
 /// rename/copy detection runs via [`git2::Diff::find_similar`] so renamed files come back as
 /// [`crate::model::FileStatus::Renamed`] instead of a delete+add pair.
 pub fn diff_committed(repo: &Repository, base: Oid, head: Oid) -> Result<DiffModel, DiffError> {
@@ -91,25 +91,25 @@ pub fn diff_committed(repo: &Repository, base: Oid, head: Oid) -> Result<DiffMod
     DiffModel::from_git2(&diff)
 }
 
-/// The diff for one [`Changeset`], shaped by its [`ChangesetSource`].
+/// The diff for one [`Changeset`], shaped by its [`ChangesetSpan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangesetDiff {
     Committed(DiffModel),
     Uncommitted(WorktreeDiffs),
 }
 
-/// Diff `cs`, routing on its [`ChangesetSource`].
+/// Diff `cs`, routing on its [`ChangesetSpan`].
 ///
 /// A changeset carrying a resolved-but-unreadable rev pair (a bad or garbage `Oid` — e.g.
 /// stale Graphite metadata pointing at a pruned commit) is a genuine failure, never an empty
 /// [`DiffModel`]: any underlying git2 error is reported as
 /// [`DiffError::ChangesetDiffFailed`].
 pub fn diff_changeset(repo: &Repository, cs: &Changeset) -> Result<ChangesetDiff, DiffError> {
-    match cs.source {
-        ChangesetSource::Committed { base, head } => diff_committed(repo, base, head)
+    match cs.span {
+        ChangesetSpan::Committed { base, head } => diff_committed(repo, base, head)
             .map(ChangesetDiff::Committed)
             .map_err(|err| changeset_diff_failed(&cs.name, err)),
-        ChangesetSource::Uncommitted => diff_uncommitted(repo)
+        ChangesetSpan::Uncommitted => diff_uncommitted(repo)
             .map(ChangesetDiff::Uncommitted)
             .map_err(|err| changeset_diff_failed(&cs.name, err)),
     }
@@ -141,7 +141,7 @@ pub fn resolve_changesets(
         )?),
         StackModel::None | StackModel::Git => Ok(vec![Changeset {
             name: head_branch.to_string(),
-            source: ChangesetSource::Uncommitted,
+            span: ChangesetSpan::Uncommitted,
             title: None,
             current: true,
             needs_restack: false,
