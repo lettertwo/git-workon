@@ -109,6 +109,10 @@ fn main() -> Result<()> {
     if let Some(source) = source {
         app.set_review_source(source);
     }
+    // CS4: defer file loads to the event loop's input-idle window rather than blocking here (or
+    // on any later selection change) — `app.open_current()` below marks the initial open pending
+    // instead of loading eagerly; see `tui::run`'s doc comment for the resulting startup contract.
+    app.set_defer_loads(true);
 
     // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
     // only set the raw layout/zoom/mode/width fields, and `open_current` is what derives
