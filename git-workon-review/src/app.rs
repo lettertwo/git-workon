@@ -756,6 +756,17 @@ pub struct App {
     /// setter (rather than a constructor parameter) so `App::from_changesets`'s signature, and
     /// every existing test building through it, stays untouched.
     review_source: Option<Source>,
+    /// CS4's idle-deferred load switch. `false` (the default) keeps every pre-CS4
+    /// `open_current`/render-path behavior byte-identical, so the ~80 existing tests asserting
+    /// eager loads keep passing unchanged. `main.rs` turns this on via [`Self::set_defer_loads`]
+    /// right after construction; the event loop is what actually defers (see `tui.rs`'s
+    /// `OPEN_DEBOUNCE`).
+    defer_loads: bool,
+    /// Set when [`Self::open_current`] deferred its load (only possible while
+    /// [`Self::defer_loads`] is on) — the render path shows a placeholder instead of loading
+    /// while this is `true`, and the event loop calls [`Self::complete_pending_open`] once input
+    /// has been quiet for `OPEN_DEBOUNCE`. Read via [`Self::open_pending`].
+    open_pending: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -891,6 +902,8 @@ impl App {
             outline,
             help_visible: false,
             review_source: None,
+            defer_loads: false,
+            open_pending: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1391,10 +1404,60 @@ impl App {
         self.derive_scroll();
     }
 
+    /// Turn CS4's idle-deferred load mode on/off. `main.rs` calls this with `true` right after
+    /// [`Self::from_changesets`], before the first [`Self::open_current`] — see the field's doc
+    /// comment. Exposed as a setter (rather than folded into construction) so every existing test
+    /// building through `from_changesets`/`App::new` keeps today's eager behavior untouched.
+    pub fn set_defer_loads(&mut self, on: bool) {
+        self.defer_loads = on;
+    }
+
+    /// Whether CS4's idle-deferred load mode is on — see [`Self::set_defer_loads`].
+    pub fn defer_loads(&self) -> bool {
+        self.defer_loads
+    }
+
+    /// Whether [`Self::open_current`] deferred its load and it hasn't been completed yet — the
+    /// render path (in defer mode) and the event loop both read this: render to decide whether to
+    /// show the placeholder, the event loop to decide whether to shorten its poll timeout and to
+    /// call [`Self::complete_pending_open`] on the next idle tick.
+    pub fn open_pending(&self) -> bool {
+        self.open_pending
+    }
+
     /// Load the current file's needed views and reset both panes to their first hunks.
+    ///
+    /// In [`Self::defer_loads`] mode this does NOT load: it marks the open pending and resets the
+    /// panes anyway (the cursor falls back to row 0 for the still-unloaded view, via
+    /// [`Self::role_first_hunk`]'s `unwrap_or(0)` — harmless, since the body renders a placeholder
+    /// until [`Self::complete_pending_open`] runs). Outside defer mode this is exactly today's
+    /// eager behavior.
     pub fn open_current(&mut self) {
+        if self.defer_loads {
+            self.open_pending = true;
+            self.reset_panes();
+            return;
+        }
         self.ensure_loaded(self.current);
         self.reset_panes();
+    }
+
+    /// Complete a deferred open, if one is pending: load the current file's needed views, then
+    /// reset both panes again so the cursor now derives from the REAL first-hunk row (rather than
+    /// the `0` fallback [`Self::open_current`] left it at). A no-op when nothing is pending —
+    /// idempotent, so the event loop can call this liberally (e.g. on every idle tick while
+    /// pending) without worrying about double-loading.
+    ///
+    /// Invariant this pins (the equivalence the tests assert): after this returns, `App` state is
+    /// byte-identical to what an eager [`Self::open_current`] would have produced for the same
+    /// current file.
+    pub fn complete_pending_open(&mut self) {
+        if !self.open_pending {
+            return;
+        }
+        self.ensure_loaded(self.current);
+        self.reset_panes();
+        self.open_pending = false;
     }
 
     /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`z`). The new zoom
@@ -2820,6 +2883,83 @@ mod tests {
         assert!(app.files()[0].is_binary);
         app.ensure_loaded(0);
         assert!(app.current_view_ref().is_none());
+    }
+
+    // ── CS4: idle-deferred loads ──────────────────────────────────────────────
+
+    /// A twin pair: one `App` with `defer_loads` off (the eager baseline), one with it on. Both
+    /// built from independent copies of the SAME fixture so their diffs (and hunks) line up.
+    fn defer_and_eager_twins(fixture: &git_workon_fixture::fixture::Fixture) -> (App, App) {
+        let mut eager = app_from_fixture(fixture);
+        eager.open_current();
+
+        let mut deferred = app_from_fixture(fixture);
+        deferred.set_defer_loads(true);
+        deferred.open_current();
+
+        (deferred, eager)
+    }
+
+    #[test]
+    fn open_current_defers_load_and_complete_matches_eager_open() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold\nl10\nl11\nl12\n",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew\nl10\nl11\nl12\n",
+            )
+            .build()
+            .unwrap();
+
+        let (mut deferred, eager) = defer_and_eager_twins(&fixture);
+
+        // `open_current` under defer mode loads NOTHING and marks the open pending.
+        assert!(
+            deferred.current_view_ref().is_none(),
+            "deferred open_current must not have loaded the current view"
+        );
+        assert!(deferred.open_pending(), "the open must be marked pending");
+
+        deferred.complete_pending_open();
+
+        assert!(
+            !deferred.open_pending(),
+            "complete_pending_open must clear the pending flag"
+        );
+        assert_eq!(
+            deferred.cursor, eager.cursor,
+            "cursor must land on the same (first-hunk) row an eager open would have"
+        );
+        assert_eq!(deferred.scroll, eager.scroll);
+        let deferred_view = deferred.current_view_ref().expect("view now loaded");
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+        assert_eq!(deferred_view.old_text(), eager_view.old_text());
+        assert_eq!(deferred_view.new_text(), eager_view.new_text());
+        assert_eq!(deferred_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn complete_pending_open_is_a_no_op_when_nothing_pending() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("tracked.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        app.complete_pending_open();
+        assert!(!app.open_pending());
+
+        let cursor_before = app.cursor;
+        let scroll_before = app.scroll;
+        // Calling again with nothing pending must not touch cursor/scroll or reload anything.
+        app.complete_pending_open();
+        assert!(!app.open_pending());
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(app.scroll, scroll_before);
     }
 
     // Hunk-nav helpers below operate purely over `DisplayRow` vectors — no fixture repo needed.

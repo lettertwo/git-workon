@@ -726,6 +726,45 @@ fn render_gap_row(
     buf.set_line(area.x, y, &line, area.width);
 }
 
+/// Whether file `idx` needs CS4's deferred-load placeholder instead of its real diff: either the
+/// current open is still pending (set by [`App::open_current`] in defer mode — see its doc
+/// comment), or it isn't pending but the view(s) its effective zoom needs haven't been loaded yet
+/// (e.g. a force-completed OTHER file's load left this one's cache untouched). Under
+/// [`EffectiveZoom::Split`] the placeholder shows only when NEITHER pane is loaded: a role with
+/// no change for the file stays legitimately `None` forever (see `ensure_role_loaded`), so
+/// gating on both panes would placeholder a one-role file for good. Once
+/// [`App::complete_pending_open`] runs, every loadable pane is loaded, and a role-less pane
+/// renders empty exactly as it did pre-CS4.
+fn needs_deferred_placeholder(app: &App, idx: usize) -> bool {
+    if app.open_pending() {
+        return true;
+    }
+    match app.effective_zoom_for(idx) {
+        EffectiveZoom::Single(role) => app.role_view_ref(idx, role).is_none(),
+        EffectiveZoom::Split => {
+            app.role_view_ref(idx, Role::Unstaged).is_none()
+                && app.role_view_ref(idx, Role::Staged).is_none()
+        }
+    }
+}
+
+/// Render CS4's deferred-load placeholder: a dim one-line paragraph naming the file, matching the
+/// existing binary-file placeholder's style (see `render_body`'s binary arm) so the two read as
+/// the same kind of "nothing to show yet" message.
+fn render_loading_placeholder(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    idx: usize,
+    theme: &Palette,
+) {
+    let msg = format!("{} — loading…", app.files()[idx].path);
+    frame.render_widget(
+        Paragraph::new(msg).style(Style::default().fg(theme.dim)),
+        area,
+    );
+}
+
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     if app.files().is_empty() {
         frame.render_widget(Paragraph::new("(no changes)"), area);
@@ -742,7 +781,17 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
         return;
     }
 
-    app.ensure_loaded(idx);
+    // CS4: in defer mode, selection changes never load — the diff body shows a placeholder until
+    // the event loop's idle window (`tui.rs`'s `OPEN_DEBOUNCE`) runs `complete_pending_open`
+    // between frames. Do NOT call `ensure_loaded` from this path in defer mode; outside defer mode
+    // (the default), behavior is unchanged.
+    if app.defer_loads() && needs_deferred_placeholder(app, idx) {
+        render_loading_placeholder(frame, app, area, idx, theme);
+        return;
+    }
+    if !app.defer_loads() {
+        app.ensure_loaded(idx);
+    }
 
     // The gate re-evaluates the effective zoom for the current file every frame (no caching —
     // ratatui relayout is free, per locked decision #3).
@@ -1349,6 +1398,52 @@ mod tests {
                 .any(|line| line.contains("[Binary file: bin.dat]")),
             "expected binary placeholder, got:\n{}",
             content.join("\n")
+        );
+    }
+
+    // ── CS4: idle-deferred loads ──────────────────────────────────────────────
+
+    #[test]
+    fn defer_mode_shows_placeholder_and_does_not_load() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("tracked.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current(); // marks pending; does not load
+
+        let buf = render_once(&mut app, 60, 10);
+        let content = buf_lines(&buf);
+        assert!(
+            content
+                .iter()
+                .any(|line| line.contains("tracked.txt") && line.contains("loading")),
+            "expected the CS4 loading placeholder, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            app.current_view_ref().is_none(),
+            "rendering in defer mode must not have triggered a load"
+        );
+    }
+
+    #[test]
+    fn non_defer_mode_still_loads_from_the_render_path() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("tracked.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        // `defer_loads` defaults off — render must still load eagerly, exactly like before CS4.
+        let _ = render_once(&mut app, 60, 10);
+        assert!(
+            app.current_view_ref().is_some(),
+            "non-defer mode must still load from the render path"
         );
     }
 

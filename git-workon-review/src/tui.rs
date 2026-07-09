@@ -186,8 +186,45 @@ fn map_key(
     }
 }
 
+/// Whether `action`'s effect READS the current [`App::current_view`]/cursor-space state
+/// (cursor-space movement, staging, selection) rather than only changing WHICH file/changeset is
+/// current. An action in the first group must force-complete any pending deferred open first (see
+/// [`apply_action`]'s chokepoint) so it observes the same loaded view an eager `open_current` would
+/// have produced — e.g. `j` then immediately `s` must stage the same hunk eager code would have.
+///
+/// Exempt (returns `false`): every action that ends in its own fresh `open_current` (`NextFile`,
+/// `PrevFile`, `NextChangeset`, `PrevChangeset`, `CycleZoom`, and the outline nav/confirm actions),
+/// since those simply set a NEW pending open rather than needing the current one force-completed;
+/// plus pure UI toggles/no-ops (`Refresh` rebuilds all views itself; `ToggleHelp`/`Quit`/`None`
+/// touch no view state at all).
+fn action_needs_loaded_view(action: Action) -> bool {
+    matches!(
+        action,
+        Action::MoveCursorBy(_)
+            | Action::ScrollTop
+            | Action::ScrollBottom
+            | Action::NextHunk
+            | Action::PrevHunk
+            | Action::StageHunk
+            | Action::StageFile
+            | Action::DiscardHunk
+            | Action::DiscardFile
+            | Action::StartSelection
+            | Action::ToggleSplitFocus
+    )
+}
+
 /// Apply an [`Action`] to `app`. Returns `true` when the loop should exit.
+///
+/// Chokepoint (CS4): before doing anything else, force-complete a pending deferred open for every
+/// action [`action_needs_loaded_view`] flags — see that function's doc comment for the principle
+/// and the exemption list. [`App::complete_pending_open`] is a no-op when nothing is pending, so
+/// this costs nothing outside defer mode (where `open_pending` is never set) or when the debounce
+/// window already completed the open on its own.
 fn apply_action(app: &mut App, action: Action) -> bool {
+    if action_needs_loaded_view(action) {
+        app.complete_pending_open();
+    }
     match action {
         Action::Quit => return true,
         Action::ToggleHelp => app.toggle_help(),
@@ -342,11 +379,21 @@ enum RunKind {
 /// Apply and clear `run`, if one is open. `outline_move_by`/`move_cursor_by` both clamp at their
 /// ends, so one call with the summed delta lands exactly where the equivalent sequence of unit
 /// calls would (see [`update_batch`]'s doc comment for why this only holds for same-sign runs).
+///
+/// `MoveCursorBy` reads cursor-space state exactly like [`apply_action`]'s `Action::MoveCursorBy`
+/// arm does, and this is the OTHER path (besides `apply_action`) that can run it — CS2's
+/// coalescing calls `App::move_cursor_by` directly rather than routing the flush through
+/// `apply_action`, so the same force-completion has to happen here too (see the plan's chokepoint
+/// note: whichever path applies `MoveCursorBy` must complete first). `OutlineMoveBy` needs no such
+/// call: it ends in its own fresh `open_current`, exactly like `apply_action`'s exemption list.
 fn flush_run(app: &mut App, run: &mut Option<(RunKind, i64)>) {
     if let Some((kind, delta)) = run.take() {
         match kind {
             RunKind::OutlineMoveBy => app.outline_move_by(delta),
-            RunKind::MoveCursorBy => app.move_cursor_by(delta),
+            RunKind::MoveCursorBy => {
+                app.complete_pending_open();
+                app.move_cursor_by(delta);
+            }
         }
     }
 }
@@ -477,8 +524,12 @@ fn install_panic_hook() {
     }));
 }
 
-/// Run the review TUI's terminal lifecycle and main loop against `app`. Callers must have
-/// already loaded the initial file (`app.open_current()`) before calling this.
+/// Run the review TUI's terminal lifecycle and main loop against `app`. Callers must have already
+/// called `app.open_current()` before calling this — under CS4's deferred-load mode
+/// (`app.set_defer_loads(true)`, `main.rs`'s default) that call marks the open PENDING rather than
+/// loading eagerly, so the first frame shows CS4's placeholder for one `OPEN_DEBOUNCE` window
+/// instead of blocking startup on the initial file's load; a caller that never turned defer mode
+/// on gets today's eager behavior unchanged.
 pub fn run(app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
@@ -496,6 +547,13 @@ pub fn run(app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
     result
 }
 
+/// CS4's input-idle window: how long the loop waits with no new input before running a pending
+/// deferred file open. Long enough that held-key autorepeat (~30-90ms between events on most
+/// terminals) usually keeps re-arming the debounce and deferring the load past the whole burst;
+/// short enough that releasing the key feels instant rather than laggy. Tunable if either edge
+/// proves wrong in practice — there is nothing else load-bearing about this exact number.
+const OPEN_DEBOUNCE: Duration = Duration::from_millis(80);
+
 fn event_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     app: &mut App,
@@ -512,7 +570,22 @@ fn event_loop<W: Write>(
             return Ok(());
         }
 
-        if let Some(event) = next_event(Duration::from_millis(200))? {
+        // While an open is pending, poll on the short debounce window instead of the regular
+        // 200ms redraw beat, so the deferred load runs promptly once input goes quiet — a plain
+        // timeout (no new terminal event) is what "quiet" means here. This borrows the same
+        // `Tick` beat the M4 index watcher already polls on (see the module doc); the watcher
+        // occasionally running ~120ms early during a debounce window is harmless (its own doc
+        // comment already tolerates an "unseen" signature settling one tick late).
+        let timeout = if app.open_pending() {
+            OPEN_DEBOUNCE
+        } else {
+            Duration::from_millis(200)
+        };
+
+        if let Some(event) = next_event(timeout)? {
+            if matches!(event, AppEvent::Tick) && app.open_pending() {
+                app.complete_pending_open();
+            }
             let mut batch = vec![event];
             drain_pending(&mut batch)?;
             quit = update_batch(app, keymap, &mut pending, batch);
@@ -1668,5 +1741,135 @@ mod tests {
         assert!(!quit2);
         assert!(pending.is_empty());
         assert_eq!(app.current, 1, "]f must have fired NextFile");
+    }
+
+    // ── CS4: idle-deferred loads ──────────────────────────────────────────────
+
+    #[test]
+    fn deferred_outline_burst_loads_nothing_until_completed() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Role;
+        use workon_review::outline::OutlineMode;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = many_files_app(&fixture, 5);
+        // `many_files_app` opens eagerly (defer mode isn't on yet) — file 0 is loaded before we
+        // flip the switch, exactly like a real session's startup open would be under CS4 (see
+        // `main.rs`, which turns defer mode on before its own initial `open_current`).
+        app.set_defer_loads(true);
+        app.set_outline_mode(OutlineMode::Flat);
+        app.toggle_outline(); // open + focus, cursor synced onto file 0's row
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        ];
+
+        let quit = update_batch(&mut app, &km, &mut pending, events);
+
+        assert!(!quit);
+        assert_eq!(app.current, 4, "the outline jump still lands on file 4");
+        assert!(
+            app.open_pending(),
+            "landing on file 4 in defer mode must mark the open pending, not load it"
+        );
+        for f in 1..=4 {
+            assert!(
+                app.role_view_ref(f, Role::Combined).is_none(),
+                "file {f} must not be loaded — not even the landing file, until completed"
+            );
+        }
+
+        app.complete_pending_open();
+
+        assert!(!app.open_pending());
+        assert!(
+            app.role_view_ref(4, Role::Combined).is_some(),
+            "completing the pending open loads only the landing file"
+        );
+    }
+
+    #[test]
+    fn force_completion_before_move_lets_stage_hit_the_eager_hunk() {
+        use git_workon_fixture::prelude::*;
+
+        // Twin fixtures with identical content: one driven through defer mode (open_current
+        // defers, `j` must force-complete before moving, then `s` stages), the other through
+        // today's eager path — both must end up staging the exact same hunk.
+        let fixture_deferred = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let fixture_eager = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app_deferred = app_from_fixture(&fixture_deferred);
+        app_deferred.set_defer_loads(true);
+        app_deferred.open_current();
+        assert!(
+            app_deferred.open_pending(),
+            "open_current in defer mode must not load eagerly"
+        );
+
+        let mut app_eager = app_from_fixture(&fixture_eager);
+        app_eager.open_current();
+
+        let km = Keymap::defaults();
+        let mut pending_deferred: Vec<KeyPress> = Vec::new();
+        let mut pending_eager: Vec<KeyPress> = Vec::new();
+
+        // `j`: in defer mode this must force-complete the pending open (loading the view and
+        // re-deriving the cursor from the REAL first-hunk row) before applying the move — else
+        // the move would apply against the `0`-fallback cursor `reset_panes` left behind.
+        update(
+            &mut app_deferred,
+            &km,
+            &mut pending_deferred,
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        );
+        assert!(
+            !app_deferred.open_pending(),
+            "MoveCursorBy must force-complete the pending open"
+        );
+        update(
+            &mut app_eager,
+            &km,
+            &mut pending_eager,
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        );
+        assert_eq!(
+            app_deferred.cursor, app_eager.cursor,
+            "post-completion cursor must match the eager path's cursor exactly"
+        );
+
+        // `s`: stages whatever hunk the (now-correct) cursor resolves to.
+        update(
+            &mut app_deferred,
+            &km,
+            &mut pending_deferred,
+            AppEvent::Key(key(KeyCode::Char('s'))),
+        );
+        update(
+            &mut app_eager,
+            &km,
+            &mut pending_eager,
+            AppEvent::Key(key(KeyCode::Char('s'))),
+        );
+
+        let repo_deferred = fixture_deferred.repo().unwrap();
+        let repo_eager = fixture_eager.repo().unwrap();
+        repo_deferred.assert(predicate::repo::has_staged_file("a.txt"));
+        repo_eager.assert(predicate::repo::has_staged_file("a.txt"));
     }
 }
