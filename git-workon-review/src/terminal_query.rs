@@ -13,12 +13,17 @@
 //!
 //! The probe is the single most terminal-fragile component in the review TUI, so its blast radius
 //! is contained to "return a curated theme instead":
-//! - **Never hangs.** The tty is set **non-blocking** and the whole read ([`read_replies`]) is
-//!   bounded by a hard `Instant` deadline. `read()` therefore can never block on a terminal that
-//!   doesn't answer (tmux without passthrough, ssh, CI, a dumb terminal) — it returns `WouldBlock`
-//!   and the deadline is the backstop. (A blocking read guarded only by `poll(2)` is NOT safe:
-//!   `poll` on a tty is unreliable on macOS — it can report spurious readability — and
-//!   `cfmakeraw` sets `VMIN=1`, so a blocking `read` after a bad `poll` waits forever.)
+//! - **Never hangs, but always waits.** The tty is set **non-blocking** and the whole read
+//!   ([`read_replies`]) is bounded by a hard `Instant` deadline. `read()` therefore can never
+//!   block on a terminal that doesn't answer (tmux without passthrough, ssh, CI, a dumb
+//!   terminal) — a not-yet-answered read yields `WouldBlock` or, with the `VMIN=0` polling-read
+//!   semantics the probe sets, `Ok(0)`. BOTH mean "no data yet", never EOF: treating `Ok(0)` as
+//!   EOF made the deadline loop exit in microseconds, so the probe read nothing, the replies
+//!   arrived after the [`query_terminal_raw`] flush, leaked into crossterm, and froze input at
+//!   startup (the dogfood-round-2 wedge). Only the deadline and the DA1 sentinel end the wait.
+//!   (A blocking read guarded only by `poll(2)` is NOT safe: `poll` on a tty is unreliable on
+//!   macOS — it can report spurious readability — and `cfmakeraw` sets `VMIN=1`, so a blocking
+//!   `read` after a bad `poll` waits forever.)
 //! - **Never corrupts the terminal.** The probe runs BEFORE `tui::run` installs its own raw mode /
 //!   alternate screen. It saves the tty's `termios`, sets raw for the duration of the read, and
 //!   **always restores** the saved `termios` before returning — leaving the tty exactly as it was
@@ -53,8 +58,31 @@ pub struct ProbeResult {
 /// usable [`Palette`] — a terminal-derived one when the probe succeeds, a curated fallback
 /// otherwise. This is the entry point `main.rs` calls; the timeout is the non-negotiable backstop
 /// against a silent terminal.
+///
+/// The deadline is generous because it almost never bites: every interactive terminal answers the
+/// DA1 sentinel (a VT100-era query), so the probe normally returns at the sentinel within a few
+/// ms (or one network round-trip over ssh). Only a tty whose far end answers *nothing* waits the
+/// full deadline — and giving up early on a merely-slow terminal is worse than the wait, because
+/// replies that arrive after the probe stopped listening leak into crossterm as phantom
+/// keystrokes (`r` → refresh storms, `d` → a discard confirm that captures the keyboard).
 pub fn detect_auto_palette() -> Palette {
-    palette_for_auto(&probe_terminal(Duration::from_millis(120)))
+    palette_for_auto(&probe_terminal(Duration::from_millis(800)))
+}
+
+/// Discard any bytes pending on the controlling tty's input queue. `main.rs` calls this after the
+/// `theme = auto` probe and immediately before the TUI takes over the terminal: OSC replies that
+/// straggle in while the app is still assembling changesets (an ssh round-trip can outlast the
+/// probe's deadline) would otherwise sit in the queue and reach crossterm as phantom keystrokes.
+/// Only meaningful after a probe — an un-probed launch has no replies owed, and flushing would
+/// discard legitimate type-ahead.
+pub fn flush_pending_tty_input() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        if let Ok(tty) = std::fs::File::options().read(true).open("/dev/tty") {
+            unsafe { libc::tcflush(tty.as_raw_fd(), libc::TCIFLUSH) };
+        }
+    }
 }
 
 /// The pure decision that turns a [`ProbeResult`] into a [`Palette`] (unit-tested with injected
@@ -348,34 +376,17 @@ fn read_replies(
         return None;
     }
 
-    // Switch to non-blocking for the read: a silent terminal must yield `WouldBlock`, never a
-    // blocked `read`. The `Instant` deadline (not `poll`) is the sole timing authority.
+    // Switch to non-blocking for the read: a silent terminal must yield `WouldBlock` (or the
+    // `VMIN=0` polling-read `Ok(0)`), never a blocked `read`. The `Instant` deadline (not `poll`)
+    // is the sole timing authority.
     set_nonblocking(fd);
 
-    let deadline = Instant::now() + timeout;
-    let mut buf = Vec::with_capacity(512);
+    let mut buf = collect_replies(|chunk| tty.read(chunk), Instant::now() + timeout);
     let mut chunk = [0u8; 256];
 
-    while Instant::now() < deadline {
-        match tty.read(&mut chunk) {
-            Ok(0) => break, // EOF
-            Ok(n) => {
-                buf.extend_from_slice(&chunk[..n]);
-                if has_da1_terminator(&buf) {
-                    break;
-                }
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data yet — yield briefly and let the deadline bound the wait.
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            Err(_) => break,
-        }
-    }
-
     // Drain anything immediately available (e.g. a terminal that answered without a DA1) so it
-    // doesn't surface as spurious input once the TUI takes over the tty. Non-blocking, so this
-    // stops at the first `WouldBlock`.
+    // doesn't surface as spurious input once the TUI takes over the tty. Stops the moment nothing
+    // is pending (`Ok(0)` or `WouldBlock`), so it never waits.
     loop {
         match tty.read(&mut chunk) {
             Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
@@ -388,6 +399,40 @@ fn read_replies(
     } else {
         Some(buf)
     }
+}
+
+/// Accumulate terminal reply bytes from `read` until the DA1 sentinel arrives or `deadline`
+/// passes — the read half of [`read_replies`], seamed on the reader so the loop's give-up
+/// conditions are unit-testable without a tty.
+///
+/// Both `Ok(0)` and `WouldBlock` mean "the terminal hasn't answered yet", NEVER end-of-file:
+/// with the `VMIN=0` termios the probe sets, a tty `read` is a *polling read* that returns 0
+/// immediately when the queue is empty. Only a genuine read error ends the wait early — every
+/// "no data yet" result just yields briefly and retries until the deadline.
+#[cfg(unix)]
+fn collect_replies(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize>,
+    deadline: std::time::Instant,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(512);
+    let mut chunk = [0u8; 256];
+
+    while std::time::Instant::now() < deadline {
+        match read(&mut chunk) {
+            Ok(n) if n > 0 => {
+                buf.extend_from_slice(&chunk[..n]);
+                if has_da1_terminator(&buf) {
+                    break;
+                }
+            }
+            Ok(_) => std::thread::sleep(Duration::from_millis(2)),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(_) => break,
+        }
+    }
+    buf
 }
 
 /// Set `O_NONBLOCK` on the fd so `read` returns `WouldBlock` instead of blocking when the terminal
@@ -505,6 +550,87 @@ mod tests {
         assert_eq!(payloads.len(), 2);
         assert_eq!(payloads[0], b"11;rgb:aa/bb/cc");
         assert_eq!(payloads[1], b"10;rgb:11/22/33");
+    }
+
+    // ── collect_replies give-up conditions ───────────────────────────────────
+
+    /// A reader that scripts each successive `read` call's result: `Ok(&[u8])` delivers bytes,
+    /// `Err(kind)` returns that error kind. Exhausting the script yields `Ok(0)` ("no data yet").
+    #[cfg(unix)]
+    fn scripted_reader(
+        script: Vec<Result<&'static [u8], std::io::ErrorKind>>,
+    ) -> impl FnMut(&mut [u8]) -> std::io::Result<usize> {
+        let mut steps = script.into_iter();
+        move |chunk: &mut [u8]| match steps.next() {
+            Some(Ok(bytes)) => {
+                chunk[..bytes.len()].copy_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            Some(Err(kind)) => Err(kind.into()),
+            None => Ok(0),
+        }
+    }
+
+    #[cfg(unix)]
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + Duration::from_millis(200)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_replies_treats_zero_byte_reads_as_pending_not_eof() {
+        // The dogfood-round-2 wedge: with `VMIN=0` a tty read returns `Ok(0)` while the terminal
+        // is still composing its answer. The loop must keep waiting — bailing here left the
+        // replies to arrive after the probe's flush and freeze crossterm's input at startup.
+        let read = scripted_reader(vec![
+            Ok(b""),
+            Ok(b""),
+            Ok(b"\x1b]11;rgb:1a1a/1a1a/1a1a\x1b\\"),
+            Ok(b"\x1b[?62;22c"),
+        ]);
+        let buf = collect_replies(read, soon());
+        assert!(
+            buf.starts_with(b"\x1b]11;"),
+            "replies after Ok(0) polling reads must still be collected"
+        );
+        assert!(has_da1_terminator(&buf), "loop ran on to the DA1 sentinel");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_replies_stops_at_the_da1_sentinel() {
+        // Bytes offered after the DA1 reply must never be consumed — the sentinel ends the read
+        // so the probe returns promptly on a terminal that answered everything.
+        let read = scripted_reader(vec![Ok(b"\x1b[?62;22c"), Ok(b"leftover")]);
+        let buf = collect_replies(read, soon());
+        assert_eq!(buf, b"\x1b[?62;22c");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_replies_waits_out_would_block_and_gives_up_at_the_deadline() {
+        // WouldBlock is the O_NONBLOCK "no data yet"; a terminal that never answers must yield
+        // an empty buffer once the deadline passes — bounded, not hung, and nothing invented.
+        let read = scripted_reader(vec![Err(std::io::ErrorKind::WouldBlock); 3]);
+        let buf = collect_replies(read, soon());
+        assert!(buf.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_replies_gives_up_on_a_real_read_error() {
+        // A genuine error (not WouldBlock) ends the wait early with whatever already arrived.
+        let start = std::time::Instant::now();
+        let read = scripted_reader(vec![
+            Ok(b"\x1b]11;rgb:1a1a/1a1a/1a1a\x1b\\"),
+            Err(std::io::ErrorKind::Other),
+        ]);
+        let buf = collect_replies(read, std::time::Instant::now() + Duration::from_secs(5));
+        assert!(buf.starts_with(b"\x1b]11;"));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "error must end the wait, not the deadline"
+        );
     }
 
     #[test]
