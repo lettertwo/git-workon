@@ -316,6 +316,14 @@ impl FileView {
 fn old_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tree<'_>> {
     match span {
         ChangesetSpan::Committed { base, .. } => repo.find_commit(base).and_then(|c| c.tree()).ok(),
+        // Root commit reviewed on its own: the old side is the empty tree. `treebuilder(None)`
+        // builds (and `write` persists, idempotently — git's well-known empty-tree object) an
+        // empty tree without needing a real parent commit to peel.
+        ChangesetSpan::CommittedRoot { .. } => repo
+            .treebuilder(None)
+            .and_then(|b| b.write())
+            .and_then(|oid| repo.find_tree(oid))
+            .ok(),
         ChangesetSpan::Uncommitted => repo.head().and_then(|h| h.peel_to_tree()).ok(),
     }
 }
@@ -332,6 +340,7 @@ fn old_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tre
 fn new_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tree<'_>> {
     match span {
         ChangesetSpan::Committed { head, .. } => repo.find_commit(head).and_then(|c| c.tree()).ok(),
+        ChangesetSpan::CommittedRoot { head } => repo.find_commit(head).and_then(|c| c.tree()).ok(),
         ChangesetSpan::Uncommitted => None,
     }
 }
@@ -986,7 +995,10 @@ impl App {
     /// committed-mode guard: the mode-aware staging refusal, skipping combined attribution (no
     /// staged/unstaged sets exist to color by), and locking zoom to combined.
     pub fn is_committed(&self) -> bool {
-        matches!(self.cur().cs.span, ChangesetSpan::Committed { .. })
+        matches!(
+            self.cur().cs.span,
+            ChangesetSpan::Committed { .. } | ChangesetSpan::CommittedRoot { .. }
+        )
     }
 
     /// Re-run [`crate::acquire::resolve_changesets`] against the CURRENT `HEAD` branch and
@@ -2512,6 +2524,8 @@ fn base_label_for(cs: &Changeset) -> String {
             let full = base.to_string();
             full.chars().take(7).collect()
         }
+        // No real base commit to abbreviate — the base is the empty tree.
+        ChangesetSpan::CommittedRoot { .. } => "(empty)".to_string(),
         ChangesetSpan::Uncommitted => "HEAD".to_string(),
     }
 }

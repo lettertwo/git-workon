@@ -16,7 +16,8 @@ use workon_review::theme::Palette;
 #[derive(Debug, Parser)]
 #[clap(about, author, bin_name = env!("CARGO_PKG_NAME"), version)]
 struct Cli {
-    /// What to review: stack, uncommitted, or (later CSes) a ref/range/PR
+    /// What to review: stack, uncommitted, a ref (branch/tag/commit), a..b / a...b range, or
+    /// (CS4) a PR reference
     #[arg(value_name = "SOURCE")]
     source: Option<String>,
 }
@@ -40,7 +41,7 @@ fn main() -> Result<()> {
     // No `[SOURCE]` argument: the M5 auto-detect entry point (locked decision #7), unchanged —
     // the full Graphite stack when one is active, or a single synthetic uncommitted changeset
     // otherwise (keeps a non-Graphite repo byte-identical to M2–M4's `diff_uncommitted` path).
-    // A `[SOURCE]` argument routes through the ADR-036 classifier/resolver instead (M7 CS2).
+    // A `[SOURCE]` argument routes through the ADR-036 classifier/resolver instead (M7 CS2/CS3).
     // `source` is kept (not just the resolved changesets) so it can be handed to `App` below —
     // `App::refresh` re-runs THIS same ask on every refresh rather than downgrading to
     // auto-detect (M7 CS2 fix).
@@ -63,7 +64,12 @@ fn main() -> Result<()> {
     // exit 0 (ADR-036), never a `views` list handed to `App::from_changesets`, which panics on
     // empty input.
     if views.is_empty() || (views.len() == 1 && views[0].file_count() == 0) {
-        eprintln!("nothing to review");
+        // Name the source when one was given (CS3) — a bare `nothing to review` would leave a
+        // typo'd-but-empty range like `v1..v1` looking indistinguishable from the no-arg case.
+        match cli.source.as_deref() {
+            Some(text) => eprintln!("nothing to review in {text}"),
+            None => eprintln!("nothing to review"),
+        }
         return Ok(());
     }
 
