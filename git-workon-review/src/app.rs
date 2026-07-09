@@ -1649,12 +1649,22 @@ impl App {
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
     /// clamped into the current row list. Landing on a FILE row jumps the diff there
-    /// immediately (outline -> diff, per the locked design); landing on a HEADER row does NOT
-    /// jump — only [`Self::outline_confirm`] (`Enter`) jumps from a header, since a header's
-    /// "first file" isn't necessarily where a `j`/`k` scan through the stack should keep
-    /// stopping the diff. This calls [`Self::switch_changeset`] directly (not `next_file`/
-    /// `goto_changeset`), so it does NOT re-trigger [`Self::sync_outline_to_current`] — see that
-    /// method's doc comment for why only the DIFF-initiated entry points do.
+    /// immediately (outline -> diff, per the locked design); a HEADER/DIR row itself never
+    /// causes a jump — only [`Self::outline_confirm`] (`Enter`) jumps from a header, since a
+    /// header's "first file" isn't necessarily where a `j`/`k` scan through the stack should
+    /// keep stopping the diff. This calls [`Self::switch_changeset`] directly (not
+    /// `next_file`/`goto_changeset`), so it does NOT re-trigger
+    /// [`Self::sync_outline_to_current`] — see that method's doc comment for why only the
+    /// DIFF-initiated entry points do.
+    ///
+    /// A multi-row `delta` is a coalesced burst of unit presses (the event loop merges
+    /// same-sign `j`/`k` runs — see `tui.rs`'s `update_batch`), so it must be
+    /// indistinguishable from the unit presses it stands for: N unit moves jump the diff at
+    /// every FILE row they cross, leaving it on the LAST one when the run stops on a
+    /// header/dir row. So a non-File landing scans back toward (but excluding) the starting
+    /// row for the last file crossed and jumps there. For a unit move that range is empty,
+    /// preserving the single-press rule above: bare `j`/`k` onto a header neither jumps nor
+    /// resets the diff.
     pub fn outline_move_by(&mut self, delta: i64) {
         let items = self.outline_items();
         if items.is_empty() {
@@ -1670,6 +1680,19 @@ impl App {
         } = &items[new_idx]
         {
             self.switch_changeset(*cs_idx, *file_idx);
+        } else if new_idx as i64 != cur {
+            let step = if delta > 0 { -1 } else { 1 };
+            let mut idx = new_idx as i64 + step;
+            while idx != cur && (0..=max).contains(&idx) {
+                if let OutlineItem::File {
+                    cs_idx, file_idx, ..
+                } = &items[idx as usize]
+                {
+                    self.switch_changeset(*cs_idx, *file_idx);
+                    break;
+                }
+                idx += step;
+            }
         }
     }
 
@@ -5391,17 +5414,52 @@ mod tests {
     fn outline_move_by_on_a_header_row_does_not_jump_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
-        app.outline.cursor = 0; // cs-a's header row
-        let cs_before = app.current_cs();
-        let file_before = app.current;
-
         // Header rows sit at indices 0 (cs-a) and 3 (cs-b) in Stack mode (header, a1, a2,
-        // header). Move onto the cs-b header without landing on a file row in between.
-        app.outline_move_by(3);
+        // header, b1). Park the diff on a2, cursor on its row.
+        app.outline.cursor = 2;
+        app.switch_changeset(0, 1);
+        app.cursor += 1; // nudge off the open position so a hidden re-open would be visible
+        let cursor_before = app.cursor;
+
+        // A UNIT move onto the header: the header itself never jumps — and must not reset the
+        // diff's cursor either (a re-`switch_changeset` to the same file would).
+        app.outline_move_by(1);
         assert_eq!(
             (app.current_cs(), app.current),
-            (cs_before, file_before),
-            "landing the outline cursor on a header row must not move the diff"
+            (0, 1),
+            "a bare j onto a header row must not move the diff"
+        );
+        assert_eq!(app.cursor, cursor_before, "...nor reset the diff cursor");
+    }
+
+    #[test]
+    fn coalesced_outline_burst_onto_a_header_matches_sequential_unit_moves() {
+        // A multi-row delta is CS2's coalesced stand-in for N unit presses, so the two must be
+        // indistinguishable — including which file the diff follows when the burst stops on a
+        // header row (the LAST file crossed, exactly where unit presses leave it).
+        let mut coalesced = two_committed_changesets_two_and_one_files();
+        coalesced.outline.mode = OutlineMode::Stack;
+        coalesced.outline.cursor = 0;
+        coalesced.outline_move_by(3); // header -> a1 -> a2 -> cs-b header
+
+        let mut sequential = two_committed_changesets_two_and_one_files();
+        sequential.outline.mode = OutlineMode::Stack;
+        sequential.outline.cursor = 0;
+        for _ in 0..3 {
+            sequential.outline_move_by(1);
+        }
+
+        assert_eq!(coalesced.outline.cursor, sequential.outline.cursor);
+        assert_eq!(
+            (coalesced.current_cs(), coalesced.current),
+            (sequential.current_cs(), sequential.current),
+            "a summed burst stopping on a header must leave the diff on the last file \
+             crossed, like the unit presses it coalesces"
+        );
+        assert_eq!(
+            (coalesced.current_cs(), coalesced.current),
+            (0, 1),
+            "...which is a2 here"
         );
     }
 
