@@ -41,12 +41,13 @@ fn main() -> Result<()> {
     // the full Graphite stack when one is active, or a single synthetic uncommitted changeset
     // otherwise (keeps a non-Graphite repo byte-identical to M2–M4's `diff_uncommitted` path).
     // A `[SOURCE]` argument routes through the ADR-030 classifier/resolver instead (M7 CS2).
-    let changesets = match cli.source {
+    // `source` is kept (not just the resolved changesets) so it can be handed to `App` below —
+    // `App::refresh` re-runs THIS same ask on every refresh rather than downgrading to
+    // auto-detect (M7 CS2 fix).
+    let source = cli.source.as_deref().map(Source::classify);
+    let changesets = match &source {
         None => resolve_changesets(&repo, &branch).into_diagnostic()?,
-        Some(text) => {
-            let source = Source::classify(&text);
-            resolve_source(&repo, &branch, source).into_diagnostic()?
-        }
+        Some(source) => resolve_source(&repo, &branch, source.clone()).into_diagnostic()?,
     };
 
     let mut views = Vec::with_capacity(changesets.len());
@@ -97,6 +98,9 @@ fn main() -> Result<()> {
     // acquisition is done borrowing it. `App::from_changesets` opens on whichever changeset the
     // lib marked `current` (locked decision #6).
     let mut app = App::from_changesets(repo, views);
+    if let Some(source) = source {
+        app.set_review_source(source);
+    }
 
     // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
     // only set the raw layout/zoom/mode/width fields, and `open_current` is what derives
