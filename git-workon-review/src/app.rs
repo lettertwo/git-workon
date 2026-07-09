@@ -1032,10 +1032,12 @@ impl App {
     /// Dispatches on [`Self::review_source`] (M7 CS2 fix): a no-argument launch (`None`) re-runs
     /// today's auto-detect ([`crate::acquire::resolve_changesets`]); an explicit-source launch
     /// (`Some`) re-runs [`crate::source::resolve_source`] against THAT source, never auto-detect
-    /// — every CS2 source variant (`Stack`, `Uncommitted`) is offline, so re-resolving on every
-    /// refresh (manual `r` and the tick-driven index watcher alike) is cheap and safe. Without
-    /// this, both refresh triggers would silently swap an explicit review (e.g. `uncommitted`)
-    /// for the current `HEAD`'s auto-detected state.
+    /// — every ref-shaped source variant (`Stack`, `Uncommitted`, `Ref`, `Range`) is offline,
+    /// so re-resolving on every refresh (manual `r` and the tick-driven index watcher alike) is
+    /// cheap and safe. Without this, both refresh triggers would silently swap an explicit
+    /// review (e.g. `uncommitted`) for the current `HEAD`'s auto-detected state.
+    /// [`Source::Pr`] is the one exception: it resolves over the network (gh metadata + fetch),
+    /// so refresh is a no-op for it — see the match arm below.
     pub fn refresh(&mut self) {
         let Some(head_branch) = self
             .repo
@@ -1050,6 +1052,11 @@ impl App {
         let changesets = match &self.review_source {
             None => crate::acquire::resolve_changesets(&self.repo, &head_branch)
                 .map_err(|err| err.to_string()),
+            // A PR review is committed-only: nothing it renders depends on the index/worktree
+            // state that refresh exists to pick up, and re-resolving would hit the network
+            // (gh metadata + fetch) on every tick-driven refresh. Remote freshness is a
+            // re-launch, not a refresh.
+            Some(Source::Pr(_)) => return,
             Some(source) => resolve_source(&self.repo, &head_branch, source.clone())
                 .map_err(|err| err.to_string()),
         };
@@ -3692,6 +3699,60 @@ mod tests {
              Graphite stack auto-detect would find"
         );
         assert_eq!(app.cur().cs.span, ChangesetSpan::Uncommitted);
+    }
+
+    /// A PR-sourced review must survive refresh untouched: re-resolving would hit the network
+    /// (gh + fetch), so [`App::refresh`] no-ops for [`Source::Pr`]. The fixture has no PR and no
+    /// gh — if refresh DID try to re-resolve, `resolve_pr` would fail and raise a "refresh
+    /// failed" notice; asserting no notice (and unchanged views) pins the no-op.
+    #[test]
+    fn refresh_is_a_no_op_for_a_pr_source() {
+        use crate::source::Source;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        fixture
+            .commit("main")
+            .file("a.txt", "one\n")
+            .create("first")
+            .unwrap();
+        fixture
+            .commit("main")
+            .file("a.txt", "two\n")
+            .create("second")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let base = head.parent(0).unwrap();
+        let cs = workon::Changeset {
+            name: "pr-1".to_string(),
+            span: ChangesetSpan::Committed {
+                base: base.id(),
+                head: head.id(),
+            },
+            title: Some("a pr".to_string()),
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let views = vec![ChangesetView::from_changeset_diff(cs, diff)];
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.set_review_source(Source::Pr("pr-1".to_string()));
+        app.open_current();
+
+        app.refresh();
+
+        assert_eq!(app.changeset_count(), 1);
+        assert_eq!(app.cur().cs.name, "pr-1");
+        assert!(
+            app.notice.is_none(),
+            "a PR-source refresh must no-op, not attempt (and fail) a network re-resolution"
+        );
     }
 
     // ---- M4 index watcher (`on_tick`) -------------------------------------------------------
