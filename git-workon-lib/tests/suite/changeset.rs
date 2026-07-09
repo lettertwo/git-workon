@@ -1,7 +1,8 @@
 use git_workon_fixture::prelude::*;
 use std::error::Error;
 use workon::{
-    assemble_changesets, ChangesetError, ChangesetSpan, StackError, StackModel, WorkonError,
+    assemble_changesets, ChangesetError, ChangesetSpan, StackError, StackModel, UncommittedLayer,
+    WorkonError,
 };
 
 // ── both-format parameterization (see tests/stack.rs) ────────────────────────
@@ -52,7 +53,8 @@ fn graphite_linear_order_current_and_titles(format: MetadataFormat) -> Result<()
     let b_tip = branch_tip(&fixture, "b")?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "b", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "b", StackModel::Graphite, UncommittedLayer::Include)?;
     let names: Vec<&str> = changesets.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["a", "b", "c"]);
 
@@ -100,7 +102,8 @@ fn graphite_fork_siblings_sorted_lexically(format: MetadataFormat) -> Result<(),
         .build()?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "a", StackModel::Graphite, UncommittedLayer::Include)?;
     let names: Vec<&str> = changesets.iter().map(|c| c.name.as_str()).collect();
     // Descendant DFS sorts siblings lexically, not by creation order (zeta was added first).
     assert_eq!(names, vec!["a", "alpha", "zeta"]);
@@ -118,7 +121,8 @@ fn graphite_all_at_one_commit_base_equals_head(
         .build()?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "a", StackModel::Graphite, UncommittedLayer::Include)?;
     assert_eq!(changesets.len(), 1);
     match changesets[0].span {
         ChangesetSpan::Committed { base, head } => {
@@ -141,7 +145,12 @@ fn graphite_ghost_mid_stack_skipped_children_present(
         .build()?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "child", StackModel::Graphite)?;
+    let changesets = assemble_changesets(
+        repo,
+        "child",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )?;
     let names: Vec<&str> = changesets.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["child"], "ghost must not appear in output");
     assert!(changesets[0].current);
@@ -163,7 +172,12 @@ fn graphite_untracked_parent_excluded_from_walk(
         .build()?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "feat", StackModel::Graphite)?;
+    let changesets = assemble_changesets(
+        repo,
+        "feat",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )?;
     let names: Vec<&str> = changesets.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["feat"], "untracked parent must not be emitted");
     Ok(())
@@ -180,7 +194,8 @@ fn graphite_current_branch_missing_ref_errors(
         .build()?;
     let repo = fixture.repo()?;
 
-    let err = assemble_changesets(repo, "c", StackModel::Graphite).unwrap_err();
+    let err = assemble_changesets(repo, "c", StackModel::Graphite, UncommittedLayer::Include)
+        .unwrap_err();
     match err {
         WorkonError::Changeset(ChangesetError::UnresolvableBranch { branch }) => {
             assert_eq!(branch, "c")
@@ -214,7 +229,12 @@ fn trap7_spans_stale_branch_revision_to_live_head(
         .create("commit2")?;
 
     let repo = fixture.repo()?;
-    let changesets = assemble_changesets(repo, "feat-a", StackModel::Graphite)?;
+    let changesets = assemble_changesets(
+        repo,
+        "feat-a",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )?;
     assert_eq!(changesets.len(), 1);
     match changesets[0].span {
         ChangesetSpan::Committed { base, head } => {
@@ -242,7 +262,13 @@ fn trap7_bogus_parent_revision_errors(format: MetadataFormat) -> Result<(), Box<
         .build()?;
     let repo = fixture.repo()?;
 
-    let err = assemble_changesets(repo, "feat-a", StackModel::Graphite).unwrap_err();
+    let err = assemble_changesets(
+        repo,
+        "feat-a",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )
+    .unwrap_err();
     match err {
         WorkonError::Changeset(ChangesetError::InvalidParentRevision { branch, revision }) => {
             assert_eq!(branch, "feat-a");
@@ -266,7 +292,13 @@ fn trap7_corrupt_sqlite_db_errors() -> Result<(), Box<dyn Error>> {
     let db_path = repo.commondir().join(".graphite_metadata.db");
     std::fs::write(&db_path, b"not a sqlite database")?;
 
-    let err = assemble_changesets(repo, "feat-a", StackModel::Graphite).unwrap_err();
+    let err = assemble_changesets(
+        repo,
+        "feat-a",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )
+    .unwrap_err();
     assert!(
         matches!(err, WorkonError::Stack(StackError::GtParseFailed { .. })),
         "expected GtParseFailed, got {err:?}"
@@ -293,7 +325,12 @@ fn needs_restack_true_when_parent_advances_post_build(
         .create("advance parent")?;
 
     let repo = fixture.repo()?;
-    let changesets = assemble_changesets(repo, "child", StackModel::Graphite)?;
+    let changesets = assemble_changesets(
+        repo,
+        "child",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )?;
 
     let child_cs = changesets.iter().find(|c| c.name == "child").unwrap();
     assert!(
@@ -316,7 +353,8 @@ fn needs_restack_false_for_untouched_stack(format: MetadataFormat) -> Result<(),
     let fixture = linear_chain(format)?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "c", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "c", StackModel::Graphite, UncommittedLayer::Include)?;
     assert!(
         changesets.iter().all(|c| !c.needs_restack),
         "no branch advanced past what metadata recorded"
@@ -337,7 +375,8 @@ fn needs_restack_false_with_empty_parent_revision_and_merge_base_fallback(
     let a_tip = branch_tip(&fixture, "a")?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "a", StackModel::Graphite, UncommittedLayer::Include)?;
     assert_eq!(changesets.len(), 1);
     assert!(!changesets[0].needs_restack);
     match changesets[0].span {
@@ -370,7 +409,8 @@ fn needs_restack_computed_for_ancestors_of_current(
         .create("advance main")?;
 
     let repo = fixture.repo()?;
-    let changesets = assemble_changesets(repo, "b", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "b", StackModel::Graphite, UncommittedLayer::Include)?;
 
     let a_cs = changesets.iter().find(|c| c.name == "a").unwrap();
     assert!(
@@ -447,7 +487,8 @@ fn uncommitted_layer_absent_on_clean_tree(format: MetadataFormat) -> Result<(), 
         .build()?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "a", StackModel::Graphite, UncommittedLayer::Include)?;
     assert_eq!(changesets.len(), 1);
     assert!(changesets[0].current);
     assert_ne!(changesets[0].span, ChangesetSpan::Uncommitted);
@@ -460,7 +501,12 @@ fn assert_uncommitted_inserted_after_current(
     current_branch: &str,
 ) -> Result<(), Box<dyn Error>> {
     let repo = fixture.repo()?;
-    let changesets = assemble_changesets(repo, current_branch, StackModel::Graphite)?;
+    let changesets = assemble_changesets(
+        repo,
+        current_branch,
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )?;
     assert_eq!(changesets.len(), 2);
     assert_eq!(changesets[0].name, current_branch);
     assert!(!changesets[0].current, "branch node must drop current");
@@ -485,7 +531,12 @@ fn graphite_falls_back_to_git_on_trunk(format: MetadataFormat) -> Result<(), Box
         .create("only commit")?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "main", StackModel::Graphite)?;
+    let changesets = assemble_changesets(
+        repo,
+        "main",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )?;
     assert_eq!(changesets.len(), 1);
     assert_eq!(changesets[0].title.as_deref(), Some("only commit"));
     Ok(())
@@ -508,7 +559,12 @@ fn graphite_falls_back_to_git_on_untracked_branch(
         .create("untracked commit")?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "feat-a", StackModel::Graphite)?;
+    let changesets = assemble_changesets(
+        repo,
+        "feat-a",
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )?;
     assert_eq!(changesets.len(), 1);
     assert_eq!(changesets[0].title.as_deref(), Some("untracked commit"));
     Ok(())
@@ -528,7 +584,7 @@ fn git_inference_two_commits_oldest_first() -> Result<(), Box<dyn Error>> {
     fixture.commit("main").file("b.txt", "2").create("second")?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "main", StackModel::Git)?;
+    let changesets = assemble_changesets(repo, "main", StackModel::Git, UncommittedLayer::Include)?;
     assert_eq!(changesets.len(), 2);
     assert_eq!(changesets[0].title.as_deref(), Some("first"));
     assert_eq!(changesets[1].title.as_deref(), Some("second"));
@@ -561,7 +617,7 @@ fn git_inference_dirty_tree_appends_uncommitted_as_current() -> Result<(), Box<d
     fixture.commit("main").file("a.txt", "1").create("first")?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "main", StackModel::Git)?;
+    let changesets = assemble_changesets(repo, "main", StackModel::Git, UncommittedLayer::Include)?;
     assert_eq!(changesets.len(), 2);
     assert!(!changesets[0].current);
     assert_eq!(changesets[1].span, ChangesetSpan::Uncommitted);
@@ -577,7 +633,7 @@ fn git_inference_caught_up_and_clean_returns_empty() -> Result<(), Box<dyn Error
         .build()?;
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "main", StackModel::Git)?;
+    let changesets = assemble_changesets(repo, "main", StackModel::Git, UncommittedLayer::Include)?;
     assert_eq!(changesets, vec![]);
     Ok(())
 }
@@ -587,7 +643,8 @@ fn git_inference_no_upstream_errors() -> Result<(), Box<dyn Error>> {
     let fixture = FixtureBuilder::new().build()?;
     let repo = fixture.repo()?;
 
-    let err = assemble_changesets(repo, "main", StackModel::Git).unwrap_err();
+    let err =
+        assemble_changesets(repo, "main", StackModel::Git, UncommittedLayer::Include).unwrap_err();
     match err {
         WorkonError::Changeset(ChangesetError::NoUpstream { branch }) => {
             assert_eq!(branch, "main")
@@ -604,6 +661,9 @@ fn none_model_always_returns_empty() -> Result<(), Box<dyn Error>> {
     let fixture = linear_chain(MetadataFormat::Refs)?;
     let repo = fixture.repo()?;
 
-    assert_eq!(assemble_changesets(repo, "c", StackModel::None)?, vec![]);
+    assert_eq!(
+        assemble_changesets(repo, "c", StackModel::None, UncommittedLayer::Include)?,
+        vec![]
+    );
     Ok(())
 }
