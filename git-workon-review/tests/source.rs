@@ -105,6 +105,29 @@ fn stack_keyword_with_no_upstream_errors() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `stack` on a branch that's caught up with its upstream and has a clean tree resolves to
+/// zero changesets (`assemble_git`'s empty-vec arm, `git_inference_caught_up_and_clean_returns_empty`
+/// in `git-workon-lib/tests/changeset.rs`) — end-to-end through the binary this must print
+/// "nothing to review" and exit 0, exactly like the no-argument auto-detect path, not panic.
+#[test]
+fn stack_keyword_caught_up_and_clean_prints_nothing_to_review() {
+    let fixture = FixtureBuilder::new()
+        .remote("origin", "https://example.com/origin.git")
+        .upstream("main", "origin/main")
+        .build()
+        .unwrap();
+    let repo = fixture.repo().unwrap();
+    let workdir = repo.workdir().unwrap();
+
+    let mut cmd = cargo_bin_cmd!("git-workon-review");
+    cmd.current_dir(workdir)
+        .env("NO_COLOR", "1")
+        .arg("stack")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("nothing to review"));
+}
+
 /// The classifier/resolver seam CS2 introduces resolves `Ref` to a named, hinted pre-TUI
 /// failure (real ref resolution is CS3) — end-to-end through the binary, so this doubles as
 /// the CS2 manual smoke check ("a source shape renders or errors honestly"). Color is pinned

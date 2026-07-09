@@ -55,7 +55,13 @@ fn main() -> Result<()> {
         views.push(ChangesetView::from_changeset_diff(cs, diff));
     }
 
-    if views.len() == 1 && views[0].file_count() == 0 {
+    // A resolved source can legitimately name zero changesets — `stack` on a branch that's
+    // caught up with its upstream and has a clean tree hits `assemble_git`'s empty-vec arm
+    // (see `git_inference_caught_up_and_clean_returns_empty` in git-workon-lib), same as the
+    // single-uncommitted-changeset case with nothing in it. Both are "nothing to review" +
+    // exit 0 (ADR-036), never a `views` list handed to `App::from_changesets`, which panics on
+    // empty input.
+    if views.is_empty() || (views.len() == 1 && views[0].file_count() == 0) {
         eprintln!("nothing to review");
         return Ok(());
     }
