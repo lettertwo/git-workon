@@ -152,12 +152,14 @@ pub enum SourceError {
     },
 
     /// A `<ref>` argument (or one side of a `Range`) doesn't rev-parse to anything reviewable —
-    /// a typo, a deleted branch, a garbage commit-ish. PR resolution lands in CS4; until then a
-    /// PR-shaped argument falls through to this same honest failure.
+    /// a typo, a deleted branch, a garbage commit-ish.
     #[error("cannot resolve '{text}' as a review source")]
     #[diagnostic(
         code(workon::review::unresolvable_source),
-        help("try 'stack', 'uncommitted', a branch/tag/commit, or a..b / a...b range — PRs are not yet supported")
+        help(
+            "try 'stack', 'uncommitted', a branch/tag/commit, a..b / a...b range, \
+             or a PR reference (pr-123, #123)"
+        )
     )]
     UnresolvableSource { text: String },
 
@@ -172,4 +174,30 @@ pub enum SourceError {
         )
     )]
     NoBaseForBranch { branch: String },
+
+    /// `check_gh_available` found no working `gh` CLI — a PR reference can't resolve without it,
+    /// the same requirement `git workon #123`'s own PR workflow has.
+    #[error("'{text}' is a PR reference, but gh is not available")]
+    #[diagnostic(
+        code(workon::review::gh_unavailable),
+        help("install the gh CLI and run 'gh auth login', then retry")
+    )]
+    GhUnavailable {
+        text: String,
+        #[source]
+        source: workon::WorkonError,
+    },
+
+    /// Resolving a PR reference failed after `gh` was confirmed available: an unknown PR number,
+    /// `gh` not authenticated, a fork remote/fetch failure, or a missing base/head ref.
+    #[error("failed to resolve PR reference '{text}'")]
+    #[diagnostic(
+        code(workon::review::pr_resolution_failed),
+        help("check the PR number and that 'gh auth status' is logged in")
+    )]
+    PrResolutionFailed {
+        text: String,
+        #[source]
+        source: workon::WorkonError,
+    },
 }
