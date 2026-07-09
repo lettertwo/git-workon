@@ -5,7 +5,7 @@ use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use git2::Repository;
 use miette::{IntoDiagnostic, Result};
-use workon_review::acquire::{diff_changeset, resolve_changesets};
+use workon_review::acquire::{diff_changesets, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::{self, ReviewConfig};
 use workon_review::keymap::Keymap;
@@ -52,11 +52,12 @@ fn main() -> Result<()> {
         Some(source) => resolve_source(&repo, &branch, source.clone()).into_diagnostic()?,
     };
 
-    let mut views = Vec::with_capacity(changesets.len());
-    for cs in changesets {
-        let diff = diff_changeset(&repo, &cs).into_diagnostic()?;
-        views.push(ChangesetView::from_changeset_diff(cs, diff));
-    }
+    let diffs = diff_changesets(&repo, &changesets).into_diagnostic()?;
+    let views: Vec<ChangesetView> = changesets
+        .into_iter()
+        .zip(diffs)
+        .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+        .collect();
 
     // A resolved source can legitimately name zero changesets — `stack` on a branch that's
     // caught up with its upstream and has a clean tree hits `assemble_git`'s empty-vec arm
