@@ -339,8 +339,9 @@ fn old_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tre
 /// [`git2::Tree`] borrows only `repo`, leaving `&mut self.highlighter` free at the call site.
 fn new_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tree<'_>> {
     match span {
-        ChangesetSpan::Committed { head, .. } => repo.find_commit(head).and_then(|c| c.tree()).ok(),
-        ChangesetSpan::CommittedRoot { head } => repo.find_commit(head).and_then(|c| c.tree()).ok(),
+        ChangesetSpan::Committed { head, .. } | ChangesetSpan::CommittedRoot { head } => {
+            repo.find_commit(head).and_then(|c| c.tree()).ok()
+        }
         ChangesetSpan::Uncommitted => None,
     }
 }

@@ -117,17 +117,23 @@ fn resolve_stack(
         StackModel::Git
     };
 
-    assemble_changesets(repo, head_branch, model, UncommittedLayer::Include).map_err(
-        |err| match err {
-            WorkonError::Changeset(ChangesetError::NoUpstream { branch }) => {
-                SourceError::NoUpstream { branch }
-            }
-            other => SourceError::StackResolutionFailed {
-                branch: head_branch.to_string(),
-                source: other,
-            },
+    assemble_changesets(repo, head_branch, model, UncommittedLayer::Include)
+        .map_err(map_assemble_err(head_branch))
+}
+
+/// Maps an [`assemble_changesets`] failure to a [`SourceError`], for the branch named `branch`:
+/// a missing upstream becomes [`SourceError::NoUpstream`], anything else
+/// [`SourceError::StackResolutionFailed`].
+fn map_assemble_err(branch: &str) -> impl Fn(WorkonError) -> SourceError + '_ {
+    move |err| match err {
+        WorkonError::Changeset(ChangesetError::NoUpstream { branch }) => {
+            SourceError::NoUpstream { branch }
+        }
+        other => SourceError::StackResolutionFailed {
+            branch: branch.to_string(),
+            source: other,
         },
-    )
+    }
 }
 
 /// `<ref>` resolution — shape-aware dispatch (ADR-030), checked in order:
@@ -161,17 +167,8 @@ fn resolve_ref(
             } else {
                 UncommittedLayer::Omit
             };
-            return assemble_changesets(repo, &branch_name, StackModel::Graphite, layer).map_err(
-                |err| match err {
-                    WorkonError::Changeset(ChangesetError::NoUpstream { branch }) => {
-                        SourceError::NoUpstream { branch }
-                    }
-                    other => SourceError::StackResolutionFailed {
-                        branch: branch_name.clone(),
-                        source: other,
-                    },
-                },
-            );
+            return assemble_changesets(repo, &branch_name, StackModel::Graphite, layer)
+                .map_err(map_assemble_err(&branch_name));
         }
 
         // Untracked local branch: "what this branch adds" vs its upstream, else the trunk.

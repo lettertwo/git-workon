@@ -83,12 +83,7 @@ pub fn diff_committed(repo: &Repository, base: Oid, head: Oid) -> Result<DiffMod
     let base_tree = repo.find_commit(base)?.tree()?;
     let head_tree = repo.find_commit(head)?.tree()?;
 
-    let mut opts = DiffOptions::new();
-    opts.context_lines(3);
-    let mut diff = repo.diff_tree_to_tree(Some(&base_tree), Some(&head_tree), Some(&mut opts))?;
-    diff.find_similar(None)?;
-
-    DiffModel::from_git2(&diff)
+    diff_trees(repo, Some(&base_tree), &head_tree)
 }
 
 /// Diff the empty tree against `head`'s tree, for a [`ChangesetSpan::CommittedRoot`] changeset
@@ -98,9 +93,21 @@ pub fn diff_committed(repo: &Repository, base: Oid, head: Oid) -> Result<DiffMod
 pub fn diff_committed_root(repo: &Repository, head: Oid) -> Result<DiffModel, DiffError> {
     let head_tree = repo.find_commit(head)?.tree()?;
 
+    diff_trees(repo, None, &head_tree)
+}
+
+/// Shared tail of [`diff_committed`] and [`diff_committed_root`]: diff `base` (the empty tree
+/// when `None`) against `head`, with rename/copy detection via [`git2::Diff::find_similar`] so
+/// renamed files come back as [`crate::model::FileStatus::Renamed`] instead of a delete+add
+/// pair.
+fn diff_trees(
+    repo: &Repository,
+    base: Option<&git2::Tree>,
+    head: &git2::Tree,
+) -> Result<DiffModel, DiffError> {
     let mut opts = DiffOptions::new();
     opts.context_lines(3);
-    let mut diff = repo.diff_tree_to_tree(None, Some(&head_tree), Some(&mut opts))?;
+    let mut diff = repo.diff_tree_to_tree(base, Some(head), Some(&mut opts))?;
     diff.find_similar(None)?;
 
     DiffModel::from_git2(&diff)
