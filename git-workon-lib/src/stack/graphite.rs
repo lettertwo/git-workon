@@ -17,7 +17,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use git2::Repository;
 use rusqlite::OpenFlags;
@@ -27,14 +26,30 @@ use super::Stack;
 use crate::error::StackError;
 
 /// Returns `true` if the `gt` binary is on PATH.
+///
+/// A filesystem scan of `PATH`, deliberately NOT `gt --version`: `gt` is a Node CLI whose
+/// interpreter startup costs ~300-400ms, and this runs on every stack-model detection (CLI
+/// routing and review startup). Presence-on-PATH is the documented contract; whether the
+/// binary actually executes is the invoking call site's problem (`gt track` reports its own
+/// failure).
 pub fn detect_gt() -> bool {
-    Command::new("gt")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| is_executable_file(&dir.join("gt")))
+}
+
+#[cfg(unix)]
+fn is_executable_file(candidate: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(candidate)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(candidate: &Path) -> bool {
+    candidate.is_file()
 }
 
 /// Returns `true` if the repository has been Graphite-initialized.
