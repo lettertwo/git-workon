@@ -320,6 +320,17 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
     }
 }
 
+/// The run kind and delta for an action [`update_batch`] can coalesce, or `None` for every
+/// other action. The single source of truth for WHICH actions coalesce — `update_batch`'s
+/// accumulate arm matches through this so the rule can't drift per action kind.
+fn coalescable(action: Action) -> Option<(RunKind, i64)> {
+    match action {
+        Action::OutlineMoveBy(delta) => Some((RunKind::OutlineMoveBy, delta)),
+        Action::MoveCursorBy(delta) => Some((RunKind::MoveCursorBy, delta)),
+        _ => None,
+    }
+}
+
 /// One in-flight coalesced nav run tracked by [`update_batch`]: a same-sign burst of either
 /// outline moves or diff-cursor moves, deferred until a context-changing event forces a flush.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,8 +372,9 @@ fn flush_run(app: &mut App, run: &mut Option<(RunKind, i64)>) {
 ///   before applying keys 1..N's deferred run is sound. Any action that COULD change context
 ///   (`ToggleOutline`, `ToggleHelp`, zoom, refresh, a modal, …) forces a flush before it is
 ///   applied, preserving strict ordering.
-/// - `outline_move_by(sum)` only opens the LANDING row's file (the jump happens once, at the
-///   final position) — this is precisely what skips the intermediate loads.
+/// - `outline_move_by(sum)` opens at most ONE file — the landing row's, or for a header/dir
+///   landing the last file the burst crossed (see its doc comment) — rather than one per row
+///   crossed. That single jump is precisely what skips the intermediate loads.
 fn update_batch(
     app: &mut App,
     keymap: &Keymap,
@@ -385,24 +397,23 @@ fn update_batch(
                         && !app.outline_focused()) =>
             {
                 match resolve_key(app, keymap, pending, key) {
-                    KeyOutcome::Action(Action::OutlineMoveBy(delta)) => match &mut run {
-                        Some((RunKind::OutlineMoveBy, acc)) if acc.signum() == delta.signum() => {
-                            *acc += delta;
+                    // A coalescable nav action extends the open run when it matches in kind
+                    // and sign, else flushes and starts a fresh run — one arm for both kinds
+                    // so the coalescing rule can't drift between them.
+                    KeyOutcome::Action(action) if coalescable(action).is_some() => {
+                        let Some((kind, delta)) = coalescable(action) else {
+                            continue; // unreachable: the guard just matched
+                        };
+                        match &mut run {
+                            Some((k, acc)) if *k == kind && acc.signum() == delta.signum() => {
+                                *acc += delta;
+                            }
+                            _ => {
+                                flush_run(app, &mut run);
+                                run = Some((kind, delta));
+                            }
                         }
-                        _ => {
-                            flush_run(app, &mut run);
-                            run = Some((RunKind::OutlineMoveBy, delta));
-                        }
-                    },
-                    KeyOutcome::Action(Action::MoveCursorBy(delta)) => match &mut run {
-                        Some((RunKind::MoveCursorBy, acc)) if acc.signum() == delta.signum() => {
-                            *acc += delta;
-                        }
-                        _ => {
-                            flush_run(app, &mut run);
-                            run = Some((RunKind::MoveCursorBy, delta));
-                        }
-                    },
+                    }
                     // Any other resolved action (Quit, ToggleHelp, chord-pending `Action::None`,
                     // …) can change context, so flush first, then apply it directly — `resolve_key`
                     // already did the notice-clear and keymap resolution `update` would have done
