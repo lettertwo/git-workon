@@ -61,7 +61,9 @@ fn main() -> Result<()> {
     // probe (CS6), which needs the controlling tty and so lives outside the pure `theme.rs`; it is
     // bounded by a hard timeout and always yields a curated fallback on a silent/hostile terminal,
     // never a hang. `Dark`/`Light` stay CS5's I/O-free `for_theme` path.
-    let theme = match ReviewConfig::new(&repo).theme() {
+    let selection = ReviewConfig::new(&repo).theme();
+    let probed = matches!(selection, Ok(config::Theme::Auto));
+    let theme = match selection {
         Ok(config::Theme::Auto) => terminal_query::detect_auto_palette(),
         Ok(selection) => Palette::for_theme(selection),
         Err(_) => Palette::dark(),
@@ -94,6 +96,15 @@ fn main() -> Result<()> {
         app.notify(warnings.join("; "), Severity::Error);
     }
 
+    // After a probe, OSC replies from a slow terminal (e.g. one ssh round-trip away) may have
+    // straggled in while the changesets were being assembled above. Discard them now, right
+    // before crossterm takes the terminal — parsed as input they become phantom keystrokes
+    // (`r` fires refreshes; `d` opens the discard confirm, which then swallows every key until
+    // Esc/n: the "unresponsive for ~30s with theme=auto" startup). Un-probed launches skip this
+    // so legitimate type-ahead survives.
+    if probed {
+        terminal_query::flush_pending_tty_input();
+    }
     tui::run(&mut app, &keymap, &theme).into_diagnostic()?;
 
     Ok(())
