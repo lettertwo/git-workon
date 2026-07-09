@@ -135,6 +135,11 @@ fn resolve_pr(repo: &Repository, text: String) -> Result<Vec<workon::Changeset>,
         source,
     })?;
 
+    let fail = |source| SourceError::PrResolutionFailed {
+        text: text.clone(),
+        source,
+    };
+
     // `classify` only builds `Source::Pr` from a `parse_pr_reference` `Ok(Some(_))`, so this
     // re-parse is infallible in practice; treated as unresolvable rather than unwrapped in case
     // a `Source::Pr` is ever constructed some other way.
@@ -143,41 +148,20 @@ fn resolve_pr(repo: &Repository, text: String) -> Result<Vec<workon::Changeset>,
         .flatten()
         .ok_or_else(|| SourceError::UnresolvableSource { text: text.clone() })?;
 
-    let metadata =
-        workon::fetch_pr_metadata(pr.number).map_err(|source| SourceError::PrResolutionFailed {
-            text: text.clone(),
-            source,
-        })?;
+    let metadata = workon::fetch_pr_metadata(pr.number).map_err(&fail)?;
 
-    let head_remote = if metadata.is_fork {
-        workon::setup_fork_remote(repo, &metadata)
+    // `setup_fork_remote` already dispatches on `metadata.is_fork` (non-fork → `detect_pr_remote`),
+    // so only the fork case needs a second, separate lookup for the base remote — a fork's base
+    // is what the PR targets upstream, never the fork remote itself.
+    let head_remote = workon::setup_fork_remote(repo, &metadata).map_err(&fail)?;
+    let base_remote = if metadata.is_fork {
+        workon::detect_pr_remote(repo).map_err(&fail)?
     } else {
-        workon::detect_pr_remote(repo)
-    }
-    .map_err(|source| SourceError::PrResolutionFailed {
-        text: text.clone(),
-        source,
-    })?;
-    workon::fetch_branch_fresh(repo, &head_remote, &metadata.head_ref).map_err(|source| {
-        SourceError::PrResolutionFailed {
-            text: text.clone(),
-            source,
-        }
-    })?;
+        head_remote.clone()
+    };
 
-    // The base branch is what the PR targets, never a fork branch — always the detected
-    // upstream/origin remote, regardless of whether the head came from a fork.
-    let base_remote =
-        workon::detect_pr_remote(repo).map_err(|source| SourceError::PrResolutionFailed {
-            text: text.clone(),
-            source,
-        })?;
-    workon::fetch_branch_fresh(repo, &base_remote, &metadata.base_ref).map_err(|source| {
-        SourceError::PrResolutionFailed {
-            text: text.clone(),
-            source,
-        }
-    })?;
+    workon::fetch_branch_fresh(repo, &head_remote, &metadata.head_ref).map_err(&fail)?;
+    workon::fetch_branch_fresh(repo, &base_remote, &metadata.base_ref).map_err(&fail)?;
 
     pr_changeset_from_metadata(repo, &text, &metadata, &head_remote, &base_remote)
 }
