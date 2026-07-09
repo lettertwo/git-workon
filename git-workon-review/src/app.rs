@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use git2::Repository;
-use workon::{Changeset, ChangesetSource};
+use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
@@ -312,12 +312,10 @@ impl FileView {
 /// not all of `App` — a `&self` method here would make the borrow checker treat the tree as
 /// blocking every OTHER field access (e.g. `&mut self.highlighter`) for its whole lifetime, even
 /// though the two never actually conflict.
-fn old_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2::Tree<'_>> {
-    match source {
-        ChangesetSource::Committed { base, .. } => {
-            repo.find_commit(base).and_then(|c| c.tree()).ok()
-        }
-        ChangesetSource::Uncommitted => repo.head().and_then(|h| h.peel_to_tree()).ok(),
+fn old_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tree<'_>> {
+    match span {
+        ChangesetSpan::Committed { base, .. } => repo.find_commit(base).and_then(|c| c.tree()).ok(),
+        ChangesetSpan::Uncommitted => repo.head().and_then(|h| h.peel_to_tree()).ok(),
     }
 }
 
@@ -330,12 +328,10 @@ fn old_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2:
 ///
 /// A free function for the same borrow-checker reason as [`old_side_tree_for`]: the returned
 /// [`git2::Tree`] borrows only `repo`, leaving `&mut self.highlighter` free at the call site.
-fn new_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2::Tree<'_>> {
-    match source {
-        ChangesetSource::Committed { head, .. } => {
-            repo.find_commit(head).and_then(|c| c.tree()).ok()
-        }
-        ChangesetSource::Uncommitted => None,
+fn new_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tree<'_>> {
+    match span {
+        ChangesetSpan::Committed { head, .. } => repo.find_commit(head).and_then(|c| c.tree()).ok(),
+        ChangesetSpan::Uncommitted => None,
     }
 }
 
@@ -806,7 +802,7 @@ impl App {
             .unwrap_or_default();
         let cs = Changeset {
             name,
-            source: ChangesetSource::Uncommitted,
+            span: ChangesetSpan::Uncommitted,
             title: None,
             current: true,
             needs_restack: false,
@@ -966,12 +962,12 @@ impl App {
     }
 
     /// Whether the ACTIVE changeset is a committed range (`base..head`) rather than the
-    /// uncommitted worktree layer — derived from [`workon::ChangesetSource`] on every call rather
+    /// uncommitted worktree layer — derived from [`workon::ChangesetSpan`] on every call rather
     /// than cached (locked decision #2's "derive, don't store" mode gate). Drives every
     /// committed-mode guard: the mode-aware staging refusal, skipping combined attribution (no
     /// staged/unstaged sets exist to color by), and locking zoom to combined.
     pub fn is_committed(&self) -> bool {
-        matches!(self.cur().cs.source, ChangesetSource::Committed { .. })
+        matches!(self.cur().cs.span, ChangesetSpan::Committed { .. })
     }
 
     /// Re-run [`crate::acquire::resolve_changesets`] against the CURRENT `HEAD` branch and
@@ -1256,18 +1252,18 @@ impl App {
         // Combined role.
         // Re-peeled per call rather than cached on `App`: for the uncommitted layer `HEAD` can
         // move between file loads, and the tree is cheap to re-peel either way.
-        // `self.cur().cs.source` is `Copy`, so reading it here borrows `self` only for this
+        // `self.cur().cs.span` is `Copy`, so reading it here borrows `self` only for this
         // sub-expression — `head_tree` itself ends up borrowing `self.repo` alone (via the free
         // `old_side_tree_for`), leaving `&mut self.highlighter` free below. A method tied to
         // `&self` would instead have bound the tree's lifetime to all of `self`.
-        let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.source) else {
+        let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.span) else {
             return;
         };
         // New-side source mirrors the old side: `None` (worktree) for the uncommitted layer,
         // the changeset's `head` tree for a committed changeset. Same free-fn borrow dance as
         // `old_side_tree_for` — both trees borrow only `self.repo`, so `&mut self.highlighter`
         // stays free for `FileView::load`.
-        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.source);
+        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.span);
         let file = self.cur().diff.files[idx].clone();
         let view = FileView::load(
             &self.repo,
@@ -2478,12 +2474,12 @@ fn current_cs_index(changesets: &[ChangesetView]) -> usize {
 /// base rev (7-char short-sha), or `"HEAD"` for the uncommitted layer (worktree ↔ `HEAD`,
 /// unchanged from M2–M4).
 fn base_label_for(cs: &Changeset) -> String {
-    match cs.source {
-        ChangesetSource::Committed { base, .. } => {
+    match cs.span {
+        ChangesetSpan::Committed { base, .. } => {
             let full = base.to_string();
             full.chars().take(7).collect()
         }
-        ChangesetSource::Uncommitted => "HEAD".to_string(),
+        ChangesetSpan::Uncommitted => "HEAD".to_string(),
     }
 }
 
@@ -2629,7 +2625,7 @@ pub(crate) mod test_support {
 mod tests {
     use git2::Repository;
     use git_workon_fixture::prelude::*;
-    use workon::{Changeset, ChangesetSource};
+    use workon::{Changeset, ChangesetSpan};
 
     use super::test_support::app_from_fixture;
     use super::{
@@ -4482,8 +4478,8 @@ mod tests {
         assert_eq!(app.current_cs(), 0);
         assert_eq!(app.base_label, "HEAD");
         assert!(matches!(
-            app.current_changeset().source,
-            ChangesetSource::Uncommitted
+            app.current_changeset().span,
+            ChangesetSpan::Uncommitted
         ));
     }
 
@@ -4507,7 +4503,7 @@ mod tests {
         let repo = fixture.repo().unwrap();
         let cs = Changeset {
             name: "main".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4563,7 +4559,7 @@ mod tests {
         let repo = fixture.repo().unwrap();
         let cs = Changeset {
             name: "main".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4598,14 +4594,14 @@ mod tests {
         // Deliberately NOT current — listed first, so a naive "open index 0" would pick it.
         let not_current = Changeset {
             name: "not-current".to_string(),
-            source: ChangesetSource::Committed { base, head: base },
+            span: ChangesetSpan::Committed { base, head: base },
             title: None,
             current: false,
             needs_restack: false,
         };
         let current = Changeset {
             name: "current".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4663,7 +4659,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -4673,7 +4669,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: false,
             needs_restack: false,
@@ -4797,7 +4793,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -4807,7 +4803,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4977,14 +4973,14 @@ mod tests {
 
         let committed = Changeset {
             name: "committed".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: Some("Committed work".to_string()),
             current: false,
             needs_restack: false,
         };
         let uncommitted = Changeset {
             name: "uncommitted".to_string(),
-            source: ChangesetSource::Uncommitted,
+            span: ChangesetSpan::Uncommitted,
             title: None,
             current: true,
             needs_restack: false,
@@ -5120,7 +5116,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -5130,7 +5126,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: true,
             needs_restack: true,
@@ -5351,7 +5347,7 @@ mod tests {
 
         let cs = Changeset {
             name: "cs".to_string(),
-            source: ChangesetSource::Committed { base: root, head },
+            span: ChangesetSpan::Committed { base: root, head },
             title: None,
             current: true,
             needs_restack: false,

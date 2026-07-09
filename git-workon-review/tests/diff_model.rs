@@ -7,7 +7,7 @@
 
 use git2::{BranchType, Oid, Repository};
 use git_workon_fixture::prelude::*;
-use workon::{assemble_changesets, Changeset, ChangesetSource, StackModel};
+use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel};
 use workon_review::acquire::{diff_changeset, diff_committed, diff_uncommitted, ChangesetDiff};
 use workon_review::error::DiffError;
 use workon_review::model::{FileStatus, LineKind};
@@ -476,7 +476,7 @@ fn diff_changeset_with_bad_base_oid_fails_never_empty() -> Result<(), Box<dyn st
 
     let cs = Changeset {
         name: "bogus".to_string(),
-        source: ChangesetSource::Committed {
+        span: ChangesetSpan::Committed {
             base: Oid::ZERO_SHA1,
             head,
         },

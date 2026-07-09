@@ -2,7 +2,7 @@
 //! reviewable [`Changeset`]s for the worktree whose `HEAD` is a given branch.
 //!
 //! This is the substrate the review TUI (M2+) consumes. It stays **diff-free**: every
-//! [`Changeset`] carries resolved `git2::Oid` rev pairs (or the [`ChangesetSource::Uncommitted`]
+//! [`Changeset`] carries resolved `git2::Oid` rev pairs (or the [`ChangesetSpan::Uncommitted`]
 //! marker), never a parsed diff. Detecting uncommitted changes uses `repo.statuses`, never
 //! `repo.diff_*`.
 //!
@@ -21,7 +21,7 @@
 //!   (oldest first), one [`Changeset`] per commit.
 //!
 //! In both metadata-bearing arms, a non-empty `repo.statuses` result inserts a
-//! [`ChangesetSource::Uncommitted`] entry immediately after the current node, taking over
+//! [`ChangesetSpan::Uncommitted`] entry immediately after the current node, taking over
 //! `current`.
 
 use std::collections::HashSet;
@@ -34,7 +34,7 @@ use crate::stack::{gh_stack, graphite, StackModel};
 
 /// What a [`Changeset`] spans: a resolved commit range, or the working tree + index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangesetSource {
+pub enum ChangesetSpan {
     /// A committed range `base..head` — resolved OIDs only; the lib never diffs them itself.
     Committed { base: Oid, head: Oid },
     /// Uncommitted working-tree + index changes relative to the current branch's head.
@@ -46,12 +46,12 @@ pub enum ChangesetSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Changeset {
     /// Branch name for stack nodes; 8-hex abbreviated commit id for git-inference per-commit
-    /// changesets; the current branch name for [`ChangesetSource::Uncommitted`].
+    /// changesets; the current branch name for [`ChangesetSpan::Uncommitted`].
     pub name: String,
     /// The commit range (or uncommitted marker) this changeset covers.
-    pub source: ChangesetSource,
+    pub span: ChangesetSpan,
     /// PR title (from `.graphite_pr_info`) for Graphite nodes; commit summary for
-    /// git-inference nodes; `None` for [`ChangesetSource::Uncommitted`].
+    /// git-inference nodes; `None` for [`ChangesetSpan::Uncommitted`].
     pub title: Option<String>,
     /// Exactly one entry in the returned `Vec` is current: the Uncommitted entry when
     /// present, otherwise the current branch's node (Graphite) or tip commit (Git).
@@ -151,7 +151,7 @@ fn assemble_from_metadata(
         }
         changesets.push(Changeset {
             title: meta.pr_titles.get(&name).cloned(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: base_oid,
                 head: head_oid,
             },
@@ -282,7 +282,7 @@ fn assemble_git(repo: &Repository, head_branch: &str) -> Result<Vec<Changeset>> 
         let base = commit.parent_id(0).unwrap_or(oid);
         changesets.push(Changeset {
             name: short_id(oid),
-            source: ChangesetSource::Committed { base, head: oid },
+            span: ChangesetSpan::Committed { base, head: oid },
             title: commit.summary()?.map(str::to_string),
             current: false,
             needs_restack: false,
@@ -307,7 +307,7 @@ fn short_id(oid: Oid) -> String {
     oid.to_string()[..8].to_string()
 }
 
-/// Insert a [`ChangesetSource::Uncommitted`] entry immediately after `current_index` (or at
+/// Insert a [`ChangesetSpan::Uncommitted`] entry immediately after `current_index` (or at
 /// the end, if there is no committed current node) when `repo.statuses` reports any working
 /// tree or index changes. Demotes the previous current node's `current` flag. No-op on a
 /// clean tree.
@@ -333,7 +333,7 @@ fn insert_uncommitted_layer(
         insert_at,
         Changeset {
             name: current_branch.to_string(),
-            source: ChangesetSource::Uncommitted,
+            span: ChangesetSpan::Uncommitted,
             title: None,
             current: true,
             needs_restack: false,

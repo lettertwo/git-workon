@@ -1988,7 +1988,7 @@ mod tests {
     /// (`mid..head`, one file, `current` + `needs_restack`).
     fn two_committed_changesets_app(fixture: &Fixture) -> App {
         use git2::Repository;
-        use workon::{Changeset, ChangesetSource};
+        use workon::{Changeset, ChangesetSpan};
 
         use crate::app::ChangesetView;
 
@@ -2011,7 +2011,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -2021,7 +2021,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: true,
             needs_restack: true,
@@ -2141,7 +2141,7 @@ mod tests {
         // anything, it's a committed range. Assert the fix: the Add side renders the plain
         // (bright) pair.
         use git2::Repository;
-        use workon::{Changeset, ChangesetSource};
+        use workon::{Changeset, ChangesetSpan};
 
         use crate::app::ChangesetView;
 
@@ -2165,7 +2165,7 @@ mod tests {
 
         let cs = Changeset {
             name: "main".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -2382,7 +2382,7 @@ mod tests {
     /// deliberately flat and never produce a directory row.
     fn changeset_with_nested_paths(fixture: &Fixture) -> App {
         use git2::Repository;
-        use workon::{Changeset, ChangesetSource};
+        use workon::{Changeset, ChangesetSpan};
 
         use crate::app::ChangesetView;
 
@@ -2401,7 +2401,7 @@ mod tests {
 
         let cs = Changeset {
             name: "cs".to_string(),
-            source: ChangesetSource::Committed { base: root, head },
+            span: ChangesetSpan::Committed { base: root, head },
             title: None,
             current: true,
             needs_restack: false,
