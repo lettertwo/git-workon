@@ -140,6 +140,66 @@ pub fn diff_changeset(repo: &Repository, cs: &Changeset) -> Result<ChangesetDiff
     }
 }
 
+/// Diff every changeset in `changesets`, returning the diffs in input order.
+///
+/// The changesets are independent, and a review of a deep stack runs one [`diff_changeset`]
+/// per node (a few ms of tree diff + rename detection each) — run sequentially their sum
+/// gates the first frame at startup and every whole-stack refresh. So the work is striped
+/// across `available_parallelism` threads. git2's `Repository` is `Send` but not `Sync`, so
+/// each worker opens its own handle on the same on-disk repo instead of sharing `repo`.
+///
+/// On any failure the first-failing changeset's error (by input order) is returned, matching
+/// what the sequential loop this replaces would have surfaced.
+pub fn diff_changesets(
+    repo: &Repository,
+    changesets: &[Changeset],
+) -> Result<Vec<ChangesetDiff>, DiffError> {
+    let workers = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+        .min(changesets.len());
+    if workers <= 1 {
+        return changesets
+            .iter()
+            .map(|cs| diff_changeset(repo, cs))
+            .collect();
+    }
+
+    // Workers re-open at the workdir so the Uncommitted span's index/worktree diffs resolve
+    // against the same working tree as `repo`; the gitdir is the fallback for a bare repo
+    // (where only committed spans can occur).
+    let open_at = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+
+    let chunk = changesets.len().div_ceil(workers);
+    let mut results: Vec<Option<Result<ChangesetDiff, DiffError>>> = Vec::new();
+    results.resize_with(changesets.len(), || None);
+
+    std::thread::scope(|scope| {
+        for (cs_chunk, out_chunk) in changesets.chunks(chunk).zip(results.chunks_mut(chunk)) {
+            let open_at = &open_at;
+            scope.spawn(move || {
+                let repo = match Repository::open(open_at) {
+                    Ok(repo) => repo,
+                    Err(err) => {
+                        // Every changeset in this chunk is undiffable without a handle; the
+                        // first slot's error is the one input-order selection below reports.
+                        out_chunk[0] = Some(Err(err.into()));
+                        return;
+                    }
+                };
+                for (cs, out) in cs_chunk.iter().zip(out_chunk.iter_mut()) {
+                    *out = Some(diff_changeset(&repo, cs));
+                }
+            });
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|slot| slot.expect("every chunk fills its slots or errors its first slot"))
+        .collect()
+}
+
 /// Resolve the changeset stack the review App opens on for the worktree whose `HEAD` is
 /// `head_branch` (locked design decision M5-fork-7, "auto-detect"): the full Graphite stack
 /// when one is active, or a single synthetic [`Changeset`] spanning the uncommitted worktree

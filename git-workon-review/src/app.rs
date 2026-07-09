@@ -1068,16 +1068,18 @@ impl App {
             }
         };
 
-        let mut views = Vec::with_capacity(changesets.len());
-        for cs in changesets {
-            match crate::acquire::diff_changeset(&self.repo, &cs) {
-                Ok(diff) => views.push(ChangesetView::from_changeset_diff(cs, diff)),
-                Err(err) => {
-                    self.notify(format!("refresh failed: {err}"), Severity::Error);
-                    return;
-                }
+        let diffs = match crate::acquire::diff_changesets(&self.repo, &changesets) {
+            Ok(diffs) => diffs,
+            Err(err) => {
+                self.notify(format!("refresh failed: {err}"), Severity::Error);
+                return;
             }
-        }
+        };
+        let views: Vec<ChangesetView> = changesets
+            .into_iter()
+            .zip(diffs)
+            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+            .collect();
         // `resolve_changesets` always returns at least one changeset (a lone Uncommitted entry
         // when no stack is active), but stay defensive rather than index an empty `Vec` below.
         if views.is_empty() {
