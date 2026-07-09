@@ -52,6 +52,30 @@ pub fn next_event(timeout: Duration) -> io::Result<Option<AppEvent>> {
     })
 }
 
+/// Cap on how many events [`drain_pending`] batches per iteration — leftover input past this
+/// count is simply picked up by the next iteration's `next_event` call.
+const MAX_DRAIN_BATCH: usize = 128;
+
+/// Drain all immediately-available terminal events into `batch`, mapping them exactly like
+/// [`next_event`]'s read arm (key-press and resize map; release/repeat/mouse/paste/focus are
+/// skipped, not pushed). Unlike calling `next_event(Duration::ZERO)` in a loop, a not-ready poll
+/// here simply stops draining — it must NOT fabricate a `Tick`, since `next_event`'s `!poll` arm
+/// exists solely to give the loop its regular redraw beat on a real timeout, and reusing it here
+/// would inject a spurious tick at the end of every drain.
+fn drain_pending(batch: &mut Vec<AppEvent>) -> io::Result<()> {
+    while batch.len() < MAX_DRAIN_BATCH {
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
+        match event::read()? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => batch.push(AppEvent::Key(key)),
+            Event::Resize(w, h) => batch.push(AppEvent::Resize(w, h)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The action a mapped key requests, independent of any [`App`] — kept separate from
 /// [`map_key`]'s dispatch so the mapping itself is unit-testable without building an `App`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,6 +219,43 @@ fn apply_action(app: &mut App, action: Action) -> bool {
     false
 }
 
+/// The result of resolving a `Key` event through the non-modal cascade (see [`resolve_key`]):
+/// either the key was fully handled inline (the selection-Esc guard cancelled the selection), or
+/// it resolved to an [`Action`] still waiting to be applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyOutcome {
+    Handled,
+    Action(Action),
+}
+
+/// Resolve one `Key` event to a [`KeyOutcome`], given the caller has already ruled out the two
+/// modal cases (a pending discard confirm, the help overlay) — this is cases 3-5 of `update`'s
+/// documented Esc-precedence cascade, extracted so [`update`] and [`update_batch`] share the exact
+/// same resolution instead of duplicating it.
+///
+/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 3-5 do (the
+/// confirm/help modals deliberately do not — that stays in their own arms, not here).
+fn resolve_key(
+    app: &mut App,
+    keymap: &Keymap,
+    pending: &mut Vec<KeyPress>,
+    key: KeyEvent,
+) -> KeyOutcome {
+    if app.selection_anchor.is_some() && key.code == KeyCode::Esc && !app.outline_focused() {
+        app.clear_notice();
+        app.cancel_selection();
+        return KeyOutcome::Handled;
+    }
+    app.clear_notice();
+    KeyOutcome::Action(map_key(
+        keymap,
+        pending,
+        key,
+        app.pane_height,
+        app.outline_focused(),
+    ))
+}
+
 /// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize is a
 /// no-op — ratatui re-measures `body_area` every frame regardless. Tick drives
 /// [`App::on_tick`], the M4 index watcher's poll (see the module doc).
@@ -226,7 +287,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
 /// 5. Otherwise the normal map applies, where Esc (like `q`) quits.
 ///
 /// A `Key` event clears any showing footer notice before applying its own action (cases 3-5); the
-/// confirm and help modals (cases 1-2) deliberately do not.
+/// confirm and help modals (cases 1-2) deliberately do not. Cases 3-5 are delegated to
+/// [`resolve_key`], shared with [`update_batch`].
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
@@ -246,28 +308,132 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             }
             false
         }
-        AppEvent::Key(key)
-            if app.selection_anchor.is_some()
-                && key.code == KeyCode::Esc
-                && !app.outline_focused() =>
-        {
-            app.clear_notice();
-            app.cancel_selection();
-            false
-        }
-        AppEvent::Key(key) => {
-            app.clear_notice();
-            apply_action(
-                app,
-                map_key(keymap, pending, key, app.pane_height, app.outline_focused()),
-            )
-        }
+        AppEvent::Key(key) => match resolve_key(app, keymap, pending, key) {
+            KeyOutcome::Handled => false,
+            KeyOutcome::Action(action) => apply_action(app, action),
+        },
         AppEvent::Tick => {
             app.on_tick();
             false
         }
         AppEvent::Resize(_, _) => false,
     }
+}
+
+/// One in-flight coalesced nav run tracked by [`update_batch`]: a same-sign burst of either
+/// outline moves or diff-cursor moves, deferred until a context-changing event forces a flush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunKind {
+    OutlineMoveBy,
+    MoveCursorBy,
+}
+
+/// Apply and clear `run`, if one is open. `outline_move_by`/`move_cursor_by` both clamp at their
+/// ends, so one call with the summed delta lands exactly where the equivalent sequence of unit
+/// calls would (see [`update_batch`]'s doc comment for why this only holds for same-sign runs).
+fn flush_run(app: &mut App, run: &mut Option<(RunKind, i64)>) {
+    if let Some((kind, delta)) = run.take() {
+        match kind {
+            RunKind::OutlineMoveBy => app.outline_move_by(delta),
+            RunKind::MoveCursorBy => app.move_cursor_by(delta),
+        }
+    }
+}
+
+/// Drain-and-coalesce entry point used by the event loop (`update` stays the single-event
+/// primitive whose doc-comment cascade and tests are the spec — this delegates to it for
+/// everything that isn't a coalescable nav key).
+///
+/// Batches `events` (already drained by [`drain_pending`]) and merges same-sign runs of
+/// `Action::OutlineMoveBy`/`Action::MoveCursorBy` into ONE deferred `App` call each, so
+/// intermediate outline rows in a fast `j`/`k` burst are never opened (`render_body` only loads
+/// the landing row, at draw time, via `App::ensure_loaded`). Returns `true` when the loop should
+/// exit; remaining batched events after a quit are dropped.
+///
+/// # Why coalescing same-sign runs is safe
+///
+/// - Both `App::outline_move_by(delta)` and `App::move_cursor_by(delta)` clamp at the ends; for a
+///   same-sign run, one call with the summed delta lands exactly where N unit calls land. Mixed
+///   signs are NOT equivalent at a clamped boundary (`k` at row 0 then `j` = row 1, but summed
+///   delta 0 = row 0 — a no-op) — hence a sign change always flushes the open run first.
+/// - Applying a Move action never changes key-mapping context: it cannot toggle outline focus,
+///   alter pane height (render sets it), open a modal, or change the keymap. So resolving key N+1
+///   before applying keys 1..N's deferred run is sound. Any action that COULD change context
+///   (`ToggleOutline`, `ToggleHelp`, zoom, refresh, a modal, …) forces a flush before it is
+///   applied, preserving strict ordering.
+/// - `outline_move_by(sum)` only opens the LANDING row's file (the jump happens once, at the
+///   final position) — this is precisely what skips the intermediate loads.
+fn update_batch(
+    app: &mut App,
+    keymap: &Keymap,
+    pending: &mut Vec<KeyPress>,
+    events: Vec<AppEvent>,
+) -> bool {
+    let mut run: Option<(RunKind, i64)> = None;
+
+    for event in events {
+        match event {
+            // The coalescable path: no modal is up, and this isn't the selection-Esc-cancel
+            // guard (that guard is a context change — an "Esc cascade" — so it falls to the
+            // catch-all arm below, which flushes first and delegates the whole event to
+            // `update`). Notice-clearing still happens per key via `resolve_key`.
+            AppEvent::Key(key)
+                if app.pending_confirm.is_none()
+                    && !app.help_visible
+                    && !(app.selection_anchor.is_some()
+                        && key.code == KeyCode::Esc
+                        && !app.outline_focused()) =>
+            {
+                match resolve_key(app, keymap, pending, key) {
+                    KeyOutcome::Action(Action::OutlineMoveBy(delta)) => match &mut run {
+                        Some((RunKind::OutlineMoveBy, acc)) if acc.signum() == delta.signum() => {
+                            *acc += delta;
+                        }
+                        _ => {
+                            flush_run(app, &mut run);
+                            run = Some((RunKind::OutlineMoveBy, delta));
+                        }
+                    },
+                    KeyOutcome::Action(Action::MoveCursorBy(delta)) => match &mut run {
+                        Some((RunKind::MoveCursorBy, acc)) if acc.signum() == delta.signum() => {
+                            *acc += delta;
+                        }
+                        _ => {
+                            flush_run(app, &mut run);
+                            run = Some((RunKind::MoveCursorBy, delta));
+                        }
+                    },
+                    // Any other resolved action (Quit, ToggleHelp, chord-pending `Action::None`,
+                    // …) can change context, so flush first, then apply it directly — `resolve_key`
+                    // already did the notice-clear and keymap resolution `update` would have done
+                    // for this key, so applying here (rather than re-delegating to `update`)
+                    // avoids resolving the same key twice.
+                    KeyOutcome::Action(action) => {
+                        flush_run(app, &mut run);
+                        if apply_action(app, action) {
+                            return true;
+                        }
+                    }
+                    // The selection-Esc guard already ran inline inside `resolve_key`, but the
+                    // outer match guard above rules this arm's condition out before we ever
+                    // reach it — kept for exhaustiveness.
+                    KeyOutcome::Handled => flush_run(app, &mut run),
+                }
+            }
+            // Any other event — Tick, Resize, a modal-captured key, or the selection-Esc-cancel
+            // guard — flushes the open run first, then is handled with `update`'s existing,
+            // unmodified semantics.
+            _ => {
+                flush_run(app, &mut run);
+                if update(app, keymap, pending, event) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    flush_run(app, &mut run);
+    false
 }
 
 /// Open the controlling terminal (`/dev/tty`) for writing, falling back to stdout when there is
@@ -336,7 +502,9 @@ fn event_loop<W: Write>(
         }
 
         if let Some(event) = next_event(Duration::from_millis(200))? {
-            quit = update(app, keymap, &mut pending, event);
+            let mut batch = vec![event];
+            drain_pending(&mut batch)?;
+            quit = update_batch(app, keymap, &mut pending, batch);
         }
     }
 }
@@ -1138,5 +1306,356 @@ mod tests {
             app.help_visible,
             "the confirm arm must not have touched help_visible"
         );
+    }
+
+    // ── CS2: coalesce buffered nav input ─────────────────────────────────────
+
+    /// A single committed changeset with `n` distinct multi-line files ("f0.txt".."f{n-1}.txt"),
+    /// opened on file 0 — CS2's batching tests need several files so a coalesced outline jump has
+    /// intermediate rows to skip over, and several lines per file so a coalesced diff-cursor run
+    /// has room to move without immediately clamping.
+    fn many_files_app(fixture: &git_workon_fixture::fixture::Fixture, n: usize) -> App {
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+        use workon_review::acquire::diff_changeset;
+        use workon_review::app::ChangesetView;
+
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mut builder = fixture.commit("main");
+        for i in 0..n {
+            builder = builder.file(
+                &format!("f{i}.txt"),
+                &format!("line-{i}-a\nline-{i}-b\nline-{i}-c\nline-{i}-d\nline-{i}-e\n"),
+            );
+        }
+        let head = builder.create("head").unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: "cs".to_string(),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view =
+            ChangesetView::from_changeset_diff(cs.clone(), diff_changeset(repo, &cs).unwrap());
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        app
+    }
+
+    #[test]
+    fn batched_outline_jump_skips_intermediate_file_loads() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Role;
+        use workon_review::outline::OutlineMode;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = many_files_app(&fixture, 5);
+        app.set_outline_mode(OutlineMode::Flat);
+        app.toggle_outline(); // open + focus, cursor synced onto file 0's row (index 0 in Flat mode)
+        assert!(app.outline_focused());
+        assert!(
+            app.role_view_ref(0, Role::Combined).is_some(),
+            "file 0 loaded by open_current"
+        );
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        // 4 outline-down keys: sequentially this would visit (and load) files 1, 2, 3, then land
+        // on 4 — coalescing must apply ONE outline_move_by(4), landing on file 4 directly.
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        ];
+
+        let quit = update_batch(&mut app, &km, &mut pending, events);
+
+        assert!(!quit);
+        assert_eq!(
+            app.outline_cursor(),
+            4,
+            "the outline cursor lands on the final row"
+        );
+        assert_eq!(app.current, 4, "the diff jumps to the landing file only");
+        for skipped in 1..4 {
+            assert!(
+                app.role_view_ref(skipped, Role::Combined).is_none(),
+                "file {skipped} must never have been visited, so its view must not be loaded"
+            );
+        }
+        assert!(
+            app.role_view_ref(4, Role::Combined).is_some(),
+            "the landing file's view IS loaded"
+        );
+    }
+
+    #[test]
+    fn batched_outline_jump_matches_sequential_moves() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::outline::OutlineMode;
+
+        let fixture_batch = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app_batch = many_files_app(&fixture_batch, 5);
+        app_batch.set_outline_mode(OutlineMode::Flat);
+        app_batch.toggle_outline();
+
+        let fixture_seq = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app_seq = many_files_app(&fixture_seq, 5);
+        app_seq.set_outline_mode(OutlineMode::Flat);
+        app_seq.toggle_outline();
+
+        let km = Keymap::defaults();
+        let mut pending_batch: Vec<KeyPress> = Vec::new();
+        let mut pending_seq: Vec<KeyPress> = Vec::new();
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        ];
+
+        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
+        for event in events {
+            update(&mut app_seq, &km, &mut pending_seq, event);
+        }
+
+        assert_eq!(app_batch.outline_cursor(), app_seq.outline_cursor());
+        assert_eq!(app_batch.current, app_seq.current);
+    }
+
+    #[test]
+    fn mixed_direction_batch_matches_sequential_moves_including_at_a_clamp_boundary() {
+        use git_workon_fixture::prelude::*;
+
+        // Mixed-sign run (j,j,j,k) starting away from any boundary. Each `App` gets its OWN
+        // fixture — `many_files_app` commits onto the fixture's `main`, so reusing one fixture
+        // across calls would have the second call's "head" commit re-add files the first call's
+        // "head" already committed, producing an empty diff for it.
+        let fixture_batch = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app_batch = many_files_app(&fixture_batch, 1);
+        let fixture_seq = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app_seq = many_files_app(&fixture_seq, 1);
+        let km = Keymap::defaults();
+        let mut pending_batch: Vec<KeyPress> = Vec::new();
+        let mut pending_seq: Vec<KeyPress> = Vec::new();
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Char('k'))),
+        ];
+
+        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
+        for event in events {
+            update(&mut app_seq, &km, &mut pending_seq, event);
+        }
+        assert_eq!(app_batch.cursor, app_seq.cursor);
+
+        // Clamp-boundary case: k then j starting at row 0 — a naive sum (0) would wrongly stay
+        // put; sequential unit calls land on row 1 (k clamps at 0, then j moves to 1).
+        let fixture_batch2 = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app_batch2 = many_files_app(&fixture_batch2, 1);
+        let fixture_seq2 = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app_seq2 = many_files_app(&fixture_seq2, 1);
+        let mut pending_batch2: Vec<KeyPress> = Vec::new();
+        let mut pending_seq2: Vec<KeyPress> = Vec::new();
+        let boundary_events = vec![
+            AppEvent::Key(key(KeyCode::Char('k'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        ];
+
+        update_batch(
+            &mut app_batch2,
+            &km,
+            &mut pending_batch2,
+            boundary_events.clone(),
+        );
+        for event in boundary_events {
+            update(&mut app_seq2, &km, &mut pending_seq2, event);
+        }
+        assert_eq!(app_batch2.cursor, app_seq2.cursor);
+        assert_eq!(app_batch2.cursor, 1, "k clamps at 0, then j moves to row 1");
+    }
+
+    #[test]
+    fn a_context_changing_key_mid_run_applies_moves_in_their_own_context() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = many_files_app(&fixture, 5);
+        // Default OutlineMode::Stack: row 0 is the header, row 1 is file 0 — so `o`'s
+        // sync-to-current lands the outline cursor on row 1, and a single outline `k` afterward
+        // lands on the header row (no file jump), leaving `app.cursor`/`app.current` observable.
+        assert!(!app.outline_open());
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('j'))), // MoveCursorBy(1), outline unfocused
+            AppEvent::Key(key(KeyCode::Char('j'))), // MoveCursorBy(1), outline unfocused
+            AppEvent::Key(key(KeyCode::Char('o'))), // ToggleOutline: open + focus
+            AppEvent::Key(key(KeyCode::Char('k'))), // OutlineMoveBy(-1), outline now focused
+        ];
+
+        let quit = update_batch(&mut app, &km, &mut pending, events);
+
+        assert!(!quit);
+        assert_eq!(
+            app.cursor, 2,
+            "the two j's before `o` must apply as diff-cursor moves in the OLD context"
+        );
+        assert!(
+            app.outline_open() && app.outline_focused(),
+            "`o` toggles the outline open and focused"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            0,
+            "the k after `o` must apply as an outline move in the NEW context, landing on the \
+             header row"
+        );
+        assert_eq!(
+            app.current, 0,
+            "landing on the header row must not jump the diff"
+        );
+    }
+
+    #[test]
+    fn a_pending_confirm_disables_coalescing_and_batch_matches_sequential_updates() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app_batch = app_from_fixture(&fixture);
+        app_batch.open_current();
+        let mut app_seq = app_from_fixture(&fixture);
+        app_seq.open_current();
+
+        app_batch.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+        app_seq.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+
+        let km = Keymap::defaults();
+        let mut pending_batch: Vec<KeyPress> = Vec::new();
+        let mut pending_seq: Vec<KeyPress> = Vec::new();
+        let cursor_before = app_batch.cursor;
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('j'))), // swallowed by the confirm modal
+            AppEvent::Key(key(KeyCode::Char('n'))), // cancels the confirm
+        ];
+
+        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
+        for event in events {
+            update(&mut app_seq, &km, &mut pending_seq, event);
+        }
+
+        assert_eq!(
+            app_batch.cursor, cursor_before,
+            "a captured key inside the modal must not run its normal action"
+        );
+        assert!(app_batch.pending_confirm.is_none(), "n cancels the confirm");
+        assert_eq!(app_batch.cursor, app_seq.cursor);
+        assert_eq!(
+            app_batch.pending_confirm.is_none(),
+            app_seq.pending_confirm.is_none()
+        );
+    }
+
+    #[test]
+    fn quit_mid_batch_drops_the_remaining_events_and_returns_true() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = many_files_app(&fixture, 1);
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        let cursor_before = app.cursor;
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('j'))), // applies: cursor_before + 1
+            AppEvent::Key(key(KeyCode::Char('q'))), // quits
+            AppEvent::Key(key(KeyCode::Char('j'))), // dropped: must never apply
+        ];
+
+        let quit = update_batch(&mut app, &km, &mut pending, events);
+
+        assert!(quit, "q mid-batch must report quit");
+        assert_eq!(
+            app.cursor,
+            cursor_before + 1,
+            "only the j before q must have applied"
+        );
+    }
+
+    #[test]
+    fn a_chord_split_across_two_batches_still_fires() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = many_files_app(&fixture, 3);
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(app.current, 0);
+
+        // First batch: only the chord's first key arrives — held in `pending` across the drain
+        // boundary, exactly like a real terminal delivering the two keys in separate polls.
+        let quit1 = update_batch(
+            &mut app,
+            &km,
+            &mut pending,
+            vec![AppEvent::Key(key(KeyCode::Char(']')))],
+        );
+        assert!(!quit1);
+        assert_eq!(pending, vec![KeyPress::from_event(key(KeyCode::Char(']')))]);
+
+        // Second batch: the chord's second key completes it via the SAME `pending` buffer.
+        let quit2 = update_batch(
+            &mut app,
+            &km,
+            &mut pending,
+            vec![AppEvent::Key(key(KeyCode::Char('f')))],
+        );
+        assert!(!quit2);
+        assert!(pending.is_empty());
+        assert_eq!(app.current, 1, "]f must have fired NextFile");
     }
 }
