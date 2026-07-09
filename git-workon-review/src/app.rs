@@ -25,6 +25,7 @@ use crate::ops;
 use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
+use crate::source::{resolve_source, Source};
 use crate::stage_op::{FileStagingOp, LineSelectionOp};
 use crate::synthesis::LineSelection;
 use crate::wordiff::{word_diff_spans, Span};
@@ -737,6 +738,14 @@ pub struct App {
     /// every key as a modal (mirroring [`Self::pending_confirm`]'s capture) — see its doc comment
     /// for the precedence between the two modals.
     pub help_visible: bool,
+    /// The `git workon review [<source>]` argument the session was launched with, set via
+    /// [`Self::set_review_source`] (M7 CS2 fix). `None` means the session was launched via
+    /// no-argument auto-detect (`crate::acquire::resolve_changesets`); `Some(source)` means an
+    /// explicit ask (`stack`, `uncommitted`, and later CS3/CS4's ref/range/PR variants) that
+    /// [`Self::refresh`] must re-resolve on every refresh, NEVER downgrade to auto-detect — a
+    /// setter (rather than a constructor parameter) so `App::from_changesets`'s signature, and
+    /// every existing test building through it, stays untouched.
+    review_source: Option<Source>,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -871,6 +880,7 @@ impl App {
             refresh_coordinator,
             outline,
             help_visible: false,
+            review_source: None,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -878,6 +888,15 @@ impl App {
         // file, whenever the current changeset isn't the first in the stack.
         app.sync_outline_to_current();
         app
+    }
+
+    /// Record the `[SOURCE]` argument the review session was launched with, so
+    /// [`Self::refresh`] re-resolves that same ask instead of silently falling back to
+    /// no-argument auto-detect (M7 CS2 fix). `main.rs` calls this right after
+    /// [`Self::from_changesets`] whenever a `[SOURCE]` argument was given; a no-argument launch
+    /// never calls it, leaving [`Self::review_source`] at its `None` default.
+    pub fn set_review_source(&mut self, source: Source) {
+        self.review_source = Some(source);
     }
 
     /// The current `.git/index`'s cheap fingerprint (mtime + size), or `None` if the read fails —
@@ -996,6 +1015,14 @@ impl App {
     ///
     /// On any assembly/diff error, leaves all existing state untouched and sets an error
     /// [`Notice`] instead (via [`Self::notify`]) — a failed refresh must never blank the review.
+    ///
+    /// Dispatches on [`Self::review_source`] (M7 CS2 fix): a no-argument launch (`None`) re-runs
+    /// today's auto-detect ([`crate::acquire::resolve_changesets`]); an explicit-source launch
+    /// (`Some`) re-runs [`crate::source::resolve_source`] against THAT source, never auto-detect
+    /// — every CS2 source variant (`Stack`, `Uncommitted`) is offline, so re-resolving on every
+    /// refresh (manual `r` and the tick-driven index watcher alike) is cheap and safe. Without
+    /// this, both refresh triggers would silently swap an explicit review (e.g. `uncommitted`)
+    /// for the current `HEAD`'s auto-detected state.
     pub fn refresh(&mut self) {
         let Some(head_branch) = self
             .repo
@@ -1007,7 +1034,13 @@ impl App {
             return;
         };
 
-        let changesets = match crate::acquire::resolve_changesets(&self.repo, &head_branch) {
+        let changesets = match &self.review_source {
+            None => crate::acquire::resolve_changesets(&self.repo, &head_branch)
+                .map_err(|err| err.to_string()),
+            Some(source) => resolve_source(&self.repo, &head_branch, source.clone())
+                .map_err(|err| err.to_string()),
+        };
+        let changesets = match changesets {
             Ok(cs) => cs,
             Err(err) => {
                 self.notify(format!("refresh failed: {err}"), Severity::Error);
@@ -3589,6 +3622,61 @@ mod tests {
 
         assert_eq!(app.layout, Layout::Inline, "refresh must not reset layout");
         assert_eq!(app.zoom, Zoom::Combined, "refresh must not reset zoom");
+    }
+
+    /// M7 CS2 fix: a session launched with an explicit `[SOURCE]` argument must have `refresh`
+    /// re-resolve THAT source, never silently downgrade to no-argument auto-detect. A Graphite
+    /// stack is active (`assemble_changesets` would return the whole `a`/`b` stack for
+    /// auto-detect), but the session was launched with `uncommitted` — so both the manual `r`
+    /// key and the tick-driven index watcher must keep showing only the single uncommitted
+    /// changeset, not swap in the full stack.
+    #[test]
+    fn refresh_re_resolves_the_launched_source_instead_of_auto_detecting() {
+        use crate::source::Source;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .branch_metadata("b", "a")
+            .untracked_file("scratch.txt", "hi\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        // `App::refresh` re-derives the branch from the repo's ACTUAL `HEAD`, not from a name
+        // handed to `resolve_source` — so the fixture's checkout must really be on "b" for
+        // auto-detect (were the fix absent) to see the `a`/`b` stack, not `main`.
+        repo.set_head("refs/heads/b").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let source = Source::Uncommitted;
+        let changesets =
+            crate::source::resolve_source(repo, "b", source.clone()).expect("resolve_source");
+        assert_eq!(
+            changesets.len(),
+            1,
+            "uncommitted keyword always resolves to exactly one changeset"
+        );
+        let mut views = Vec::with_capacity(changesets.len());
+        for cs in changesets {
+            let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+            views.push(ChangesetView::from_changeset_diff(cs, diff));
+        }
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.set_review_source(source);
+        app.open_current();
+
+        app.refresh();
+
+        assert_eq!(
+            app.changeset_count(),
+            1,
+            "refresh must keep reviewing only the uncommitted changeset, not the full \
+             Graphite stack auto-detect would find"
+        );
+        assert_eq!(app.cur().cs.span, ChangesetSpan::Uncommitted);
     }
 
     // ---- M4 index watcher (`on_tick`) -------------------------------------------------------
