@@ -1,6 +1,7 @@
 mod tui;
 
 use clap::{CommandFactory, Parser};
+use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use git2::Repository;
 use miette::{IntoDiagnostic, Result};
@@ -8,7 +9,7 @@ use workon_review::acquire::{diff_changeset, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::{self, ReviewConfig};
 use workon_review::keymap::Keymap;
-use workon_review::source::{resolve_source, Source};
+use workon_review::source::{complete_source, resolve_source, Source};
 use workon_review::terminal_query;
 use workon_review::theme::Palette;
 
@@ -17,8 +18,8 @@ use workon_review::theme::Palette;
 #[clap(about, author, bin_name = env!("CARGO_PKG_NAME"), version)]
 struct Cli {
     /// What to review: stack, uncommitted, a ref (branch/tag/commit), a..b / a...b range, or
-    /// (CS4) a PR reference
-    #[arg(value_name = "SOURCE")]
+    /// a PR reference
+    #[arg(value_name = "SOURCE", add = ArgValueCompleter::new(complete_source))]
     source: Option<String>,
 }
 

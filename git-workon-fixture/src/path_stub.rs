@@ -66,6 +66,16 @@ impl PathStub {
         self.dir.path().join(format!("{name}.invocations.log"))
     }
 
+    /// Symlink a real executable (e.g. another workspace binary's `CARGO_BIN_EXE_*` path) into
+    /// the stub directory as `git-workon-<name>`, so a test can drive genuine external-binary
+    /// behavior (not just canned `arg:`/`cwd:` stub output) through the same PATH-dispatch or
+    /// PATH-completion surface `command` exercises.
+    pub fn command_exe(self, name: &str, exe: &std::path::Path) -> Result<Self> {
+        let path = self.dir.path().join(format!("git-workon-{name}"));
+        symlink_exe(exe, &path)?;
+        Ok(self)
+    }
+
     /// `PATH` value with the stub directory prepended to the current process's `PATH`, so a
     /// stub shadows nothing else already on `PATH` unless intended (see built-in precedence).
     pub fn path(&self) -> String {
@@ -103,5 +113,17 @@ fn set_executable(path: &PathBuf) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_executable(_path: &PathBuf) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn symlink_exe(exe: &std::path::Path, link: &std::path::Path) -> Result<()> {
+    std::os::unix::fs::symlink(exe, link)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn symlink_exe(exe: &std::path::Path, link: &std::path::Path) -> Result<()> {
+    std::fs::copy(exe, link)?;
     Ok(())
 }

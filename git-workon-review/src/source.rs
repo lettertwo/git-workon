@@ -12,6 +12,9 @@
 //! resolution too (`check_gh_available` → `fetch_pr_metadata` → fork-aware fetch → one
 //! committed changeset).
 
+use std::ffi::OsStr;
+
+use clap_complete::engine::CompletionCandidate;
 use git2::{BranchType, Oid, Repository};
 use workon::{
     assemble_changesets, get_default_branch, graphite_trunk, ChangesetError, ChangesetSpan,
@@ -450,6 +453,84 @@ fn trunk_commit_oid(repo: &Repository) -> Option<Oid> {
     revparse_to_commit(repo, &name)
 }
 
+/// Dynamic `[SOURCE]` completion candidates (ADR-036 "Completion" section, CS5): the `stack` /
+/// `uncommitted` keywords, plus local branch and tag names via offline git2 ref enumeration —
+/// never a PR number (network stays out of the TAB hot path). When `current` contains `..` or
+/// `...`, only the right-hand side is a ref candidate; each is emitted prefixed with the
+/// left-hand text (dots included) so the shell's own prefix filtering keeps working on the full
+/// word (e.g. typing `main..fe<TAB>` offers `main..feature-x`, not just `feature-x`).
+///
+/// Failure-safe by construction: [`Repository::discover`] failing (not a repo, or any other git
+/// error) simply skips the ref arms below, leaving keyword candidates — this must never panic or
+/// surface an error into the completion path (a broken `TAB` is worse than an incomplete one).
+pub fn complete_source(current: &OsStr) -> Vec<CompletionCandidate> {
+    let Some(current) = current.to_str() else {
+        return Vec::new();
+    };
+
+    let (prefix, ref_prefix) = split_range_rhs(current);
+    let mut candidates = Vec::new();
+
+    // Keywords only make sense as the bare word itself — never after a `..`/`...` split.
+    if prefix.is_empty() {
+        for (keyword, help) in [
+            ("stack", "Review the whole Graphite/git-inferred stack"),
+            ("uncommitted", "Review only uncommitted changes"),
+        ] {
+            if keyword.starts_with(ref_prefix) {
+                candidates.push(CompletionCandidate::new(keyword).help(Some(help.into())));
+            }
+        }
+    }
+
+    if let Ok(repo) = Repository::discover(".") {
+        for name in local_branch_and_tag_names(&repo) {
+            if name.starts_with(ref_prefix) {
+                candidates.push(CompletionCandidate::new(format!("{prefix}{name}")));
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Split `text` on its last dot-range separator (`...` checked before `..`, matching
+/// [`Source::classify`]'s precedence): `(left-including-dots, right-hand-partial)`. No dots at
+/// all yields `("", text)` — the whole word is the partial being completed.
+fn split_range_rhs(text: &str) -> (&str, &str) {
+    if let Some(idx) = text.find("...") {
+        (&text[..idx + 3], &text[idx + 3..])
+    } else if let Some(idx) = text.find("..") {
+        (&text[..idx + 2], &text[idx + 2..])
+    } else {
+        ("", text)
+    }
+}
+
+/// Local branch and tag names, offline (no network, no remote enumeration) — any git2 error
+/// along the way degrades to whatever was already collected rather than propagating.
+fn local_branch_and_tag_names(repo: &Repository) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Ok(branches) = repo.branches(Some(BranchType::Local)) {
+        for (branch, _) in branches.filter_map(Result::ok) {
+            if let Ok(Some(name)) = branch.name() {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    if let Ok(tags) = repo.tag_names(None) {
+        names.extend(
+            tags.iter()
+                .filter_map(|t| t.ok().flatten())
+                .map(str::to_string),
+        );
+    }
+
+    names
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +692,25 @@ mod tests {
                 dots: RangeDots::Two,
             }
         );
+    }
+
+    // ── CS5: SOURCE completion — `split_range_rhs` (the pure half of `complete_source`) ─────
+
+    #[test]
+    fn split_range_rhs_no_dots_is_whole_word() {
+        assert_eq!(split_range_rhs("main"), ("", "main"));
+        assert_eq!(split_range_rhs(""), ("", ""));
+    }
+
+    #[test]
+    fn split_range_rhs_two_dot_splits_after_dots() {
+        assert_eq!(split_range_rhs("main..fe"), ("main..", "fe"));
+        assert_eq!(split_range_rhs("main.."), ("main..", ""));
+    }
+
+    #[test]
+    fn split_range_rhs_three_dot_wins_over_two_dot() {
+        assert_eq!(split_range_rhs("main...fe"), ("main...", "fe"));
     }
 
     // ── CS4: PR metadata → changeset mapping (the gh-free half of `resolve_pr`) ─────────────

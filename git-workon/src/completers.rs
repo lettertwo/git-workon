@@ -1,8 +1,8 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use clap::builder::StyledStr;
-use clap::Command;
+use clap::{Command, CommandFactory};
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use workon::WorktreeDescriptor;
 
@@ -91,6 +91,99 @@ fn augment_external_subcommands(cmd: Command) -> Command {
             let name: &'static str = String::leak(name);
             cmd.subcommand(Command::new(name).about("External git-workon subcommand"))
         })
+}
+
+/// Sub-delegate `git-workon <ext> <words...><TAB>` completion to `git-workon-<ext>`'s own
+/// `COMPLETE=<shell>` responder — the M6 CS3-deferred seam, wired here per ADR-036 CS5.
+///
+/// `augment_external_subcommands` (above) only adds a bare stub `Command` for each PATH-discovered
+/// external, with no argument definitions of its own — clap_complete's engine has no notion that
+/// the stub actually stands in for a whole other program, so anything typed after the external's
+/// name would otherwise complete against nothing (verified manually: `git workon review <TAB>`
+/// offered only global flags before this). This function runs *before* `CompleteEnv`'s own
+/// dispatch in `main`, so it can intercept that case and hand off instead.
+///
+/// It re-derives the shell's word list and completion index the same way `clap_complete`'s own
+/// bash/elvish adapters do (`_CLAP_COMPLETE_INDEX`; zsh/fish don't set that var and always mean
+/// "the last word", so that's the fallback). If the first non-flag word after the program name
+/// resolves to a `git-workon-<name>` executable on `$PATH` (and isn't a known built-in — a
+/// built-in's own `Cli` already completes itself) *and* the word actually being completed sits
+/// after it, this re-invokes that executable under the identical protocol: the leading
+/// `<program-name> <ext>` words collapse into one placeholder word (`git-workon-<ext>`, mirroring
+/// how the external is invoked for real by `dispatch::try_dispatch`) and the completion index
+/// shifts down by however many leading words were collapsed away. The external's stdout — already
+/// shell-formatted by its own `CompleteEnv` responder — is copied through verbatim, and this
+/// process exits with the external's exit code.
+///
+/// A no-op (returns without printing or exiting) whenever `COMPLETE` isn't set, there's no word
+/// after the program name, the completing index lands on the subcommand slot itself (that's
+/// still a top-level candidate list, not a delegation target), the leading word is a known
+/// built-in, or nothing matching is found on `$PATH` — every one of those falls through to
+/// `CompleteEnv`'s normal dispatch in `main`.
+pub fn try_delegate_external_completion() {
+    let Some(shell) = std::env::var_os("COMPLETE") else {
+        return;
+    };
+    if shell.is_empty() || shell == "0" {
+        return;
+    }
+
+    let args: Vec<OsString> = std::env::args_os().collect();
+    let Some(dash_dash) = args.iter().position(|a| a == "--") else {
+        return;
+    };
+    let words = &args[dash_dash + 1..];
+    if words.len() < 2 {
+        return; // nothing after the program-name word to delegate
+    }
+
+    // Mirrors clap_complete's own env adapters: bash/elvish read `_CLAP_COMPLETE_INDEX`; zsh/fish
+    // always treat the last word as the one being completed.
+    let index = std::env::var("_CLAP_COMPLETE_INDEX")
+        .ok()
+        .and_then(|i| i.parse::<usize>().ok())
+        .unwrap_or(words.len() - 1);
+
+    // The first non-flag word after the program name (index 0) is the subcommand candidate.
+    let Some(subcmd_pos) = words[1..]
+        .iter()
+        .position(|w| !w.to_str().is_some_and(|s| s.starts_with('-')))
+        .map(|i| i + 1)
+    else {
+        return;
+    };
+    if index <= subcmd_pos {
+        return; // completing the subcommand slot itself, not a word after it
+    }
+
+    let Some(name) = words[subcmd_pos].to_str() else {
+        return;
+    };
+    let known = crate::dispatch::known_subcommands(&crate::cli::Cli::command());
+    if known.contains(name) {
+        return; // a built-in owns this name; its own Cli completes it
+    }
+    let Some(exe) = crate::dispatch::find_external(name) else {
+        return; // no matching external on PATH
+    };
+
+    let mut delegated_words: Vec<OsString> = vec![OsString::from(format!("git-workon-{name}"))];
+    delegated_words.extend(words[subcmd_pos + 1..].iter().cloned());
+    let delegated_index = index - subcmd_pos;
+
+    let output = std::process::Command::new(&exe)
+        .env("COMPLETE", &shell)
+        .env("_CLAP_COMPLETE_INDEX", delegated_index.to_string())
+        .arg("--")
+        .args(&delegated_words)
+        .output();
+
+    let Ok(output) = output else {
+        std::process::exit(0); // fail closed: no candidates rather than a broken TAB
+    };
+    use std::io::Write as _;
+    let _ = std::io::stdout().write_all(&output.stdout);
+    std::process::exit(output.status.code().unwrap_or(0));
 }
 
 pub fn augment(cmd: Command) -> Command {
