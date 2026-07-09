@@ -28,6 +28,11 @@ pub enum ReviewError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Apply(#[from] ApplyError),
+
+    /// A `git workon review <source>` argument failed to resolve to changesets
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Source(#[from] SourceError),
 }
 
 /// Errors building a [`crate::model::DiffModel`] from git2 structures, or acquiring one for a
@@ -117,4 +122,41 @@ pub enum ApplyError {
         #[source]
         source: std::io::Error,
     },
+}
+
+/// Errors resolving a `git workon review <source>` positional argument to changesets
+/// (ADR-036: the classifier/resolver seam is [`crate::source::Source`]).
+#[derive(Error, Diagnostic, Debug)]
+pub enum SourceError {
+    /// The `stack` keyword found no Graphite metadata and `branch` has no upstream to infer a
+    /// git-only stack from. An explicit ask deserves an explicit failure — never a silent
+    /// fall-through to the uncommitted layer (ADR-036).
+    #[error("branch '{branch}' has no Graphite stack and no upstream to infer one from")]
+    #[diagnostic(
+        code(workon::review::stack_no_upstream),
+        help(
+            "set an upstream (git branch --set-upstream-to=<remote>/{branch}), \
+             or run 'git workon review uncommitted'"
+        )
+    )]
+    NoUpstream { branch: String },
+
+    /// Assembling the requested stack failed for a reason other than a missing upstream
+    /// (broken Graphite metadata, an unresolvable branch, a bad recorded parent revision).
+    #[error("failed to assemble the stack for '{branch}'")]
+    #[diagnostic(code(workon::review::stack_resolution_failed))]
+    StackResolutionFailed {
+        branch: String,
+        #[source]
+        source: workon::WorkonError,
+    },
+
+    /// A `<ref>` argument doesn't resolve to anything reviewable yet — real ref/range/PR
+    /// resolution lands in a later changeset (ADR-036); this is CS2's honest interim failure.
+    #[error("cannot resolve '{text}' as a review source")]
+    #[diagnostic(
+        code(workon::review::unresolvable_source),
+        help("try 'stack' or 'uncommitted' — refs, ranges, and PRs are not yet supported")
+    )]
+    UnresolvableSource { text: String },
 }

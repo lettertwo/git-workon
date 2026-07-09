@@ -6,7 +6,7 @@
 //! git2 diffs and then a [`DiffModel`].
 
 use git2::{DiffFindOptions, DiffOptions, Oid, Repository};
-use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel};
+use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel, UncommittedLayer};
 
 use crate::error::DiffError;
 use crate::model::DiffModel;
@@ -134,16 +134,27 @@ pub fn resolve_changesets(
     head_branch: &str,
 ) -> Result<Vec<Changeset>, DiffError> {
     match StackModel::detect(repo) {
-        model @ (StackModel::Graphite | StackModel::GhStack) => {
-            Ok(assemble_changesets(repo, head_branch, model)?)
-        }
-        StackModel::None | StackModel::Git => Ok(vec![Changeset {
-            name: head_branch.to_string(),
-            span: ChangesetSpan::Uncommitted,
-            title: None,
-            current: true,
-            needs_restack: false,
-        }]),
+        model @ (StackModel::Graphite | StackModel::GhStack) => Ok(assemble_changesets(
+            repo,
+            head_branch,
+            model,
+            UncommittedLayer::Include,
+        )?),
+        StackModel::None | StackModel::Git => Ok(vec![uncommitted_changeset(head_branch)]),
+    }
+}
+
+/// The single synthetic [`ChangesetSpan::Uncommitted`] changeset for `head_branch` — always
+/// `current`, no title, no restack question. Shared by [`resolve_changesets`]'s non-Graphite
+/// fallback arm and the review binary's `uncommitted` keyword (`crate::source`), both of which
+/// mean the same thing: "just diff the worktree."
+pub fn uncommitted_changeset(head_branch: &str) -> Changeset {
+    Changeset {
+        name: head_branch.to_string(),
+        span: ChangesetSpan::Uncommitted,
+        title: None,
+        current: true,
+        needs_restack: false,
     }
 }
 

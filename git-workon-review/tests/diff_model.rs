@@ -7,7 +7,7 @@
 
 use git2::{BranchType, Oid, Repository};
 use git_workon_fixture::prelude::*;
-use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel};
+use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel, UncommittedLayer};
 use workon_review::acquire::{diff_changeset, diff_committed, diff_uncommitted, ChangesetDiff};
 use workon_review::error::DiffError;
 use workon_review::model::{FileStatus, LineKind};
@@ -450,7 +450,8 @@ fn diff_changeset_over_real_graphite_stack() -> Result<(), Box<dyn std::error::E
     let a_head = commit_onto(repo, &main_commit, "feature.txt", "hello\n");
     fixture.update_branch("a", a_head)?;
 
-    let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "a", StackModel::Graphite, UncommittedLayer::Include)?;
     let a_cs = changesets
         .iter()
         .find(|c| c.name == "a")

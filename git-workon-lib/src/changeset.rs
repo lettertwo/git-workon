@@ -22,7 +22,11 @@
 //!
 //! In both metadata-bearing arms, a non-empty `repo.statuses` result inserts a
 //! [`ChangesetSpan::Uncommitted`] entry immediately after the current node, taking over
-//! `current`.
+//! `current` — but only when the caller passes [`UncommittedLayer::Include`]. The layer
+//! belongs only when the thing under review is where the working tree actually is; a caller
+//! resolving a source that isn't real `HEAD` (a range, a commit, a PR, a tracked branch you're
+//! not standing on) passes [`UncommittedLayer::Omit`] instead. See [`UncommittedLayer`]'s own
+//! doc for the full rationale.
 
 use std::collections::HashSet;
 
@@ -61,27 +65,52 @@ pub struct Changeset {
     pub needs_restack: bool,
 }
 
+/// Whether [`assemble_changesets`] should insert the synthetic [`ChangesetSpan::Uncommitted`]
+/// layer when the worktree has a dirty tree (see [`insert_uncommitted_layer`]).
+///
+/// ADR-036: the layer only belongs when the thing under review is where the working tree
+/// actually is (`stack`, or a `<ref>` that is the current `HEAD` branch) — every other source
+/// (a range, a commit, a PR, an untracked branch, a tracked branch you're not standing on) is
+/// committed-only, since uncommitted changes diff against `HEAD` and would otherwise attach to
+/// a branch they don't belong to. An explicit parameter, not a post-filter: a post-filter would
+/// also have to repair whichever node's `current` flag the inserted layer took over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UncommittedLayer {
+    /// Insert the layer when the tree is dirty (today's behavior).
+    Include,
+    /// Never insert the layer, regardless of tree state.
+    Omit,
+}
+
 /// Assemble the ordered (base → head) changesets for the worktree whose `HEAD` is
 /// `head_branch`, under the given [`StackModel`].
 ///
 /// See the module docs for the per-model walk semantics. Errors distinguish a genuinely
 /// broken reference or stack-metadata snapshot (bad ref, unresolvable recorded revision, no
 /// upstream) from a valid empty result (`Ok(vec![])`, e.g. a trunk-only worktree under `Git`
-/// with a clean tree).
+/// with a clean tree). `uncommitted` controls whether a dirty tree gets the synthetic
+/// [`ChangesetSpan::Uncommitted`] layer at all — see [`UncommittedLayer`].
 pub fn assemble_changesets(
     repo: &Repository,
     head_branch: &str,
     model: StackModel,
+    uncommitted: UncommittedLayer,
 ) -> Result<Vec<Changeset>> {
     match model {
         StackModel::None => Ok(vec![]),
-        StackModel::Git => assemble_git(repo, head_branch),
-        StackModel::Graphite => {
-            assemble_from_metadata(repo, head_branch, &graphite::read_metadata(repo)?)
-        }
-        StackModel::GhStack => {
-            assemble_from_metadata(repo, head_branch, &gh_stack::read_metadata(repo)?)
-        }
+        StackModel::Git => assemble_git(repo, head_branch, uncommitted),
+        StackModel::Graphite => assemble_from_metadata(
+            repo,
+            head_branch,
+            &graphite::read_metadata(repo)?,
+            uncommitted,
+        ),
+        StackModel::GhStack => assemble_from_metadata(
+            repo,
+            head_branch,
+            &gh_stack::read_metadata(repo)?,
+            uncommitted,
+        ),
     }
 }
 
@@ -91,12 +120,13 @@ fn assemble_from_metadata(
     repo: &Repository,
     head_branch: &str,
     meta: &StackMetadata,
+    uncommitted: UncommittedLayer,
 ) -> Result<Vec<Changeset>> {
     let trunks: HashSet<String> = meta.trunks.iter().cloned().collect();
 
     // Trunk or untracked head_branch: no stack metadata to walk, fall back to git-inference.
     if trunks.contains(head_branch) || !meta.parents.contains_key(head_branch) {
-        return assemble_git(repo, head_branch);
+        return assemble_git(repo, head_branch, uncommitted);
     }
 
     // head_branch is tracked but its own branch ref is gone: a genuinely broken state, distinct
@@ -161,7 +191,9 @@ fn assemble_from_metadata(
         });
     }
 
-    insert_uncommitted_layer(repo, head_branch, current_index, &mut changesets)?;
+    if uncommitted == UncommittedLayer::Include {
+        insert_uncommitted_layer(repo, head_branch, current_index, &mut changesets)?;
+    }
 
     Ok(changesets)
 }
@@ -246,7 +278,11 @@ fn resolve_live_ancestor_tip(repo: &Repository, meta: &StackMetadata, start: &st
 
 /// Git-inference assembly: one [`Changeset`] per commit in `upstream(head_branch)..head_branch`,
 /// oldest first.
-fn assemble_git(repo: &Repository, head_branch: &str) -> Result<Vec<Changeset>> {
+fn assemble_git(
+    repo: &Repository,
+    head_branch: &str,
+    uncommitted: UncommittedLayer,
+) -> Result<Vec<Changeset>> {
     let branch = repo.find_branch(head_branch, BranchType::Local)?;
     let upstream = branch.upstream().map_err(|_| ChangesetError::NoUpstream {
         branch: head_branch.to_string(),
@@ -297,7 +333,9 @@ fn assemble_git(repo: &Repository, head_branch: &str) -> Result<Vec<Changeset>> 
         Some(last)
     };
 
-    insert_uncommitted_layer(repo, head_branch, current_index, &mut changesets)?;
+    if uncommitted == UncommittedLayer::Include {
+        insert_uncommitted_layer(repo, head_branch, current_index, &mut changesets)?;
+    }
 
     Ok(changesets)
 }

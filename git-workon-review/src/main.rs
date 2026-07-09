@@ -8,13 +8,18 @@ use workon_review::acquire::{diff_changeset, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::{self, ReviewConfig};
 use workon_review::keymap::Keymap;
+use workon_review::source::{resolve_source, Source};
 use workon_review::terminal_query;
 use workon_review::theme::Palette;
 
 /// A TUI for reviewing changesets
 #[derive(Debug, Parser)]
 #[clap(about, author, bin_name = env!("CARGO_PKG_NAME"), version)]
-struct Cli {}
+struct Cli {
+    /// What to review: stack, uncommitted, or (later CSes) a ref/range/PR
+    #[arg(value_name = "SOURCE")]
+    source: Option<String>,
+}
 
 fn main() -> Result<()> {
     // Respond to the `COMPLETE=<shell>` dynamic-completion protocol before anything else — mirrors
@@ -22,7 +27,7 @@ fn main() -> Result<()> {
     // what lets git-workon delegate `git workon review <TAB>` completion here (M6 CS3).
     CompleteEnv::with_factory(Cli::command).complete();
 
-    Cli::parse();
+    let cli = Cli::parse();
 
     let repo = Repository::discover(".").into_diagnostic()?;
     let branch = repo
@@ -32,10 +37,17 @@ fn main() -> Result<()> {
         .into_diagnostic()?
         .to_string();
 
-    // `resolve_changesets` is the M5 entry point (locked decision #7, auto-detect): the full
-    // Graphite stack when one is active, or a single synthetic uncommitted changeset otherwise
-    // — the latter keeps a non-Graphite repo byte-identical to M2–M4's `diff_uncommitted` path.
-    let changesets = resolve_changesets(&repo, &branch).into_diagnostic()?;
+    // No `[SOURCE]` argument: the M5 auto-detect entry point (locked decision #7), unchanged —
+    // the full Graphite stack when one is active, or a single synthetic uncommitted changeset
+    // otherwise (keeps a non-Graphite repo byte-identical to M2–M4's `diff_uncommitted` path).
+    // A `[SOURCE]` argument routes through the ADR-036 classifier/resolver instead (M7 CS2).
+    let changesets = match cli.source {
+        None => resolve_changesets(&repo, &branch).into_diagnostic()?,
+        Some(text) => {
+            let source = Source::classify(&text);
+            resolve_source(&repo, &branch, source).into_diagnostic()?
+        }
+    };
 
     let mut views = Vec::with_capacity(changesets.len());
     for cs in changesets {
