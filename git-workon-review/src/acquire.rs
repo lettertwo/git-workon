@@ -91,6 +91,21 @@ pub fn diff_committed(repo: &Repository, base: Oid, head: Oid) -> Result<DiffMod
     DiffModel::from_git2(&diff)
 }
 
+/// Diff the empty tree against `head`'s tree, for a [`ChangesetSpan::CommittedRoot`] changeset
+/// (a root commit reviewed on its own — every file in `head` renders as added). `git2` treats
+/// `None` as the empty tree on either side of [`Repository::diff_tree_to_tree`], so no tree
+/// object needs to be synthesized.
+pub fn diff_committed_root(repo: &Repository, head: Oid) -> Result<DiffModel, DiffError> {
+    let head_tree = repo.find_commit(head)?.tree()?;
+
+    let mut opts = DiffOptions::new();
+    opts.context_lines(3);
+    let mut diff = repo.diff_tree_to_tree(None, Some(&head_tree), Some(&mut opts))?;
+    diff.find_similar(None)?;
+
+    DiffModel::from_git2(&diff)
+}
+
 /// The diff for one [`Changeset`], shaped by its [`ChangesetSpan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChangesetDiff {
@@ -107,6 +122,9 @@ pub enum ChangesetDiff {
 pub fn diff_changeset(repo: &Repository, cs: &Changeset) -> Result<ChangesetDiff, DiffError> {
     match cs.span {
         ChangesetSpan::Committed { base, head } => diff_committed(repo, base, head)
+            .map(ChangesetDiff::Committed)
+            .map_err(|err| changeset_diff_failed(&cs.name, err)),
+        ChangesetSpan::CommittedRoot { head } => diff_committed_root(repo, head)
             .map(ChangesetDiff::Committed)
             .map_err(|err| changeset_diff_failed(&cs.name, err)),
         ChangesetSpan::Uncommitted => diff_uncommitted(repo)

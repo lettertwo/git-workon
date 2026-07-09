@@ -38,6 +38,11 @@ use crate::stack::{graphite, StackModel};
 pub enum ChangesetSpan {
     /// A committed range `base..head` — resolved OIDs only; the lib never diffs them itself.
     Committed { base: Oid, head: Oid },
+    /// A committed range whose base is the empty tree: a root commit (no parent) reviewed on
+    /// its own, so every file in `head` renders as added. Only the review crate's `<ref>`
+    /// bare-commit-ish dispatch (ADR-030) constructs this — `assemble_graphite`/`assemble_git`
+    /// never do, since a stack node's base is always a real (or merge-base-derived) commit.
+    CommittedRoot { head: Oid },
     /// Uncommitted working-tree + index changes relative to the current branch's head.
     Uncommitted,
 }

@@ -151,12 +151,25 @@ pub enum SourceError {
         source: workon::WorkonError,
     },
 
-    /// A `<ref>` argument doesn't resolve to anything reviewable yet — real ref/range/PR
-    /// resolution lands in a later changeset (ADR-030); this is CS2's honest interim failure.
+    /// A `<ref>` argument (or one side of a `Range`) doesn't rev-parse to anything reviewable —
+    /// a typo, a deleted branch, a garbage commit-ish. PR resolution lands in CS4; until then a
+    /// PR-shaped argument falls through to this same honest failure.
     #[error("cannot resolve '{text}' as a review source")]
     #[diagnostic(
         code(workon::review::unresolvable_source),
-        help("try 'stack' or 'uncommitted' — refs, ranges, and PRs are not yet supported")
+        help("try 'stack', 'uncommitted', a branch/tag/commit, or a..b / a...b range — PRs are not yet supported")
     )]
     UnresolvableSource { text: String },
+
+    /// An untracked (or remote-tracking) `<ref>` branch has neither an upstream nor a resolvable
+    /// trunk to compute "what this branch adds" from.
+    #[error("branch '{branch}' has no upstream and no trunk to compute a base from")]
+    #[diagnostic(
+        code(workon::review::no_base_for_branch),
+        help(
+            "set an upstream (git branch --set-upstream-to=<remote>/{branch}), \
+             or ensure a trunk branch (main/master) exists"
+        )
+    )]
+    NoBaseForBranch { branch: String },
 }
