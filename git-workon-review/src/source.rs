@@ -6,13 +6,16 @@
 //! ([`resolve_source`]) is where repo state comes in.
 //!
 //! CS3 wires real `<ref>` dispatch (shape-aware: Graphite-tracked branch, other branch,
-//! bare commit-ish) and `Range` (`a..b` / `a...b`, git-diff semantics). `Pr` still lands with
-//! its own changeset — no dead arm here yet (CS4).
+//! bare commit-ish) and `Range` (`a..b` / `a...b`, git-diff semantics). CS4 wires `Pr`: any
+//! form git-workon-lib's `parse_pr_reference` accepts (`pr-123`, `#123`, `pr#123`, GitHub URLs;
+//! a bare number never matches — that spelling stays a `Ref`), reused end-to-end for
+//! resolution too (`check_gh_available` → `fetch_pr_metadata` → fork-aware fetch → one
+//! committed changeset).
 
 use git2::{BranchType, Oid, Repository};
 use workon::{
     assemble_changesets, get_default_branch, graphite_trunk, ChangesetError, ChangesetSpan,
-    StackModel, UncommittedLayer, WorkonError,
+    PrMetadata, StackModel, UncommittedLayer, WorkonError,
 };
 
 use crate::acquire::uncommitted_changeset;
@@ -33,6 +36,10 @@ pub enum RangeDots {
 /// auto-detect path in `main.rs` and never constructs a `Source` at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
+    /// A PR reference (`pr-123`, `#123`, `pr#123`, a GitHub PR URL — any form
+    /// `workon::parse_pr_reference` accepts). Carries the source text as typed, for the
+    /// changeset name; the PR number is re-derived from it at resolution time.
+    Pr(String),
     /// The exact bare word `stack`.
     Stack,
     /// The exact bare word `uncommitted`.
@@ -49,12 +56,18 @@ pub enum Source {
 }
 
 impl Source {
-    /// Classify `text` per ADR-030's precedence: exact bare keyword, else a range (three-dot
-    /// checked before two-dot, since `...` contains `..`), else `Ref`. Keywords are checked
-    /// first — they're exact-bare and contain no dots, so the order between "keyword" and
-    /// "range" never actually competes, but reading top-to-bottom matches the ADR's precedence
-    /// list.
+    /// Classify `text` per ADR-030's precedence: PR reference first (checked via
+    /// `workon::parse_pr_reference`, pure string parsing — no network, no repo access), then
+    /// exact bare keyword, else a range (three-dot checked before two-dot, since `...` contains
+    /// `..`), else `Ref`. A malformed near-PR spelling (`pr-`, `pr-abc`) is `Ok(Err(_))` from the
+    /// lib parser, not `Ok(Some(_))` — it falls through to the normal precedence chain rather
+    /// than being force-classified as a broken PR, so it ultimately resolves (or fails) as a
+    /// `Ref` like any other typo. A bare number (`123`) never matches any of the lib parser's
+    /// accepted spellings, so it also falls through to `Ref` — no separate digit guard needed.
     pub fn classify(text: &str) -> Source {
+        if let Ok(Some(_)) = workon::parse_pr_reference(text) {
+            return Source::Pr(text.to_string());
+        }
         match text {
             "stack" => return Source::Stack,
             "uncommitted" => return Source::Uncommitted,
@@ -91,6 +104,7 @@ pub fn resolve_source(
     source: Source,
 ) -> Result<Vec<workon::Changeset>, SourceError> {
     match source {
+        Source::Pr(text) => resolve_pr(repo, text),
         Source::Stack => resolve_stack(repo, head_branch),
         Source::Uncommitted => Ok(vec![uncommitted_changeset(head_branch)]),
         Source::Range {
@@ -100,6 +114,110 @@ pub fn resolve_source(
         } => resolve_range(repo, &base_text, &head_text, dots),
         Source::Ref(text) => resolve_ref(repo, head_branch, text),
     }
+}
+
+/// `Pr` resolution (ADR-030): reuse git-workon-lib's `pr.rs` PR workflow end-to-end, minus the
+/// worktree-creation step — review only needs the PR's base and head fetched locally so their
+/// merge-base span can be computed, never a branch or worktree. Every failure here is a named,
+/// hinted pre-TUI error. The network round-trip (`check_gh_available`, `fetch_pr_metadata`,
+/// `fetch_branch`) lives entirely in this function so [`pr_changeset_from_metadata`] can stay a
+/// pure git2 mapping, fixture-testable without gh (the real gh path is exercised manually — see
+/// the CS4 changeset description).
+fn resolve_pr(repo: &Repository, text: String) -> Result<Vec<workon::Changeset>, SourceError> {
+    workon::check_gh_available().map_err(|source| SourceError::GhUnavailable {
+        text: text.clone(),
+        source,
+    })?;
+
+    // `classify` only builds `Source::Pr` from a `parse_pr_reference` `Ok(Some(_))`, so this
+    // re-parse is infallible in practice; treated as unresolvable rather than unwrapped in case
+    // a `Source::Pr` is ever constructed some other way.
+    let pr = workon::parse_pr_reference(&text)
+        .ok()
+        .flatten()
+        .ok_or_else(|| SourceError::UnresolvableSource { text: text.clone() })?;
+
+    let metadata =
+        workon::fetch_pr_metadata(pr.number).map_err(|source| SourceError::PrResolutionFailed {
+            text: text.clone(),
+            source,
+        })?;
+
+    let head_remote = if metadata.is_fork {
+        workon::setup_fork_remote(repo, &metadata)
+    } else {
+        workon::detect_pr_remote(repo)
+    }
+    .map_err(|source| SourceError::PrResolutionFailed {
+        text: text.clone(),
+        source,
+    })?;
+    workon::fetch_branch(repo, &head_remote, &metadata.head_ref).map_err(|source| {
+        SourceError::PrResolutionFailed {
+            text: text.clone(),
+            source,
+        }
+    })?;
+
+    // The base branch is what the PR targets, never a fork branch — always the detected
+    // upstream/origin remote, regardless of whether the head came from a fork.
+    let base_remote =
+        workon::detect_pr_remote(repo).map_err(|source| SourceError::PrResolutionFailed {
+            text: text.clone(),
+            source,
+        })?;
+    workon::fetch_branch(repo, &base_remote, &metadata.base_ref).map_err(|source| {
+        SourceError::PrResolutionFailed {
+            text: text.clone(),
+            source,
+        }
+    })?;
+
+    pr_changeset_from_metadata(repo, &text, &metadata, &head_remote, &base_remote)
+}
+
+/// Map fetched PR metadata to the one committed changeset review renders for it:
+/// `merge-base(base tip, head tip)..head`, PR title carried through (ADR-030: "GitHub's own
+/// three-dot PR diff"). Pure git2 — no gh, no fetch — assuming `head_remote`/`base_remote`
+/// already have `metadata.head_ref`/`metadata.base_ref` as remote-tracking branches (true after
+/// [`resolve_pr`]'s fetches, or hand-built in a fixture for testing this half without gh).
+fn pr_changeset_from_metadata(
+    repo: &Repository,
+    text: &str,
+    metadata: &PrMetadata,
+    head_remote: &str,
+    base_remote: &str,
+) -> Result<Vec<workon::Changeset>, SourceError> {
+    let unresolvable = || SourceError::UnresolvableSource {
+        text: text.to_string(),
+    };
+
+    let head_oid =
+        remote_branch_tip(repo, head_remote, &metadata.head_ref).ok_or_else(unresolvable)?;
+    let base_tip =
+        remote_branch_tip(repo, base_remote, &metadata.base_ref).ok_or_else(unresolvable)?;
+    let base_oid = repo
+        .merge_base(base_tip, head_oid)
+        .map_err(|_| unresolvable())?;
+
+    Ok(vec![workon::Changeset {
+        name: text.to_string(),
+        span: ChangesetSpan::Committed {
+            base: base_oid,
+            head: head_oid,
+        },
+        title: Some(metadata.title.clone()),
+        current: true,
+        needs_restack: false,
+    }])
+}
+
+/// The tip commit of `refs/remotes/{remote}/{branch}`, or `None` if it isn't a remote-tracking
+/// branch that resolves to a commit.
+fn remote_branch_tip(repo: &Repository, remote: &str, branch: &str) -> Option<Oid> {
+    repo.find_branch(&format!("{remote}/{branch}"), BranchType::Remote)
+        .ok()
+        .and_then(|b| b.get().target())
 }
 
 /// `stack` keyword resolution: Graphite metadata when active, otherwise the git-inference arm
@@ -396,6 +514,47 @@ mod tests {
     }
 
     #[test]
+    fn classify_pr_dash_number_is_pr() {
+        assert_eq!(Source::classify("pr-123"), Source::Pr("pr-123".to_string()));
+    }
+
+    #[test]
+    fn classify_hash_number_is_pr() {
+        assert_eq!(Source::classify("#123"), Source::Pr("#123".to_string()));
+    }
+
+    #[test]
+    fn classify_pr_hash_number_is_pr() {
+        assert_eq!(Source::classify("pr#123"), Source::Pr("pr#123".to_string()));
+    }
+
+    #[test]
+    fn classify_github_url_is_pr() {
+        let url = "https://github.com/owner/repo/pull/123";
+        assert_eq!(Source::classify(url), Source::Pr(url.to_string()));
+    }
+
+    #[test]
+    fn classify_bare_number_is_ref_not_pr() {
+        // ADR-030 explicitly excludes a bare number — it could be a branch or an abbreviated
+        // sha. `workon::parse_pr_reference` already requires a `#`/`pr-`/`pr#` prefix or a
+        // GitHub URL, so this falls through to `Ref` with no extra guard needed here.
+        assert_eq!(Source::classify("123"), Source::Ref("123".to_string()));
+    }
+
+    #[test]
+    fn classify_malformed_pr_dash_is_ref_not_pr() {
+        // `pr-` and `pr-abc` look PR-shaped but don't carry a valid number —
+        // `parse_pr_reference` returns `Err`, not `Ok(Some(_))`, so classify falls through
+        // rather than force-classifying a broken PR reference.
+        assert_eq!(Source::classify("pr-"), Source::Ref("pr-".to_string()));
+        assert_eq!(
+            Source::classify("pr-abc"),
+            Source::Ref("pr-abc".to_string())
+        );
+    }
+
+    #[test]
     fn classify_empty_string_is_ref() {
         assert_eq!(Source::classify(""), Source::Ref(String::new()));
     }
@@ -462,5 +621,120 @@ mod tests {
                 dots: RangeDots::Two,
             }
         );
+    }
+
+    // ── CS4: PR metadata → changeset mapping (the gh-free half of `resolve_pr`) ─────────────
+
+    /// [`pr_changeset_from_metadata`] is the pure git2 half of PR resolution — everything
+    /// downstream of `fetch_pr_metadata`/`fetch_branch`, which the real `gh` path can't exercise
+    /// in CI. This fixture stands in for "already fetched": a real (local, file-path) remote,
+    /// with `fetch_branch` itself used to populate the remote-tracking refs, so the only thing
+    /// not exercised here is the network round-trip to `gh` and to a non-local remote.
+    #[test]
+    fn pr_metadata_maps_to_merge_base_changeset_with_title(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use git_workon_fixture::prelude::*;
+
+        // `RemoteSource::from(&Fixture)` only resolves to the bare `.git` dir when
+        // `fixture.repo()` itself reports bare — true for a bare fixture with NO worktree (a
+        // worktree checkout is never bare, even off a bare main repo). So this "remote" fixture
+        // stays worktree-free, and its two divergent branches are built directly with git2
+        // rather than via `commit()` (which requires a checked-out worktree path).
+        let upstream = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let upstream_repo = upstream.repo()?;
+        let base_commit = upstream_repo.head()?.peel_to_commit()?;
+        let sig = git2::Signature::now("Test User", "test@example.com")?;
+
+        let mut main_tree = upstream_repo.treebuilder(None)?;
+        let a_blob = upstream_repo.blob(b"1")?;
+        main_tree.insert("a.txt", a_blob, 0o100_644)?;
+        let main_tree_oid = main_tree.write()?;
+        let main_tree = upstream_repo.find_tree(main_tree_oid)?;
+        let main_oid = upstream_repo.commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            "on main",
+            &main_tree,
+            &[&base_commit],
+        )?;
+
+        let mut head_tree = upstream_repo.treebuilder(None)?;
+        let b_blob = upstream_repo.blob(b"1")?;
+        head_tree.insert("b.txt", b_blob, 0o100_644)?;
+        let head_tree_oid = head_tree.write()?;
+        let head_tree = upstream_repo.find_tree(head_tree_oid)?;
+        let head_oid = upstream_repo.commit(
+            Some("refs/heads/pr-head"),
+            &sig,
+            &sig,
+            "on pr-head",
+            &head_tree,
+            &[&base_commit],
+        )?;
+
+        let local = FixtureBuilder::new().remote("origin", &upstream).build()?;
+        let repo = local.repo()?;
+        workon::fetch_branch(repo, "origin", "main")?;
+        workon::fetch_branch(repo, "origin", "pr-head")?;
+
+        let metadata = PrMetadata {
+            number: 123,
+            title: "Add widget".to_string(),
+            author: "someone".to_string(),
+            head_ref: "pr-head".to_string(),
+            base_ref: "main".to_string(),
+            is_fork: false,
+            fork_owner: None,
+            fork_url: None,
+        };
+
+        let changesets = pr_changeset_from_metadata(repo, "pr-123", &metadata, "origin", "origin")?;
+        assert_eq!(changesets.len(), 1);
+        assert_eq!(changesets[0].name, "pr-123");
+        assert_eq!(changesets[0].title.as_deref(), Some("Add widget"));
+        assert!(changesets[0].current);
+        match changesets[0].span {
+            ChangesetSpan::Committed { base, head } => {
+                assert_eq!(head, head_oid);
+                let expected_base = repo.merge_base(main_oid, head_oid)?;
+                assert_eq!(base, expected_base);
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// A missing remote-tracking ref (nothing fetched yet for that branch) is unresolvable, not
+    /// a panic — guards the "assumes already fetched" precondition documented on
+    /// [`pr_changeset_from_metadata`].
+    #[test]
+    fn pr_metadata_with_unfetched_head_is_unresolvable() -> Result<(), Box<dyn std::error::Error>> {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new().build()?;
+        let repo = fixture.repo()?;
+
+        let metadata = PrMetadata {
+            number: 123,
+            title: "Add widget".to_string(),
+            author: "someone".to_string(),
+            head_ref: "pr-head".to_string(),
+            base_ref: "main".to_string(),
+            is_fork: false,
+            fork_owner: None,
+            fork_url: None,
+        };
+
+        let err =
+            pr_changeset_from_metadata(repo, "pr-123", &metadata, "origin", "origin").unwrap_err();
+        match err {
+            SourceError::UnresolvableSource { text } => assert_eq!(text, "pr-123"),
+            other => panic!("expected UnresolvableSource, got {other:?}"),
+        }
+        Ok(())
     }
 }
