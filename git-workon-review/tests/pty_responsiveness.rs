@@ -33,12 +33,12 @@
 
 #![cfg(unix)]
 
+mod pty_support;
+use pty_support::spawn_review;
+
 use std::time::{Duration, Instant};
 
-use expectrl::{
-    session::{OsProcess, OsStream},
-    Expect, Session,
-};
+use expectrl::Expect;
 use git_workon_fixture::prelude::*;
 
 /// Upper bound on spawn→quit for a healthy launch (~120ms release, well under a second in
@@ -62,24 +62,6 @@ const BURST_FILES: usize = 36;
 
 /// Lines per generated fixture file — see `BURST_FILES`.
 const BURST_FILE_LINES: usize = 2_000;
-
-/// Spawn the review binary in a PTY sized like a real terminal (an unsized PTY is 0×0 and
-/// ratatui draws nothing), cwd'd into the fixture's worktree. Mirrors `pty_smoke.rs`.
-fn spawn_review(fixture: &Fixture) -> Session<OsProcess, OsStream> {
-    let repo = fixture.repo().expect("fixture repo");
-    let workdir = repo.workdir().expect("fixture workdir").to_path_buf();
-
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_git-workon-review"));
-    cmd.current_dir(workdir).env("TERM", "xterm-256color");
-
-    let mut session = expectrl::Session::spawn(cmd).expect("spawn in PTY");
-    session
-        .get_process_mut()
-        .set_window_size(120, 40)
-        .expect("size PTY");
-    session.set_expect_timeout(Some(Duration::from_secs(15)));
-    session
-}
 
 /// A plausible-enough Rust source of ~`lines` lines, distinct per `seed`, so the tree-sitter
 /// highlighter has real parsing work per file (the regression cost being guarded).
