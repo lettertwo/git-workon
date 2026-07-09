@@ -467,11 +467,14 @@ pub fn setup_fork_remote(repo: &Repository, metadata: &PrMetadata) -> Result<Str
 }
 
 /// Fetch `branch` from `remote_name`, making it available as
-/// `refs/remotes/{remote_name}/{branch}`.
+/// `refs/remotes/{remote_name}/{branch}`, *unless* the tracking ref already exists.
 ///
-/// This is used for both fork and non-fork PRs to fetch the PR's head branch
-/// identified via `gh` CLI metadata. If the ref already exists locally the
-/// fetch is skipped.
+/// Use this for the worktree-creation flow, where a PR branch is fetched exactly once — if
+/// `refs/remotes/{remote_name}/{branch}` is already there, there's nothing to gain by
+/// re-fetching it. **Do not use this where freshness matters** (e.g. reviewing a PR that may
+/// have moved since a prior fetch): a previously-fetched branch is silently left stale, and a
+/// long-lived ref like a base branch's is virtually always already present, so it would never
+/// be refreshed at all. Use [`fetch_branch_fresh`] there instead.
 pub fn fetch_branch(repo: &Repository, remote_name: &str, branch: &str) -> Result<()> {
     // Check if branch already exists locally
     let branch_ref = format!("refs/remotes/{}/{}", remote_name, branch);
@@ -480,6 +483,18 @@ pub fn fetch_branch(repo: &Repository, remote_name: &str, branch: &str) -> Resul
         return Ok(());
     }
 
+    fetch_branch_fresh(repo, remote_name, branch)
+}
+
+/// Fetch `branch` from `remote_name`, making it available as
+/// `refs/remotes/{remote_name}/{branch}`, always — force-updating the tracking ref to the
+/// remote's current tip even if it already exists locally.
+///
+/// Use this whenever a stale tracking ref would be wrong to review against (e.g. resolving a
+/// PR's head and base for `git workon review`): the refspec is already force (`+`), so this
+/// never fails on a diverged tracking ref, it just moves it. For the one-time
+/// worktree-creation fetch where an existing ref is fine to leave alone, use [`fetch_branch`].
+pub fn fetch_branch_fresh(repo: &Repository, remote_name: &str, branch: &str) -> Result<()> {
     debug!("Fetching branch {} from remote {}", branch, remote_name);
 
     let refspec = format!(
@@ -682,6 +697,55 @@ mod tests {
             format_pr_name_with_metadata("{branch}-{number}", &metadata),
             "feature-fix-auth-123"
         );
+    }
+
+    /// `fetch_branch` skips a re-fetch once the tracking ref exists, even when the remote has
+    /// since moved — right for the one-time worktree-creation fetch, wrong for review, which is
+    /// why [`fetch_branch_fresh`] exists. Pins both: the existence short-circuit staying put,
+    /// and `fetch_branch_fresh` force-updating past it via the refspec's `+`.
+    #[test]
+    fn fetch_branch_fresh_updates_stale_tracking_ref_but_fetch_branch_does_not(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        use git_workon_fixture::prelude::*;
+
+        let upstream = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let upstream_repo = upstream.repo()?;
+        let old_oid = upstream_repo.head()?.peel_to_commit()?.id();
+
+        let local = FixtureBuilder::new().remote("origin", &upstream).build()?;
+        let repo = local.repo()?;
+
+        // First fetch: creates the tracking ref at the remote's current tip.
+        fetch_branch(repo, "origin", "main")?;
+        let tracking_ref = "refs/remotes/origin/main";
+        assert_eq!(repo.find_reference(tracking_ref)?.target(), Some(old_oid));
+
+        // The remote moves.
+        let sig = git2::Signature::now("Test User", "test@example.com")?;
+        let old_commit = upstream_repo.find_commit(old_oid)?;
+        let tree = old_commit.tree()?;
+        let new_oid = upstream_repo.commit(
+            Some("refs/heads/main"),
+            &sig,
+            &sig,
+            "moved on main",
+            &tree,
+            &[&old_commit],
+        )?;
+        assert_ne!(new_oid, old_oid);
+
+        // `fetch_branch` sees the ref already exists and leaves it stale.
+        fetch_branch(repo, "origin", "main")?;
+        assert_eq!(repo.find_reference(tracking_ref)?.target(), Some(old_oid));
+
+        // `fetch_branch_fresh` force-updates it to the remote's new tip.
+        fetch_branch_fresh(repo, "origin", "main")?;
+        assert_eq!(repo.find_reference(tracking_ref)?.target(), Some(new_oid));
+
+        Ok(())
     }
 
     // Integration tests requiring gh CLI (marked with #[ignore])

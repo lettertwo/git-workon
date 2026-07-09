@@ -120,9 +120,15 @@ pub fn resolve_source(
 /// worktree-creation step — review only needs the PR's base and head fetched locally so their
 /// merge-base span can be computed, never a branch or worktree. Every failure here is a named,
 /// hinted pre-TUI error. The network round-trip (`check_gh_available`, `fetch_pr_metadata`,
-/// `fetch_branch`) lives entirely in this function so [`pr_changeset_from_metadata`] can stay a
-/// pure git2 mapping, fixture-testable without gh (the real gh path is exercised manually — see
-/// the CS4 changeset description).
+/// `fetch_branch_fresh`) lives entirely in this function so [`pr_changeset_from_metadata`] can
+/// stay a pure git2 mapping, fixture-testable without gh (the real gh path is exercised manually
+/// — see the CS4 changeset description).
+///
+/// Both refs are fetched with [`workon::fetch_branch_fresh`], not [`workon::fetch_branch`]:
+/// review's whole point is freshness, and `fetch_branch`'s existence short-circuit (right for
+/// its original one-time worktree-creation fetch) would leave a previously-fetched head stale
+/// and — since `refs/remotes/{remote}/{base}` is virtually always already present — would never
+/// refresh the base at all, corrupting the merge-base against a stale base tip.
 fn resolve_pr(repo: &Repository, text: String) -> Result<Vec<workon::Changeset>, SourceError> {
     workon::check_gh_available().map_err(|source| SourceError::GhUnavailable {
         text: text.clone(),
@@ -152,7 +158,7 @@ fn resolve_pr(repo: &Repository, text: String) -> Result<Vec<workon::Changeset>,
         text: text.clone(),
         source,
     })?;
-    workon::fetch_branch(repo, &head_remote, &metadata.head_ref).map_err(|source| {
+    workon::fetch_branch_fresh(repo, &head_remote, &metadata.head_ref).map_err(|source| {
         SourceError::PrResolutionFailed {
             text: text.clone(),
             source,
@@ -166,7 +172,7 @@ fn resolve_pr(repo: &Repository, text: String) -> Result<Vec<workon::Changeset>,
             text: text.clone(),
             source,
         })?;
-    workon::fetch_branch(repo, &base_remote, &metadata.base_ref).map_err(|source| {
+    workon::fetch_branch_fresh(repo, &base_remote, &metadata.base_ref).map_err(|source| {
         SourceError::PrResolutionFailed {
             text: text.clone(),
             source,
