@@ -965,6 +965,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
+ "expectrl",
  "git-workon-fixture",
  "git-workon-lib",
  "git2",
