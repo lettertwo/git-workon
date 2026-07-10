@@ -108,6 +108,12 @@ pub struct OutlineChangeset {
     pub current: bool,
     /// Mirrors `workon::Changeset::needs_restack` — drives the outline's amber warning glyph.
     pub needs_restack: bool,
+    /// ADR-031: the changeset's diff hasn't been acquired yet — the header shows a loading
+    /// indication in place of the (currently absent, since `files` is empty for a `Pending`
+    /// slot) file rows.
+    pub loading: bool,
+    /// ADR-031: the acquisition attempt for this changeset errored — the header marks it.
+    pub failed: bool,
     pub files: Vec<OutlineFile>,
 }
 
@@ -132,6 +138,10 @@ pub enum OutlineItem {
         label: String,
         current: bool,
         needs_restack: bool,
+        /// ADR-031: this changeset hasn't been diffed yet — rendered as a loading indication.
+        loading: bool,
+        /// ADR-031: this changeset's acquisition attempt errored — rendered as a marker.
+        failed: bool,
     },
     /// A directory row — only emitted in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`]. Not a
     /// jump target: it carries no `cs_idx`/`file_idx`, so `App::outline_move_by` no-ops on it
@@ -187,6 +197,8 @@ fn build_stack(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
             label: cs.label.clone(),
             current: cs.current,
             needs_restack: cs.needs_restack,
+            loading: cs.loading,
+            failed: cs.failed,
         });
         for (file_idx, file) in cs.files.iter().enumerate() {
             items.push(OutlineItem::File {
@@ -353,6 +365,8 @@ fn build_stack_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
             label: cs.label.clone(),
             current: cs.current,
             needs_restack: cs.needs_restack,
+            loading: cs.loading,
+            failed: cs.failed,
         });
         let mut root = TrieNode::default();
         for (file_idx, file) in cs.files.iter().enumerate() {
@@ -378,6 +392,8 @@ mod tests {
             label: label.to_string(),
             current,
             needs_restack,
+            loading: false,
+            failed: false,
             files: files
                 .iter()
                 .map(|(p, s)| OutlineFile {
@@ -385,6 +401,19 @@ mod tests {
                     status: *s,
                 })
                 .collect(),
+        }
+    }
+
+    /// [`cs`] variant for ADR-031's slot tests — builds a `Pending`/`Failed` outline changeset
+    /// (no files, since a non-`Ready` [`crate::app::ChangesetView`] never has any).
+    fn cs_slot(label: &str, loading: bool, failed: bool) -> OutlineChangeset {
+        OutlineChangeset {
+            label: label.to_string(),
+            current: false,
+            needs_restack: false,
+            loading,
+            failed,
+            files: Vec::new(),
         }
     }
 
@@ -403,6 +432,8 @@ mod tests {
                     label: "cs-a".to_string(),
                     current: false,
                     needs_restack: false,
+                    loading: false,
+                    failed: false,
                 },
                 OutlineItem::File {
                     cs_idx: 0,
@@ -416,6 +447,8 @@ mod tests {
                     label: "cs-b".to_string(),
                     current: true,
                     needs_restack: true,
+                    loading: false,
+                    failed: false,
                 },
                 OutlineItem::File {
                     cs_idx: 1,
@@ -425,6 +458,40 @@ mod tests {
                     guides: Vec::new(),
                 },
             ]
+        );
+    }
+
+    /// ADR-031: a `Pending`/`Failed` changeset (no files) still emits a Stack-mode header row,
+    /// carrying the loading/failed marker instead of any file rows.
+    #[test]
+    fn stack_mode_marks_pending_and_failed_headers_with_no_file_rows() {
+        let changesets = vec![
+            cs_slot("cs-pending", true, false),
+            cs_slot("cs-failed", false, true),
+        ];
+        let items = build_items(&changesets, OutlineMode::Stack);
+        assert_eq!(
+            items,
+            vec![
+                OutlineItem::Header {
+                    cs_idx: 0,
+                    label: "cs-pending".to_string(),
+                    current: false,
+                    needs_restack: false,
+                    loading: true,
+                    failed: false,
+                },
+                OutlineItem::Header {
+                    cs_idx: 1,
+                    label: "cs-failed".to_string(),
+                    current: false,
+                    needs_restack: false,
+                    loading: false,
+                    failed: true,
+                },
+            ],
+            "a Pending/Failed changeset carries no file rows (its files list is empty), only its \
+             own marked header"
         );
     }
 
@@ -625,6 +692,8 @@ mod tests {
                     label: "cs-a".to_string(),
                     current: false,
                     needs_restack: false,
+                    loading: false,
+                    failed: false,
                 },
                 OutlineItem::Dir {
                     name: "x".to_string(),
@@ -642,6 +711,8 @@ mod tests {
                     label: "cs-b".to_string(),
                     current: true,
                     needs_restack: true,
+                    loading: false,
+                    failed: false,
                 },
                 OutlineItem::File {
                     cs_idx: 1,
