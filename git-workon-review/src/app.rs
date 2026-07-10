@@ -730,6 +730,15 @@ impl ChangesetView {
         }
     }
 
+    /// Whether this changeset's diff is real and ready (ADR-031's third slot state, named from
+    /// the other side) — [`App::refresh`]'s span-keyed reuse reads this to decide which existing
+    /// slots may be carried over wholesale. Deliberately excludes `Failed` (reuse only carries
+    /// `Ready` slots — `r` naturally retries a failed one instead, see the ADR's "Failures") and
+    /// `Pending` (nothing yet to reuse).
+    fn is_ready(&self) -> bool {
+        matches!(self.slot, ChangesetSlot::Ready)
+    }
+
     /// Build the [`ChangesetView`] for `cs` from its acquired [`ChangesetDiff`] (see
     /// [`crate::acquire::diff_changeset`]) — the router from "how was this changeset diffed" to
     /// the uniform [`DiffState`] shape every [`ChangesetView`] carries.
@@ -892,12 +901,22 @@ pub struct App {
     /// ([`Self::apply_file_ready`]) — the ONLY drop rule; within a generation, results are cached
     /// even if the user navigated away (warmth, not staleness — see the ADR's "Generations").
     generation: u64,
-    /// Whether the startup wave (ADR-031's streamed launch) has already raised its one footer
-    /// notice for a `ChangesetReady { result: Err }`. Set by [`Self::apply_changeset_ready`],
-    /// never cleared in this slice (only ONE wave — startup — exists yet; the refresh path stays
-    /// synchronous, so nothing re-arms it). "the wave's first failure raises a footer notice" —
-    /// this is what makes it FIRST, not every one of a bad stack's failures.
+    /// Whether the CURRENT wave (startup's, or the most recent refresh's) has already raised its
+    /// one footer notice for a `ChangesetReady { result: Err }`. Set by
+    /// [`Self::apply_changeset_ready`]; reset to `false` by every [`Self::refresh`] right
+    /// alongside the generation bump, since a refresh dispatching a NEW wave (ADR-031's "Refresh"
+    /// changeset) starts that wave's own "first failure" count over — otherwise a stack whose
+    /// first-ever wave had one bad changeset would never notify again for a LATER, unrelated
+    /// failure. "the wave's first failure raises a footer notice" — this is what makes it FIRST
+    /// per wave, not every one of a bad stack's failures within it.
     wave_failure_notified: bool,
+    /// The ADR-031 refresh wave [`Self::refresh`] most recently queued (span-keyed reuse's
+    /// changed/new committed spans, stamped with the generation they belong to), if any — taken
+    /// (and cleared) by [`Self::take_pending_wave`]. Mirrors [`Self::open_pending`]/
+    /// [`Self::take_pending_load_spec`]'s shape: `App` computes WHAT needs diffing but never
+    /// touches a thread or a `Repository`-carrying `Sender` itself, so it stays constructible (and
+    /// `refresh` stays synchronously testable) with nothing wired up to actually dispatch this.
+    pending_wave: Option<(u64, Vec<(usize, Changeset)>)>,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1038,6 +1057,7 @@ impl App {
             open_pending_dispatched: false,
             generation: 1,
             wave_failure_notified: false,
+            pending_wave: None,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1170,31 +1190,60 @@ impl App {
     }
 
     /// Re-run [`crate::acquire::resolve_changesets`] against the CURRENT `HEAD` branch and
-    /// rebuild every [`ChangesetView`] from scratch — the operation both a manual refresh (`r`)
-    /// and (later) a post-staging-op/external-write refresh need. Re-assembling (not just
-    /// re-diffing the active changeset) matters because a restack can change the stack's
-    /// topology, not just its diffs.
+    /// rebuild [`Self::changesets`] — the operation both a manual refresh (`r`) and the
+    /// post-staging-op/external-write refresh need. Re-assembling (not just re-diffing the
+    /// active changeset) matters because a restack can change the stack's topology, not just its
+    /// diffs.
     ///
-    /// - Rebuilds [`Self::changesets`] and [`Self::base_label`] in place. Does NOT touch `repo`
-    ///   (same handle), `highlighter` (its per-instance grammar cache would have to re-parse
-    ///   every language from scratch if rebuilt), `layout`, or `zoom` (the user's current view
-    ///   mode shouldn't reset just because they pressed `r`, or because a background refresh
-    ///   fired).
+    /// ADR-031 "Refresh" — span-keyed reuse, uncommitted always sync:
+    ///
+    /// - Resolve (this method's first half) stays fully synchronous on the main thread — it's
+    ///   offline and cheap, and re-running it on every refresh is what keeps [`Self::review_source`]
+    ///   honored (see below).
+    /// - The rebuilt view list carries over any existing `Ready` slot whose `(name, span)` is
+    ///   unchanged — a committed diff is a pure function of its span
+    ///   ([`ChangesetSpan::Committed`] compares `base`/`head`; [`ChangesetSpan::CommittedRoot`]
+    ///   compares `head`) — so an ordinary post-staging refresh re-diffs *nothing but the
+    ///   uncommitted layer*. A carried slot keeps its `DiffState` AND warm view caches verbatim:
+    ///   never blanked, never re-diffed. Reuse only ever carries a `Ready` slot — a `Failed` one
+    ///   goes back through the `Pending`+wave path below, which is how `r` naturally retries it
+    ///   with no separate retry machinery.
+    /// - The [`ChangesetSpan::Uncommitted`] layer is never "unchanged": it re-diffs
+    ///   SYNCHRONOUSLY, right here, on every refresh — ms-scale, and this is what preserves
+    ///   staging's guarantee that the next keystroke sees the post-op world (an async refresh
+    ///   would let a second `s` compute its patch against a stale diff). A failed sync re-diff
+    ///   becomes a `Failed` slot plus a footer notice (an explicit error beats stale wrong
+    ///   content) rather than aborting the whole refresh.
+    /// - Every other changed-or-new committed span becomes a `Pending` slot; the caller (the
+    ///   event loop, via [`Self::take_pending_wave`]) dispatches those as an async wave, current-
+    ///   first if the active changeset is among them, same as the streamed-launch wave. Their
+    ///   results land through [`Self::apply_changeset_ready`] tagged with the NEW generation.
+    /// - Every refresh bumps the generation exactly once, right where the view caches it protects
+    ///   are actually replaced — reused (carried) slots' in-flight loader results now carry a
+    ///   stale `gen` and die at [`Self::apply_file_ready`]'s chokepoint; accepted waste for one
+    ///   global rule (see the ADR's "Generations"). [`Self::wave_failure_notified`] resets
+    ///   alongside it, so the freshly-dispatched wave gets its own first-failure notice.
+    ///
+    /// Position rules, adapted to the streamed world:
     /// - Preserves the active changeset by NAME: if a changeset with that name still exists in
     ///   the rebuilt stack, `current_cs` follows it; otherwise it falls back to whichever
     ///   changeset the lib now reports as `current`, or index `0`.
-    /// - Preserves file position by PATH within the (possibly different) active changeset, same
-    ///   rule M4 used: `current` follows the path if it still exists, else clamps into the new
-    ///   list (or `0` if empty).
-    /// - Re-seats the (possibly changed) current file at its first hunk via [`Self::open_current`]
-    ///   — the same path a file switch already uses. This does NOT try to preserve the exact
-    ///   cursor row: the rows under an old cursor position may no longer correspond to the same
-    ///   content once the diff is rebuilt, so jumping to the first hunk (like opening a file fresh)
-    ///   is the only always-valid choice, consistent with how zoom/layout switches already treat
-    ///   cursor position as non-transferable across a reshape.
+    /// - A carried (still-`Ready`) active changeset — or the always-sync uncommitted layer —
+    ///   preserves file position by PATH exactly like before streaming: `current` follows the
+    ///   path if it still exists, else clamps into the new list (or `0` if empty), then
+    ///   [`Self::open_current`] re-seats it at the first hunk (this does NOT try to preserve the
+    ///   exact cursor row — jumping to the first hunk is the only always-valid choice once the
+    ///   diff is rebuilt, consistent with zoom/layout switches). An active changeset that went
+    ///   `Pending` instead has no diff yet to preserve a path INTO — `current` resets to `0` and
+    ///   [`Self::apply_changeset_ready`] re-seats it (to its first file) exactly as it already
+    ///   does for a freshly-`Pending` changeset, once that `ChangesetReady` lands.
+    /// - The rebuilt changeset list can resize/reorder the outline's row list out from under its
+    ///   cursor — reposition it, same as every other diff-initiated nav (does NOT touch
+    ///   `outline.open`/`focused`/`mode`, which persist across a refresh like `layout`/`zoom`).
     ///
-    /// On any assembly/diff error, leaves all existing state untouched and sets an error
-    /// [`Notice`] instead (via [`Self::notify`]) — a failed refresh must never blank the review.
+    /// On a resolve/assembly error (or the uncommitted layer's own sync re-diff failing — see
+    /// above), leaves the rest of `Self::changesets` untouched and sets an error [`Notice`]
+    /// instead (via [`Self::notify`]) — a failed refresh must never blank the review.
     ///
     /// Dispatches on [`Self::review_source`] (M7 CS2 fix): a no-argument launch (`None`) re-runs
     /// today's auto-detect ([`crate::acquire::resolve_changesets`]); an explicit-source launch
@@ -1234,22 +1283,9 @@ impl App {
                 return;
             }
         };
-
-        let diffs = match crate::acquire::diff_changesets(&self.repo, &changesets) {
-            Ok(diffs) => diffs,
-            Err(err) => {
-                self.notify(format!("refresh failed: {err}"), Severity::Error);
-                return;
-            }
-        };
-        let views: Vec<ChangesetView> = changesets
-            .into_iter()
-            .zip(diffs)
-            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
-            .collect();
         // `resolve_changesets` always returns at least one changeset (a lone Uncommitted entry
         // when no stack is active), but stay defensive rather than index an empty `Vec` below.
-        if views.is_empty() {
+        if changesets.is_empty() {
             self.notify("refresh failed: no changesets to review", Severity::Error);
             return;
         }
@@ -1262,28 +1298,80 @@ impl App {
             .get(self.current)
             .map(|f| f.path.clone());
 
-        self.current_cs = views
+        // Span-keyed reuse: pull the OLD view list out so a `Ready` slot whose `(name, span)`
+        // survives can be moved (not cloned) into the rebuilt list, keeping its warm view caches.
+        // `Vec::remove`'s O(n) shift is immaterial at stack sizes (a handful of changesets).
+        let mut old_views = std::mem::take(&mut self.changesets);
+
+        let mut new_views: Vec<ChangesetView> = Vec::with_capacity(changesets.len());
+        let mut to_diff: Vec<(usize, Changeset)> = Vec::new();
+        let mut uncommitted_diff_failed: Option<String> = None;
+
+        for cs in changesets {
+            if cs.span == ChangesetSpan::Uncommitted {
+                match crate::acquire::diff_changeset(&self.repo, &cs) {
+                    Ok(diff) => new_views.push(ChangesetView::from_changeset_diff(cs, diff)),
+                    Err(err) => {
+                        let message = err.to_string();
+                        uncommitted_diff_failed = Some(message.clone());
+                        new_views.push(ChangesetView::failed(cs, message));
+                    }
+                }
+                continue;
+            }
+            if let Some(pos) = old_views
+                .iter()
+                .position(|v| v.is_ready() && v.cs.name == cs.name && v.cs.span == cs.span)
+            {
+                // Carry the slot's diff/view caches verbatim, but adopt the FRESH descriptor —
+                // metadata like `needs_restack` can change even when the span itself didn't.
+                let mut reused = old_views.remove(pos);
+                reused.cs = cs;
+                new_views.push(reused);
+            } else {
+                let idx = new_views.len();
+                to_diff.push((idx, cs.clone()));
+                new_views.push(ChangesetView::pending(cs));
+            }
+        }
+
+        self.current_cs = new_views
             .iter()
             .position(|v| v.cs.name == prev_cs_name)
-            .unwrap_or_else(|| current_cs_index(&views));
-        self.base_label = base_label_for(&views[self.current_cs].cs);
-        self.changesets = views;
+            .unwrap_or_else(|| current_cs_index(&new_views));
+        self.base_label = base_label_for(&new_views[self.current_cs].cs);
+        self.changesets = new_views;
         // ADR-031: every refresh bumps the generation, right where the view caches it protects
-        // are actually replaced — an early `return` above (a failed resolve/diff) leaves the old
+        // are actually replaced — an early `return` above (a failed resolve) leaves the old
         // world's caches intact, so it must NOT bump. Any loader result still in flight for the
-        // pre-refresh world now carries a stale `gen` and dies at `apply_file_ready`'s chokepoint.
+        // pre-refresh world now carries a stale `gen` and dies at `apply_file_ready`'s chokepoint;
+        // same for a wave result still in flight for a superseded generation.
         self.generation += 1;
+        self.wave_failure_notified = false;
 
-        let n = self.cur().diff.files.len();
-        self.current = current_path
-            .and_then(|path| self.cur().diff.files.iter().position(|f| f.path == path))
-            .unwrap_or(if n == 0 { 0 } else { self.current.min(n - 1) });
-
+        if self.cur().is_pending() {
+            self.current = 0;
+        } else {
+            let n = self.cur().diff.files.len();
+            self.current = current_path
+                .and_then(|path| self.cur().diff.files.iter().position(|f| f.path == path))
+                .unwrap_or(if n == 0 { 0 } else { self.current.min(n - 1) });
+        }
         self.open_current();
-        // The rebuilt changeset list can resize/reorder the outline's row list out from under
-        // its cursor — reposition it, same as every other diff-initiated nav (does NOT touch
-        // `outline.open`/`focused`/`mode`, which persist across a refresh like `layout`/`zoom`).
         self.sync_outline_to_current();
+
+        if let Some(err) = uncommitted_diff_failed {
+            self.notify(
+                format!("refresh failed: uncommitted diff failed: {err}"),
+                Severity::Error,
+            );
+        }
+
+        self.pending_wave = if to_diff.is_empty() {
+            None
+        } else {
+            Some((self.generation, to_diff))
+        };
     }
 
     /// Resolve the [`EffectiveZoom`] for file `idx` this frame: the requested [`Self::zoom`] gated
@@ -1560,7 +1648,13 @@ impl App {
     /// navigation of all, and it must render immediately. Outside defer mode this is exactly
     /// the pre-defer eager behavior.
     pub fn open_current(&mut self) {
-        if self.defer_loads && !self.current_views_cached() {
+        // An empty file list (a `Pending`/`Failed` slot, ADR-031, or a genuinely empty committed
+        // changeset) has nothing to defer: `current_load_spec` indexes `diff.files[self.current]`
+        // unconditionally, which would panic on the loader-dispatch path if `open_pending` were
+        // set here for a file that doesn't exist. There's nothing to load either way — this is
+        // the same "no-op on an empty file list" contract `main.rs`'s streamed-launch comment
+        // documents for a fresh `Pending` changeset, made actually true rather than incidental.
+        if self.defer_loads && !self.files().is_empty() && !self.current_views_cached() {
             self.open_pending = true;
             // A fresh pending open has nothing dispatched to the loader yet — see
             // [`Self::take_pending_load_spec`].
@@ -1660,6 +1754,19 @@ impl App {
         let spec = self.current_load_spec()?;
         self.open_pending_dispatched = true;
         Some((self.generation, self.current_cs, self.current, spec))
+    }
+
+    /// Take the ADR-031 refresh wave [`Self::refresh`] most recently queued (span-keyed reuse's
+    /// changed/new committed spans), if any — `None` when the last refresh had nothing left to
+    /// diff asynchronously (every span was reused or is the always-sync uncommitted layer; this
+    /// is what keeps a single-uncommitted-changeset session's refresh effectively synchronous,
+    /// see the ADR's "Refresh"). Mirrors [`Self::take_pending_load_spec`]'s take-once shape: the
+    /// caller (the event loop — the only place with thread-spawning ability) is responsible for
+    /// actually dispatching it; `App` never touches a `Sender`/`Repository`-carrying handle
+    /// itself, so it stays constructible — and `refresh` stays synchronously testable — with
+    /// nothing wired up to consume this at all.
+    pub fn take_pending_wave(&mut self) -> Option<(u64, Vec<(usize, Changeset)>)> {
+        self.pending_wave.take()
     }
 
     /// Apply one loader result (ADR-031's chokepoint, the `FileReady` inbox arm routes here):
@@ -4750,6 +4857,352 @@ mod tests {
             app.notice.is_none(),
             "a PR-source refresh must no-op, not attempt (and fail) a network re-resolution"
         );
+    }
+
+    // ---- ADR-031 refresh: span-keyed reuse, uncommitted always sync, async waves ----------
+
+    /// Build a two-commit chain (`root` then `head`) on the fixture's default branch and return
+    /// both `Oid`s — the shared setup every span-keyed-reuse test below diffs a
+    /// [`ChangesetSpan::Committed`] across.
+    fn root_and_head_commits(fixture: &Fixture) -> (git2::Oid, git2::Oid) {
+        let root = fixture
+            .commit("main")
+            .file("r.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .file("b.txt", "b\n")
+            .create("head")
+            .unwrap();
+        (root, head)
+    }
+
+    #[test]
+    fn refresh_reuses_a_ready_committed_slot_with_unchanged_span_keeping_warm_caches() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        // `head_text: "main"` re-resolves through the branch ref on every refresh — the span
+        // stays `Committed { base: root, head }` as long as `main` doesn't move, exercising the
+        // REAL re-resolve path (not a hand-frozen span) for the "unchanged" case.
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+
+        app.open_current(); // caches file 0 ("a.txt")
+        assert_eq!(app.files().len(), 2, "root..head touches a.txt and b.txt");
+        app.next_file(); // caches file 1 ("b.txt") too
+        app.prev_file(); // back to file 0 — the file `refresh`'s tail will re-seat
+        assert!(app.role_view_ref(1, Role::Combined).is_some());
+
+        let gen_before = app.generation();
+        app.refresh();
+
+        assert_eq!(
+            app.generation(),
+            gen_before + 1,
+            "every refresh bumps the generation, reused slot or not"
+        );
+        assert!(
+            !app.is_current_pending(),
+            "an unchanged span must be carried over Ready, never go through Pending"
+        );
+        assert_eq!(app.files().len(), 2);
+        assert_eq!(app.current, 0, "file position by path is preserved");
+        assert!(
+            app.role_view_ref(1, Role::Combined).is_some(),
+            "file 1's view cache must survive untouched — refresh's tail only (re)opens the \
+             CURRENT file (0), so a still-populated cache at 1 proves the whole ChangesetView \
+             (not just its diff) was carried over rather than rebuilt fresh"
+        );
+        assert!(
+            app.take_pending_wave().is_none(),
+            "a fully-reused refresh has nothing left to diff asynchronously"
+        );
+    }
+
+    #[test]
+    fn refresh_sends_a_changed_committed_span_through_a_wave_instead_of_reusing_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, old_head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: old_head,
+            },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+        app.open_current();
+
+        // Advance `main` past `old_head` — the same shape as a real amend/restack: the name
+        // ("{root}..main") stays identical, but the span's `head` moves.
+        let new_head = fixture
+            .commit("main")
+            .file("c.txt", "c\n")
+            .create("new head")
+            .unwrap();
+
+        let gen_before = app.generation();
+        app.refresh();
+        let gen_after = app.generation();
+        assert_eq!(gen_after, gen_before + 1);
+
+        assert!(
+            app.is_current_pending(),
+            "a changed span must NOT be reused — it goes Pending for the wave to diff"
+        );
+        assert!(app.files().is_empty());
+
+        let (wave_gen, to_diff) = app
+            .take_pending_wave()
+            .expect("a changed committed span must queue a wave request");
+        assert_eq!(wave_gen, gen_after);
+        assert_eq!(to_diff.len(), 1);
+        assert_eq!(
+            to_diff[0].0, 0,
+            "the stack index the result must be seated at"
+        );
+        assert_eq!(
+            to_diff[0].1.span,
+            ChangesetSpan::Committed {
+                base: root,
+                head: new_head,
+            },
+            "the wave must diff the NEW span, not the stale one"
+        );
+        assert!(
+            app.take_pending_wave().is_none(),
+            "take_pending_wave is a take-once — a second call must find nothing left"
+        );
+
+        // A stale-generation result (as if it were still in flight for the pre-refresh world)
+        // must be dropped outright.
+        app.apply_changeset_ready(
+            gen_before,
+            0,
+            Ok(crate::acquire::ChangesetDiff::Committed(
+                crate::acquire::diff_committed(repo, root, new_head).unwrap(),
+            )),
+        );
+        assert!(
+            app.is_current_pending(),
+            "a stale-generation ChangesetReady must be dropped, not seat the changeset"
+        );
+
+        // The NEW generation's result lands and seats the (still active) changeset.
+        app.apply_changeset_ready(
+            gen_after,
+            0,
+            Ok(crate::acquire::ChangesetDiff::Committed(
+                crate::acquire::diff_committed(repo, root, new_head).unwrap(),
+            )),
+        );
+        assert!(!app.is_current_pending());
+        assert_eq!(
+            app.files().len(),
+            3,
+            "root..new_head accumulates a.txt/b.txt (from `head`) and c.txt (from `new_head`)"
+        );
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Committed {
+                base: root,
+                head: new_head,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_retries_a_failed_committed_slot_via_a_wave_rather_than_reusing_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        // Seed the slot as `Failed` for this exact (name, span) — as if a previous wave's diff
+        // for it had errored.
+        let view = ChangesetView::failed(cs, "a previous diff attempt failed");
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+        assert!(app.current_failure().is_some());
+
+        app.refresh(); // span is UNCHANGED from the Failed slot's — reuse must still skip it
+
+        assert!(
+            app.is_current_pending(),
+            "reuse only carries `Ready` slots — a `Failed` one goes back through Pending+wave, \
+             which is what makes `r` a retry with no separate retry machinery"
+        );
+        let (_, to_diff) = app
+            .take_pending_wave()
+            .expect("the retried span must be queued for the wave");
+        assert_eq!(to_diff.len(), 1);
+        assert_eq!(
+            to_diff[0].1.span,
+            ChangesetSpan::Committed { base: root, head }
+        );
+    }
+
+    #[test]
+    fn coordinated_refresh_after_staging_rebuilds_the_uncommitted_layer_synchronously_while_reusing_an_unchanged_committed_span(
+    ) {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .unstaged_file("dirty.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        repo.set_head("refs/heads/a").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let changesets = crate::acquire::resolve_changesets(repo, "a").unwrap();
+        assert_eq!(
+            changesets.len(),
+            2,
+            "expected the 'a' Graphite node plus the dirty tree's uncommitted layer"
+        );
+        let diffs = crate::acquire::diff_changesets(repo, &changesets).unwrap();
+        let views: Vec<ChangesetView> = changesets
+            .into_iter()
+            .zip(diffs)
+            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+            .collect();
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Uncommitted,
+            "opens on the uncommitted layer (lib-`current`)"
+        );
+
+        app.open_current(); // cursor lands on dirty.txt's one hunk
+        app.stage_hunk(); // run_op -> coordinated_refresh -> refresh, synchronously
+
+        // The post-op world is visible SYNCHRONOUSLY, before the next event loop iteration.
+        repo.assert(predicate::repo::has_staged_file("dirty.txt"));
+        assert!(
+            !app.is_current_pending(),
+            "the uncommitted layer always re-diffs sync — it must never go through Pending"
+        );
+        assert!(
+            app.take_pending_wave().is_none(),
+            "the 'a' node's committed span didn't change — staging must not have dispatched a \
+             wave for it"
+        );
+    }
+
+    #[test]
+    fn refresh_marks_the_uncommitted_layer_failed_when_its_sync_diff_errors() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_review_source(crate::source::Source::Uncommitted);
+        // Deliberately do NOT call `app.open_current()` here: reading a file's content already
+        // walks `HEAD`'s commit/tree chain through `app`'s OWN `Repository` handle, which would
+        // warm libgit2's per-handle object cache for the exact commit this test corrupts below —
+        // a cache hit would silently mask the corruption instead of exercising the failure path.
+
+        // Corrupt the loose object `HEAD` points to (not the `HEAD` ref itself): `repo.head()`'s
+        // SHORTHAND still resolves fine (refresh's own branch-name read, and
+        // `Source::Uncommitted`'s resolution, which is a pure string wrap needing no repo access
+        // at all), but `diff_uncommitted`'s `repo.head()?.peel_to_tree()` — which walks all the
+        // way to the commit object, through `app`'s never-yet-used-for-this-object handle — fails.
+        let repo = fixture.repo().unwrap();
+        let head_oid = repo.head().unwrap().target().unwrap();
+        let hex = head_oid.to_string();
+        let object_path = repo.path().join("objects").join(&hex[0..2]).join(&hex[2..]);
+        // Loose objects are written read-only by git — reclaim write permission before
+        // clobbering the bytes, or the write itself fails with EACCES.
+        let mut perms = std::fs::metadata(&object_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&object_path, perms).unwrap();
+        std::fs::write(&object_path, b"garbage-not-a-git-object\n").unwrap();
+
+        app.refresh();
+
+        assert!(
+            !app.is_current_pending(),
+            "a sync diff failure sets Failed, not Pending — nothing async is retrying this"
+        );
+        assert!(
+            app.current_failure().is_some(),
+            "the uncommitted layer's failed sync re-diff must become a Failed slot"
+        );
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("a failed uncommitted sync re-diff must set a footer notice");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("uncommitted diff failed"),
+            "got notice text: {:?}",
+            notice.text
+        );
+        assert!(app.take_pending_wave().is_none());
     }
 
     // ---- M4 index watcher (`on_tick`) -------------------------------------------------------
