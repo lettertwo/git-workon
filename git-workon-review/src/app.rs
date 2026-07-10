@@ -1607,13 +1607,19 @@ impl App {
     /// what [`Self::ensure_loaded`] would read from live state — see [`FileLoadSpec`]'s doc
     /// comment. Every field is owned (cloned out), so the spec outlives the borrow and can cross
     /// to the loader thread.
-    fn current_load_spec(&self) -> FileLoadSpec {
+    ///
+    /// `None` when the current changeset's file list doesn't have an entry at `self.current` —
+    /// a clean uncommitted layer (zero files) is the common case, and a Pending/Failed slot
+    /// (also zero files) will join this once ADR-037's later changesets land. Total by
+    /// construction rather than relying on callers to guard first.
+    fn current_load_spec(&self) -> Option<FileLoadSpec> {
         let idx = self.current;
         let zoom = self.effective_zoom_for(idx);
         let diff = &self.cur().diff;
-        FileLoadSpec {
+        let combined_file = diff.files.get(idx)?.clone();
+        Some(FileLoadSpec {
             span: self.cur().cs.span,
-            combined_file: diff.files[idx].clone(),
+            combined_file,
             zoom,
             unstaged_file: diff
                 .unstaged_idx
@@ -1627,7 +1633,7 @@ impl App {
                 .copied()
                 .flatten()
                 .map(|mi| diff.staged_model.files[mi].clone()),
-        }
+        })
     }
 
     /// Take the [`FileLoadSpec`] for the current pending open, tagged with the generation/
@@ -1635,18 +1641,18 @@ impl App {
     /// for this same pending open (see [`Self::open_pending_dispatched`]'s doc comment). The event
     /// loop calls this on every idle `Tick` while an open is pending; without the dispatched guard
     /// it would re-send the same request on every one of those ticks until the loader answers.
-    /// Returns `None` when nothing is pending, or a request already went out for it.
+    /// Returns `None` when nothing is pending, a request already went out for it, or the
+    /// current file has no spec to build (see [`Self::current_load_spec`]) — the pending flags
+    /// are left alone in that last case, matching upstack's eventual empty-file guard in
+    /// [`Self::open_current`]: this is a total fallback for a defer that outraced it, not a
+    /// second copy of that guard.
     pub fn take_pending_load_spec(&mut self) -> Option<(u64, usize, usize, FileLoadSpec)> {
         if !self.open_pending || self.open_pending_dispatched {
             return None;
         }
+        let spec = self.current_load_spec()?;
         self.open_pending_dispatched = true;
-        Some((
-            self.generation,
-            self.current_cs,
-            self.current,
-            self.current_load_spec(),
-        ))
+        Some((self.generation, self.current_cs, self.current, spec))
     }
 
     /// Apply one loader result (ADR-037's chokepoint, the `FileReady` inbox arm routes here):
@@ -3369,7 +3375,9 @@ mod tests {
         // exactly the two-handle shape `Tui::run`/`spawn_loader_thread` build for real.
         let mut spec_app = app_from_fixture(&fixture);
         spec_app.set_zoom(Zoom::Combined);
-        let spec = spec_app.current_load_spec();
+        let spec = spec_app
+            .current_load_spec()
+            .expect("fixture has a file at index 0");
         let repo = fixture.repo().unwrap();
         let loader_repo =
             Repository::open(repo.workdir().unwrap()).expect("loader's own repo handle");
@@ -3447,6 +3455,28 @@ mod tests {
         assert!(
             app.take_pending_load_spec().is_none(),
             "a second take before the result lands must not re-dispatch"
+        );
+    }
+
+    #[test]
+    fn take_pending_load_spec_is_none_for_a_fileless_changeset_without_panicking() {
+        // A clean uncommitted layer diffs to zero files. A pending open onto it (e.g. one that
+        // outraces a refresh, or the Pending/Failed slots ADR-037's later changesets introduce)
+        // must not panic `current_load_spec`'s file-list indexing — F7's regression.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        assert!(app.files().is_empty(), "fixture must have no diffed files");
+        app.set_defer_loads(true);
+        app.open_current();
+        assert!(app.open_pending(), "empty-file open still marks pending");
+
+        assert!(
+            app.take_pending_load_spec().is_none(),
+            "no spec can be built for a file that doesn't exist"
         );
     }
 
