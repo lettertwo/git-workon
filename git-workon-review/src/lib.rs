@@ -21,6 +21,7 @@ pub mod config;
 pub mod error;
 pub mod file_ops;
 pub mod highlight;
+pub mod icons;
 pub mod keymap;
 pub mod model;
 pub mod ops;

@@ -20,6 +20,7 @@ use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow,
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
 use crate::highlight::{FgSpan, TsHighlighter};
+use crate::icons::OutlineIcons;
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
 use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder};
@@ -564,6 +565,18 @@ fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
     }
 }
 
+/// Parse `workon.review.outline.icons` (CS5) into an [`OutlineIcons`]. Canonical strings mirror
+/// the variant names, kebab-cased: `nerd`, `none`. `None` on anything else —
+/// [`App::apply_view_config`] falls back to [`OutlineIcons::default`] (also `none` — CS5's
+/// no-auto-detection default) and warns.
+fn parse_outline_icons(raw: &str) -> Option<OutlineIcons> {
+    match raw {
+        "nerd" => Some(OutlineIcons::Nerd),
+        "none" => Some(OutlineIcons::None),
+        _ => None,
+    }
+}
+
 /// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. Canonical strings mirror the
 /// variant names: `sbs`, `inline`. `None` on anything else — [`App::apply_view_config`] falls
 /// back to [`Layout::default`] and warns.
@@ -633,6 +646,10 @@ pub struct OutlineState {
     /// Which end of the stack the stack-shaped modes display first — `workon.review.outline.order`
     /// (CS3), defaulting to [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
     pub order: OutlineOrder,
+    /// CS5: opt-in nerd-font file/dir icons — `workon.review.outline.icons`, defaulting to
+    /// [`OutlineIcons::None`] (no auto-detection story exists — a terminal can't report the
+    /// user's font). Read by `render::build_outline_line`.
+    pub icons: OutlineIcons,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1065,6 +1082,7 @@ impl App {
             width: DEFAULT_OUTLINE_WIDTH,
             scroll: 0,
             order: OutlineOrder::default(),
+            icons: OutlineIcons::default(),
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -2145,6 +2163,7 @@ impl App {
                     .map(|(idx, f)| OutlineFile {
                         path: f.path.clone(),
                         status: v.staged_status(idx),
+                        change: f.status,
                     })
                     .collect(),
             })
@@ -2224,12 +2243,14 @@ impl App {
                 // the same alpha order the Tree outline itself paints (`emit`'s own sort).
                 let snapshot = self.outline_snapshot();
                 let latest = outline::latest_by_path(&snapshot);
-                let mut entries: Vec<(&String, &(usize, usize, outline::StagedStatus))> =
-                    latest.iter().collect();
+                let mut entries: Vec<(
+                    &String,
+                    &(usize, usize, outline::StagedStatus, FileStatus),
+                )> = latest.iter().collect();
                 entries.sort_by(|a, b| a.0.cmp(b.0));
                 let files: Vec<&FileChange> = entries
                     .into_iter()
-                    .filter_map(|(_, &(cs_idx, file_idx, _))| {
+                    .filter_map(|(_, &(cs_idx, file_idx, _, _))| {
                         self.changesets[cs_idx].files().get(file_idx)
                     })
                     .collect();
@@ -2271,6 +2292,12 @@ impl App {
     /// or [`OutlineOrder::default`] if never set.
     pub fn outline_order(&self) -> OutlineOrder {
         self.outline.order
+    }
+
+    /// CS5: whether the outline renders nerd-font icons — `workon.review.outline.icons`, or
+    /// [`OutlineIcons::default`] (`None`) if never set.
+    pub fn outline_icons(&self) -> OutlineIcons {
+        self.outline.icons
     }
 
     /// `o`: a pure show/hide toggle — closed -> open+focused (+[`Self::sync_outline_to_current`]),
@@ -2343,6 +2370,14 @@ impl App {
     /// needed here either.
     pub fn set_outline_order(&mut self, order: OutlineOrder) {
         self.outline.order = order;
+    }
+
+    /// Set the outline icons setting directly — the config-startup (CS5) counterpart; there is
+    /// no interactive key for this (icons are a static config choice, not something to toggle
+    /// mid-session). Same non-resync posture as [`Self::set_outline_mode`]/
+    /// [`Self::set_outline_order`].
+    pub fn set_outline_icons(&mut self, icons: OutlineIcons) {
+        self.outline.icons = icons;
     }
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
@@ -2740,6 +2775,17 @@ impl App {
             None => OutlineOrder::default(),
         };
         self.set_outline_order(order);
+
+        let icons = match &raw.outline_icons {
+            Some(i) => parse_outline_icons(i).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.outline.icons = '{i}' unrecognized; using default"
+                ));
+                OutlineIcons::default()
+            }),
+            None => OutlineIcons::default(),
+        };
+        self.set_outline_icons(icons);
 
         let layout = match &raw.diff_layout {
             Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
@@ -3620,6 +3666,7 @@ mod tests {
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
+    use crate::icons::OutlineIcons;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
 
@@ -7467,6 +7514,7 @@ mod tests {
                 file_idx: 0,
                 path: "c1.txt".to_string(),
                 status: StagedStatus::None,
+                change: FileStatus::Added,
                 guides: Vec::new(),
             },
             "a committed changeset's file must carry no staged-ness status"
@@ -7480,6 +7528,32 @@ mod tests {
             !matches!(uncommitted_file, OutlineItem::File { status: StagedStatus::None, .. }),
             "the untracked uncommitted file must carry a real staged-ness status, got: {uncommitted_file:?}"
         );
+    }
+
+    /// CS5: `outline_snapshot`'s `change` field is lifted from the owning `FileChange::status`,
+    /// a wholly separate axis from `status` (staged-ness — see `outline::OutlineFile::change`'s
+    /// doc comment). `c1.txt` is a new file introduced by the committed changeset's head commit
+    /// (`Added`); `u1.txt` is an untracked worktree file (`Untracked`) — distinct FileStatus
+    /// values, confirming this isn't just always defaulting to one variant.
+    #[test]
+    fn outline_snapshot_lifts_change_status_from_the_file_model_independent_of_staged_status() {
+        let mut app = committed_and_uncommitted_stack();
+        app.outline.mode = OutlineMode::Stack;
+        let items = app.outline_items();
+
+        let change_for = |path: &str| {
+            items
+                .iter()
+                .find_map(|it| match it {
+                    OutlineItem::File {
+                        path: p, change, ..
+                    } if p == path => Some(*change),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{path}'s file row present"))
+        };
+        assert_eq!(change_for("c1.txt"), FileStatus::Added);
+        assert_eq!(change_for("u1.txt"), FileStatus::Untracked);
     }
 
     #[test]
@@ -7610,6 +7684,7 @@ mod tests {
                 file_idx: 0,
                 path: "b1.txt".to_string(),
                 status: StagedStatus::None,
+                change: FileStatus::Added,
                 guides: Vec::new(),
             },
             "the outline cursor must follow the diff's new position"
@@ -7637,6 +7712,7 @@ mod tests {
                 file_idx: 0,
                 path: "b1.txt".to_string(),
                 status: StagedStatus::None,
+                change: FileStatus::Added,
                 guides: vec![true],
             },
             "the outline cursor must follow the diff's new position, landing on b1.txt's row \
@@ -7955,6 +8031,7 @@ mod tests {
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(app.outline_mode(), OutlineMode::default());
         assert_eq!(app.outline_order(), OutlineOrder::default());
+        assert_eq!(app.outline_icons(), OutlineIcons::default());
         assert_eq!(app.layout, Layout::default());
         assert_eq!(app.zoom, Zoom::default());
     }
@@ -8050,6 +8127,37 @@ mod tests {
         assert_eq!(app.outline_order(), OutlineOrder::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("outline.order"));
+    }
+
+    #[test]
+    fn outline_icons_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.icons", "nerd")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_icons(), OutlineIcons::Nerd);
+    }
+
+    #[test]
+    fn outline_icons_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.icons", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.outline_icons(), OutlineIcons::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outline.icons"));
     }
 
     #[test]

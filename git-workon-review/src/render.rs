@@ -19,6 +19,7 @@ use crate::app::{
 use crate::attribute::Attribution;
 use crate::config::View;
 use crate::highlight::FgSpan;
+use crate::icons::OutlineIcons;
 use crate::keymap::{footer_hint, help_sections, Keymap};
 use crate::model::FileStatus;
 use crate::outline::OutlineItem;
@@ -488,6 +489,7 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     let cursor = app.outline_cursor();
     let focused = app.outline_focused();
     let scroll = app.outline_scroll();
+    let icons = app.outline_icons();
 
     let buf = frame.buffer_mut();
     for row in 0..area.height {
@@ -497,7 +499,7 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
             continue;
         };
         let is_cursor = item_idx == cursor;
-        let line = build_outline_line(item, theme);
+        let line = build_outline_line(item, theme, icons);
         let line = if is_cursor && focused {
             apply_cursor_row(line, area.width, theme)
         } else if is_cursor {
@@ -529,9 +531,26 @@ fn tree_prefix(guides: &[bool]) -> String {
     s
 }
 
+/// The [`FileStatus`] change-letter's foreground color (CS5): a create-like status (Added/
+/// Untracked) reuses the theme's `add_strong` tint, a destroy-like status (Deleted) reuses
+/// `del_strong`, and everything else (Modified/Renamed/Copied/Unmerged — a change to EXISTING
+/// content, not a create/destroy) gets the theme's neutral `foreground`. No new [`Palette`]
+/// fields — this is deliberately just a remap of tints CS4's summary rows already use.
+fn change_letter_color(change: FileStatus, theme: &Palette) -> Color {
+    match change {
+        FileStatus::Added | FileStatus::Untracked => theme.add_strong,
+        FileStatus::Deleted => theme.del_strong,
+        FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied | FileStatus::Unmerged => {
+            theme.foreground
+        }
+    }
+}
+
 /// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
-/// marker rules.
-fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
+/// marker rules. `icons` (CS5, `workon.review.outline.icons`) is [`OutlineIcons::None`] by
+/// default, which reproduces the pre-CS5 row text exactly (no icon glyph, no extra space); only
+/// [`OutlineIcons::Nerd`] inserts an icon before the name/path.
+fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) -> Line<'static> {
     match item {
         OutlineItem::Header {
             label,
@@ -565,7 +584,11 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
             Line::from(spans)
         }
         OutlineItem::Dir { name, guides, .. } => {
-            let text = format!("{}{name}/", tree_prefix(guides));
+            let icon = match icons {
+                OutlineIcons::Nerd => format!("{} ", crate::icons::DIR_ICON),
+                OutlineIcons::None => String::new(),
+            };
+            let text = format!("{}{icon}{name}/", tree_prefix(guides));
             Line::from(TSpan::styled(
                 text,
                 Style::default()
@@ -576,10 +599,12 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
         OutlineItem::File {
             path,
             status,
+            change,
             guides,
             ..
         } => {
             let glyph = status.glyph();
+            let letter = change.letter();
             // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
             // non-empty `guides` (Tree/StackTree modes) draws tree connectors instead — see
             // `OutlineItem`'s doc comment for why emptiness is the mode signal.
@@ -588,8 +613,24 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
             } else {
                 tree_prefix(guides)
             };
-            let text = format!("{prefix}{glyph} {path}");
-            Line::from(TSpan::styled(text, Style::default().fg(theme.foreground)))
+            let icon = match icons {
+                OutlineIcons::Nerd => format!("{} ", crate::icons::icon_for_path(path)),
+                OutlineIcons::None => String::new(),
+            };
+            Line::from(vec![
+                TSpan::styled(
+                    format!("{prefix}{glyph}"),
+                    Style::default().fg(theme.foreground),
+                ),
+                TSpan::styled(
+                    letter.to_string(),
+                    Style::default().fg(change_letter_color(*change, theme)),
+                ),
+                TSpan::styled(
+                    format!(" {icon}{path}"),
+                    Style::default().fg(theme.foreground),
+                ),
+            ])
         }
     }
 }
@@ -2758,6 +2799,151 @@ mod tests {
         assert!(
             content[3].contains('\u{2514}') && content[3].contains("top.txt"),
             "expected row 3 to be top.txt with a last-child '└─' guide, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    // ── CS5: file status letter + opt-in nerd-font icons ───────────────────────────
+
+    #[test]
+    fn outline_file_row_shows_the_modified_change_letter_in_its_own_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.rs", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        // A lone changeset defaults the outline closed — force it open so this render test can
+        // inspect its rows (same pattern as `outline_tree_mode_renders_directory_rows_with_tree_guides`).
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        // Skip y=0: the full-width winbar also names the file ("[1/1] a.rs"), so an unskipped
+        // search would match it instead of the outline's own row below it.
+        let row = content
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, r)| r.contains("a.rs"))
+            .map(|(i, _)| i)
+            .expect("a.rs's file row present");
+        assert!(
+            content[row].contains('M'),
+            "expected the Modified change letter 'M' in a.rs's row, got: {:?}",
+            content[row]
+        );
+
+        let letter_x = content[row].find('M').unwrap() as u16;
+        assert_eq!(
+            buf.cell((letter_x, row as u16)).unwrap().style().fg,
+            Some(Palette::dark().foreground),
+            "Modified is a change-to-existing-content status, so its letter must carry the \
+             theme's neutral foreground, not an add/del tint"
+        );
+    }
+
+    #[test]
+    fn outline_icons_nerd_renders_the_rust_file_icon_and_the_dir_icon() {
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        use crate::app::ChangesetView;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("src/main.rs", "fn main() {}\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "cs".to_string(),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> Tree, so `src/` renders as its own Dir row
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        // Skip y=0 in both searches: the full-width winbar names the path ("[1/1] src/main.rs"),
+        // so an unskipped search would match it instead of the outline's own rows below it.
+        let dir_row = content
+            .iter()
+            .skip(1)
+            .find(|r| r.contains("src/"))
+            .expect("src/ dir row present");
+        assert!(
+            dir_row.contains(crate::icons::DIR_ICON),
+            "expected the dir icon before src/, got: {dir_row:?}"
+        );
+        let file_row = content
+            .iter()
+            .skip(1)
+            .find(|r| r.contains("main.rs"))
+            .expect("main.rs file row present");
+        assert!(
+            file_row.contains(crate::icons::icon_for_path("main.rs")),
+            "expected the rust file icon before main.rs, got: {file_row:?}"
+        );
+    }
+
+    #[test]
+    fn outline_icons_none_renders_neither_icon() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> Tree
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+        assert_eq!(
+            app.outline_icons(),
+            crate::icons::OutlineIcons::None,
+            "sanity: icons default to None"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        assert!(
+            !content.iter().any(|r| r.contains(crate::icons::DIR_ICON)),
+            "icons=none must never render the dir icon, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            !content
+                .iter()
+                .any(|r| r.contains(crate::icons::DEFAULT_ICON)),
+            "icons=none must never render the default file icon, got:\n{}",
             content.join("\n")
         );
     }

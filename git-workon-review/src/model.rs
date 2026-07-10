@@ -101,6 +101,26 @@ pub enum FileStatus {
     Unmerged,
 }
 
+impl FileStatus {
+    /// The single-character letter the outline's file rows render for this status (CS5):
+    /// `M`/`A`/`D`/`R`/`C`/`?`/`U`, mirroring `git status --short`'s XY letters where they exist
+    /// (`?` for untracked, `U` for unmerged/conflicted — git's own convention, not this crate's
+    /// invention). No mapping like this existed elsewhere in the crate before CS5 (checked the
+    /// winbar/header, which only special-cases `Renamed`/`Copied` for the `old -> new` label,
+    /// never prints a letter) — this is the canonical one going forward.
+    pub fn letter(self) -> char {
+        match self {
+            FileStatus::Modified => 'M',
+            FileStatus::Added => 'A',
+            FileStatus::Deleted => 'D',
+            FileStatus::Renamed => 'R',
+            FileStatus::Copied => 'C',
+            FileStatus::Untracked => '?',
+            FileStatus::Unmerged => 'U',
+        }
+    }
+}
+
 impl From<git2::Delta> for FileStatus {
     fn from(delta: git2::Delta) -> Self {
         match delta {

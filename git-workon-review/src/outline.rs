@@ -3,11 +3,19 @@
 //! renders and the outline cursor indexes — no [`crate::app::App`]/[`crate::app::ChangesetView`]
 //! dependency, mirroring how [`crate::attribute`] stays a pure module consumed by `app`/`render`.
 //!
-//! CS3 shipped two of the four modes ([`OutlineMode::Flat`]/[`OutlineMode::Stack`]); CS4 (this
-//! revision) adds the two path-trie modes ([`OutlineMode::Tree`]/[`OutlineMode::StackTree`]) via
-//! the private [`TrieNode`] builder below.
+//! CS3 shipped two of the four modes ([`OutlineMode::Flat`]/[`OutlineMode::Stack`]); CS4 added
+//! the two path-trie modes ([`OutlineMode::Tree`]/[`OutlineMode::StackTree`]) via the private
+//! [`TrieNode`] builder below. CS5 adds each file row's [`crate::model::FileStatus`] (the `M`/
+//! `A`/`D`/... change-status letter — see [`OutlineFile::change`]/[`OutlineItem::File::change`]'s
+//! doc comments for why that's a wholly separate field from [`StagedStatus`], which tracks
+//! index/worktree staged-ness, not the underlying change kind). Pulling in
+//! `crate::model::FileStatus` keeps this module's pure-data posture intact: `model.rs` is itself
+//! a pure data module (no `App`/`ChangesetView` dependency), so importing its plain enum doesn't
+//! reintroduce the `App` coupling this module was factored out to avoid.
 
 use std::collections::HashMap;
+
+use crate::model::FileStatus;
 
 /// Which of the outline's row-building strategies is active — cycled by `i` (only while the
 /// outline pane has focus; see `App::outline_cycle_mode`).
@@ -123,7 +131,15 @@ impl StagedStatus {
 #[derive(Debug, Clone)]
 pub struct OutlineFile {
     pub path: String,
+    /// Index/worktree staged-ness — [`StagedStatus::None`] for a committed changeset's files.
+    /// NOT the same axis as [`Self::change`]: a file can be `Staged` (this field) while its
+    /// underlying change is `Deleted` (that one) — they answer different questions ("is it
+    /// staged" vs. "what kind of change is it") and must stay two distinct fields.
     pub status: StagedStatus,
+    /// CS5: the underlying change kind (Modified/Added/Deleted/...), lifted from the owning
+    /// [`crate::model::FileChange::status`] — drives the outline's `M`/`A`/`D`/`R`/`C`/`?`/`U`
+    /// letter (`render::build_outline_line`), independent of [`Self::status`] above.
+    pub change: FileStatus,
 }
 
 /// One changeset's outline-relevant data — a snapshot, not a borrow, so this module never needs
@@ -200,6 +216,9 @@ pub enum OutlineItem {
         file_idx: usize,
         path: String,
         status: StagedStatus,
+        /// CS5: the change kind (Modified/Added/Deleted/...) — see [`OutlineFile::change`]'s doc
+        /// comment on why this is distinct from `status` above.
+        change: FileStatus,
         guides: Vec<bool>,
     },
 }
@@ -258,6 +277,7 @@ fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outl
                 file_idx,
                 path: file.path.clone(),
                 status: file.status,
+                change: file.change,
                 guides: Vec::new(),
             });
         }
@@ -288,12 +308,13 @@ fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outli
     order_list
         .into_iter()
         .map(|path| {
-            let (cs_idx, file_idx, status) = latest[&path];
+            let (cs_idx, file_idx, status, change) = latest[&path];
             OutlineItem::File {
                 cs_idx,
                 file_idx,
                 path,
                 status,
+                change,
                 guides: Vec::new(),
             }
         })
@@ -310,11 +331,14 @@ fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outli
 /// re-deriving the dedup logic in `app.rs`.
 pub(crate) fn latest_by_path(
     changesets: &[OutlineChangeset],
-) -> HashMap<String, (usize, usize, StagedStatus)> {
+) -> HashMap<String, (usize, usize, StagedStatus, FileStatus)> {
     let mut latest = HashMap::new();
     for (cs_idx, cs) in changesets.iter().enumerate() {
         for (file_idx, file) in cs.files.iter().enumerate() {
-            latest.insert(file.path.clone(), (cs_idx, file_idx, file.status));
+            latest.insert(
+                file.path.clone(),
+                (cs_idx, file_idx, file.status, file.change),
+            );
         }
     }
     latest
@@ -325,14 +349,22 @@ pub(crate) fn latest_by_path(
 /// collide a file and a directory at the same path, so a node is never both.
 #[derive(Debug, Default)]
 struct TrieNode {
-    file: Option<(usize, usize, StagedStatus)>,
+    file: Option<(usize, usize, StagedStatus, FileStatus)>,
     /// Insertion order is irrelevant — [`emit`] re-sorts children (dirs-before-files, alpha
     /// within group) every time it flattens a node.
     children: Vec<(String, TrieNode)>,
 }
 
 impl TrieNode {
-    fn insert(&mut self, segments: &[&str], cs_idx: usize, file_idx: usize, status: StagedStatus) {
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &mut self,
+        segments: &[&str],
+        cs_idx: usize,
+        file_idx: usize,
+        status: StagedStatus,
+        change: FileStatus,
+    ) {
         let (head, rest) = segments
             .split_first()
             .expect("insert is never called with an empty segment list");
@@ -346,9 +378,9 @@ impl TrieNode {
         let child = &mut self.children[idx].1;
         if rest.is_empty() {
             // Last-write-wins: a later insert of the same full path overwrites the leaf data.
-            child.file = Some((cs_idx, file_idx, status));
+            child.file = Some((cs_idx, file_idx, status, change));
         } else {
-            child.insert(rest, cs_idx, file_idx, status);
+            child.insert(rest, cs_idx, file_idx, status, change);
         }
     }
 }
@@ -384,12 +416,13 @@ fn emit(
         let mut guides = ancestors_last.to_vec();
         guides.push(is_last);
         match child.file {
-            Some((cs_idx, file_idx, status)) => {
+            Some((cs_idx, file_idx, status, change)) => {
                 items.push(OutlineItem::File {
                     cs_idx,
                     file_idx,
                     path: name.clone(),
                     status,
+                    change,
                     guides,
                 });
             }
@@ -419,9 +452,9 @@ fn emit(
 fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
     let latest = latest_by_path(changesets);
     let mut root = TrieNode::default();
-    for (path, (cs_idx, file_idx, status)) in &latest {
+    for (path, (cs_idx, file_idx, status, change)) in &latest {
         let segments: Vec<&str> = path.split('/').collect();
-        root.insert(&segments, *cs_idx, *file_idx, *status);
+        root.insert(&segments, *cs_idx, *file_idx, *status, *change);
     }
     let mut items = Vec::new();
     emit(&root, &[], "", None, &mut items);
@@ -447,7 +480,7 @@ fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec
         let mut root = TrieNode::default();
         for (file_idx, file) in cs.files.iter().enumerate() {
             let segments: Vec<&str> = file.path.split('/').collect();
-            root.insert(&segments, cs_idx, file_idx, file.status);
+            root.insert(&segments, cs_idx, file_idx, file.status, file.change);
         }
         emit(&root, &[], "", Some(cs_idx), &mut items);
     }
@@ -458,11 +491,32 @@ fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec
 mod tests {
     use super::*;
 
+    /// `change` defaults to [`FileStatus::Modified`] for every file — the ordinary case, and
+    /// irrelevant to the order/dedup/depth semantics these tests exercise. Tests that care about
+    /// a SPECIFIC change status (dedup target resolution) use [`cs_with_change`] instead.
     fn cs(
         label: &str,
         current: bool,
         needs_restack: bool,
         files: &[(&str, StagedStatus)],
+    ) -> OutlineChangeset {
+        cs_with_change(
+            label,
+            current,
+            needs_restack,
+            &files
+                .iter()
+                .map(|(p, s)| (*p, *s, FileStatus::Modified))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// [`cs`] variant that lets a test pin each file's [`FileStatus`] explicitly (CS5).
+    fn cs_with_change(
+        label: &str,
+        current: bool,
+        needs_restack: bool,
+        files: &[(&str, StagedStatus, FileStatus)],
     ) -> OutlineChangeset {
         OutlineChangeset {
             label: label.to_string(),
@@ -472,9 +526,10 @@ mod tests {
             failed: false,
             files: files
                 .iter()
-                .map(|(p, s)| OutlineFile {
+                .map(|(p, s, c)| OutlineFile {
                     path: p.to_string(),
                     status: *s,
+                    change: *c,
                 })
                 .collect(),
         }
@@ -519,6 +574,7 @@ mod tests {
                     file_idx: 0,
                     path: "a1.txt".to_string(),
                     status: StagedStatus::None,
+                    change: FileStatus::Modified,
                     guides: Vec::new(),
                 },
                 OutlineItem::Header {
@@ -534,6 +590,7 @@ mod tests {
                     file_idx: 0,
                     path: "b1.txt".to_string(),
                     status: StagedStatus::None,
+                    change: FileStatus::Modified,
                     guides: Vec::new(),
                 },
             ]
@@ -612,6 +669,7 @@ mod tests {
                 file_idx: 0,
                 path: "shared.txt".to_string(),
                 status: StagedStatus::Unstaged,
+                change: FileStatus::Modified,
                 guides: Vec::new(),
             },
             "must point at cs-b (the LATER/newer changeset), not cs-a"
@@ -691,6 +749,7 @@ mod tests {
                 file_idx: 0,
                 path: "shared.txt".to_string(),
                 status: StagedStatus::Staged,
+                change: FileStatus::Modified,
                 guides: Vec::new(),
             }),
             "target resolution stays head-wins (cs-b) regardless of display order"
@@ -757,6 +816,7 @@ mod tests {
                     file_idx: 1,
                     path: "b.rs".to_string(),
                     status: StagedStatus::None,
+                    change: FileStatus::Modified,
                     guides: vec![false, false, false],
                 },
                 OutlineItem::File {
@@ -764,6 +824,7 @@ mod tests {
                     file_idx: 2,
                     path: "c.rs".to_string(),
                     status: StagedStatus::None,
+                    change: FileStatus::Modified,
                     guides: vec![false, false, true],
                 },
                 OutlineItem::File {
@@ -771,6 +832,7 @@ mod tests {
                     file_idx: 3,
                     path: "d.rs".to_string(),
                     status: StagedStatus::None,
+                    change: FileStatus::Modified,
                     guides: vec![false, true],
                 },
                 OutlineItem::File {
@@ -778,6 +840,7 @@ mod tests {
                     file_idx: 0,
                     path: "top.rs".to_string(),
                     status: StagedStatus::None,
+                    change: FileStatus::Modified,
                     guides: vec![true],
                 },
             ],
@@ -804,6 +867,7 @@ mod tests {
                 file_idx: 0,
                 path: "shared.txt".to_string(),
                 status: StagedStatus::Staged,
+                change: FileStatus::Modified,
                 guides: vec![true],
             }],
             "the shared path must appear exactly once, pointing at the newer changeset"
@@ -839,6 +903,7 @@ mod tests {
                     file_idx: 0,
                     path: "y.txt".to_string(),
                     status: StagedStatus::None,
+                    change: FileStatus::Modified,
                     guides: vec![true, true],
                 },
                 OutlineItem::Header {
@@ -854,6 +919,7 @@ mod tests {
                     file_idx: 0,
                     path: "z.txt".to_string(),
                     status: StagedStatus::Unstaged,
+                    change: FileStatus::Modified,
                     guides: vec![true],
                 },
             ],
@@ -946,6 +1012,7 @@ mod tests {
                 file_idx: 0,
                 path: "z.txt".to_string(),
                 status: StagedStatus::None,
+                change: FileStatus::Modified,
                 guides: vec![true],
             },
             "cs-b's own file follows immediately under its head-first header"
