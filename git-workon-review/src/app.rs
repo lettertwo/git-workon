@@ -27,6 +27,7 @@ use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::source::{resolve_source, Source};
 use crate::stage_op::{FileStagingOp, LineSelectionOp};
+use crate::summary;
 use crate::synthesis::LineSelection;
 use crate::wordiff::{word_diff_spans, Span};
 
@@ -585,6 +586,30 @@ fn parse_diff_zoom(raw: &str) -> Option<Zoom> {
         "staged" => Some(Zoom::Staged),
         _ => None,
     }
+}
+
+/// CS4: which outline row a Header/Dir cursor selection resolves to — [`App::summary_target`]'s
+/// return type, and the input [`App::summary_for`] consumes to build the renderable summary.
+/// `render.rs`'s `render_summary` never matches on this directly — it only calls
+/// `App::summary_for`/renders the [`Summary`] that comes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryTarget {
+    /// The cursor rests on an [`OutlineItem::Header`] row — `cs_idx` is that row's true index
+    /// into [`App::changesets`].
+    Changeset(usize),
+    /// The cursor rests on an [`OutlineItem::Dir`] row — `path` is that row's full path, `cs_idx`
+    /// its `cs_idx` (`Some` in [`OutlineMode::StackTree`], `None` in the cross-stack
+    /// [`OutlineMode::Tree`] — see that field's doc comment on [`OutlineItem::Dir`]).
+    Dir { cs_idx: Option<usize>, path: String },
+}
+
+/// CS4: the renderable summary [`App::summary_for`] builds for a [`SummaryTarget`] — a thin
+/// wrapper so `render.rs` has one return type to match on regardless of which kind of row was
+/// selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Summary {
+    Changeset(summary::ChangesetSummary),
+    Dir(summary::DirSummary),
 }
 
 /// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
@@ -2098,14 +2123,14 @@ impl App {
 
     // ── Outline side pane (CS3) ─────────────────────────────────────────────────
 
-    /// Snapshot every reviewed changeset into [`OutlineChangeset`]/[`OutlineFile`] and build the
-    /// current [`OutlineMode`]'s row list — the outline cursor's index space, and the source of
-    /// truth `render.rs` draws from. Rebuilt fresh on every call (cheap: a small stack times a
-    /// handful of files each, no caching, same posture as [`Self::effective_zoom_for`]) rather
-    /// than cached on `App`, so it's never stale across a mode toggle, a nav, or a refresh.
-    pub fn outline_items(&self) -> Vec<OutlineItem> {
-        let snapshot: Vec<OutlineChangeset> = self
-            .changesets
+    // ── Summary panel (CS4) ─────────────────────────────────────────────────────
+
+    /// Snapshot every reviewed changeset into [`OutlineChangeset`]/[`OutlineFile`] — the input
+    /// [`Self::outline_items`] feeds `outline::build_items`, and CS4's [`Self::summary_for`]
+    /// feeds `outline::latest_by_path` for a [`OutlineMode::Tree`] directory's cross-stack
+    /// aggregate. Rebuilt fresh on every call, same posture as [`Self::outline_items`] itself.
+    fn outline_snapshot(&self) -> Vec<OutlineChangeset> {
+        self.changesets
             .iter()
             .map(|v| OutlineChangeset {
                 label: v.cs.title.clone().unwrap_or_else(|| v.cs.name.clone()),
@@ -2123,8 +2148,91 @@ impl App {
                     })
                     .collect(),
             })
-            .collect();
+            .collect()
+    }
+
+    /// Build the current [`OutlineMode`]'s row list — the outline cursor's index space, and the
+    /// source of truth `render.rs` draws from. Rebuilt fresh on every call (cheap: a small stack
+    /// times a handful of files each, no caching, same posture as [`Self::effective_zoom_for`])
+    /// rather than cached on `App`, so it's never stale across a mode toggle, a nav, or a
+    /// refresh.
+    pub fn outline_items(&self) -> Vec<OutlineItem> {
+        let snapshot = self.outline_snapshot();
         outline::build_items(&snapshot, self.outline.mode, self.outline.order)
+    }
+
+    /// CS4: the outline row a Header/Dir cursor selection resolves to — `None` when the outline
+    /// isn't in a state where the diff area shows a summary instead of a file's diff (closed,
+    /// merely open-but-unfocused, or the cursor is on a File row). `render_body` branches on this
+    /// before any of its usual diff-body gates (pending/failed/binary/deferred-load).
+    pub fn summary_target(&self) -> Option<SummaryTarget> {
+        if !self.outline.open || !self.outline.focused {
+            return None;
+        }
+        let items = self.outline_items();
+        match items.get(self.outline.cursor)? {
+            OutlineItem::Header { cs_idx, .. } => Some(SummaryTarget::Changeset(*cs_idx)),
+            OutlineItem::Dir { path, cs_idx, .. } => Some(SummaryTarget::Dir {
+                cs_idx: *cs_idx,
+                path: path.clone(),
+            }),
+            OutlineItem::File { .. } => None,
+        }
+    }
+
+    /// Build the renderable summary for `target` (see [`Self::summary_target`]) —
+    /// `render::render_summary`'s data source.
+    pub fn summary_for(&self, target: SummaryTarget) -> Summary {
+        match target {
+            SummaryTarget::Changeset(cs_idx) => {
+                let view = &self.changesets[cs_idx];
+                let label = view
+                    .cs
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| view.cs.name.clone());
+                let failure_message = view.failure_message().map(|s| s.to_string());
+                Summary::Changeset(summary::changeset_summary(
+                    label,
+                    view.cs.current,
+                    view.cs.needs_restack,
+                    view.is_pending(),
+                    view.is_failed(),
+                    failure_message,
+                    view.files(),
+                ))
+            }
+            SummaryTarget::Dir {
+                cs_idx: Some(cs_idx),
+                path,
+            } => {
+                // StackTree mode: the dir row's trie belongs to exactly one changeset, so scope
+                // the aggregate to that changeset's own files (mirrors `build_stack_tree`'s "no
+                // cross-changeset dedup" rule).
+                let view = &self.changesets[cs_idx];
+                Summary::Dir(summary::dir_summary(path, view.files()))
+            }
+            SummaryTarget::Dir { cs_idx: None, path } => {
+                // Tree mode: the dir row's trie spans the whole stack with no single owning
+                // changeset — aggregate over the same last-write-wins de-duped path set the Tree
+                // outline itself displays, reusing `outline::latest_by_path` rather than
+                // re-deriving the dedup rule here. `latest_by_path` returns a `HashMap`, whose
+                // iteration order is unspecified — sort by path so the panel's file list reads in
+                // the same alpha order the Tree outline itself paints (`emit`'s own sort).
+                let snapshot = self.outline_snapshot();
+                let latest = outline::latest_by_path(&snapshot);
+                let mut entries: Vec<(&String, &(usize, usize, outline::StagedStatus))> =
+                    latest.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let files: Vec<FileChange> = entries
+                    .into_iter()
+                    .filter_map(|(_, &(cs_idx, file_idx, _))| {
+                        self.changesets[cs_idx].files().get(file_idx).cloned()
+                    })
+                    .collect();
+                Summary::Dir(summary::dir_summary(path, &files))
+            }
+        }
     }
 
     pub fn outline_open(&self) -> bool {
@@ -3504,7 +3612,8 @@ mod tests {
     use super::test_support::app_from_fixture;
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        EffectiveZoom, Layout, LoadedViews, Role, Severity, Zoom, DEFAULT_OUTLINE_WIDTH,
+        EffectiveZoom, Layout, LoadedViews, Role, Severity, Summary, SummaryTarget, Zoom,
+        DEFAULT_OUTLINE_WIDTH,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
@@ -8000,5 +8109,152 @@ mod tests {
         assert_eq!(app.zoom, Zoom::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("diff.zoom"));
+    }
+
+    // ── CS4: summary panel ───────────────────────────────────────────────────────
+
+    /// Force the outline open+focused with `mode` and `cursor`, matching the state
+    /// `summary_target` requires — the individual state-transition tests below build off this
+    /// instead of repeating the three-field setup. Pins `order` to `BaseFirst` so a fixture's
+    /// base -> head file/changeset indices line up with display order (the default `HeadFirst`
+    /// reverses the header row sequence — irrelevant to what's under test here, see CS3).
+    fn open_focused_outline(app: &mut App, mode: OutlineMode, cursor: usize) {
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.mode = mode;
+        app.outline.cursor = cursor;
+        app.outline.order = OutlineOrder::BaseFirst;
+    }
+
+    #[test]
+    fn summary_target_is_none_when_the_outline_is_closed() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.open = false;
+        app.outline.focused = false;
+        assert_eq!(app.summary_target(), None);
+    }
+
+    #[test]
+    fn summary_target_is_none_when_the_outline_is_open_but_unfocused() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.open = true;
+        app.outline.focused = false;
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.cursor = 0; // a Header row
+        assert_eq!(
+            app.summary_target(),
+            None,
+            "an unfocused open outline must never override the diff area (locked design)"
+        );
+    }
+
+    #[test]
+    fn summary_target_is_none_when_the_cursor_is_on_a_file_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 1); // cs-a's first file row
+        let items = app.outline_items();
+        assert!(matches!(items[1], OutlineItem::File { .. }));
+        assert_eq!(app.summary_target(), None);
+    }
+
+    #[test]
+    fn summary_target_is_some_changeset_on_a_header_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0); // cs-a's header row
+        let items = app.outline_items();
+        assert!(matches!(items[0], OutlineItem::Header { cs_idx: 0, .. }));
+        assert_eq!(app.summary_target(), Some(SummaryTarget::Changeset(0)));
+    }
+
+    #[test]
+    fn summary_target_is_some_dir_with_cs_idx_none_in_tree_mode() {
+        let mut app = single_changeset_with_nested_paths();
+        let items = {
+            app.outline.mode = OutlineMode::Tree;
+            app.outline_items()
+        };
+        let dir_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ dir row present in Tree mode");
+        open_focused_outline(&mut app, OutlineMode::Tree, dir_idx);
+        assert_eq!(
+            app.summary_target(),
+            Some(SummaryTarget::Dir {
+                cs_idx: None,
+                path: "src".to_string(),
+            }),
+            "Tree mode's single cross-stack trie has no owning changeset"
+        );
+    }
+
+    #[test]
+    fn summary_target_is_some_dir_with_cs_idx_some_in_stack_tree_mode() {
+        let mut app = single_changeset_with_nested_paths();
+        let items = {
+            app.outline.mode = OutlineMode::StackTree;
+            app.outline_items()
+        };
+        let dir_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+        assert_eq!(
+            app.summary_target(),
+            Some(SummaryTarget::Dir {
+                cs_idx: Some(0),
+                path: "src".to_string(),
+            }),
+            "StackTree mode's dir row belongs to the single changeset in this fixture"
+        );
+    }
+
+    #[test]
+    fn summary_target_returns_none_again_after_focus_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        assert!(app.summary_target().is_some());
+        app.focus_diff();
+        assert_eq!(
+            app.summary_target(),
+            None,
+            "losing outline focus must immediately fall back to the diff body"
+        );
+    }
+
+    #[test]
+    fn summary_for_changeset_reflects_the_changesets_flags_and_files() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        let target = app.summary_target().unwrap();
+        let Summary::Changeset(summary) = app.summary_for(target) else {
+            panic!("expected a Changeset summary for a Header target");
+        };
+        assert!(summary.current, "cs-a is the current changeset");
+        assert!(!summary.needs_restack);
+        assert!(!summary.loading);
+        assert!(!summary.failed);
+        assert_eq!(summary.files.len(), 2, "cs-a touches a1.txt and a2.txt");
+        assert!(summary.total_adds + summary.total_dels > 0);
+    }
+
+    #[test]
+    fn summary_for_dir_in_tree_mode_aggregates_the_deduped_cross_stack_set() {
+        let mut app = single_changeset_with_nested_paths();
+        app.outline.mode = OutlineMode::Tree;
+        let items = app.outline_items();
+        let dir_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .unwrap();
+        open_focused_outline(&mut app, OutlineMode::Tree, dir_idx);
+        let target = app.summary_target().unwrap();
+        let Summary::Dir(summary) = app.summary_for(target) else {
+            panic!("expected a Dir summary for a Dir target");
+        };
+        assert_eq!(summary.path, "src");
+        let paths: Vec<&str> = summary.files.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.txt", "src/b.txt"]);
     }
 }

@@ -173,11 +173,24 @@ pub enum OutlineItem {
         failed: bool,
     },
     /// A directory row — only emitted in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`]. Not a
-    /// jump target: it carries no `cs_idx`/`file_idx`, so `App::outline_move_by` no-ops on it
-    /// (same as [`Self::Header`]) and `App::outline_confirm` also no-ops on it (CS4 decision —
-    /// there's no expand/collapse state to toggle, so Enter on a directory row does nothing but
-    /// still returns focus to the diff, matching every other confirm outcome).
-    Dir { name: String, guides: Vec<bool> },
+    /// jump target: it carries no `file_idx`, so `App::outline_move_by` no-ops on it (same as
+    /// [`Self::Header`]) and `App::outline_confirm` also no-ops on it (CS4 decision — there's no
+    /// expand/collapse state to toggle, so Enter on a directory row does nothing but still
+    /// returns focus to the diff, matching every other confirm outcome).
+    Dir {
+        name: String,
+        /// The FULL path from the trie root (e.g. `"src/cmd"`), unlike `name` which is just the
+        /// leaf segment — CS4's summary panel needs the whole path to filter files under this
+        /// directory (see `crate::summary::dir_summary`).
+        path: String,
+        /// `Some(cs_idx)` when this row's trie is per-changeset ([`OutlineMode::StackTree`] —
+        /// the same true index its owning [`Self::Header`] carries); `None` in the cross-stack
+        /// [`OutlineMode::Tree`], whose single trie spans every changeset (so a dir row there has
+        /// no single owning changeset to scope a summary to — CS4's `App::summary_for` instead
+        /// aggregates over [`latest_by_path`]'s de-duped set for that case).
+        cs_idx: Option<usize>,
+        guides: Vec<bool>,
+    },
     /// A file row — the target of every outline->diff jump. `path` is the FULL path in
     /// [`OutlineMode::Flat`]/[`OutlineMode::Stack`] (unchanged from CS3), but is just the leaf
     /// segment in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`] — the ancestor directory rows
@@ -290,7 +303,12 @@ fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outli
 /// De-dupe every changed path across the stack to its LAST occurrence (mirrors
 /// [`build_flat`]'s last-write-wins rule), independent of iteration/insertion order — the trie
 /// builders below re-sort by path segment anyway, so no stable-order bookkeeping is needed here.
-fn latest_by_path(
+///
+/// `pub(crate)`: CS4's `App::summary_for` reuses this directly to aggregate a
+/// [`OutlineMode::Tree`] directory's files (`cs_idx: None` on that mode's [`OutlineItem::Dir`]
+/// rows) over the same last-write-wins de-duped set the Tree outline itself displays, rather than
+/// re-deriving the dedup logic in `app.rs`.
+pub(crate) fn latest_by_path(
     changesets: &[OutlineChangeset],
 ) -> HashMap<String, (usize, usize, StagedStatus)> {
     let mut latest = HashMap::new();
@@ -340,7 +358,13 @@ impl TrieNode {
 /// given level, matching the conventional file-tree convention of grouping folders above
 /// loose files). `ancestors_last` is the growing guide vector — see [`OutlineItem`]'s doc
 /// comment for how rendering consumes it.
-fn emit(node: &TrieNode, ancestors_last: &[bool], items: &mut Vec<OutlineItem>) {
+fn emit(
+    node: &TrieNode,
+    ancestors_last: &[bool],
+    path_prefix: &str,
+    dir_cs_idx: Option<usize>,
+    items: &mut Vec<OutlineItem>,
+) {
     let mut files: Vec<&(String, TrieNode)> = node
         .children
         .iter()
@@ -370,11 +394,18 @@ fn emit(node: &TrieNode, ancestors_last: &[bool], items: &mut Vec<OutlineItem>) 
                 });
             }
             None => {
+                let full_path = if path_prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{path_prefix}/{name}")
+                };
                 items.push(OutlineItem::Dir {
                     name: name.clone(),
+                    path: full_path.clone(),
+                    cs_idx: dir_cs_idx,
                     guides: guides.clone(),
                 });
-                emit(child, &guides, items);
+                emit(child, &guides, &full_path, dir_cs_idx, items);
             }
         }
     }
@@ -393,7 +424,7 @@ fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
         root.insert(&segments, *cs_idx, *file_idx, *status);
     }
     let mut items = Vec::new();
-    emit(&root, &[], &mut items);
+    emit(&root, &[], "", None, &mut items);
     items
 }
 
@@ -418,7 +449,7 @@ fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec
             let segments: Vec<&str> = file.path.split('/').collect();
             root.insert(&segments, cs_idx, file_idx, file.status);
         }
-        emit(&root, &[], &mut items);
+        emit(&root, &[], "", Some(cs_idx), &mut items);
     }
     items
 }
@@ -711,10 +742,14 @@ mod tests {
             vec![
                 OutlineItem::Dir {
                     name: "src".to_string(),
+                    path: "src".to_string(),
+                    cs_idx: None,
                     guides: vec![false],
                 },
                 OutlineItem::Dir {
                     name: "a".to_string(),
+                    path: "src/a".to_string(),
+                    cs_idx: None,
                     guides: vec![false, false],
                 },
                 OutlineItem::File {
@@ -795,6 +830,8 @@ mod tests {
                 },
                 OutlineItem::Dir {
                     name: "x".to_string(),
+                    path: "x".to_string(),
+                    cs_idx: Some(0),
                     guides: vec![true],
                 },
                 OutlineItem::File {

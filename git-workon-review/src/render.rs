@@ -13,13 +13,16 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
-use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role, Severity};
+use crate::app::{
+    App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role, Severity, Summary,
+};
 use crate::attribute::Attribution;
 use crate::config::View;
 use crate::highlight::FgSpan;
 use crate::keymap::{footer_hint, help_sections, Keymap};
 use crate::model::FileStatus;
 use crate::outline::OutlineItem;
+use crate::summary::{ChangesetSummary, DirSummary, SummaryFileRow};
 use crate::theme::Palette;
 use crate::wordiff::Span as WordSpan;
 
@@ -561,7 +564,7 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
             }
             Line::from(spans)
         }
-        OutlineItem::Dir { name, guides } => {
+        OutlineItem::Dir { name, guides, .. } => {
             let text = format!("{}{name}/", tree_prefix(guides));
             Line::from(TSpan::styled(
                 text,
@@ -773,7 +776,177 @@ fn render_loading_placeholder(
     );
 }
 
+/// Push a `"path  +N -M"` file row's spans onto `lines`: the path in the theme foreground, the
+/// add/del counts tinted with the theme's own diff-add/diff-del colors (the strong variants — the
+/// same tint a hunk's `+`/`-` gutter itself uses, see [`Palette::add_strong`]/
+/// [`Palette::del_strong`]) so the panel's diffstat reads consistently with the diff body it's
+/// standing in for.
+fn push_summary_file_row(lines: &mut Vec<Line<'static>>, row: &SummaryFileRow, theme: &Palette) {
+    lines.push(Line::from(vec![
+        TSpan::styled(row.path.clone(), Style::default().fg(theme.foreground)),
+        TSpan::raw("  "),
+        TSpan::styled(
+            format!("+{}", row.adds),
+            Style::default().fg(theme.add_strong),
+        ),
+        TSpan::raw(" "),
+        TSpan::styled(
+            format!("-{}", row.dels),
+            Style::default().fg(theme.del_strong),
+        ),
+    ]));
+}
+
+/// Append `rows`' file lines to `lines`, truncated to leave room for `budget` more rows within the
+/// panel's height — the last line becomes `"… and N more"` (dim) when the list overflows instead
+/// of silently clipping.
+fn push_summary_file_rows(
+    lines: &mut Vec<Line<'static>>,
+    rows: &[SummaryFileRow],
+    budget: usize,
+    theme: &Palette,
+) {
+    if rows.len() <= budget {
+        for row in rows {
+            push_summary_file_row(lines, row, theme);
+        }
+        return;
+    }
+    // Reserve the last visible row for the "… and N more" marker.
+    let shown = budget.saturating_sub(1);
+    for row in &rows[..shown] {
+        push_summary_file_row(lines, row, theme);
+    }
+    let remaining = rows.len() - shown;
+    lines.push(Line::from(TSpan::styled(
+        format!("\u{2026} and {remaining} more"),
+        Style::default().fg(theme.dim),
+    )));
+}
+
+/// Build a [`ChangesetSummary`]'s lines: title line (carrying the same current/needs-restack/
+/// failed markers `build_outline_line`'s Header arm draws), a loading/failed line OR the per-file
+/// list + totals line.
+fn changeset_summary_lines(
+    summary: &ChangesetSummary,
+    height: usize,
+    theme: &Palette,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+
+    let mut title_spans = vec![TSpan::styled(
+        if summary.current { "\u{25CF} " } else { "  " },
+        Style::default().fg(FG_CURRENT),
+    )];
+    title_spans.push(TSpan::styled(
+        summary.label.clone(),
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if summary.needs_restack {
+        title_spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
+    }
+    lines.push(Line::from(title_spans));
+
+    if summary.failed {
+        let msg = summary
+            .failure_message
+            .as_deref()
+            .unwrap_or("(no error message)");
+        lines.push(Line::from(TSpan::styled(
+            format!("\u{2717} {msg}"),
+            Style::default().fg(FG_ERROR),
+        )));
+        return lines;
+    }
+    if summary.loading {
+        lines.push(Line::from(TSpan::styled(
+            "Loading\u{2026}",
+            Style::default().fg(theme.dim),
+        )));
+        return lines;
+    }
+
+    lines.push(Line::from(""));
+    let footer_budget = 1; // the totals line always shows
+    let file_budget = height.saturating_sub(lines.len() + footer_budget);
+    push_summary_file_rows(&mut lines, &summary.files, file_budget, theme);
+    lines.push(Line::from(vec![
+        TSpan::styled(
+            format!("{} files", summary.files.len()),
+            Style::default().fg(theme.foreground),
+        ),
+        TSpan::raw("  "),
+        TSpan::styled(
+            format!("+{}", summary.total_adds),
+            Style::default().fg(theme.add_strong),
+        ),
+        TSpan::raw(" "),
+        TSpan::styled(
+            format!("-{}", summary.total_dels),
+            Style::default().fg(theme.del_strong),
+        ),
+    ]));
+    lines
+}
+
+/// Build a [`DirSummary`]'s lines: a bold path title, a blank line, the per-file list, and the
+/// totals line — no current/restack/loading/failed markers (a directory carries none of those).
+fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(TSpan::styled(
+        format!("{}/", summary.path),
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    lines.push(Line::from(""));
+    let footer_budget = 1;
+    let file_budget = height.saturating_sub(lines.len() + footer_budget);
+    push_summary_file_rows(&mut lines, &summary.files, file_budget, theme);
+    lines.push(Line::from(vec![
+        TSpan::styled(
+            format!("{} files", summary.files.len()),
+            Style::default().fg(theme.foreground),
+        ),
+        TSpan::raw("  "),
+        TSpan::styled(
+            format!("+{}", summary.total_adds),
+            Style::default().fg(theme.add_strong),
+        ),
+        TSpan::raw(" "),
+        TSpan::styled(
+            format!("-{}", summary.total_dels),
+            Style::default().fg(theme.del_strong),
+        ),
+    ]));
+    lines
+}
+
+/// CS4's summary panel: renders in place of the diff body while the outline is open and focused
+/// with its cursor on a Header/Dir row (see [`App::summary_target`]) — a title line, a blank
+/// line, per-file `"path  +N -M"` rows (truncated to the pane height), and a totals line. A
+/// loading/failed Header shows its own inline state instead of a file list (see
+/// [`changeset_summary_lines`]).
+fn render_summary(frame: &mut Frame, summary: &Summary, area: Rect, theme: &Palette) {
+    let height = area.height as usize;
+    let lines = match summary {
+        Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme),
+        Summary::Dir(dir) => dir_summary_lines(dir, height, theme),
+    };
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
+    // CS4: the outline is open AND focused, and its cursor rests on a Header/Dir row — show that
+    // row's summary instead of a file's diff. Checked before every other body gate below (an
+    // unfocused open outline, or the cursor on a File row, falls straight through to the usual
+    // diff-body rendering; `summary_target` returns `None` in both cases).
+    if let Some(target) = app.summary_target() {
+        let summary = app.summary_for(target);
+        render_summary(frame, &summary, area, theme);
+        return;
+    }
     // ADR-031: the active changeset's diff hasn't been acquired (or failed to acquire) yet —
     // both cases have an empty `files()` list, so they must be checked BEFORE the "(no changes)"
     // fallback below, which would otherwise misreport a Pending/Failed changeset as an
@@ -1291,6 +1464,7 @@ mod tests {
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
     use crate::keymap::Keymap;
+    use crate::outline::OutlineItem;
     use crate::theme::Palette;
 
     /// Render one frame against the default (unrebound) keymap and the dark theme — the vast
@@ -2576,6 +2750,104 @@ mod tests {
             content[3].contains('\u{2514}') && content[3].contains("top.txt"),
             "expected row 3 to be top.txt with a last-child '└─' guide, got:\n{}",
             content.join("\n")
+        );
+    }
+
+    // ── CS4: summary panel ───────────────────────────────────────────────────────
+
+    /// The body area's columns, for a render at [`OUTLINE_TEST_WIDTH`] (outline `0..35`, divider
+    /// `35`, body `36..`) — mirrors [`outline_row`]'s slice but for the OTHER side of the pane.
+    fn body_text(buf: &Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (36..buf.area.width)
+                    .map(|x| cell_text(buf, x, y))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn focused_header_selection_renders_the_summary_panel_instead_of_the_diff() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open(), "a two-changeset stack default-opens");
+        // Default is open+unfocused; two toggles (close, reopen) focuses it — same idiom
+        // `outline_cursor_row_carries_cursor_background_when_focused` uses. Construction's
+        // `sync_outline_to_current` already parked the cursor on cs-b's (the `current`
+        // changeset's) own File row, not a Header — move it onto cs-b's Header explicitly.
+        app.toggle_outline();
+        app.toggle_outline();
+        assert!(app.outline_open() && app.outline_focused());
+        let header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header row present in Stack mode") as i64;
+        // A Header row never jumps the diff on `outline_move_by` (only a File row does — see its
+        // doc comment), so a single relative move onto it is side-effect-free.
+        let delta = header_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        assert!(matches!(
+            app.outline_items()[app.outline_cursor()],
+            OutlineItem::Header { cs_idx: 1, .. }
+        ));
+        app.focus_outline(); // outline_move_by doesn't touch focus; ensure it's still focused
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let body = body_text(&buf);
+        assert!(
+            body.contains("cs-b"),
+            "expected the summary panel's title (cs-b's label — it has no title, so falls back \
+             to its name), got:\n{body}"
+        );
+        assert!(
+            body.contains("+1") && body.contains("-0"),
+            "expected a '+N -M' diffstat fragment for cs-b's single added file, got:\n{body}"
+        );
+        assert!(
+            body.contains("1 files"),
+            "expected the summary panel's totals line, got:\n{body}"
+        );
+    }
+
+    #[test]
+    fn unfocused_open_outline_on_a_header_row_still_renders_the_normal_diff_body() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        // Default state: open, UNFOCUSED — must NOT show the summary panel (locked design: only
+        // a FOCUSED outline overrides the diff area) even with the cursor moved onto a Header
+        // row (construction's `sync_outline_to_current` parks it on cs-b's File row by default).
+        assert!(app.outline_open() && !app.outline_focused());
+        let header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header row present in Stack mode") as i64;
+        let delta = header_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        assert!(matches!(
+            app.outline_items()[app.outline_cursor()],
+            OutlineItem::Header { cs_idx: 1, .. }
+        ));
+        assert!(
+            !app.outline_focused(),
+            "outline_move_by must not itself grant focus"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let body = body_text(&buf);
+        assert!(
+            !body.contains("1 files"),
+            "an unfocused open outline must never override the diff body with the summary \
+             panel's totals line, got:\n{body}"
         );
     }
 
