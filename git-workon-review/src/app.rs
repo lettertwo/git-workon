@@ -1666,11 +1666,18 @@ impl App {
     ///   notice (never silently stranding the file — see this changeset's report for why a footer
     ///   notice, not a new per-file `Failed` state, is the shape chosen here).
     ///
-    /// Either way, when the readied file IS the current pending open, it's seated exactly like
-    /// [`Self::complete_pending_open`]'s tail: `open_pending` clears regardless of `Ok`/`Err` — a
-    /// failed load must not leave the placeholder stuck forever. Correctness never depends on
-    /// this: the next nav/force-completion retries via [`Self::ensure_loaded`]'s ordinary
-    /// cache-miss path, which is where a load actually being CORRECT is guaranteed.
+    /// Either way, when the readied file IS the current pending open, it's seated like
+    /// [`Self::complete_pending_open`]'s tail — with one refinement over a plain "always clear"
+    /// rule: an `Ok` result only clears the pending open when its SHAPE satisfies the current
+    /// effective zoom (see [`loaded_views_satisfy`]). Without this, a zoom cycled mid-load
+    /// (`z` is exempt from force-completion — [`Self::open_current`] re-defers with
+    /// `open_pending_dispatched = false`) lets the stale-shaped in-flight result seat only the
+    /// old view, clear the pending flags, and strand the new zoom's view forever un-dispatched.
+    /// When unsatisfied, `open_pending` stays set and `open_pending_dispatched` resets to
+    /// `false` so the next idle Tick re-dispatches against the NOW-current zoom — mirroring a
+    /// fresh [`Self::open_current`] defer. An `Err` result keeps clearing unconditionally: a
+    /// failed load must not leave the placeholder stuck forever, and correctness never depends
+    /// on this path — the sync fallback owns correctness (see this method's summary above).
     pub fn apply_file_ready(
         &mut self,
         gen: u64,
@@ -1681,8 +1688,12 @@ impl App {
         if gen != self.generation {
             return;
         }
+        let is_current_pending =
+            cs_idx == self.current_cs && file_idx == self.current && self.open_pending;
         match result {
             Ok(views) => {
+                let satisfies_current_zoom = is_current_pending
+                    && loaded_views_satisfy(&views, self.effective_zoom_for(file_idx));
                 if let Some(cs) = self.changesets.get_mut(cs_idx) {
                     match views {
                         LoadedViews::Single(role, view) => set_if_absent(cs, role, file_idx, view),
@@ -1692,15 +1703,24 @@ impl App {
                         }
                     }
                 }
+                if is_current_pending {
+                    if satisfies_current_zoom {
+                        self.reset_panes();
+                        self.open_pending = false;
+                        self.open_pending_dispatched = false;
+                    } else {
+                        self.open_pending_dispatched = false;
+                    }
+                }
             }
             Err(message) => {
                 self.notify(format!("failed to load file: {message}"), Severity::Error);
+                if is_current_pending {
+                    self.reset_panes();
+                    self.open_pending = false;
+                    self.open_pending_dispatched = false;
+                }
             }
-        }
-        if cs_idx == self.current_cs && file_idx == self.current && self.open_pending {
-            self.reset_panes();
-            self.open_pending = false;
-            self.open_pending_dispatched = false;
         }
     }
 
@@ -2911,6 +2931,20 @@ pub enum LoadedViews {
     },
 }
 
+/// Whether a loaded result's SHAPE — what zoom it was built against, per [`FileLoadSpec::zoom`]
+/// — still matches `current_zoom`, the current file's effective zoom at result-apply time. Used
+/// by [`App::apply_file_ready`] to tell a still-useful deferred-open result apart from one a
+/// mid-load `z` cycle outran: `Single` satisfies only the SAME role's `Single`, `Split`
+/// satisfies only `Split` (never the reverse — a `Split` result doesn't seat a `Single` open,
+/// and vice versa, even though `set_if_absent` already caches whichever roles it carries).
+fn loaded_views_satisfy(views: &LoadedViews, current_zoom: EffectiveZoom) -> bool {
+    match (views, current_zoom) {
+        (LoadedViews::Single(role, _), EffectiveZoom::Single(want)) => *role == want,
+        (LoadedViews::Split { .. }, EffectiveZoom::Split) => true,
+        _ => false,
+    }
+}
+
 /// Build every [`FileView`] a [`FileLoadSpec`] needs, against `repo`/`ts` — the ADR-031 loader
 /// thread's pure job body: unit-testable directly against a fixture repo, no threads or channels
 /// involved. Routes through the SAME [`build_combined_view`]/[`build_sub_role_view`] free
@@ -3435,6 +3469,54 @@ mod tests {
         assert_eq!(deferred_view.old_text(), eager_view.old_text());
         assert_eq!(deferred_view.new_text(), eager_view.new_text());
         assert_eq!(deferred_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn apply_file_ready_redispatches_when_zoom_outran_the_in_flight_load() {
+        // F2 regression: a zoom cycled mid-load must not let the stale-shaped in-flight result
+        // seat and clear the pending open — the new zoom's view would then never be dispatched.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", "committed\n", "staged\n", "workdir\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        // Default zoom is `Split`; this file has both staged and unstaged sub-diffs, so the
+        // effective zoom stays `Split` too.
+        app.open_current();
+        assert!(app.open_pending(), "deferred open must be pending");
+
+        let (gen, cs_idx, file_idx, spec) = app
+            .take_pending_load_spec()
+            .expect("first take dispatches against the Split zoom");
+        assert_eq!(spec.zoom, EffectiveZoom::Split);
+
+        // Mid-load `z`: CycleZoom is exempt from force-completion, so this re-defers the open
+        // against the NEW zoom instead of blocking for it.
+        app.cycle_zoom();
+        assert!(
+            app.open_pending(),
+            "cycling zoom while a load is pending must still be pending"
+        );
+
+        // The loader answers the now-STALE (Split) request.
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        app.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        assert!(
+            app.open_pending(),
+            "a stale-shaped result must not clear the pending open"
+        );
+        assert!(
+            app.take_pending_load_spec().is_some(),
+            "the next Tick must re-dispatch against the current (Combined) zoom"
+        );
     }
 
     #[test]
