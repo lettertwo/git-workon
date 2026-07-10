@@ -18,6 +18,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -27,25 +28,56 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use git2::Repository;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
-use workon_review::app::App;
+use workon_review::app::{self, App, FileLoadSpec, LoadedViews};
+use workon_review::highlight::TsHighlighter;
 use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
 use workon_review::render;
 use workon_review::theme::Palette;
 
 /// One event the review loop reacts to. `Tick` is synthesized by the main loop on an inbox
 /// `recv_timeout` timeout — it is never sent through the channel itself (see [`recv_event`]).
-/// `Key`/`Resize` are forwarded from the input thread via [`map_terminal_event`]. Not `Copy`
-/// (ADR-031): the next slice's loader-result variants carry non-`Copy` payloads; dropping `Copy`
-/// now is mechanical prep so this slice's diff doesn't collide with that one's.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Key`/`Resize` are forwarded from the input thread via [`map_terminal_event`]; `FileReady` is
+/// forwarded from the loader thread via [`run_load_job`]. Not `Copy`/`Clone`/`PartialEq`/`Eq`
+/// (ADR-031): `FileReady`'s payload carries [`LoadedViews`], which wraps
+/// [`workon_review::app::FileView`] — a type with none of those (its highlight/word-diff caches
+/// don't implement them, and rebuilding one is cheap enough that nothing has ever needed to).
+#[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
     Tick,
+    /// One [`LoadRequest`]'s result — ADR-031's loader-result variant. `gen`/`cs_idx`/`file_idx`
+    /// echo the request's stamp; `result` is `Err` for a job that panicked or otherwise failed
+    /// (see [`run_load_job`]'s doc comment for why a footer notice, not a new AppEvent shape, is
+    /// how that surfaces). Applied at ONE chokepoint: [`App::apply_file_ready`].
+    FileReady {
+        gen: u64,
+        cs_idx: usize,
+        file_idx: usize,
+        result: Result<LoadedViews, String>,
+    },
+}
+
+impl PartialEq for AppEvent {
+    /// Manual, deliberately PARTIAL equality (can't derive — `FileReady`'s `LoadedViews` payload
+    /// isn't `PartialEq`, see the enum's doc comment): `Key`/`Resize`/`Tick` compare structurally,
+    /// exactly like the pre-ADR-031 derive did, for the input-thread tests that still assert
+    /// mapped-event shape via `assert_eq!`. Two `FileReady` events are never considered equal —
+    /// there's no sound definition of "the same loader result" once `FileView` can't be compared,
+    /// and nothing needs one; tests that care about a `FileReady`'s fields match on them directly.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AppEvent::Key(a), AppEvent::Key(b)) => a == b,
+            (AppEvent::Resize(w1, h1), AppEvent::Resize(w2, h2)) => w1 == w2 && h1 == h2,
+            (AppEvent::Tick, AppEvent::Tick) => true,
+            _ => false,
+        }
+    }
 }
 
 /// The inbox message type: a mapped terminal event, or the input thread's terminal `event::read`
@@ -66,17 +98,19 @@ fn map_terminal_event(event: Event) -> Option<AppEvent> {
     }
 }
 
-/// Spawn the dedicated input thread and return the receiving end of its inbox. Must be called
-/// AFTER the terminal is acquired and any pre-takeover tty work (the theme probe, stray-input
-/// flush) has finished — crossterm input must not be consumed before that ordering completes
-/// (see `main.rs`'s block comment on the resolve/probe/acquire sequence). The thread loops
-/// forever on a blocking `event::read()`, forwarding mapped events; on a read error it forwards
-/// the error once and exits — the sole way this thread ever stops short of the process dying.
-/// Never joined: [`Tui::run`] returns without waiting for it (ADR-031's kill-on-exit lifecycle —
-/// the input thread, like the future loader thread, never writes, so an abandoned read can't
-/// corrupt anything).
-fn spawn_input_thread() -> mpsc::Receiver<InboxMessage> {
-    let (tx, rx) = mpsc::channel();
+/// Spawn the dedicated input thread against an already-built inbox sender. Must be called AFTER
+/// the terminal is acquired and any pre-takeover tty work (the theme probe, stray-input flush)
+/// has finished — crossterm input must not be consumed before that ordering completes (see
+/// `main.rs`'s block comment on the resolve/probe/acquire sequence). The thread loops forever on
+/// a blocking `event::read()`, forwarding mapped events; on a read error it forwards the error
+/// once and exits — the sole way this thread ever stops short of the process dying. Never joined:
+/// [`Tui::run`] returns without waiting for it (ADR-031's kill-on-exit lifecycle — the input
+/// thread, like the loader thread, never writes, so an abandoned read can't corrupt anything).
+///
+/// `tx` is a clone of the SAME inbox sender the loader thread also holds (ADR-031's "one inbox" —
+/// [`Tui::run`] builds the channel once and hands a clone to each producer thread), so both
+/// threads' events interleave into a single `recv_event`/`drain_pending` stream.
+fn spawn_input_thread(tx: mpsc::Sender<InboxMessage>) {
     thread::spawn(move || loop {
         match event::read() {
             Ok(event) => {
@@ -92,7 +126,94 @@ fn spawn_input_thread() -> mpsc::Receiver<InboxMessage> {
             }
         }
     });
-    rx
+}
+
+/// One file-load request handed to the loader thread (ADR-031's "Protocol": the loader is
+/// stateless between jobs — everything a job needs rides along on the request). `gen`/`cs_idx`/
+/// `file_idx` are stamped at send time from [`App::take_pending_load_spec`]'s return and echoed
+/// back verbatim on the [`AppEvent::FileReady`] result, so [`App::apply_file_ready`] can apply
+/// (or drop) it without the loader ever touching `App`.
+struct LoadRequest {
+    gen: u64,
+    cs_idx: usize,
+    file_idx: usize,
+    spec: FileLoadSpec,
+}
+
+/// Extract a human-readable message from a `catch_unwind` panic payload — the common `&str`/
+/// `String` panic-message shapes get their text; anything else (a panic with a non-string
+/// payload) falls back to a generic message rather than failing to report at all.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "loader job panicked".to_string()
+    }
+}
+
+/// The ADR-031 loader job's pure body: `LoadRequest -> AppEvent`, unit-tested directly (no
+/// threads) against a fixture repo + highlighter. Wrapped in `catch_unwind` per the ADR's
+/// "Lifecycle" decision — the specific failure mode this catches that nothing else does: a
+/// panicked job would otherwise silently drop into a slot stranded `Pending` forever (the file
+/// never re-requested, since [`App::open_pending_dispatched`]'s guard already marked it sent), an
+/// invisible hang instead of a visible error.
+///
+/// A panic's message surfaces through [`AppEvent::FileReady`]'s `Err` arm, which
+/// [`App::apply_file_ready`] turns into a footer notice — a footer notice, not a new per-file
+/// `Failed` slot, is the shape chosen here (see this changeset's report): it's visible, it
+/// doesn't strand `open_pending`, and correctness never depended on the loader succeeding in the
+/// first place (the force-completion sync fallback is where correctness actually lives).
+fn run_load_job(repo: &Repository, ts: &mut TsHighlighter, req: LoadRequest) -> AppEvent {
+    let LoadRequest {
+        gen,
+        cs_idx,
+        file_idx,
+        spec,
+    } = req;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app::build_file_views(repo, ts, &spec)
+    }))
+    .map_err(panic_message);
+    AppEvent::FileReady {
+        gen,
+        cs_idx,
+        file_idx,
+        result,
+    }
+}
+
+/// Spawn the ADR-031 loader thread: it owns its own long-lived `Repository` + `TsHighlighter`
+/// (never `App`'s — the loader is a separate thread and can't touch `App`'s handles) and serves
+/// [`LoadRequest`]s sequentially off `req_rx`, forwarding each job's [`AppEvent::FileReady`] into
+/// the shared inbox via `tx` (a clone of the same sender the input thread holds). Returns the
+/// `Sender` half the main loop dispatches requests through.
+///
+/// If `repo_path` can't be opened here (should be unreachable — `main.rs` already opened it once
+/// to build `App`), the thread exits immediately without serving anything: every subsequent
+/// dispatch attempt just accumulates in `req_rx`'s buffer until the main loop's `send` starts
+/// erroring, which is harmless (the force-completion sync fallback is what correctness actually
+/// depends on — see [`run_load_job`]'s doc comment). Never joined — same kill-on-exit lifecycle as
+/// the input thread.
+fn spawn_loader_thread(
+    repo_path: PathBuf,
+    tx: mpsc::Sender<InboxMessage>,
+) -> mpsc::Sender<LoadRequest> {
+    let (req_tx, req_rx) = mpsc::channel::<LoadRequest>();
+    thread::spawn(move || {
+        let Ok(repo) = Repository::open(&repo_path) else {
+            return;
+        };
+        let mut ts = TsHighlighter::new();
+        for req in req_rx {
+            let event = run_load_job(&repo, &mut ts, req);
+            if tx.send(Ok(event)).is_err() {
+                return; // main loop is gone; nothing left to forward to
+            }
+        }
+    });
+    req_tx
 }
 
 /// Receive the next event from `inbox`, waiting up to `timeout`. A timeout with nothing received
@@ -417,6 +538,15 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             false
         }
         AppEvent::Resize(_, _) => false,
+        AppEvent::FileReady {
+            gen,
+            cs_idx,
+            file_idx,
+            result,
+        } => {
+            app.apply_file_ready(gen, cs_idx, file_idx, result);
+            false
+        }
     }
 }
 
@@ -628,18 +758,33 @@ impl Tui {
     /// Run the main loop against `app`, then restore the terminal. Callers must have already
     /// called `app.open_current()` — under CS4's deferred-load mode (`app.set_defer_loads(true)`,
     /// `main.rs`'s default) that call marks the open PENDING rather than loading eagerly, so the
-    /// first frame shows CS4's placeholder for one `OPEN_DEBOUNCE` window instead of blocking on
-    /// the initial file's load; a caller that never turned defer mode on gets eager behavior.
+    /// first frame shows CS4's placeholder until the ADR-031 loader thread answers (or a
+    /// force-completion chokepoint loads it synchronously first); a caller that never turned defer
+    /// mode on gets eager behavior.
     ///
-    /// Spawns the ADR-031 input thread here — after the terminal is fully acquired (`self` already
-    /// exists, so raw mode and the alternate screen are live) and after every earlier tty
-    /// consumer (`main.rs`'s theme probe and its stray-input flush) has already run, since those
-    /// must own the tty before crossterm's event stream has a reader racing them. The thread is
-    /// never joined: when `run` returns, `main` returns, and the process takes it down (ADR-031's
-    /// kill-on-exit lifecycle — the input thread never writes, so this can't corrupt anything).
-    pub fn run(&mut self, app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
-        let inbox = spawn_input_thread();
-        let result = event_loop(&mut self.terminal, app, keymap, theme, &inbox);
+    /// `repo_path` opens the loader thread's OWN `Repository` handle — a second handle onto the
+    /// same on-disk repo `app` already holds one of, exactly like `crate::acquire::diff_changesets`'s
+    /// worker threads (`app` can't hand its handle across threads: `git2::Repository` is `Send`
+    /// but not `Sync`).
+    ///
+    /// Builds the single ADR-031 inbox HERE and spawns both the input thread and the loader thread
+    /// against clones of its sender — after the terminal is fully acquired (`self` already exists,
+    /// so raw mode and the alternate screen are live) and after every earlier tty consumer
+    /// (`main.rs`'s theme probe and its stray-input flush) has already run, since those must own
+    /// the tty before crossterm's event stream has a reader racing them. Neither thread is joined:
+    /// when `run` returns, `main` returns, and the process takes both down (ADR-031's kill-on-exit
+    /// lifecycle — neither thread ever writes, so an abandoned one can't corrupt anything).
+    pub fn run(
+        &mut self,
+        app: &mut App,
+        keymap: &Keymap,
+        theme: &Palette,
+        repo_path: PathBuf,
+    ) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        spawn_input_thread(tx.clone());
+        let load_tx = spawn_loader_thread(repo_path, tx);
+        let result = event_loop(&mut self.terminal, app, keymap, theme, &rx, &load_tx);
         let restored = self.restore();
         result.and(restored)
     }
@@ -688,6 +833,7 @@ fn event_loop<W: Write>(
     keymap: &Keymap,
     theme: &Palette,
     inbox: &mpsc::Receiver<InboxMessage>,
+    load_tx: &mpsc::Sender<LoadRequest>,
 ) -> io::Result<()> {
     let mut pending: Vec<KeyPress> = Vec::new();
     let mut quit = false;
@@ -700,11 +846,11 @@ fn event_loop<W: Write>(
         }
 
         // While an open is pending, wait on the short debounce window instead of the regular
-        // 200ms redraw beat, so the deferred load runs promptly once input goes quiet — a plain
-        // timeout (no new inbox message) is what "quiet" means here. This borrows the same
-        // `Tick` beat the M4 index watcher already polls on (see the module doc); the watcher
-        // occasionally running ~120ms early during a debounce window is harmless (its own doc
-        // comment already tolerates an "unseen" signature settling one tick late).
+        // 200ms redraw beat, so the deferred load's request goes out promptly once input goes
+        // quiet — a plain timeout (no new inbox message) is what "quiet" means here. This borrows
+        // the same `Tick` beat the M4 index watcher already polls on (see the module doc); the
+        // watcher occasionally running ~120ms early during a debounce window is harmless (its own
+        // doc comment already tolerates an "unseen" signature settling one tick late).
         let timeout = if app.open_pending() {
             OPEN_DEBOUNCE
         } else {
@@ -712,8 +858,21 @@ fn event_loop<W: Write>(
         };
 
         let event = recv_event(inbox, timeout)?;
+        // ADR-031: the debounce-fired deferred open is now an ASYNC `LoadFile` request rather
+        // than a synchronous `complete_pending_open` — the placeholder keeps rendering until the
+        // loader's `FileReady` result lands (or a force-completion chokepoint loads it
+        // synchronously first, e.g. the user presses `j` before the loader answers).
+        // `take_pending_load_spec` is idempotent across repeated debounce-window Ticks: it
+        // returns `None` once a request has already gone out for the current pending open.
         if matches!(event, AppEvent::Tick) && app.open_pending() {
-            app.complete_pending_open();
+            if let Some((gen, cs_idx, file_idx, spec)) = app.take_pending_load_spec() {
+                let _ = load_tx.send(LoadRequest {
+                    gen,
+                    cs_idx,
+                    file_idx,
+                    spec,
+                });
+            }
         }
         let mut batch = vec![event];
         drain_pending(inbox, &mut batch)?;
@@ -782,11 +941,20 @@ mod tests {
         assert_eq!(map_terminal_event(Event::FocusLost), None);
     }
 
+    /// `AppEvent` dropped `PartialEq`/`Eq` in ADR-031 (`FileReady`'s `LoadedViews` payload wraps
+    /// `FileView`, which has neither) — this test-only helper is the `matches!`-based replacement
+    /// for the `assert_eq!(event, AppEvent::Key(key(...)))` shape used throughout this module's
+    /// tests. Only compares `code`/`modifiers`/`kind` (what `key(...)`/`ctrl_key(...)` set), same
+    /// fields a `PartialEq` derive on `KeyEvent` itself would have compared.
+    fn is_key_event(event: &AppEvent, expected: KeyEvent) -> bool {
+        matches!(event, AppEvent::Key(k) if *k == expected)
+    }
+
     #[test]
     fn recv_event_yields_tick_on_a_plain_timeout() {
         let (_tx, rx) = mpsc::channel::<InboxMessage>();
         let event = recv_event(&rx, Duration::from_millis(5)).expect("timeout is not an error");
-        assert_eq!(event, AppEvent::Tick);
+        assert!(matches!(event, AppEvent::Tick));
     }
 
     #[test]
@@ -794,7 +962,7 @@ mod tests {
         let (tx, rx) = mpsc::channel::<InboxMessage>();
         tx.send(Ok(AppEvent::Key(key(KeyCode::Char('q'))))).unwrap();
         let event = recv_event(&rx, Duration::from_secs(1)).unwrap();
-        assert_eq!(event, AppEvent::Key(key(KeyCode::Char('q'))));
+        assert!(is_key_event(&event, key(KeyCode::Char('q'))));
     }
 
     #[test]
@@ -823,13 +991,9 @@ mod tests {
         tx.send(Ok(AppEvent::Key(key(KeyCode::Char('b'))))).unwrap();
         let mut batch = Vec::new();
         drain_pending(&rx, &mut batch).unwrap();
-        assert_eq!(
-            batch,
-            vec![
-                AppEvent::Key(key(KeyCode::Char('a'))),
-                AppEvent::Key(key(KeyCode::Char('b'))),
-            ]
-        );
+        assert_eq!(batch.len(), 2);
+        assert!(is_key_event(&batch[0], key(KeyCode::Char('a'))));
+        assert!(is_key_event(&batch[1], key(KeyCode::Char('b'))));
     }
 
     #[test]
@@ -1041,6 +1205,88 @@ mod tests {
         let owned = Repository::open(repo.workdir().expect("fixture has a workdir"))
             .expect("reopen fixture repo");
         App::new(owned, diffs)
+    }
+
+    // ── ADR-031: the loader job's pure body ──────────────────────────────────────
+
+    #[test]
+    fn panic_message_reads_a_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_reads_a_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_a_non_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(panic_message(payload), "loader job panicked");
+    }
+
+    #[test]
+    fn run_load_job_result_matches_a_synchronous_ensure_loaded() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Role;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut eager = app_from_fixture(&fixture);
+        eager.ensure_loaded(0);
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+        let eager_old_text = eager_view.old_text().to_string();
+        let eager_new_text = eager_view.new_text().to_string();
+
+        // Same two-handle shape the real loader thread uses: `app`'s own repo builds the spec,
+        // a SEPARATE repo + highlighter (standing in for `spawn_loader_thread`'s own) runs the
+        // job.
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        let (gen, cs_idx, file_idx, spec) = app
+            .take_pending_load_spec()
+            .expect("a fresh pending open has an undispatched spec");
+
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = TsHighlighter::new();
+        let event = run_load_job(
+            &loader_repo,
+            &mut loader_ts,
+            LoadRequest {
+                gen,
+                cs_idx,
+                file_idx,
+                spec,
+            },
+        );
+
+        let AppEvent::FileReady {
+            gen: got_gen,
+            cs_idx: got_cs_idx,
+            file_idx: got_file_idx,
+            result,
+        } = event
+        else {
+            panic!("run_load_job must return a FileReady event");
+        };
+        assert_eq!(got_gen, gen);
+        assert_eq!(got_cs_idx, cs_idx);
+        assert_eq!(got_file_idx, file_idx);
+
+        let LoadedViews::Single(role, Some(view)) = result.expect("job must not fail") else {
+            panic!("expected a loaded single-role view");
+        };
+        assert_eq!(role, Role::Unstaged, "a.txt has only an unstaged change");
+        assert_eq!(view.old_text(), eager_old_text);
+        assert_eq!(view.new_text(), eager_new_text);
     }
 
     #[test]
@@ -1754,14 +2000,19 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending_batch: Vec<KeyPress> = Vec::new();
         let mut pending_seq: Vec<KeyPress> = Vec::new();
-        let events = vec![
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-        ];
+        // `AppEvent` isn't `Clone` (ADR-031: `FileReady`'s payload wraps a non-`Clone`
+        // `FileView`), so the batch/sequential runs each build their own copy of the same
+        // three-key press sequence rather than sharing one `Vec` via `.clone()`.
+        let build_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+            ]
+        };
 
-        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
-        for event in events {
+        update_batch(&mut app_batch, &km, &mut pending_batch, build_events());
+        for event in build_events() {
             update(&mut app_seq, &km, &mut pending_seq, event);
         }
 
@@ -1790,15 +2041,19 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending_batch: Vec<KeyPress> = Vec::new();
         let mut pending_seq: Vec<KeyPress> = Vec::new();
-        let events = vec![
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('k'))),
-        ];
+        // See the sibling test above for why this builds two independent copies rather than
+        // cloning one `Vec<AppEvent>`.
+        let build_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('k'))),
+            ]
+        };
 
-        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
-        for event in events {
+        update_batch(&mut app_batch, &km, &mut pending_batch, build_events());
+        for event in build_events() {
             update(&mut app_seq, &km, &mut pending_seq, event);
         }
         assert_eq!(app_batch.cursor, app_seq.cursor);
@@ -1817,18 +2072,20 @@ mod tests {
         let mut app_seq2 = many_files_app(&fixture_seq2, 1);
         let mut pending_batch2: Vec<KeyPress> = Vec::new();
         let mut pending_seq2: Vec<KeyPress> = Vec::new();
-        let boundary_events = vec![
-            AppEvent::Key(key(KeyCode::Char('k'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-        ];
+        let build_boundary_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('k'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+            ]
+        };
 
         update_batch(
             &mut app_batch2,
             &km,
             &mut pending_batch2,
-            boundary_events.clone(),
+            build_boundary_events(),
         );
-        for event in boundary_events {
+        for event in build_boundary_events() {
             update(&mut app_seq2, &km, &mut pending_seq2, event);
         }
         assert_eq!(app_batch2.cursor, app_seq2.cursor);
@@ -1902,13 +2159,15 @@ mod tests {
         let mut pending_batch: Vec<KeyPress> = Vec::new();
         let mut pending_seq: Vec<KeyPress> = Vec::new();
         let cursor_before = app_batch.cursor;
-        let events = vec![
-            AppEvent::Key(key(KeyCode::Char('j'))), // swallowed by the confirm modal
-            AppEvent::Key(key(KeyCode::Char('n'))), // cancels the confirm
-        ];
+        let build_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('j'))), // swallowed by the confirm modal
+                AppEvent::Key(key(KeyCode::Char('n'))), // cancels the confirm
+            ]
+        };
 
-        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
-        for event in events {
+        update_batch(&mut app_batch, &km, &mut pending_batch, build_events());
+        for event in build_events() {
             update(&mut app_seq, &km, &mut pending_seq, event);
         }
 

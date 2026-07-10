@@ -164,6 +164,14 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Captured BEFORE `repo` moves into `App` below — the ADR-031 loader thread needs its own
+    // `Repository` handle onto the same on-disk repo (`git2::Repository` is `Send` but not
+    // `Sync`, so it can't cross threads directly), opened the same way
+    // `crate::acquire::diff_changesets`'s worker threads already do: at the workdir so the
+    // uncommitted layer's index/worktree diffs resolve correctly, falling back to the gitdir for
+    // a bare repo (where only committed spans can occur).
+    let repo_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+
     // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here after
     // acquisition is done borrowing it. `App::from_changesets` opens on whichever changeset the
     // lib marked `current` (locked decision #6).
@@ -195,7 +203,7 @@ fn main() -> Result<()> {
     // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
     // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
     tui.into_diagnostic()?
-        .run(&mut app, &keymap, &theme)
+        .run(&mut app, &keymap, &theme, repo_path)
         .into_diagnostic()?;
 
     Ok(())
