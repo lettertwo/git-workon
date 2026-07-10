@@ -1,5 +1,6 @@
-//! PTY responsiveness smoke tests for the 2026-07 performance pass — the launch path and the
-//! rapid-outline-nav path, driven against the real binary in a pseudo-terminal.
+//! PTY responsiveness smoke tests for the 2026-07 performance pass — the launch path, the
+//! rapid-outline-nav path, and (ADR-031) the streamed-startup path, driven against the real
+//! binary in a pseudo-terminal.
 //!
 //! These guard the *regression classes* that pass fixed, not the milliseconds it measured:
 //!
@@ -13,6 +14,11 @@
 //!   burst→quit; if input coalescing (`update_batch`) or idle-deferred loads
 //!   (`open_pending`/`OPEN_DEBOUNCE`) regress, the quit waits behind the sum of every
 //!   intermediate file's load and blows the bound.
+//! - **Streamed startup (ADR-031):** before the progressive pipeline, a multi-changeset launch
+//!   diffed the WHOLE stack sequentially-then-in-parallel before the first frame ever drew —
+//!   the wait scaled with stack depth. The streamed-startup test bounds spawn→quit on a deep
+//!   stack so a reintroduced "wait for the full wave" launch fails loudly; see that test's doc
+//!   comment for the measured before/after numbers that sized its bound.
 //!
 //! The bounds are deliberately blunt (seconds, not milliseconds): absolute wall-clock
 //! assertions flake under parallel CPU load, exactly like git-workon's
@@ -62,6 +68,37 @@ const BURST_FILES: usize = 36;
 
 /// Lines per generated fixture file — see `BURST_FILES`.
 const BURST_FILE_LINES: usize = 2_000;
+
+/// Upper bound on spawn→quit for `streamed_startup_lands_before_a_full_wave_could_have_finished`
+/// (ADR-031). Sized from real measurements on this fixture (debug build, `q` sent right after
+/// alternate-screen entry — same protocol as `LAUNCH_RESPONSIVE`, so `q` buffers in the PTY
+/// until the event loop actually starts polling input):
+///
+/// - The CURRENT (streamed) binary: ~1.1-1.4s — dominated by fixed per-launch costs
+///   (`gt --version`'s ~350ms subprocess spawn, checking out `STREAMED_STACK_SIZE` branches'
+///   worth of files) plus ONE changeset's diff (the active one, streamed first).
+/// - The PRE-ADR-031 binary (commit `2214558`, built and run against the identical fixture):
+///   ~6.4s — it blocks on the full stack's diff wave before the event loop ever starts, so `q`
+///   sits in the PTY the whole time.
+///
+/// This bound sits roughly 2× above the healthy number and comfortably (~2×) below the
+/// regressed one — the same blunt, load-tolerant margin philosophy as `LAUNCH_RESPONSIVE`/
+/// `BURST_RESPONSIVE`, just re-measured for this fixture rather than reused, since the streamed
+/// path's fixed costs (checkout of a much deeper stack) differ from the single-changeset launch
+/// test's.
+const STREAMED_STARTUP_RESPONSIVE: Duration = Duration::from_secs(3);
+
+/// Depth of the Graphite stack `streamed_startup_lands_before_a_full_wave_could_have_finished`
+/// builds — deep and wide enough (with `STREAMED_STARTUP_FILE_LINES`) that the full wave's
+/// total diff cost is many seconds, well clear of `STREAMED_STARTUP_RESPONSIVE`, while a single
+/// changeset's diff (what the streamed path actually waits on before its first frame) stays
+/// well under it. See `STREAMED_STARTUP_RESPONSIVE`'s doc comment for the measurements that
+/// picked this size.
+const STREAMED_STARTUP_STACK_SIZE: usize = 150;
+
+/// Lines per generated fixture file in the streamed-startup stack — see
+/// `STREAMED_STARTUP_STACK_SIZE`.
+const STREAMED_STARTUP_FILE_LINES: usize = 3_000;
 
 /// A plausible-enough Rust source of ~`lines` lines, distinct per `seed`, so the tree-sitter
 /// highlighter has real parsing work per file (the regression cost being guarded).
@@ -151,5 +188,141 @@ fn rapid_outline_nav_burst_stays_responsive() {
         elapsed < BURST_RESPONSIVE,
         "burst→quit took {elapsed:?} — outline nav is loading files synchronously again \
          (input coalescing or idle-deferred loads regressed)"
+    );
+}
+
+/// Commit `path`/`content` as a child of `parent`, without moving any branch ref — mirrors
+/// `diff_model.rs`'s `commit_onto`, duplicated here rather than shared: this file needs it only
+/// to build one deep real Graphite chain, not worth a cross-test-file dependency for.
+fn commit_onto(
+    repo: &git2::Repository,
+    parent: &git2::Commit,
+    path: &str,
+    content: &str,
+) -> git2::Oid {
+    let mut treebuilder = repo.treebuilder(Some(&parent.tree().unwrap())).unwrap();
+    let blob_oid = repo.blob(content.as_bytes()).unwrap();
+    treebuilder
+        .insert(path, blob_oid, git2::FileMode::Blob.into())
+        .unwrap();
+    let tree_oid = treebuilder.write().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = repo.signature().unwrap();
+    repo.commit(None, &sig, &sig, "test commit", &tree, &[parent])
+        .unwrap()
+}
+
+/// ADR-031's Testing layer 3, part two: the `pty_responsiveness` extension the ADR calls for —
+/// "asserting the first interactive frame lands before a full wave could have finished". A real
+/// `STREAMED_STARTUP_STACK_SIZE`-deep Graphite stack, each node adding one
+/// `STREAMED_STARTUP_FILE_LINES`-line file (real content, so each changeset's diff is real,
+/// non-trivial work — the cost being guarded), checked out on the TIP branch so the real
+/// binary's no-argument auto-detect (`StackModel::detect` + `assemble_changesets`) sees the
+/// whole stack, exactly like a real multi-changeset Graphite review.
+///
+/// The oracle is the SAME shape as `launch_reaches_the_tui_and_quits_promptly`'s: `q` sent the
+/// instant the alternate screen appears, bounding spawn→quit — `q` buffers in the PTY until the
+/// event loop starts polling input, so this elapsed time IS "time until the event loop is
+/// actually running and responsive", not just "time to first draw". That is precisely what a
+/// de-streaming regression breaks: reverting `Tui::run_streamed` to block on the full diff wave
+/// (e.g. joining `spawn_wave_thread`, or calling `diff_changesets` synchronously like the
+/// pre-ADR-031 multi-changeset path did) delays the event loop's first `recv_event` by the
+/// WHOLE wave's cost, not just the active changeset's — so `q` sits unanswered in the PTY for
+/// the full wave's duration. See `STREAMED_STARTUP_RESPONSIVE`'s doc comment for the actual
+/// measured numbers (streamed ~1.1-1.4s, reverted-to-pre-ADR-031 ~6.4s on this exact fixture)
+/// that sized the bound and confirm this assertion fails on the regressed shape, the same
+/// validation discipline `BURST_RESPONSIVE`'s doc comment describes.
+#[test]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_responsiveness -- --ignored"]
+fn streamed_startup_lands_before_a_full_wave_could_have_finished() {
+    use workon::{assemble_changesets, StackModel, UncommittedLayer};
+
+    let n = STREAMED_STARTUP_STACK_SIZE;
+    let mut builder = FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .config("workon.review.theme", "dark")
+        .graphite_config(&["main"]);
+    for i in 0..n {
+        let parent = if i == 0 {
+            "main".to_string()
+        } else {
+            format!("cs{}", i - 1)
+        };
+        builder = builder.branch_metadata(&format!("cs{i}"), &parent);
+    }
+    let fixture = builder.build().expect("fixture");
+    let repo = fixture.repo().expect("fixture repo");
+
+    // `branch_metadata` creates each branch ref at build() time (co-located with `main`'s tip);
+    // advance each one to a REAL, distinct commit forming an actual linear chain — same pattern
+    // `diff_model.rs`'s Graphite tests use.
+    let main_tip = repo
+        .find_branch("main", git2::BranchType::Local)
+        .expect("main branch")
+        .get()
+        .target()
+        .expect("main tip");
+    let mut parent_oid = main_tip;
+    for i in 0..n {
+        let parent_commit = repo.find_commit(parent_oid).expect("parent commit");
+        let head = commit_onto(
+            repo,
+            &parent_commit,
+            &format!("f{i}.rs"),
+            &rust_source(i, STREAMED_STARTUP_FILE_LINES),
+        );
+        fixture
+            .update_branch(&format!("cs{i}"), head)
+            .expect("advance branch");
+        parent_oid = head;
+    }
+
+    // Sanity: the stack really does resolve to `n` real changesets, each with a real diff to
+    // do — a fixture bug here (e.g. all branches landing on the same commit) would make the
+    // bound pass for the wrong reason.
+    let changesets = assemble_changesets(
+        repo,
+        &format!("cs{}", n - 1),
+        StackModel::Graphite,
+        UncommittedLayer::Include,
+    )
+    .expect("assemble the real Graphite stack");
+    assert_eq!(
+        changesets
+            .iter()
+            .filter(|c| c.name.starts_with("cs"))
+            .count(),
+        n,
+        "fixture setup must produce every tracked changeset"
+    );
+
+    // Check out the tip branch as HEAD — the real binary's no-argument auto-detect reads
+    // `repo.head()`'s shorthand, not an explicit `[SOURCE]` argument.
+    repo.set_head(&format!("refs/heads/cs{}", n - 1))
+        .expect("set HEAD to the tip branch");
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.force();
+    repo.checkout_head(Some(&mut checkout))
+        .expect("checkout the tip branch");
+
+    let launched = Instant::now();
+    let mut session = spawn_review(&fixture);
+    session
+        .expect("\x1b[?1049h")
+        .expect("TUI entered the alternate screen");
+
+    // Same protocol as the launch test: `q` buffers in the PTY until the event loop polls
+    // input, so spawn→quit IS time-to-interactive plus one quit — the full wave's cost, if the
+    // event loop were blocked behind it, lands entirely inside this window.
+    session.send("q").expect("send q");
+    session.expect(expectrl::Eof).expect("app exited on q");
+
+    let elapsed = launched.elapsed();
+    eprintln!("streamed startup ({n} changesets)→quit: {elapsed:?}");
+    assert!(
+        elapsed < STREAMED_STARTUP_RESPONSIVE,
+        "streamed-startup→quit took {elapsed:?} on a {n}-changeset stack — the event loop \
+         looks blocked behind the full diff wave again (streamed launch regressed to a \
+         synchronous wait)"
     );
 }
