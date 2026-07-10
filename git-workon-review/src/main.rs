@@ -173,31 +173,7 @@ fn main() -> Result<()> {
         // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here
         // after acquisition is done borrowing it. `App::from_changesets` opens on whichever
         // changeset the lib marked `current` (locked decision #6).
-        let mut app = App::from_changesets(repo, views);
-        if let Some(source) = source {
-            app.set_review_source(source);
-        }
-        // CS4: defer file loads to the event loop's input-idle window rather than blocking here
-        // (or on any later selection change) — `app.open_current()` below marks the initial open
-        // pending instead of loading eagerly; see `tui::run`'s doc comment for the resulting
-        // startup contract.
-        app.set_defer_loads(true);
-
-        // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s
-        // setters only set the raw layout/zoom/mode/width fields, and `open_current` is what
-        // derives `cursor`/`scroll` fresh from whichever settings just landed (see each setter's
-        // doc comment).
-        let view_config_warnings = app.apply_view_config(&view_config);
-        app.open_current();
-
-        // A misconfigured keybinding or view-config setting is non-fatal: show the collected
-        // warnings as a startup notice (cleared on the first keypress, like any notice) and run
-        // with the defaults for those keys/settings.
-        let mut warnings = keymap.warnings().to_vec();
-        warnings.extend(view_config_warnings);
-        if !warnings.is_empty() {
-            app.notify(warnings.join("; "), Severity::Error);
-        }
+        let mut app = seat_app(repo, views, source, &view_config, &keymap);
 
         // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
         // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
@@ -215,23 +191,7 @@ fn main() -> Result<()> {
             .map(ChangesetView::pending)
             .collect();
 
-        let mut app = App::from_changesets(repo, views);
-        if let Some(source) = source {
-            app.set_review_source(source);
-        }
-        app.set_defer_loads(true);
-        let view_config_warnings = app.apply_view_config(&view_config);
-        // The active changeset is `Pending` (no files yet) — `open_current` is still the right
-        // call: it's a no-op on an empty file list, and re-running it the moment the active
-        // changeset's diff lands (`Tui::run_streamed`'s `ChangesetReady` handling) is what
-        // actually seats the first real file.
-        app.open_current();
-
-        let mut warnings = keymap.warnings().to_vec();
-        warnings.extend(view_config_warnings);
-        if !warnings.is_empty() {
-            app.notify(warnings.join("; "), Severity::Error);
-        }
+        let mut app = seat_app(repo, views, source, &view_config, &keymap);
 
         tui.into_diagnostic()?
             .run_streamed(&mut app, &keymap, &theme, repo_path, changesets)
@@ -239,4 +199,46 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// The app-seating tail both `changesets.len()` arms of `main` share byte-identically (F5):
+/// build `App` from `views`, wire the review source, defer file loads (CS4), apply CS7's
+/// view-config settings, open the current file, and surface any keymap/view-config warnings as
+/// a startup notice. `open_current` is a no-op on an empty file list — safe for the streamed
+/// arm's `Pending` slots (no files yet), which `Tui::run_streamed`'s `ChangesetReady` handling
+/// re-runs it for once the active changeset's diff actually lands.
+fn seat_app(
+    repo: Repository,
+    views: Vec<ChangesetView>,
+    source: Option<Source>,
+    view_config: &config::RawViewConfig,
+    keymap: &Keymap,
+) -> App {
+    let mut app = App::from_changesets(repo, views);
+    if let Some(source) = source {
+        app.set_review_source(source);
+    }
+    // CS4: defer file loads to the event loop's input-idle window rather than blocking here (or
+    // on any later selection change) — `app.open_current()` below marks the initial open pending
+    // instead of loading eagerly; see `tui::run`'s doc comment for the resulting startup
+    // contract.
+    app.set_defer_loads(true);
+
+    // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
+    // only set the raw layout/zoom/mode/width fields, and `open_current` is what derives
+    // `cursor`/`scroll` fresh from whichever settings just landed (see each setter's doc
+    // comment).
+    let view_config_warnings = app.apply_view_config(view_config);
+    app.open_current();
+
+    // A misconfigured keybinding or view-config setting is non-fatal: show the collected
+    // warnings as a startup notice (cleared on the first keypress, like any notice) and run with
+    // the defaults for those keys/settings.
+    let mut warnings = keymap.warnings().to_vec();
+    warnings.extend(view_config_warnings);
+    if !warnings.is_empty() {
+        app.notify(warnings.join("; "), Severity::Error);
+    }
+
+    app
 }
