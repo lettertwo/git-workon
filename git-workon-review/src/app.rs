@@ -1008,6 +1008,9 @@ impl App {
         // "decided without interview" default — preserves the M4 full-width look for a lone
         // uncommitted changeset), unfocused (the diff keeps initial keyboard focus so the user
         // can start reading immediately), Stack mode (shows the structure M5 exists to surface).
+        // Under the pure open/closed toggle (`o`) this is now a consistent split: `o` controls
+        // visibility, `h`/[`App::focus_outline`] controls focus — so seeding open+unfocused here
+        // doesn't fight the toggle the way it did under the old three-state cycle.
         let outline = OutlineState {
             open: changesets.len() > 1,
             focused: false,
@@ -2123,35 +2126,44 @@ impl App {
         self.outline.mode
     }
 
-    /// `o`: a three-state cycle — closed -> open+focused -> open+unfocused (focus back on the
-    /// diff, pane stays visible) -> closed. Opening always grabs focus (per the locked design);
-    /// the middle -> closed transition ("o while the outline is open but the diff has focus
-    /// closes it") isn't explicitly specified in the plan but is the natural completion of the
-    /// cycle, kept simple rather than adding a separate "close" key.
+    /// `o`: a pure show/hide toggle — closed -> open+focused (+[`Self::sync_outline_to_current`]),
+    /// open (regardless of focus) -> closed+diff-focused. Focus itself is now a separate concern
+    /// handled by [`Self::focus_outline`]/[`Self::focus_diff`] (`h`/`l`) — `o` only ever changes
+    /// visibility.
     pub fn toggle_outline(&mut self) {
         if !self.outline.open {
             self.outline.open = true;
             self.outline.focused = true;
             self.sync_outline_to_current();
-        } else if self.outline.focused {
-            self.outline.focused = false;
         } else {
             self.outline.open = false;
+            self.outline.focused = false;
         }
+    }
+
+    /// `h`/Esc-cascade target: focus the outline, opening it first if it's closed. Syncing the
+    /// cursor to the current diff position only happens on the closed -> open transition — if the
+    /// outline is already open, re-focusing it (e.g. `h` after a manual `j`/`k` outline move
+    /// followed by `l`) must not stomp a manually positioned cursor.
+    pub fn focus_outline(&mut self) {
+        if !self.outline.open {
+            self.outline.open = true;
+            self.sync_outline_to_current();
+        }
+        self.outline.focused = true;
+    }
+
+    /// `l`/Enter: return focus to the diff. The outline stays open — this only ever changes
+    /// focus, never visibility (that's `o`/[`Self::toggle_outline`]'s job).
+    pub fn focus_diff(&mut self) {
+        self.outline.focused = false;
     }
 
     /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
     /// view currently has keyboard focus (see `render::render_help_overlay`), so there is no
-    /// extra state to reposition here, unlike [`Self::toggle_outline`]'s three-state cycle.
+    /// extra state to reposition here, unlike [`Self::toggle_outline`].
     pub fn toggle_help(&mut self) {
         self.help_visible = !self.help_visible;
-    }
-
-    /// Return focus to the diff without closing the outline (`Esc` while the outline has focus —
-    /// `tui::update` routes it here instead of quitting, per the locked design's "Esc must still
-    /// not quit when the outline has focus").
-    pub fn outline_unfocus(&mut self) {
-        self.outline.focused = false;
     }
 
     /// `i` while the outline has focus: cycle [`OutlineMode`], then reposition the cursor onto
@@ -6726,7 +6738,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_outline_cycles_closed_open_focused_open_unfocused_closed() {
+    fn toggle_outline_is_a_pure_show_hide_toggle() {
         let mut app = two_committed_changesets_two_and_one_files();
         // Force a known starting state regardless of the default.
         while app.outline_open() {
@@ -6737,19 +6749,88 @@ mod tests {
         app.toggle_outline();
         assert!(
             app.outline_open() && app.outline_focused(),
-            "opening focuses"
+            "o from closed opens AND focuses"
         );
 
         app.toggle_outline();
+        assert!(
+            !app.outline_open() && !app.outline_focused(),
+            "o from open+focused closes — the toggle only ever tracks visibility"
+        );
+
+        // Re-open, then unfocus without going through `toggle_outline` (mirrors the startup
+        // seed: open, but diff-focused) — `o` from THAT state must still close, not cycle
+        // through a middle focused-then-unfocused state.
+        app.toggle_outline();
+        app.focus_diff();
+        assert!(app.outline_open() && !app.outline_focused());
+
+        app.toggle_outline();
+        assert!(
+            !app.outline_open() && !app.outline_focused(),
+            "o from open+unfocused closes the pane"
+        );
+    }
+
+    #[test]
+    fn focus_outline_opens_when_closed_and_syncs_the_cursor() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        while app.outline_open() {
+            app.toggle_outline();
+        }
+        assert!(!app.outline_open());
+        // Move the diff onto the second changeset before focusing, so a sync is observable.
+        app.next_changeset();
+        let current_cs = app.current_cs();
+
+        app.focus_outline();
+
+        assert!(app.outline_open() && app.outline_focused());
+        let items = app.outline_items();
+        assert!(
+            matches!(
+                items[app.outline_cursor()],
+                crate::outline::OutlineItem::File { cs_idx, .. } if cs_idx == current_cs
+            ),
+            "opening via focus_outline syncs the cursor to the current diff position"
+        );
+    }
+
+    #[test]
+    fn focus_outline_on_an_already_open_outline_does_not_move_the_cursor() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        while app.outline_open() {
+            app.toggle_outline();
+        }
+        app.toggle_outline(); // open + focus, synced
+        app.outline_move_by(-1); // manually reposition the outline cursor
+        app.focus_diff();
+        let cursor_before = app.outline_cursor();
+
+        app.focus_outline();
+
+        assert!(app.outline_focused());
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before,
+            "re-focusing an already-open outline must not stomp a manually positioned cursor"
+        );
+    }
+
+    #[test]
+    fn focus_diff_unfocuses_without_closing_the_outline() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        while app.outline_open() {
+            app.toggle_outline();
+        }
+        app.toggle_outline(); // open + focus
+        assert!(app.outline_open() && app.outline_focused());
+
+        app.focus_diff();
+
         assert!(
             app.outline_open() && !app.outline_focused(),
-            "toggling while focused returns focus to the diff without closing"
-        );
-
-        app.toggle_outline();
-        assert!(
-            !app.outline_open(),
-            "toggling again while open-but-unfocused closes the pane"
+            "focus_diff unfocuses but leaves the outline open"
         );
     }
 
@@ -7409,8 +7490,8 @@ mod tests {
         // contract `render::render` reads (`outline_open`), so a regression there is caught at
         // the state layer too.
         let mut app = two_committed_changesets_two_and_one_files();
-        // Default state is open+unfocused (locked design), so a single `o` here hits the
-        // "open, diff has focus" branch of the cycle, which closes the pane.
+        // Default state is open+unfocused (locked design); the pure toggle closes it regardless
+        // of focus.
         assert!(app.outline_open() && !app.outline_focused());
         app.toggle_outline();
         assert!(!app.outline_open());
