@@ -1,17 +1,25 @@
 //! Terminal lifecycle, event seam, and the main input loop for the review TUI.
 //!
 //! Ported loop shape from the `review-tui-spike` prototype's `main.rs` (`install_panic_hook`,
-//! raw-mode + alternate-screen setup, `draw -> quit-check -> next_event -> update`), adapted to
-//! read events through [`next_event`] rather than calling crossterm directly from the loop.
+//! raw-mode + alternate-screen setup, `draw -> quit-check -> recv_event -> update`), adapted to
+//! read events through the [`AppEvent`] inbox rather than calling crossterm directly from the
+//! loop.
 //!
-//! M4's index watcher (locked decision #4) does NOT swap `next_event`'s internals for a
-//! channel-fed watcher thread, despite an earlier note here suggesting that direction — the
-//! locked decision is a synchronous poll on the existing `Tick` (every `next_event` timeout),
-//! comparing [`workon_review::refresh::IndexSignature`] and re-diffing in place via
-//! [`App::on_tick`] when it changes. No threads, no `mpsc`, no new deps.
+//! ADR-031 (progressive pipeline) supersedes M4's locked decision #4 — the "no threads, no
+//! `mpsc`" letter of that note, recorded here in an earlier revision, no longer holds. A
+//! dedicated *input thread* (spawned by [`Tui::run`]) is now the ONLY code that calls
+//! crossterm's event API: it blocks on `event::read()` forever, maps each event exactly like
+//! this module's old `next_event`/`drain_pending` read arms did, and forwards mapped events into
+//! an `std::sync::mpsc` inbox that the main loop drains via [`recv_event`]/[`drain_pending`].
+//! `recv_timeout`'s timeout arm IS the `Tick` beat — unchanged from before, just relocated from
+//! `event::poll`'s timeout to the channel's. The M4 index watcher's *semantics* are exactly
+//! unchanged by this move: it still compares [`workon_review::refresh::IndexSignature`] and
+//! re-diffs in place via [`App::on_tick`] on every `Tick`; only the beat's mechanism moved.
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -28,51 +36,104 @@ use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
 use workon_review::render;
 use workon_review::theme::Palette;
 
-/// One event the review loop reacts to. `Tick` is now also the index-watcher's poll beat (see the
-/// module doc's note on locked decision #4) — `next_event`'s mapping and this enum otherwise stay
-/// the shape M3 built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One event the review loop reacts to. `Tick` is synthesized by the main loop on an inbox
+/// `recv_timeout` timeout — it is never sent through the channel itself (see [`recv_event`]).
+/// `Key`/`Resize` are forwarded from the input thread via [`map_terminal_event`]. Not `Copy`
+/// (ADR-031): the next slice's loader-result variants carry non-`Copy` payloads; dropping `Copy`
+/// now is mechanical prep so this slice's diff doesn't collide with that one's.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
     Tick,
 }
 
-/// Poll for the next terminal event, up to `timeout`.
-///
-/// `Ok(Some(AppEvent::Tick))` on a plain timeout (the loop's regular redraw beat); `Ok(None)` for
-/// a terminal event we don't map to an [`AppEvent`] (key release/repeat, mouse, paste, focus) —
-/// the loop redraws and keeps going without calling `update`.
-pub fn next_event(timeout: Duration) -> io::Result<Option<AppEvent>> {
-    if !event::poll(timeout)? {
-        return Ok(Some(AppEvent::Tick));
-    }
-    Ok(match event::read()? {
+/// The inbox message type: a mapped terminal event, or the input thread's terminal `event::read`
+/// error forwarded verbatim (ADR-031: "the input thread never exits silently" — a read error is
+/// still observable, just relayed rather than swallowed). `Tick` never appears here.
+type InboxMessage = io::Result<AppEvent>;
+
+/// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press and
+/// resize map; key release/repeat, mouse, paste, and focus events are skipped (`None`), exactly
+/// like this module's pre-ADR-031 `next_event`/`drain_pending` read arms did. Pure and
+/// independent of any thread or channel, so it's unit-tested directly; the input thread's loop
+/// body is a thin wrapper around it.
+fn map_terminal_event(event: Event) -> Option<AppEvent> {
+    match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => Some(AppEvent::Key(key)),
         Event::Resize(w, h) => Some(AppEvent::Resize(w, h)),
         _ => None,
-    })
+    }
+}
+
+/// Spawn the dedicated input thread and return the receiving end of its inbox. Must be called
+/// AFTER the terminal is acquired and any pre-takeover tty work (the theme probe, stray-input
+/// flush) has finished — crossterm input must not be consumed before that ordering completes
+/// (see `main.rs`'s block comment on the resolve/probe/acquire sequence). The thread loops
+/// forever on a blocking `event::read()`, forwarding mapped events; on a read error it forwards
+/// the error once and exits — the sole way this thread ever stops short of the process dying.
+/// Never joined: [`Tui::run`] returns without waiting for it (ADR-031's kill-on-exit lifecycle —
+/// the input thread, like the future loader thread, never writes, so an abandoned read can't
+/// corrupt anything).
+fn spawn_input_thread() -> mpsc::Receiver<InboxMessage> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || loop {
+        match event::read() {
+            Ok(event) => {
+                if let Some(mapped) = map_terminal_event(event) {
+                    if tx.send(Ok(mapped)).is_err() {
+                        return; // main loop is gone; nothing left to forward to
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err));
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// Receive the next event from `inbox`, waiting up to `timeout`. A timeout with nothing received
+/// yields `Ok(AppEvent::Tick)` — the loop's regular redraw beat, and the mechanism the M4 index
+/// watcher polls on (see the module doc). A disconnected inbox (the input thread panicked, or
+/// exited after an error without this being observed yet) is surfaced as an `io::Error` rather
+/// than spinning — the loop must exit, not busy-loop on an empty channel forever.
+fn recv_event(inbox: &mpsc::Receiver<InboxMessage>, timeout: Duration) -> io::Result<AppEvent> {
+    match inbox.recv_timeout(timeout) {
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(err)) => Err(err),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(AppEvent::Tick),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "review TUI input thread disconnected without a final error",
+        )),
+    }
 }
 
 /// Cap on how many events [`drain_pending`] batches per iteration — leftover input past this
-/// count is simply picked up by the next iteration's `next_event` call.
+/// count is simply picked up by the next iteration's `recv_event` call.
 const MAX_DRAIN_BATCH: usize = 128;
 
-/// Drain all immediately-available terminal events into `batch`, mapping them exactly like
-/// [`next_event`]'s read arm (key-press and resize map; release/repeat/mouse/paste/focus are
-/// skipped, not pushed). Unlike calling `next_event(Duration::ZERO)` in a loop, a not-ready poll
-/// here simply stops draining — it must NOT fabricate a `Tick`, since `next_event`'s `!poll` arm
-/// exists solely to give the loop its regular redraw beat on a real timeout, and reusing it here
-/// would inject a spurious tick at the end of every drain.
-fn drain_pending(batch: &mut Vec<AppEvent>) -> io::Result<()> {
+/// Drain all immediately-available events from `inbox` into `batch`. Unlike calling
+/// `recv_event(inbox, Duration::ZERO)` in a loop, an empty inbox here simply stops draining — it
+/// must NOT fabricate a `Tick`, since [`recv_event`]'s timeout arm exists solely to give the loop
+/// its regular redraw beat on a real timeout, and reusing it here would inject a spurious tick at
+/// the end of every drain.
+fn drain_pending(
+    inbox: &mpsc::Receiver<InboxMessage>,
+    batch: &mut Vec<AppEvent>,
+) -> io::Result<()> {
     while batch.len() < MAX_DRAIN_BATCH {
-        if !event::poll(Duration::ZERO)? {
-            break;
-        }
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => batch.push(AppEvent::Key(key)),
-            Event::Resize(w, h) => batch.push(AppEvent::Resize(w, h)),
-            _ => {}
+        match inbox.try_recv() {
+            Ok(Ok(event)) => batch.push(event),
+            Ok(Err(err)) => return Err(err),
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::other(
+                    "review TUI input thread disconnected without a final error",
+                ))
+            }
         }
     }
     Ok(())
@@ -569,8 +630,16 @@ impl Tui {
     /// `main.rs`'s default) that call marks the open PENDING rather than loading eagerly, so the
     /// first frame shows CS4's placeholder for one `OPEN_DEBOUNCE` window instead of blocking on
     /// the initial file's load; a caller that never turned defer mode on gets eager behavior.
+    ///
+    /// Spawns the ADR-031 input thread here — after the terminal is fully acquired (`self` already
+    /// exists, so raw mode and the alternate screen are live) and after every earlier tty
+    /// consumer (`main.rs`'s theme probe and its stray-input flush) has already run, since those
+    /// must own the tty before crossterm's event stream has a reader racing them. The thread is
+    /// never joined: when `run` returns, `main` returns, and the process takes it down (ADR-031's
+    /// kill-on-exit lifecycle — the input thread never writes, so this can't corrupt anything).
     pub fn run(&mut self, app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
-        let result = event_loop(&mut self.terminal, app, keymap, theme);
+        let inbox = spawn_input_thread();
+        let result = event_loop(&mut self.terminal, app, keymap, theme, &inbox);
         let restored = self.restore();
         result.and(restored)
     }
@@ -618,6 +687,7 @@ fn event_loop<W: Write>(
     app: &mut App,
     keymap: &Keymap,
     theme: &Palette,
+    inbox: &mpsc::Receiver<InboxMessage>,
 ) -> io::Result<()> {
     let mut pending: Vec<KeyPress> = Vec::new();
     let mut quit = false;
@@ -629,9 +699,9 @@ fn event_loop<W: Write>(
             return Ok(());
         }
 
-        // While an open is pending, poll on the short debounce window instead of the regular
+        // While an open is pending, wait on the short debounce window instead of the regular
         // 200ms redraw beat, so the deferred load runs promptly once input goes quiet — a plain
-        // timeout (no new terminal event) is what "quiet" means here. This borrows the same
+        // timeout (no new inbox message) is what "quiet" means here. This borrows the same
         // `Tick` beat the M4 index watcher already polls on (see the module doc); the watcher
         // occasionally running ~120ms early during a debounce window is harmless (its own doc
         // comment already tolerates an "unseen" signature settling one tick late).
@@ -641,14 +711,13 @@ fn event_loop<W: Write>(
             Duration::from_millis(200)
         };
 
-        if let Some(event) = next_event(timeout)? {
-            if matches!(event, AppEvent::Tick) && app.open_pending() {
-                app.complete_pending_open();
-            }
-            let mut batch = vec![event];
-            drain_pending(&mut batch)?;
-            quit = update_batch(app, keymap, &mut pending, batch);
+        let event = recv_event(inbox, timeout)?;
+        if matches!(event, AppEvent::Tick) && app.open_pending() {
+            app.complete_pending_open();
         }
+        let mut batch = vec![event];
+        drain_pending(inbox, &mut batch)?;
+        quit = update_batch(app, keymap, &mut pending, batch);
     }
 }
 
@@ -664,6 +733,124 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    // ── ADR-031: input thread's pure mapping + inbox draining ──────────────────
+
+    #[test]
+    fn map_terminal_event_maps_key_press_and_resize() {
+        assert_eq!(
+            map_terminal_event(Event::Key(key(KeyCode::Char('q')))),
+            Some(AppEvent::Key(key(KeyCode::Char('q'))))
+        );
+        assert_eq!(
+            map_terminal_event(Event::Resize(80, 24)),
+            Some(AppEvent::Resize(80, 24))
+        );
+    }
+
+    #[test]
+    fn map_terminal_event_skips_release_repeat_mouse_paste_and_focus() {
+        use crossterm::event::{KeyEventState, MouseButton, MouseEvent, MouseEventKind};
+
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(map_terminal_event(Event::Key(release)), None);
+
+        let repeat = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+            KeyEventState::NONE,
+        );
+        assert_eq!(map_terminal_event(Event::Key(repeat)), None);
+
+        assert_eq!(
+            map_terminal_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })),
+            None
+        );
+        assert_eq!(map_terminal_event(Event::Paste("pasted".to_string())), None);
+        assert_eq!(map_terminal_event(Event::FocusGained), None);
+        assert_eq!(map_terminal_event(Event::FocusLost), None);
+        let _ = MouseButton::Left; // silence an unused-import lint if MouseButton goes unused above
+    }
+
+    #[test]
+    fn recv_event_yields_tick_on_a_plain_timeout() {
+        let (_tx, rx) = mpsc::channel::<InboxMessage>();
+        let event = recv_event(&rx, Duration::from_millis(5)).expect("timeout is not an error");
+        assert_eq!(event, AppEvent::Tick);
+    }
+
+    #[test]
+    fn recv_event_forwards_a_sent_event_before_the_timeout() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Ok(AppEvent::Key(key(KeyCode::Char('q'))))).unwrap();
+        let event = recv_event(&rx, Duration::from_secs(1)).unwrap();
+        assert_eq!(event, AppEvent::Key(key(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn recv_event_propagates_a_forwarded_read_error() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Err(io::Error::other("read failed"))).unwrap();
+        let err = recv_event(&rx, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.to_string(), "read failed");
+    }
+
+    #[test]
+    fn recv_event_errors_when_the_inbox_disconnects_instead_of_spinning() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        drop(tx);
+        let result = recv_event(&rx, Duration::from_millis(5));
+        assert!(
+            result.is_err(),
+            "a disconnected inbox must surface as an error, not a Tick"
+        );
+    }
+
+    #[test]
+    fn drain_pending_collects_everything_immediately_available_without_a_tick() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Ok(AppEvent::Key(key(KeyCode::Char('a'))))).unwrap();
+        tx.send(Ok(AppEvent::Key(key(KeyCode::Char('b'))))).unwrap();
+        let mut batch = Vec::new();
+        drain_pending(&rx, &mut batch).unwrap();
+        assert_eq!(
+            batch,
+            vec![
+                AppEvent::Key(key(KeyCode::Char('a'))),
+                AppEvent::Key(key(KeyCode::Char('b'))),
+            ]
+        );
+    }
+
+    #[test]
+    fn drain_pending_stops_on_an_empty_inbox_without_fabricating_a_tick() {
+        let (_tx, rx) = mpsc::channel::<InboxMessage>();
+        let mut batch = Vec::new();
+        drain_pending(&rx, &mut batch).unwrap();
+        assert!(
+            batch.is_empty(),
+            "an empty inbox must not inject a spurious Tick"
+        );
+    }
+
+    #[test]
+    fn drain_pending_propagates_a_forwarded_read_error() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Err(io::Error::other("read failed"))).unwrap();
+        let mut batch = Vec::new();
+        let err = drain_pending(&rx, &mut batch).unwrap_err();
+        assert_eq!(err.to_string(), "read failed");
     }
 
     #[test]
