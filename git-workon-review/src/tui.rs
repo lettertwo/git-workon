@@ -18,7 +18,7 @@
 
 use std::fs::File;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -229,13 +229,23 @@ fn spawn_loader_thread(
     req_tx
 }
 
-/// Spawn the ADR-037 startup wave: stripe `changesets` (lib-`current` first, then input order)
-/// across `available_parallelism`-many transient WORKER threads — same fan-out shape as
+/// Spawn a ADR-037 diff wave — the startup wave over the whole resolved stack, or (ADR-037
+/// "Refresh") a refresh's span-keyed reuse leftovers, the changed/new committed spans
+/// [`workon_review::app::App::take_pending_wave`] queued. Stripes `to_diff` (`current_idx`-first
+/// if the active changeset is among the pairs being diffed, then input order) across
+/// `available_parallelism`-many transient WORKER threads — same fan-out shape as
 /// `crate::acquire::diff_changesets` (each worker opens its own `Repository`, since
 /// `git2::Repository` is `Send` but not `Sync`) — but STREAM each result the instant it completes
 /// via `tx` rather than joining the batch. Never joined itself either — a wave straggler left
-/// running past quit is harmless (it only ever sends into an inbox nothing is listening to
-/// anymore; `tx.send` failing is the signal each worker already checks).
+/// running past quit (or superseded by a later refresh's generation) is harmless: it only ever
+/// sends into an inbox nothing is listening to anymore, or a result [`App::apply_changeset_ready`]
+/// drops outright on a generation mismatch; `tx.send` failing is the signal each worker already
+/// checks for the former.
+///
+/// `to_diff`'s `usize` is the pair's index into `App`'s FULL changeset stack (not a position
+/// within `to_diff` itself) — carried straight through to each `ChangesetReady { idx, .. }` so
+/// [`App::apply_changeset_ready`] can seat the result without `App` and this wave ever agreeing
+/// on a separate numbering.
 ///
 /// A DELIBERATELY separate set of threads from the loader thread (ADR-037 leaves this shape
 /// open — "yours to shape"): the wave never touches the loader's request queue, so an in-flight
@@ -252,20 +262,22 @@ fn spawn_loader_thread(
 fn spawn_wave_thread(
     repo_path: PathBuf,
     tx: mpsc::Sender<InboxMessage>,
-    changesets: Vec<Changeset>,
+    to_diff: Vec<(usize, Changeset)>,
     gen: u64,
+    current_idx: Option<usize>,
 ) {
     thread::spawn(move || {
-        let n = changesets.len();
+        let n = to_diff.len();
         if n == 0 {
             return;
         }
-        // Current changeset first, then input order for the rest — the changeset the user lands
-        // on becomes interactive earliest (ADR-037's "Slots").
-        let current_idx = changesets.iter().position(|cs| cs.current);
+        // The active changeset first (if it's among these pairs at all), then input order for
+        // the rest — the changeset the user lands on becomes interactive earliest (ADR-037's
+        // "Slots"). `current_pos` is a position WITHIN `to_diff`, not the stack index itself.
+        let current_pos = current_idx.and_then(|ci| to_diff.iter().position(|(idx, _)| *idx == ci));
         let mut order: Vec<usize> = Vec::with_capacity(n);
-        order.extend(current_idx);
-        order.extend((0..n).filter(|&i| Some(i) != current_idx));
+        order.extend(current_pos);
+        order.extend((0..n).filter(|&i| Some(i) != current_pos));
 
         let workers = thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
@@ -274,20 +286,21 @@ fn spawn_wave_thread(
         let chunk = n.div_ceil(workers.max(1));
 
         thread::scope(|scope| {
-            for idx_chunk in order.chunks(chunk) {
+            for pos_chunk in order.chunks(chunk) {
                 let tx = tx.clone();
-                let changesets = &changesets;
+                let to_diff = &to_diff;
                 let repo_path = &repo_path;
                 scope.spawn(move || {
                     let repo = match Repository::open(repo_path) {
                         Ok(repo) => repo,
                         Err(err) => {
                             let message = err.to_string();
-                            for &idx in idx_chunk {
+                            for &pos in pos_chunk {
+                                let (idx, _) = &to_diff[pos];
                                 if tx
                                     .send(Ok(AppEvent::ChangesetReady {
                                         gen,
-                                        idx,
+                                        idx: *idx,
                                         result: Err(message.clone()),
                                     }))
                                     .is_err()
@@ -298,11 +311,15 @@ fn spawn_wave_thread(
                             return;
                         }
                     };
-                    for &idx in idx_chunk {
-                        let result =
-                            diff_changeset(&repo, &changesets[idx]).map_err(|e| e.to_string());
+                    for &pos in pos_chunk {
+                        let (idx, cs) = &to_diff[pos];
+                        let result = diff_changeset(&repo, cs).map_err(|e| e.to_string());
                         if tx
-                            .send(Ok(AppEvent::ChangesetReady { gen, idx, result }))
+                            .send(Ok(AppEvent::ChangesetReady {
+                                gen,
+                                idx: *idx,
+                                result,
+                            }))
                             .is_err()
                         {
                             return; // main loop is gone; nothing left to forward to
@@ -312,6 +329,20 @@ fn spawn_wave_thread(
             }
         });
     });
+}
+
+/// The ADR-037 pipeline handles [`event_loop`] needs to dispatch off-thread work — bundled into
+/// one struct (rather than four separate parameters) so `event_loop` stays under clippy's
+/// `too_many_arguments`. `inbox` is the single shared receiver; `load_tx`/`wave_tx` dispatch to
+/// the loader thread and a fresh diff-wave thread respectively; `repo_path` is what any
+/// newly-spawned wave thread opens its own `Repository` handle against (a refresh can queue a
+/// wave well after startup, so this is kept around for the whole loop, not just its setup).
+#[derive(Clone, Copy)]
+struct Pipeline<'a> {
+    inbox: &'a mpsc::Receiver<InboxMessage>,
+    load_tx: &'a mpsc::Sender<LoadRequest>,
+    wave_tx: &'a mpsc::Sender<InboxMessage>,
+    repo_path: &'a Path,
 }
 
 /// Receive the next event from `inbox`, waiting up to `timeout`. A timeout with nothing received
@@ -885,8 +916,14 @@ impl Tui {
     ) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<InboxMessage>();
         spawn_input_thread(tx.clone());
-        let load_tx = spawn_loader_thread(repo_path, tx);
-        let result = event_loop(&mut self.terminal, app, keymap, theme, &rx, &load_tx);
+        let load_tx = spawn_loader_thread(repo_path.clone(), tx.clone());
+        let pipeline = Pipeline {
+            inbox: &rx,
+            load_tx: &load_tx,
+            wave_tx: &tx,
+            repo_path: &repo_path,
+        };
+        let result = event_loop(&mut self.terminal, app, keymap, theme, &pipeline);
         let restored = self.restore();
         result.and(restored)
     }
@@ -912,8 +949,24 @@ impl Tui {
         let (tx, rx) = mpsc::channel::<InboxMessage>();
         spawn_input_thread(tx.clone());
         let load_tx = spawn_loader_thread(repo_path.clone(), tx.clone());
-        spawn_wave_thread(repo_path, tx, changesets, app.generation());
-        let result = event_loop(&mut self.terminal, app, keymap, theme, &rx, &load_tx);
+        // `App::from_changesets` (which built `app`'s all-`Pending` slots) picked `current_cs`
+        // via the same lib-`current` lookup this enumeration mirrors, so `app.current_cs()` IS
+        // that changeset's index into `to_diff` here — no separate lookup needed.
+        let to_diff: Vec<(usize, Changeset)> = changesets.into_iter().enumerate().collect();
+        spawn_wave_thread(
+            repo_path.clone(),
+            tx.clone(),
+            to_diff,
+            app.generation(),
+            Some(app.current_cs()),
+        );
+        let pipeline = Pipeline {
+            inbox: &rx,
+            load_tx: &load_tx,
+            wave_tx: &tx,
+            repo_path: &repo_path,
+        };
+        let result = event_loop(&mut self.terminal, app, keymap, theme, &pipeline);
         let restored = self.restore();
         result.and(restored)
     }
@@ -961,9 +1014,14 @@ fn event_loop<W: Write>(
     app: &mut App,
     keymap: &Keymap,
     theme: &Palette,
-    inbox: &mpsc::Receiver<InboxMessage>,
-    load_tx: &mpsc::Sender<LoadRequest>,
+    pipeline: &Pipeline<'_>,
 ) -> io::Result<()> {
+    let Pipeline {
+        inbox,
+        load_tx,
+        wave_tx,
+        repo_path,
+    } = *pipeline;
     let mut pending: Vec<KeyPress> = Vec::new();
     let mut quit = false;
 
@@ -1006,6 +1064,22 @@ fn event_loop<W: Write>(
         let mut batch = vec![event];
         drain_pending(inbox, &mut batch)?;
         quit = update_batch(app, keymap, &mut pending, batch);
+
+        // ADR-037 "Refresh": every refresh trigger (`r`, the on-tick index watcher, a
+        // post-staging drain) runs through `App::refresh` somewhere inside the `update_batch`
+        // call above, however deeply nested — `App` itself never touches a thread, so it just
+        // queues the span-keyed-reuse leftovers on `Self::pending_wave` for whoever's holding the
+        // thread-spawning ability to pick up. This ONE checkpoint, run after every batch, is that
+        // pickup: it covers every refresh trigger uniformly with no per-trigger wiring.
+        if let Some((gen, to_diff)) = app.take_pending_wave() {
+            spawn_wave_thread(
+                repo_path.to_path_buf(),
+                wave_tx.clone(),
+                to_diff,
+                gen,
+                Some(app.current_cs()),
+            );
+        }
     }
 }
 
