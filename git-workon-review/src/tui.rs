@@ -419,6 +419,8 @@ enum Action {
     OutlineCycleMode,
     FocusOutline,
     FocusDiff,
+    OutlineTop,
+    OutlineBottom,
     None,
 }
 
@@ -459,6 +461,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::OutlineCycleMode => Action::OutlineCycleMode,
         Command::FocusOutline => Action::FocusOutline,
         Command::FocusDiff => Action::FocusDiff,
+        Command::OutlineTop => Action::OutlineTop,
+        Command::OutlineBottom => Action::OutlineBottom,
     }
 }
 
@@ -572,6 +576,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::OutlineCycleMode => app.outline_cycle_mode(),
         Action::FocusOutline => app.focus_outline(),
         Action::FocusDiff => app.focus_diff(),
+        Action::OutlineTop => app.outline_top(),
+        Action::OutlineBottom => app.outline_bottom(),
         Action::None => {}
     }
     false
@@ -1297,6 +1303,33 @@ mod tests {
         );
         assert_eq!(
             map_key(&km, &mut pending, key(KeyCode::Char('G')), 20, false, false),
+            Action::ScrollBottom
+        );
+    }
+
+    #[test]
+    fn g_and_shift_g_map_to_outline_top_and_bottom_when_outline_focused() {
+        // CS2: `g`/`G` are bound per-view (`scroll-top`/`scroll-bottom` in both View::Diff and
+        // View::Outline), so the SAME key must resolve to a different Action depending on which
+        // pane has focus — outline-focused maps to the outline jump, not the diff scroll.
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('g')), 20, true, true),
+            Action::OutlineTop
+        );
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('G')), 20, true, true),
+            Action::OutlineBottom
+        );
+        // Diff-focused (`outline_focused = false`) still maps to the diff's own scroll actions,
+        // even with the outline open — see `g_and_shift_g_map_to_top_and_bottom` above.
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('g')), 20, false, true),
+            Action::ScrollTop
+        );
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('G')), 20, false, true),
             Action::ScrollBottom
         );
     }

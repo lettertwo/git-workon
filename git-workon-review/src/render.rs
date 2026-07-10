@@ -472,20 +472,19 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
 /// diff's [`App::cursor`]) gets the theme's cursor tint while the outline has focus, or the dimmer
 /// [`Palette::outline_cursor_unfocused_bg`] while it's merely open (so the remembered position stays
-/// legible even after focus returns to the diff).
-fn render_outline(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+/// legible even after focus returns to the diff). `&mut App` (CS2, precedent: [`render_body`]
+/// writing [`App::pane_height`]) — writes [`App::outline_height`] and re-derives
+/// [`App::derive_outline_scroll`] before painting from `app.outline.scroll`, giving the outline
+/// the same stateful scrolloff-margined viewport the diff panes already have, instead of the old
+/// transient bottom-anchor scroll computed fresh each frame.
+fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
+    app.outline_height = area.height as usize;
+    app.derive_outline_scroll();
+
     let items = app.outline_items();
     let cursor = app.outline_cursor();
     let focused = app.outline_focused();
-
-    let visible_h = area.height as usize;
-    let scroll = if visible_h == 0 {
-        0
-    } else if cursor >= visible_h {
-        cursor + 1 - visible_h
-    } else {
-        0
-    };
+    let scroll = app.outline_scroll();
 
     let buf = frame.buffer_mut();
     for row in 0..area.height {

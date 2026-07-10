@@ -70,6 +70,8 @@ pub enum Command {
     OutlineConfirm,
     OutlineCycleMode,
     FocusDiff,
+    OutlineTop,
+    OutlineBottom,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -304,6 +306,20 @@ pub static REGISTRY: &[Registered] = &[
         name: "focus-diff",
         default_keys: "l right",
         description: "Focus the diff view",
+    },
+    Registered {
+        command: Command::OutlineTop,
+        view: View::Outline,
+        name: "scroll-top",
+        default_keys: "g",
+        description: "Jump to the top of the outline",
+    },
+    Registered {
+        command: Command::OutlineBottom,
+        view: View::Outline,
+        name: "scroll-bottom",
+        default_keys: "G",
+        description: "Jump to the bottom of the outline",
     },
 ];
 
