@@ -604,6 +604,27 @@ pub struct ChangesetView {
     views_combined: Vec<Option<FileView>>,
     views_unstaged: Vec<Option<FileView>>,
     views_staged: Vec<Option<FileView>>,
+    /// ADR-037's per-changeset acquisition state. `Ready` for every changeset this changeset
+    /// (this revision of the codebase) actually diffs through; `Pending`/`Failed` slots are
+    /// constructible today (state model + rendering) but nothing in the synchronous startup/
+    /// refresh paths produces them yet — that lands with the streamed-acquisition changesets.
+    slot: ChangesetSlot,
+}
+
+/// A [`ChangesetView`]'s acquisition state (ADR-037's "Slots" decision). `diff`/the `views_*`
+/// caches stay meaningful only for `Ready` — a `Pending`/`Failed` view's [`DiffState`] is always
+/// [`DiffState::empty`], so every existing `.diff.`-reading call site (file counts, outline
+/// rows, nav guards) already treats it as "nothing to show" with no per-site branch needed; only
+/// the render/outline paths that must actively DISTINGUISH the three states (vs. a genuinely
+/// empty `Ready` changeset) read this directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChangesetSlot {
+    /// Acquisition hasn't run (or hasn't completed) for this changeset yet.
+    Pending,
+    /// The diff (and its view caches) are real.
+    Ready,
+    /// The acquisition attempt errored; the message is shown in place of a diff body.
+    Failed(String),
 }
 
 impl ChangesetView {
@@ -615,6 +636,43 @@ impl ChangesetView {
             views_combined: (0..n).map(|_| None).collect(),
             views_unstaged: (0..n).map(|_| None).collect(),
             views_staged: (0..n).map(|_| None).collect(),
+            slot: ChangesetSlot::Ready,
+        }
+    }
+
+    /// Construct a `Pending` slot for `cs` (ADR-037): no diff acquired yet. The outline shows
+    /// its header with a loading indication; navigating onto it renders a changeset-level
+    /// placeholder instead of "(no changes)"/per-file content.
+    pub fn pending(cs: Changeset) -> Self {
+        let mut view = Self::new(cs, DiffState::empty());
+        view.slot = ChangesetSlot::Pending;
+        view
+    }
+
+    /// Construct a `Failed` slot for `cs` carrying `message` (ADR-037): the acquisition attempt
+    /// for this changeset errored. The outline marks it; navigating onto it renders `message`
+    /// instead of a diff body.
+    pub fn failed(cs: Changeset, message: impl Into<String>) -> Self {
+        let mut view = Self::new(cs, DiffState::empty());
+        view.slot = ChangesetSlot::Failed(message.into());
+        view
+    }
+
+    /// Whether this changeset's diff hasn't been acquired yet (ADR-037).
+    pub fn is_pending(&self) -> bool {
+        matches!(self.slot, ChangesetSlot::Pending)
+    }
+
+    /// Whether this changeset's acquisition attempt errored (ADR-037).
+    pub fn is_failed(&self) -> bool {
+        matches!(self.slot, ChangesetSlot::Failed(_))
+    }
+
+    /// This changeset's failure message, if [`Self::is_failed`] — `None` for `Pending`/`Ready`.
+    pub fn failure_message(&self) -> Option<&str> {
+        match &self.slot {
+            ChangesetSlot::Failed(msg) => Some(msg.as_str()),
+            ChangesetSlot::Pending | ChangesetSlot::Ready => None,
         }
     }
 
@@ -989,6 +1047,19 @@ impl App {
     /// [`Self::goto_changeset`]).
     pub fn current_cs(&self) -> usize {
         self.current_cs
+    }
+
+    /// Whether the ACTIVE changeset's slot is `Pending` (ADR-037) — `render.rs`'s body path
+    /// shows a changeset-level loading placeholder instead of "(no changes)"/per-file content
+    /// while this holds.
+    pub fn is_current_pending(&self) -> bool {
+        self.cur().is_pending()
+    }
+
+    /// The ACTIVE changeset's failure message, if its slot is `Failed` (ADR-037) — `render.rs`'s
+    /// body path shows this instead of a diff body.
+    pub fn current_failure(&self) -> Option<&str> {
+        self.cur().failure_message()
     }
 
     /// The active changeset's descriptor (name, source, restack status) — read by tests
@@ -1640,6 +1711,8 @@ impl App {
                 label: v.cs.title.clone().unwrap_or_else(|| v.cs.name.clone()),
                 current: v.cs.current,
                 needs_restack: v.cs.needs_restack,
+                loading: v.is_pending(),
+                failed: v.is_failed(),
                 files: v
                     .files()
                     .iter()
@@ -2611,6 +2684,20 @@ impl From<WorktreeDiffs> for DiffState {
 }
 
 impl DiffState {
+    /// An empty [`DiffState`] — every field zero-length. Used for `Pending`/`Failed`
+    /// [`ChangesetView`] slots (ADR-037), which carry no real diff; existing `.diff.` read sites
+    /// already treat an empty `files` list as "nothing to show," so this alone is enough to make
+    /// those slots render/navigate as inert with no per-site Pending/Failed branch.
+    fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            unstaged_model: DiffModel { files: Vec::new() },
+            staged_model: DiffModel { files: Vec::new() },
+            unstaged_idx: Vec::new(),
+            staged_idx: Vec::new(),
+        }
+    }
+
     /// Build a [`DiffState`] for a COMMITTED changeset's [`DiffModel`] (`base..head`, already
     /// diffed by [`crate::acquire::diff_committed`]) — there is no staged/unstaged split for a
     /// committed range, so both sub-models are empty and every index map entry is `None`. This
@@ -2797,8 +2884,8 @@ mod tests {
 
     use super::test_support::app_from_fixture;
     use super::{
-        find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, EffectiveZoom, Layout, Role,
-        Zoom, DEFAULT_OUTLINE_WIDTH,
+        find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState, EffectiveZoom,
+        Layout, Role, Zoom, DEFAULT_OUTLINE_WIDTH,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
@@ -5538,6 +5625,8 @@ mod tests {
                 label: "cs-a".to_string(),
                 current: false,
                 needs_restack: false,
+                loading: false,
+                failed: false,
             }
         );
         let header_b = items
@@ -5551,7 +5640,110 @@ mod tests {
                 label: "cs-b".to_string(),
                 current: true,
                 needs_restack: true,
+                loading: false,
+                failed: false,
             }
+        );
+    }
+
+    // ── ADR-037: per-changeset slots (Pending/Ready/Failed) ─────────────────────
+
+    /// A minimal [`Changeset`] descriptor for the slot tests below — the slot model only cares
+    /// about the metadata `ChangesetView::pending`/`failed` carry alongside a diff-free
+    /// [`DiffState`], not any real git content.
+    fn bare_changeset(name: &str, current: bool) -> Changeset {
+        Changeset {
+            name: name.to_string(),
+            span: ChangesetSpan::Uncommitted,
+            title: None,
+            current,
+            needs_restack: false,
+        }
+    }
+
+    #[test]
+    fn app_is_constructible_from_a_pending_changeset_alone() {
+        // ADR-037: `App::from_changesets`'s >=1 assert survives unchanged — an all-Pending stack
+        // (the streamed-launch shape, before any diff has landed) is a valid `App`.
+        let view = ChangesetView::pending(bare_changeset("cs-a", true));
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
+        let app = App::from_changesets(repo, vec![view]);
+
+        assert!(app.is_current_pending());
+        assert_eq!(app.current_failure(), None);
+        assert!(app.files().is_empty());
+        assert_eq!(app.changeset_count(), 1);
+    }
+
+    #[test]
+    fn navigating_onto_a_pending_changeset_shows_no_files_and_stays_pending() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let cs_ready = bare_changeset("cs-ready", true);
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        let view_ready = ChangesetView::new(cs_ready, DiffState::from(diffs));
+        let view_pending = ChangesetView::pending(bare_changeset("cs-pending", false));
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_ready, view_pending]);
+
+        assert!(!app.is_current_pending(), "opens on the Ready changeset");
+        assert!(!app.files().is_empty());
+
+        app.next_changeset();
+
+        assert_eq!(app.current_cs(), 1);
+        assert!(app.is_current_pending());
+        assert!(
+            app.files().is_empty(),
+            "a Pending changeset has no file rows to navigate onto"
+        );
+    }
+
+    #[test]
+    fn failed_slot_carries_its_error_message() {
+        let view = ChangesetView::failed(bare_changeset("cs-a", true), "diff acquisition failed");
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
+        let app = App::from_changesets(repo, vec![view]);
+
+        assert!(!app.is_current_pending());
+        assert_eq!(app.current_failure(), Some("diff acquisition failed"));
+        assert!(app.files().is_empty());
+    }
+
+    #[test]
+    fn outline_marks_pending_and_failed_changeset_headers() {
+        let view_pending = ChangesetView::pending(bare_changeset("cs-pending", true));
+        let view_failed = ChangesetView::failed(bare_changeset("cs-failed", false), "boom");
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(repo, vec![view_pending, view_failed]);
+        app.outline.mode = OutlineMode::Stack;
+
+        let items = app.outline_items();
+        assert_eq!(
+            items,
+            vec![
+                OutlineItem::Header {
+                    cs_idx: 0,
+                    label: "cs-pending".to_string(),
+                    current: true,
+                    needs_restack: false,
+                    loading: true,
+                    failed: false,
+                },
+                OutlineItem::Header {
+                    cs_idx: 1,
+                    label: "cs-failed".to_string(),
+                    current: false,
+                    needs_restack: false,
+                    loading: false,
+                    failed: true,
+                },
+            ],
+            "Pending/Failed changesets emit only their (marked) header, no file rows"
         );
     }
 

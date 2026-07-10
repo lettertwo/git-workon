@@ -535,6 +535,8 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
             label,
             current,
             needs_restack,
+            loading,
+            failed,
             ..
         } => {
             let marker = if *current { "\u{25CF} " } else { "  " };
@@ -550,6 +552,13 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette) -> Line<'static> {
             ));
             if *needs_restack {
                 spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
+            }
+            // ADR-037: a Failed changeset's marker wins over Pending's (a slot is never both,
+            // but Failed is the more actionable state to surface if it somehow were).
+            if *failed {
+                spans.push(TSpan::styled(" \u{2717}", Style::default().fg(FG_ERROR)));
+            } else if *loading {
+                spans.push(TSpan::styled(" \u{2026}", Style::default().fg(theme.dim)));
             }
             Line::from(spans)
         }
@@ -766,6 +775,25 @@ fn render_loading_placeholder(
 }
 
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
+    // ADR-037: the active changeset's diff hasn't been acquired (or failed to acquire) yet —
+    // both cases have an empty `files()` list, so they must be checked BEFORE the "(no changes)"
+    // fallback below, which would otherwise misreport a Pending/Failed changeset as an
+    // intentionally empty one.
+    if let Some(message) = app.current_failure() {
+        let msg = format!("Failed to load this changeset: {message}");
+        frame.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(FG_ERROR)),
+            area,
+        );
+        return;
+    }
+    if app.is_current_pending() {
+        frame.render_widget(
+            Paragraph::new("Loading\u{2026}").style(Style::default().fg(theme.dim)),
+            area,
+        );
+        return;
+    }
     if app.files().is_empty() {
         frame.render_widget(Paragraph::new("(no changes)"), area);
         return;
