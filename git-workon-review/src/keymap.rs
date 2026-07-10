@@ -17,9 +17,10 @@
 //!   action names and same-view key collisions are collected as [`Keymap::warnings`].
 //!
 //! **Not handled here** (stays hardcoded in `tui.rs`): the confirm modal (`y`/`n`/`Esc`) and the
-//! whole `Esc`-precedence cascade (confirm > outline-unfocus > selection-cancel > quit). Per
-//! ADR-034 those are conventional and safety-sensitive; they are never routed through the
-//! registry, so `Esc` is not a registry token.
+//! whole `Esc`-precedence cascade (confirm > help > selection-cancel > outline-focused-quit >
+//! focus-outline > quit — see `tui::update`'s doc comment). Per ADR-034 those are conventional
+//! and safety-sensitive; they are never routed through the registry, so `Esc` is not a registry
+//! token.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -61,11 +62,14 @@ pub enum Command {
     PrevHunk,
     NextChangeset,
     PrevChangeset,
+    // Diff view.
+    FocusOutline,
     // Outline view.
     OutlineDown,
     OutlineUp,
     OutlineConfirm,
     OutlineCycleMode,
+    FocusDiff,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -101,7 +105,7 @@ pub static REGISTRY: &[Registered] = &[
         view: View::Global,
         name: "toggle-outline",
         default_keys: "o",
-        description: "Toggle the outline pane / focus",
+        description: "Show or hide the outline pane",
     },
     Registered {
         command: Command::ToggleHelp,
@@ -258,6 +262,13 @@ pub static REGISTRY: &[Registered] = &[
         default_keys: "[c",
         description: "Go to the previous changeset",
     },
+    Registered {
+        command: Command::FocusOutline,
+        view: View::Diff,
+        name: "focus-outline",
+        default_keys: "h left",
+        description: "Focus the outline",
+    },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {
         command: Command::OutlineDown,
@@ -286,6 +297,13 @@ pub static REGISTRY: &[Registered] = &[
         name: "cycle-mode",
         default_keys: "i",
         description: "Cycle the outline mode",
+    },
+    Registered {
+        command: Command::FocusDiff,
+        view: View::Outline,
+        name: "focus-diff",
+        default_keys: "l right",
+        description: "Focus the diff view",
     },
 ];
 

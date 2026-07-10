@@ -417,7 +417,8 @@ enum Action {
     OutlineMoveBy(i64),
     OutlineConfirm,
     OutlineCycleMode,
-    OutlineUnfocus,
+    FocusOutline,
+    FocusDiff,
     None,
 }
 
@@ -456,13 +457,15 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::OutlineUp => Action::OutlineMoveBy(-1),
         Command::OutlineConfirm => Action::OutlineConfirm,
         Command::OutlineCycleMode => Action::OutlineCycleMode,
+        Command::FocusOutline => Action::FocusOutline,
+        Command::FocusDiff => Action::FocusDiff,
     }
 }
 
 /// Map one key press to an [`Action`] through the resolved [`Keymap`], given `pending` (the
 /// in-flight multi-key sequence buffer — generalized from the old `]`/`[` bracket chord to ANY
 /// bound sequence), the current pane height (for the half-page deltas), and whether the outline
-/// pane currently has focus.
+/// pane currently has focus/is open.
 ///
 /// Dispatch order:
 /// 1. The keymap ([`Keymap::advance`]) consumes the key. A bound sequence fires its command; a
@@ -470,8 +473,9 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
 ///    unrecognized suffix mid-sequence drops the buffer without re-processing (the old
 ///    bracket-drop behavior, now general).
 /// 2. `Esc` stays HARDCODED (ADR-034: the whole `Esc`-precedence cascade is never routed through
-///    the registry). Reached only as a fresh, otherwise-unbound key: it unfocuses the outline when
-///    the outline has focus, else quits — the terminal leaf of the cascade `update` enforces.
+///    the registry). Reached only as a fresh, otherwise-unbound key, it walks outward: the outline
+///    having focus quits (same terminal leaf as `q`); otherwise, with the outline open, it focuses
+///    the outline (home-base model: `h`/`FocusOutline`'s effect); otherwise it quits.
 ///
 /// `outline_focused` selects the keymap's outline vs diff context; the global bindings (`q`/`o`)
 /// are active in both, so `o` toggles and `q` quits from either pane.
@@ -481,6 +485,7 @@ fn map_key(
     key: KeyEvent,
     pane_height: usize,
     outline_focused: bool,
+    outline_open: bool,
 ) -> Action {
     match keymap.advance(outline_focused, pending, key) {
         Dispatch::Command(command) => command_to_action(command, pane_height),
@@ -488,7 +493,9 @@ fn map_key(
         Dispatch::Unmatched { mid_sequence } => {
             if !mid_sequence && key.code == KeyCode::Esc {
                 if outline_focused {
-                    Action::OutlineUnfocus
+                    Action::Quit
+                } else if outline_open {
+                    Action::FocusOutline
                 } else {
                     Action::Quit
                 }
@@ -563,7 +570,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::OutlineMoveBy(delta) => app.outline_move_by(delta),
         Action::OutlineConfirm => app.outline_confirm(),
         Action::OutlineCycleMode => app.outline_cycle_mode(),
-        Action::OutlineUnfocus => app.outline_unfocus(),
+        Action::FocusOutline => app.focus_outline(),
+        Action::FocusDiff => app.focus_diff(),
         Action::None => {}
     }
     false
@@ -603,6 +611,7 @@ fn resolve_key(
         key,
         app.pane_height,
         app.outline_focused(),
+        app.outline_open(),
     ))
 }
 
@@ -615,9 +624,10 @@ fn resolve_key(
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
 ///
-/// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
-/// outline having focus > an active line selection > the normal key map (where Esc quits).
-/// Concretely:
+/// Esc precedence (highest first): a pending discard confirm > the help overlay being open > an
+/// active line selection (diff-focused) > the outline having focus > the diff having focus with
+/// the outline open > the normal key map (where Esc quits). Concretely — the home-base model:
+/// the outline is where Esc always eventually lands you before it quits.
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
@@ -627,17 +637,20 @@ fn resolve_key(
 ///    reacts). Ranked just below the confirm modal — in practice the two are never up
 ///    together, since opening help doesn't run through a confirm, but the confirm winning keeps
 ///    a destructive prompt from ever being silently dismissed by a stray overlay key.
-/// 3. Otherwise, while the outline pane has focus, Esc returns focus to the diff (via the normal
-///    map's `outline_focused` branch — see [`map_key`]) rather than quitting or falling into the
-///    selection-cancel case below (locked design: "Esc must still not quit when the outline has
-///    focus"). The selection-Esc arm below is guarded to defer to this case.
-/// 4. Otherwise, with an active line selection, Esc CANCELS the selection instead of quitting (`q`
-///    still quits). Other keys fall through to the normal map — `j`/`k` extend the selection,
-///    `s`/`d` act on it.
-/// 5. Otherwise the normal map applies, where Esc (like `q`) quits.
+/// 3. Otherwise, with an active line selection AND the diff focused, Esc CANCELS the selection
+///    instead of moving focus or quitting (`q` still quits). This arm is guarded to defer to case
+///    4 when the outline has focus (a selection can only be active while looking at the diff, but
+///    the guard keeps the precedence explicit). Other keys fall through to the normal map —
+///    `j`/`k` extend the selection, `s`/`d` act on it.
+/// 4. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
+///    outline is home base; there's nowhere further out to walk to.
+/// 5. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
+///    focuses the outline (same effect as `h`/[`App::focus_outline`]) rather than quitting.
+/// 6. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
+///    — there's no outline to walk out to.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 3-5); the
-/// confirm and help modals (cases 1-2) deliberately do not. Cases 3-5 are delegated to
+/// A `Key` event clears any showing footer notice before applying its own action (cases 3-6); the
+/// confirm and help modals (cases 1-2) deliberately do not. Cases 3-6 are delegated to
 /// [`resolve_key`], shared with [`update_batch`].
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
@@ -1224,11 +1237,11 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('q')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('q')), 20, false, false),
             Action::Quit
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Esc), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Esc), 20, false, false),
             Action::Quit
         );
     }
@@ -1238,19 +1251,19 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('j')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('j')), 20, false, false),
             Action::MoveCursorBy(1)
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Down), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Down), 20, false, false),
             Action::MoveCursorBy(1)
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('k')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('k')), 20, false, false),
             Action::MoveCursorBy(-1)
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Up), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Up), 20, false, false),
             Action::MoveCursorBy(-1)
         );
     }
@@ -1260,16 +1273,16 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, ctrl_key('d'), 21, false),
+            map_key(&km, &mut pending, ctrl_key('d'), 21, false, false),
             Action::MoveCursorBy(10)
         );
         assert_eq!(
-            map_key(&km, &mut pending, ctrl_key('u'), 21, false),
+            map_key(&km, &mut pending, ctrl_key('u'), 21, false, false),
             Action::MoveCursorBy(-10)
         );
         // A pane height of 1 still scrolls by at least one line.
         assert_eq!(
-            map_key(&km, &mut pending, ctrl_key('d'), 1, false),
+            map_key(&km, &mut pending, ctrl_key('d'), 1, false, false),
             Action::MoveCursorBy(1)
         );
     }
@@ -1279,11 +1292,11 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('g')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('g')), 20, false, false),
             Action::ScrollTop
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('G')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('G')), 20, false, false),
             Action::ScrollBottom
         );
     }
@@ -1293,7 +1306,7 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('L')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('L')), 20, false, false),
             Action::ToggleLayout
         );
     }
@@ -1303,11 +1316,11 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false, false),
             Action::CycleZoom
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('w')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('w')), 20, false, false),
             Action::ToggleSplitFocus
         );
     }
@@ -1317,7 +1330,7 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('r')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('r')), 20, false, false),
             Action::Refresh
         );
     }
@@ -1327,11 +1340,11 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Tab), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Tab), 20, false, false),
             Action::NextFile
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::BackTab), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::BackTab), 20, false, false),
             Action::PrevFile
         );
     }
@@ -1341,23 +1354,23 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false, false),
             Action::None
         );
         // The buffer holds the in-flight chord prefix (generalized from the old `Option<char>`).
         assert_eq!(pending, vec![KeyPress::from_event(key(KeyCode::Char(']')))]);
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('f')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('f')), 20, false, false),
             Action::NextFile
         );
         assert!(pending.is_empty());
 
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('[')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('[')), 20, false, false),
             Action::None
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('f')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('f')), 20, false, false),
             Action::PrevFile
         );
     }
@@ -1366,15 +1379,15 @@ mod tests {
     fn bracket_h_maps_to_hunk_nav() {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
-        map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false);
+        map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false, false);
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('h')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('h')), 20, false, false),
             Action::NextHunk
         );
 
-        map_key(&km, &mut pending, key(KeyCode::Char('[')), 20, false);
+        map_key(&km, &mut pending, key(KeyCode::Char('[')), 20, false, false);
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('h')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('h')), 20, false, false),
             Action::PrevHunk
         );
     }
@@ -1383,9 +1396,9 @@ mod tests {
     fn unrecognized_bracket_suffix_drops_pending_without_side_effect() {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
-        map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false);
+        map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false, false);
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('x')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('x')), 20, false, false),
             Action::None
         );
         assert!(
@@ -1603,24 +1616,24 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('s')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('s')), 20, false, false),
             Action::StageHunk
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('S')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('S')), 20, false, false),
             Action::StageFile
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('d')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('d')), 20, false, false),
             Action::DiscardHunk
         );
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('D')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('D')), 20, false, false),
             Action::DiscardFile
         );
         // Ctrl-d keeps its half-page meaning — the plain-`d` staging arm must not shadow it.
         assert_eq!(
-            map_key(&km, &mut pending, ctrl_key('d'), 20, false),
+            map_key(&km, &mut pending, ctrl_key('d'), 20, false, false),
             Action::MoveCursorBy(10)
         );
     }
@@ -1630,7 +1643,7 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('v')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('v')), 20, false, false),
             Action::StartSelection
         );
     }
@@ -1689,6 +1702,48 @@ mod tests {
         assert!(
             app.pending_confirm.is_none(),
             "the confirm arm consumes Esc first"
+        );
+    }
+
+    #[test]
+    fn esc_cancels_a_selection_before_focusing_the_outline() {
+        // Even with the outline open (so a bare Esc would otherwise walk out to it), an active
+        // selection still wins — the outline-focus move is a lower-precedence fallback, not an
+        // alternative to selection-cancel.
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        // Selection needs a stageable (uncommitted) change; a single changeset seeds the
+        // outline closed, so open it and hand focus back to the diff.
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.toggle_outline();
+        app.focus_diff();
+        assert!(app.outline_open() && !app.outline_focused());
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+
+        assert!(!quit, "Esc must not quit while a selection is active");
+        assert!(
+            app.selection_anchor.is_none(),
+            "Esc cancels the active selection first"
+        );
+        assert!(
+            !app.outline_focused(),
+            "the outline-focus move only happens on a LATER Esc, once the selection is gone"
         );
     }
 
@@ -1804,7 +1859,7 @@ mod tests {
     }
 
     #[test]
-    fn o_key_toggles_the_outline_through_its_full_cycle() {
+    fn o_key_is_a_pure_show_hide_toggle() {
         use git_workon_fixture::prelude::*;
 
         let fixture = FixtureBuilder::new()
@@ -1823,7 +1878,10 @@ mod tests {
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('o'))),
         );
-        assert!(!app.outline_open(), "o from open+unfocused closes the pane");
+        assert!(
+            !app.outline_open() && !app.outline_focused(),
+            "o from open+unfocused closes the pane"
+        );
 
         update(
             &mut app,
@@ -1843,8 +1901,8 @@ mod tests {
             AppEvent::Key(key(KeyCode::Char('o'))),
         );
         assert!(
-            app.outline_open() && !app.outline_focused(),
-            "o from open+focused returns focus to the diff without closing"
+            !app.outline_open() && !app.outline_focused(),
+            "o from open+focused closes the pane — the toggle only ever tracks visibility"
         );
     }
 
@@ -1890,7 +1948,83 @@ mod tests {
     }
 
     #[test]
-    fn esc_does_not_quit_while_the_outline_has_focus() {
+    fn h_from_the_diff_opens_and_focuses_a_closed_outline() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline(); // close
+        assert!(!app.outline_open() && !app.outline_focused());
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('h'))),
+        );
+
+        assert!(
+            app.outline_open() && app.outline_focused(),
+            "h from the diff with the outline closed opens AND focuses it"
+        );
+        let items = app.outline_items();
+        assert!(
+            matches!(
+                items[app.outline_cursor()],
+                workon_review::outline::OutlineItem::File { cs_idx, file_idx, .. }
+                    if cs_idx == app.current_cs() && file_idx == app.current
+            ),
+            "opening via h syncs the outline cursor to the current diff position"
+        );
+    }
+
+    #[test]
+    fn h_from_the_diff_with_the_outline_already_open_focuses_without_moving_the_cursor() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline(); // close
+        app.toggle_outline(); // open + focus, synced
+        app.outline_move_by(-1); // manually reposition
+                                 // Return focus to the diff without going through `o` (mirrors `l`), so the outline
+                                 // stays open but the diff has keyboard focus.
+        update(
+            &mut app,
+            &Keymap::defaults(),
+            &mut Vec::new(),
+            AppEvent::Key(key(KeyCode::Char('l'))),
+        );
+        assert!(app.outline_open() && !app.outline_focused());
+        let cursor_before = app.outline_cursor();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('h'))),
+        );
+
+        assert!(app.outline_focused(), "h focuses the already-open outline");
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before,
+            "h on an already-open outline must not stomp a manually positioned cursor"
+        );
+    }
+
+    #[test]
+    fn l_from_the_outline_focuses_the_diff_and_leaves_the_outline_open() {
         use git_workon_fixture::prelude::*;
 
         let fixture = FixtureBuilder::new()
@@ -1900,6 +2034,35 @@ mod tests {
         let mut app = two_committed_changesets_app(&fixture);
         app.toggle_outline(); // close
         app.toggle_outline(); // open + focus
+        assert!(app.outline_open() && app.outline_focused());
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('l'))),
+        );
+
+        assert!(
+            app.outline_open() && !app.outline_focused(),
+            "l focuses the diff but leaves the outline open"
+        );
+    }
+
+    #[test]
+    fn esc_quits_while_the_outline_has_focus() {
+        // Home-base model: the outline has nowhere further out to walk to, so Esc there is the
+        // terminal leaf of the cascade — same as `q`.
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.focus_outline();
         assert!(app.outline_focused());
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
@@ -1911,14 +2074,65 @@ mod tests {
             AppEvent::Key(key(KeyCode::Esc)),
         );
 
-        assert!(!quit, "Esc must not quit while the outline has focus");
+        assert!(quit, "Esc while the outline has focus quits, like q");
+    }
+
+    #[test]
+    fn esc_focuses_the_outline_from_the_diff_when_open() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        // Default: open, unfocused (diff has focus).
+        assert!(app.outline_open() && !app.outline_focused());
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+
         assert!(
-            !app.outline_focused(),
-            "Esc while the outline has focus returns focus to the diff"
+            !quit,
+            "Esc must not quit when it can walk out to the outline instead"
         );
         assert!(
-            app.outline_open(),
-            "Esc must not also close the pane, only unfocus it"
+            app.outline_focused(),
+            "Esc from the diff with the outline open focuses the outline"
+        );
+        assert!(app.outline_open(), "Esc must not close the pane");
+    }
+
+    #[test]
+    fn esc_quits_from_the_diff_when_the_outline_is_closed() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline(); // close
+        assert!(!app.outline_open() && !app.outline_focused());
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+
+        assert!(
+            quit,
+            "Esc from the diff with the outline closed has nowhere to walk to, so it quits"
         );
     }
 
