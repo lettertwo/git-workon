@@ -3758,9 +3758,12 @@ mod tests {
 
     #[test]
     fn take_pending_load_spec_is_none_for_a_fileless_changeset_without_panicking() {
-        // A clean uncommitted layer diffs to zero files. A pending open onto it (e.g. one that
-        // outraces a refresh, or the Pending/Failed slots ADR-037's later changesets introduce)
-        // must not panic `current_load_spec`'s file-list indexing — F7's regression.
+        // A clean uncommitted layer diffs to zero files. A pending open onto it must not panic
+        // `current_load_spec`'s file-list indexing — F7's regression. Where this test was born
+        // (the loader changeset), a fileless `open_current` still MARKED the open pending and
+        // only the spec-building was total; this changeset's flag hygiene supersedes that —
+        // a fileless open now never marks (and actively clears) `open_pending`, so both the
+        // flag and the spec must come back empty.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -3770,7 +3773,10 @@ mod tests {
         assert!(app.files().is_empty(), "fixture must have no diffed files");
         app.set_defer_loads(true);
         app.open_current();
-        assert!(app.open_pending(), "empty-file open still marks pending");
+        assert!(
+            !app.open_pending(),
+            "a fileless open never marks pending (the non-deferred path clears the flags)"
+        );
 
         assert!(
             app.take_pending_load_spec().is_none(),
