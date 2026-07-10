@@ -22,7 +22,7 @@ use crate::config::RawViewConfig;
 use crate::highlight::{FgSpan, TsHighlighter};
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
-use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode};
+use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::source::{resolve_source, Source};
@@ -552,6 +552,17 @@ fn parse_outline_mode(raw: &str) -> Option<OutlineMode> {
     }
 }
 
+/// Parse `workon.review.outline.order` (CS3) into an [`OutlineOrder`]. Canonical strings mirror
+/// the variant names, kebab-cased: `head-first`, `base-first`. `None` on anything else —
+/// [`App::apply_view_config`] falls back to [`OutlineOrder::default`] and warns.
+fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
+    match raw {
+        "head-first" => Some(OutlineOrder::HeadFirst),
+        "base-first" => Some(OutlineOrder::BaseFirst),
+        _ => None,
+    }
+}
+
 /// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. Canonical strings mirror the
 /// variant names: `sbs`, `inline`. `None` on anything else — [`App::apply_view_config`] falls
 /// back to [`Layout::default`] and warns.
@@ -594,6 +605,9 @@ pub struct OutlineState {
     /// via the same scrolloff discipline as [`App::scroll`] (see [`App::derive_outline_scroll`]) —
     /// never written directly.
     pub scroll: usize,
+    /// Which end of the stack the stack-shaped modes display first — `workon.review.outline.order`
+    /// (CS3), defaulting to [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
+    pub order: OutlineOrder,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1025,6 +1039,7 @@ impl App {
             mode: OutlineMode::default(),
             width: DEFAULT_OUTLINE_WIDTH,
             scroll: 0,
+            order: OutlineOrder::default(),
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -2109,7 +2124,7 @@ impl App {
                     .collect(),
             })
             .collect();
-        outline::build_items(&snapshot, self.outline.mode)
+        outline::build_items(&snapshot, self.outline.mode, self.outline.order)
     }
 
     pub fn outline_open(&self) -> bool {
@@ -2139,6 +2154,12 @@ impl App {
 
     pub fn outline_mode(&self) -> OutlineMode {
         self.outline.mode
+    }
+
+    /// Which end of the stack the outline displays first — `workon.review.outline.order` (CS3),
+    /// or [`OutlineOrder::default`] if never set.
+    pub fn outline_order(&self) -> OutlineOrder {
+        self.outline.order
     }
 
     /// `o`: a pure show/hide toggle — closed -> open+focused (+[`Self::sync_outline_to_current`]),
@@ -2203,6 +2224,14 @@ impl App {
     /// [`OutlineState::mode`] today (the outline cursor starts at `0` either way).
     pub fn set_outline_mode(&mut self, mode: OutlineMode) {
         self.outline.mode = mode;
+    }
+
+    /// Set the outline stack order directly — the config-startup (CS3) counterpart there is no
+    /// interactive key for today. Same non-resync posture as [`Self::set_outline_mode`]: called
+    /// before the first [`Self::open_current`], so no [`Self::sync_outline_to_current`] call is
+    /// needed here either.
+    pub fn set_outline_order(&mut self, order: OutlineOrder) {
+        self.outline.order = order;
     }
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
@@ -2589,6 +2618,17 @@ impl App {
             None => OutlineMode::default(),
         };
         self.set_outline_mode(mode);
+
+        let order = match &raw.outline_order {
+            Some(o) => parse_outline_order(o).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.outline.order = '{o}' unrecognized; using default"
+                ));
+                OutlineOrder::default()
+            }),
+            None => OutlineOrder::default(),
+        };
+        self.set_outline_order(order);
 
         let layout = match &raw.diff_layout {
             Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
@@ -3469,7 +3509,7 @@ mod tests {
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
     use crate::model::FileStatus;
-    use crate::outline::{OutlineItem, OutlineMode, StagedStatus};
+    use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
 
     #[test]
     fn combined_files_arrive_path_sorted() {
@@ -6988,6 +7028,9 @@ mod tests {
         let owned = Repository::open(repo.workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(owned, vec![view_a, view_b]);
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — this test asserts per-header marker content, not
+        // display order, so it doesn't need to track the new HeadFirst default.
+        app.outline.order = OutlineOrder::BaseFirst;
 
         let items = app.outline_items();
         assert_eq!(
@@ -7093,6 +7136,10 @@ mod tests {
         let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(repo, vec![view_pending, view_failed]);
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — this test asserts the exact header vec, which is
+        // incidental to base -> head storage order here, not what's under test (the
+        // loading/failed markers).
+        app.outline.order = OutlineOrder::BaseFirst;
 
         let items = app.outline_items();
         assert_eq!(
@@ -7247,6 +7294,10 @@ mod tests {
         let owned = Repository::open(repo.workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(owned, vec![view_a, view_b]);
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — the regression this test guards needs cs-a BEFORE
+        // cs-b in the row list (an earlier row's insertion shifting a later row's index); the
+        // new HeadFirst default would put cs-b (head) first instead, inverting the scenario.
+        app.outline.order = OutlineOrder::BaseFirst;
         assert_eq!(
             app.current_cs(),
             1,
@@ -7323,6 +7374,9 @@ mod tests {
     fn outline_move_by_on_a_file_row_jumps_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Flat;
+        // CS3: pin BaseFirst explicitly — this test exercises `outline_move_by`'s row-crossing
+        // mechanics via hardcoded Flat-mode indices, not display order.
+        app.outline.order = OutlineOrder::BaseFirst;
         app.outline.cursor = 0;
         assert_eq!(app.current_cs(), 0);
         assert_eq!(app.current, 0);
@@ -7342,6 +7396,10 @@ mod tests {
     fn outline_move_by_on_a_header_row_does_not_jump_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — this test's hardcoded row indices assume base -> head
+        // order (header, a1, a2, header, b1); the new HeadFirst default is a display-order
+        // concern orthogonal to what's under test here (whether a header move jumps the diff).
+        app.outline.order = OutlineOrder::BaseFirst;
         // Header rows sit at indices 0 (cs-a) and 3 (cs-b) in Stack mode (header, a1, a2,
         // header, b1). Park the diff on a2, cursor on its row.
         app.outline.cursor = 2;
@@ -7367,11 +7425,16 @@ mod tests {
         // header row (the LAST file crossed, exactly where unit presses leave it).
         let mut coalesced = two_committed_changesets_two_and_one_files();
         coalesced.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — the burst-vs-sequential equivalence under test doesn't
+        // depend on which end of the stack displays first, and the inline comments below assume
+        // base -> head row order.
+        coalesced.outline.order = OutlineOrder::BaseFirst;
         coalesced.outline.cursor = 0;
         coalesced.outline_move_by(3); // header -> a1 -> a2 -> cs-b header
 
         let mut sequential = two_committed_changesets_two_and_one_files();
         sequential.outline.mode = OutlineMode::Stack;
+        sequential.outline.order = OutlineOrder::BaseFirst;
         sequential.outline.cursor = 0;
         for _ in 0..3 {
             sequential.outline_move_by(1);
@@ -7395,6 +7458,9 @@ mod tests {
     fn outline_confirm_on_a_header_row_jumps_to_its_first_file_and_returns_focus() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — cursor 3 is hardcoded to cs-b's header under base ->
+        // head row order; the confirm mechanic under test is order-agnostic.
+        app.outline.order = OutlineOrder::BaseFirst;
         app.outline.open = true;
         app.outline.focused = true;
         app.outline.cursor = 3; // cs-b's header row
@@ -7682,19 +7748,24 @@ mod tests {
 
     #[test]
     fn outline_top_lands_cursor_zero_and_does_not_jump_a_header() {
+        // CS3: the outline's default order is now HeadFirst, so Stack mode's row 0 is cs-b's
+        // (the head changeset's) header, not cs-a's — see
+        // `stack_mode_head_first_shows_last_changesets_header_first_with_true_cs_idx` in
+        // outline.rs for the row-order pin. `outline_top`'s own contract (row 0, no diff jump)
+        // is order-agnostic, so only the "which header" framing below changes.
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
         app.outline_height = 3;
         app.next_changeset(); // move the diff off its start so a stray jump would be observable
         let (cs_before, file_before) = (app.current_cs(), app.current);
 
-        app.outline.cursor = 4; // b1.txt's row
+        app.outline.cursor = 4; // a2.txt's row under head-first order (cs-a's last file)
         app.outline_top();
 
         assert_eq!(app.outline_cursor(), 0, "g lands on row 0");
         assert!(
             matches!(app.outline_items()[0], OutlineItem::Header { .. }),
-            "row 0 in Stack mode is cs-a's header"
+            "row 0 in Stack mode is a header (cs-b's, the head changeset, under head-first order)"
         );
         assert_eq!(
             (app.current_cs(), app.current),
@@ -7705,6 +7776,9 @@ mod tests {
 
     #[test]
     fn outline_bottom_lands_on_the_last_row_and_jumps_a_file() {
+        // CS3: under the new HeadFirst default, Stack mode's row order is cs-b's header/file(s)
+        // first, then cs-a's — so the LAST row is cs-a's last file (a2.txt, cs_idx 0, file_idx
+        // 1), not cs-b's only file as it was under the old base-first order.
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
         app.outline_height = 3;
@@ -7716,11 +7790,11 @@ mod tests {
         assert_eq!(app.outline_cursor(), last, "G lands on the last row");
         assert!(
             matches!(app.outline_items()[last], OutlineItem::File { .. }),
-            "the last row in Stack mode is cs-b's only file, b1.txt"
+            "the last row in Stack mode under head-first order is cs-a's last file, a2.txt"
         );
         assert_eq!(
             (app.current_cs(), app.current),
-            (1, 0),
+            (0, 1),
             "landing on a File must switch the diff there"
         );
     }
@@ -7768,6 +7842,7 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(app.outline_mode(), OutlineMode::default());
+        assert_eq!(app.outline_order(), OutlineOrder::default());
         assert_eq!(app.layout, Layout::default());
         assert_eq!(app.zoom, Zoom::default());
     }
@@ -7832,6 +7907,37 @@ mod tests {
         assert_eq!(app.outline_mode(), OutlineMode::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("outline.mode"));
+    }
+
+    #[test]
+    fn outline_order_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.order", "base-first")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_order(), OutlineOrder::BaseFirst);
+    }
+
+    #[test]
+    fn outline_order_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.order", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.outline_order(), OutlineOrder::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outline.order"));
     }
 
     #[test]

@@ -2178,6 +2178,10 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
+        // CS3: pin BaseFirst explicitly — this test exercises Enter's header-jump + focus
+        // return, which is orthogonal to display order, but the `-3` row offset below assumes
+        // the base->head row layout.
+        app.set_outline_order(workon_review::outline::OutlineOrder::BaseFirst);
         app.toggle_outline(); // close
         app.toggle_outline(); // open + focus, cursor synced onto cs-b's file row
         assert!(app.outline_focused());

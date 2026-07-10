@@ -2557,24 +2557,24 @@ mod tests {
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
         let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
 
-        // Row order per the dirs-after-files/alpha-within-group rule, one outline row per
-        // buffer row starting at y=1 (y=0 is the winbar): `top.txt` (file, root, NOT the root's
-        // last child — `src/` follows), `src/` (dir, root, IS the root's last child), then
-        // `a.txt` nested one level under `src/` (the only — hence last — child of `src/`).
+        // Row order per the CS3 dirs-before-files/alpha-within-group rule, one outline row per
+        // buffer row starting at y=1 (y=0 is the winbar): `src/` (dir, root, NOT the root's last
+        // child — `top.txt` follows), `a.txt` nested one level under `src/` (the only — hence
+        // last — child of `src/`), then `top.txt` (file, root, IS the root's last child).
         assert!(
-            content[1].contains('\u{251C}') && content[1].contains("top.txt"),
-            "expected row 1 to be top.txt with a non-last '├─' guide, got:\n{}",
+            content[1].contains('\u{251C}') && content[1].contains("src/"),
+            "expected row 1 to be the src/ directory row with a non-last '├─' guide, got:\n{}",
             content.join("\n")
         );
         assert!(
-            content[2].contains('\u{2514}') && content[2].contains("src/"),
-            "expected row 2 to be the src/ directory row with a last-child '└─' guide, got:\n{}",
-            content.join("\n")
-        );
-        assert!(
-            content[3].contains('\u{2514}') && content[3].contains("a.txt"),
-            "expected row 3 to be src/a.txt, indented under src/ with its own last-child '└─' \
+            content[2].contains('\u{2514}') && content[2].contains("a.txt"),
+            "expected row 2 to be src/a.txt, indented under src/ with its own last-child '└─' \
              guide, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content[3].contains('\u{2514}') && content[3].contains("top.txt"),
+            "expected row 3 to be top.txt with a last-child '└─' guide, got:\n{}",
             content.join("\n")
         );
     }
