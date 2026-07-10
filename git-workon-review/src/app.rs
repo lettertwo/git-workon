@@ -1763,6 +1763,18 @@ impl App {
             return;
         };
         let cs = existing.cs.clone();
+        // F3: a landed NON-active changeset inserts file rows into the outline's row list,
+        // silently shifting a plain row-index cursor. Capture the identity of the row under the
+        // cursor now (before the slot swap rebuilds `outline_items()`) so it can be re-found
+        // afterward — the active-changeset case doesn't need this, since `sync_outline_to_current`
+        // below already repositions by diff identity, not row index.
+        let cursor_identity = if idx != self.current_cs {
+            self.outline_items()
+                .get(self.outline.cursor)
+                .and_then(outline_row_identity)
+        } else {
+            None
+        };
         match result {
             Ok(diff) => {
                 self.changesets[idx] = ChangesetView::from_changeset_diff(cs, diff);
@@ -1782,6 +1794,18 @@ impl App {
             self.current = 0;
             self.open_current();
             self.sync_outline_to_current();
+        } else if let Some(identity) = cursor_identity {
+            let items = self.outline_items();
+            if let Some(new_idx) = items
+                .iter()
+                .position(|it| outline_row_identity(it) == Some(identity))
+            {
+                self.outline.cursor = new_idx;
+            } else {
+                // The identified row is gone (e.g. Flat mode deduped it out) — fall back to the
+                // same clamp `sync_outline_to_current` uses.
+                self.outline.cursor = self.outline.cursor.min(items.len().saturating_sub(1));
+            }
         }
     }
 
@@ -2954,6 +2978,21 @@ impl DiffState {
 /// when the previously-active changeset's name no longer exists after a re-assembly.
 fn current_cs_index(changesets: &[ChangesetView]) -> usize {
     changesets.iter().position(|v| v.cs.current).unwrap_or(0)
+}
+
+/// The `(cs_idx, file_idx)` identity an [`OutlineItem::Header`]/[`OutlineItem::File`] row
+/// carries — `file_idx` is `None` for a header row. `OutlineItem::Dir` carries no `cs_idx` at
+/// all (see its doc comment) and has no identity to preserve. Used by
+/// [`App::apply_changeset_ready`] (F3) to re-find the row the outline cursor was on after a
+/// streamed diff landing inserts/removes rows ahead of it in the row-index space.
+fn outline_row_identity(item: &OutlineItem) -> Option<(usize, Option<usize>)> {
+    match item {
+        OutlineItem::Header { cs_idx, .. } => Some((*cs_idx, None)),
+        OutlineItem::File {
+            cs_idx, file_idx, ..
+        } => Some((*cs_idx, Some(*file_idx))),
+        OutlineItem::Dir { .. } => None,
+    }
 }
 
 // ── ADR-037: the loader thread's stateless request/job shape ────────────────────
@@ -6506,6 +6545,60 @@ mod tests {
         assert!(
             notice_after.text.contains("first failure"),
             "a second failure in the same wave must not overwrite the first's notice"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_keeps_outline_cursor_anchored_when_an_earlier_non_active_changeset_lands(
+    ) {
+        // F3 regression: cs-a sits BEFORE the active cs-b in the outline row list. Landing cs-a's
+        // diff inserts its file rows ahead of cs-b's header, shifting every row-index cursor at
+        // or after cs-a's header — a plain row-index cursor would silently drift onto one of
+        // cs-a's new file rows instead of staying on cs-b's header.
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", false));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", true));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.outline.mode = OutlineMode::Stack;
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "cs-b is the lib-marked current changeset"
+        );
+
+        let items_before = app.outline_items();
+        let cursor_before = items_before
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header row exists before cs-a lands");
+        app.outline.cursor = cursor_before;
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            app.generation(),
+            0,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        let items_after = app.outline_items();
+        assert!(
+            items_after.len() > items_before.len(),
+            "cs-a's file rows must have been inserted ahead of cs-b's header"
+        );
+        assert_eq!(
+            items_after[app.outline_cursor()],
+            OutlineItem::Header {
+                cs_idx: 1,
+                label: "cs-b".to_string(),
+                current: true,
+                needs_restack: false,
+                loading: true,
+                failed: false,
+            },
+            "the outline cursor must still identify cs-b's header row, not whatever row now \
+             sits at its old index"
         );
     }
 
