@@ -48,6 +48,7 @@ const SCROLLOFF: usize = 2;
 /// The new side reads from the **worktree file on disk**, not the index blob — unstaged
 /// content isn't in the object database; reading the staged (index) blob is an M4 concern (the
 /// staged/unstaged split zoom).
+#[derive(Debug)]
 pub struct FileView {
     old_text: String,
     new_text: String,
@@ -344,6 +345,59 @@ fn new_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tre
         }
         ChangesetSpan::Uncommitted => None,
     }
+}
+
+/// Build a [`Role::Combined`] [`FileView`] against `repo`/`ts` for a file whose combined
+/// [`FileChange`] is `file` and whose changeset span is `span` — the shared core
+/// [`App::ensure_role_loaded`]'s combined branch and ADR-037's [`build_file_views`] (the loader
+/// job's pure body) both call, so a deferred-then-loader-completed open is byte-identical to an
+/// eager one. `None` for a binary file or an unreadable tree; never panics.
+fn build_combined_view(
+    repo: &Repository,
+    ts: &mut TsHighlighter,
+    span: ChangesetSpan,
+    file: &FileChange,
+) -> Option<FileView> {
+    if file.is_binary {
+        return None;
+    }
+    // Re-peeled per call rather than cached: for the uncommitted layer `HEAD` can move between
+    // file loads, and the tree is cheap to re-peel either way (see `old_side_tree_for`'s doc
+    // comment).
+    let head_tree = old_side_tree_for(repo, span)?;
+    let new_tree = new_side_tree_for(repo, span);
+    Some(FileView::load(
+        repo,
+        &head_tree,
+        new_tree.as_ref(),
+        file,
+        Role::Combined,
+        ts,
+    ))
+}
+
+/// Build a non-Combined ([`Role::Unstaged`]/[`Role::Staged`]) [`FileView`] against `repo`/`ts` for
+/// sub-role file `file` — the mirror of [`build_combined_view`], shared the same way. Non-Combined
+/// roles are uncommitted-only (a committed changeset's staged/unstaged sub-models are always
+/// empty — see [`DiffState::from_committed`]), so the new side always stays worktree/index (`None`
+/// to [`FileView::load`]) and the old side is always live `HEAD`, never a changeset's `base`.
+/// `None` for a binary file or an unreadable `HEAD`; never panics.
+fn build_sub_role_view(
+    repo: &Repository,
+    ts: &mut TsHighlighter,
+    role: Role,
+    file: &FileChange,
+) -> Option<FileView> {
+    debug_assert_ne!(
+        role,
+        Role::Combined,
+        "build_sub_role_view is non-Combined only"
+    );
+    if file.is_binary {
+        return None;
+    }
+    let head_tree = repo.head().and_then(|h| h.peel_to_tree()).ok()?;
+    Some(FileView::load(repo, &head_tree, None, file, role, ts))
 }
 
 fn read_head_blob(repo: &Repository, tree: &git2::Tree<'_>, path: &str) -> String {
@@ -825,6 +879,19 @@ pub struct App {
     /// while this is `true`, and the event loop calls [`Self::complete_pending_open`] once input
     /// has been quiet for `OPEN_DEBOUNCE`. Read via [`Self::open_pending`].
     open_pending: bool,
+    /// Whether a [`crate::app::FileLoadSpec`] has already been dispatched to the ADR-037 loader
+    /// thread for the CURRENT pending open — set by [`Self::take_pending_load_spec`], cleared
+    /// whenever a fresh open is marked pending. Without this, every idle `Tick` while
+    /// `open_pending` stays true (the loader hasn't answered yet) would re-dispatch the same
+    /// request; this makes dispatch idempotent across the pending open's whole lifetime.
+    open_pending_dispatched: bool,
+    /// ADR-037's global generation counter. Invariant: bumps ⟺ every view cache was invalidated
+    /// — launch seeds it at `1` ([`Self::from_changesets`]); [`Self::refresh`] bumps it on every
+    /// successful rebuild (still synchronous in this slice). A loader result whose `gen` doesn't
+    /// match this is for a world that no longer exists and is dropped at the inbox chokepoint
+    /// ([`Self::apply_file_ready`]) — the ONLY drop rule; within a generation, results are cached
+    /// even if the user navigated away (warmth, not staleness — see the ADR's "Generations").
+    generation: u64,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -962,6 +1029,8 @@ impl App {
             review_source: None,
             defer_loads: false,
             open_pending: false,
+            open_pending_dispatched: false,
+            generation: 1,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1039,6 +1108,13 @@ impl App {
     /// the old `pub files` field, which moved onto [`ChangesetView`] (see [`Self::cur`]).
     pub fn files(&self) -> &[FileChange] {
         &self.cur().diff.files
+    }
+
+    /// ADR-037's global generation — see the field's doc comment for the invariant. The loader
+    /// thread stamps every [`FileLoadSpec`] request it's handed with this value at send time;
+    /// [`Self::apply_file_ready`] drops a result whose stamp no longer matches.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Index into the reviewed stack of the active changeset — read by tests asserting the
@@ -1185,6 +1261,11 @@ impl App {
             .unwrap_or_else(|| current_cs_index(&views));
         self.base_label = base_label_for(&views[self.current_cs].cs);
         self.changesets = views;
+        // ADR-037: every refresh bumps the generation, right where the view caches it protects
+        // are actually replaced — an early `return` above (a failed resolve/diff) leaves the old
+        // world's caches intact, so it must NOT bump. Any loader result still in flight for the
+        // pre-refresh world now carries a stale `gen` and dies at `apply_file_ready`'s chokepoint.
+        self.generation += 1;
 
         let n = self.cur().diff.files.len();
         self.current = current_path
@@ -1362,62 +1443,26 @@ impl App {
                 Role::Staged => self.cur().diff.staged_model.files[mi].clone(),
                 Role::Combined => unreachable!(),
             };
-            if file.is_binary {
+            // `file` is cloned out of `self.cur()` (rather than a borrow) because
+            // `build_sub_role_view` needs `&self.repo` and `&mut self.highlighter` at once, which
+            // a borrow still anchored in `self.cur()` would conflict with — same rationale as the
+            // combined path below.
+            let Some(view) = build_sub_role_view(&self.repo, &mut self.highlighter, role, &file)
+            else {
                 return;
-            }
-            // Build the view in a block so `head_tree` (which borrows `self.repo`) drops before
-            // the `views_for_mut` reborrow — same reason the combined path below can assign a
-            // direct field while `head_tree` is live but this method-call path cannot. `file` is
-            // cloned out of `self.cur()` for the same reason: `FileView::load` needs `&self.repo`
-            // and `&mut self.highlighter` at once, which a borrow still anchored in `self.cur()`
-            // would conflict with.
-            let view = {
-                // Re-peeled per call, same rationale as the combined path below.
-                let Ok(head_tree) = self.repo.head().and_then(|h| h.peel_to_tree()) else {
-                    return;
-                };
-                // Non-Combined roles are uncommitted-only (committed changesets have empty
-                // staged/unstaged sub-models), so the new side always stays worktree/index —
-                // `None` here preserves that exactly.
-                FileView::load(
-                    &self.repo,
-                    &head_tree,
-                    None,
-                    &file,
-                    role,
-                    &mut self.highlighter,
-                )
             };
             self.views_for_mut(role)[idx] = Some(view);
             return;
         }
 
-        // Combined role.
-        // Re-peeled per call rather than cached on `App`: for the uncommitted layer `HEAD` can
-        // move between file loads, and the tree is cheap to re-peel either way.
-        // `self.cur().cs.span` is `Copy`, so reading it here borrows `self` only for this
-        // sub-expression — `head_tree` itself ends up borrowing `self.repo` alone (via the free
-        // `old_side_tree_for`), leaving `&mut self.highlighter` free below. A method tied to
-        // `&self` would instead have bound the tree's lifetime to all of `self`.
-        let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.span) else {
+        // Combined role. `self.cur().cs.span`/`self.cur().diff.files[idx].clone()` are read out
+        // (rather than borrowed) for the same reason as the sub-role branch above —
+        // `build_combined_view` needs `&self.repo` and `&mut self.highlighter` together.
+        let span = self.cur().cs.span;
+        let file = self.cur().diff.files[idx].clone();
+        let Some(view) = build_combined_view(&self.repo, &mut self.highlighter, span, &file) else {
             return;
         };
-        // New-side source mirrors the old side: `None` (worktree) for the uncommitted layer,
-        // the changeset's `head` tree for a committed changeset. Same free-fn borrow dance as
-        // `old_side_tree_for` — both trees borrow only `self.repo`, so `&mut self.highlighter`
-        // stays free for `FileView::load`.
-        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.span);
-        let file = self.cur().diff.files[idx].clone();
-        let view = FileView::load(
-            &self.repo,
-            &head_tree,
-            new_tree.as_ref(),
-            &file,
-            Role::Combined,
-            &mut self.highlighter,
-        );
-        drop(head_tree);
-        drop(new_tree);
         self.cur_mut().views_combined[idx] = Some(view);
     }
 
@@ -1510,6 +1555,9 @@ impl App {
     pub fn open_current(&mut self) {
         if self.defer_loads && !self.current_views_cached() {
             self.open_pending = true;
+            // A fresh pending open has nothing dispatched to the loader yet — see
+            // [`Self::take_pending_load_spec`].
+            self.open_pending_dispatched = false;
             self.reset_panes();
             return;
         }
@@ -1550,6 +1598,104 @@ impl App {
         self.ensure_loaded(self.current);
         self.reset_panes();
         self.open_pending = false;
+        self.open_pending_dispatched = false;
+    }
+
+    // ── ADR-037: the loader thread's request/result seam ────────────────────────
+
+    /// Snapshot everything the ADR-037 loader needs to load the CURRENT file, mirroring exactly
+    /// what [`Self::ensure_loaded`] would read from live state — see [`FileLoadSpec`]'s doc
+    /// comment. Every field is owned (cloned out), so the spec outlives the borrow and can cross
+    /// to the loader thread.
+    fn current_load_spec(&self) -> FileLoadSpec {
+        let idx = self.current;
+        let zoom = self.effective_zoom_for(idx);
+        let diff = &self.cur().diff;
+        FileLoadSpec {
+            span: self.cur().cs.span,
+            combined_file: diff.files[idx].clone(),
+            zoom,
+            unstaged_file: diff
+                .unstaged_idx
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|mi| diff.unstaged_model.files[mi].clone()),
+            staged_file: diff
+                .staged_idx
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|mi| diff.staged_model.files[mi].clone()),
+        }
+    }
+
+    /// Take the [`FileLoadSpec`] for the current pending open, tagged with the generation/
+    /// changeset/file it was built against — but ONLY if a request hasn't already been dispatched
+    /// for this same pending open (see [`Self::open_pending_dispatched`]'s doc comment). The event
+    /// loop calls this on every idle `Tick` while an open is pending; without the dispatched guard
+    /// it would re-send the same request on every one of those ticks until the loader answers.
+    /// Returns `None` when nothing is pending, or a request already went out for it.
+    pub fn take_pending_load_spec(&mut self) -> Option<(u64, usize, usize, FileLoadSpec)> {
+        if !self.open_pending || self.open_pending_dispatched {
+            return None;
+        }
+        self.open_pending_dispatched = true;
+        Some((
+            self.generation,
+            self.current_cs,
+            self.current,
+            self.current_load_spec(),
+        ))
+    }
+
+    /// Apply one loader result (ADR-037's chokepoint, the `FileReady` inbox arm routes here):
+    /// dropped outright on a generation mismatch (`gen != self.generation` — the world it was
+    /// computed against no longer exists, see [`Self::generation`]'s doc comment). Otherwise:
+    ///
+    /// - `Ok(views)` caches every view the result carries, UNLESS that slot is already `Some` — a
+    ///   result for an already-cached file is discarded (the loader is a pure cache-warmer, never
+    ///   an overwriter; the synchronous force-completion fallback may have already filled it).
+    /// - `Err(message)` is a job that panicked or otherwise failed: surfaced as a visible footer
+    ///   notice (never silently stranding the file — see this changeset's report for why a footer
+    ///   notice, not a new per-file `Failed` state, is the shape chosen here).
+    ///
+    /// Either way, when the readied file IS the current pending open, it's seated exactly like
+    /// [`Self::complete_pending_open`]'s tail: `open_pending` clears regardless of `Ok`/`Err` — a
+    /// failed load must not leave the placeholder stuck forever. Correctness never depends on
+    /// this: the next nav/force-completion retries via [`Self::ensure_loaded`]'s ordinary
+    /// cache-miss path, which is where a load actually being CORRECT is guaranteed.
+    pub fn apply_file_ready(
+        &mut self,
+        gen: u64,
+        cs_idx: usize,
+        file_idx: usize,
+        result: Result<LoadedViews, String>,
+    ) {
+        if gen != self.generation {
+            return;
+        }
+        match result {
+            Ok(views) => {
+                if let Some(cs) = self.changesets.get_mut(cs_idx) {
+                    match views {
+                        LoadedViews::Single(role, view) => set_if_absent(cs, role, file_idx, view),
+                        LoadedViews::Split { unstaged, staged } => {
+                            set_if_absent(cs, Role::Unstaged, file_idx, unstaged);
+                            set_if_absent(cs, Role::Staged, file_idx, staged);
+                        }
+                    }
+                }
+            }
+            Err(message) => {
+                self.notify(format!("failed to load file: {message}"), Severity::Error);
+            }
+        }
+        if cs_idx == self.current_cs && file_idx == self.current && self.open_pending {
+            self.reset_panes();
+            self.open_pending = false;
+            self.open_pending_dispatched = false;
+        }
     }
 
     /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`z`). The new zoom
@@ -2723,6 +2869,103 @@ fn current_cs_index(changesets: &[ChangesetView]) -> usize {
     changesets.iter().position(|v| v.cs.current).unwrap_or(0)
 }
 
+// ── ADR-037: the loader thread's stateless request/job shape ────────────────────
+
+/// Everything the ADR-037 loader job needs to reproduce one file's [`App::ensure_loaded`] work
+/// against its OWN `Repository` + [`TsHighlighter`] — the loader is stateless between jobs (see
+/// the ADR's "Protocol": "each request carries what it needs"). Built by
+/// [`App::current_load_spec`] from live `App` state at request-send time; every field is owned
+/// (cloned out of `App`), so the spec outlives the borrow and crosses to the loader thread.
+#[derive(Debug, Clone)]
+pub struct FileLoadSpec {
+    span: ChangesetSpan,
+    combined_file: FileChange,
+    /// The [`EffectiveZoom`] `App` had AT DISPATCH TIME — the views built are shaped by this,
+    /// not by whatever `App`'s zoom/current file happen to be when the result lands (which may
+    /// have changed by then; that's fine, see the ADR's "Generations": within a generation, a
+    /// result is warmth even after the user navigated away).
+    zoom: EffectiveZoom,
+    unstaged_file: Option<FileChange>,
+    staged_file: Option<FileChange>,
+}
+
+/// The [`FileView`]s [`build_file_views`] built for one [`FileLoadSpec`], shaped exactly like the
+/// [`EffectiveZoom`] it was built for — [`App::apply_file_ready`] reads this shape to know which
+/// cache slot(s) to fill without re-deriving the zoom itself (which could disagree with the zoom
+/// the views were actually built against — see [`FileLoadSpec::zoom`]'s doc comment).
+/// `FileView` fields (`Box`ed here, see below) — a `FileReady` `AppEvent` carrying this unboxed
+/// would otherwise make the WHOLE `AppEvent` enum balloon to `FileView`'s size on every variant
+/// (clippy's `large_enum_variant`), even the plain `Key`/`Tick` ones sent on every keystroke.
+#[derive(Debug)]
+pub enum LoadedViews {
+    Single(Role, Option<Box<FileView>>),
+    Split {
+        unstaged: Option<Box<FileView>>,
+        staged: Option<Box<FileView>>,
+    },
+}
+
+/// Build every [`FileView`] a [`FileLoadSpec`] needs, against `repo`/`ts` — the ADR-037 loader
+/// thread's pure job body: unit-testable directly against a fixture repo, no threads or channels
+/// involved. Routes through the SAME [`build_combined_view`]/[`build_sub_role_view`] free
+/// functions [`App::ensure_role_loaded`] calls, so a deferred-then-loader-completed open is
+/// byte-identical to an eager [`App::open_current`] — the invariant ADR-037 carries over from
+/// CS4's `complete_pending_open`.
+pub fn build_file_views(
+    repo: &Repository,
+    ts: &mut TsHighlighter,
+    spec: &FileLoadSpec,
+) -> LoadedViews {
+    match spec.zoom {
+        EffectiveZoom::Single(role) => {
+            let view = match role {
+                Role::Combined => build_combined_view(repo, ts, spec.span, &spec.combined_file),
+                Role::Unstaged => spec
+                    .unstaged_file
+                    .as_ref()
+                    .and_then(|f| build_sub_role_view(repo, ts, Role::Unstaged, f)),
+                Role::Staged => spec
+                    .staged_file
+                    .as_ref()
+                    .and_then(|f| build_sub_role_view(repo, ts, Role::Staged, f)),
+            };
+            LoadedViews::Single(role, view.map(Box::new))
+        }
+        EffectiveZoom::Split => LoadedViews::Split {
+            unstaged: spec
+                .unstaged_file
+                .as_ref()
+                .and_then(|f| build_sub_role_view(repo, ts, Role::Unstaged, f))
+                .map(Box::new),
+            staged: spec
+                .staged_file
+                .as_ref()
+                .and_then(|f| build_sub_role_view(repo, ts, Role::Staged, f))
+                .map(Box::new),
+        },
+    }
+}
+
+/// Cache `view` into changeset `cs`'s `role` view slot for file `idx`, UNLESS that slot is
+/// already `Some` — [`App::apply_file_ready`]'s "a result for an already-cached file is
+/// discarded" rule (the loader is a pure cache-warmer, never an overwriter). A no-op if `idx` is
+/// out of range (the changeset shrank across a refresh — should already be unreachable, since a
+/// refresh bumps the generation and `apply_file_ready` drops stale-generation results before
+/// this ever runs, but `get_mut` stays defensive rather than indexing).
+fn set_if_absent(cs: &mut ChangesetView, role: Role, idx: usize, view: Option<Box<FileView>>) {
+    let view = view.map(|boxed| *boxed);
+    let slots = match role {
+        Role::Combined => &mut cs.views_combined,
+        Role::Unstaged => &mut cs.views_unstaged,
+        Role::Staged => &mut cs.views_staged,
+    };
+    if let Some(slot) = slots.get_mut(idx) {
+        if slot.is_none() {
+            *slot = view;
+        }
+    }
+}
+
 /// [`App::base_label`] for the changeset that would become active — a committed changeset's
 /// base rev (7-char short-sha), or `"HEAD"` for the uncommitted layer (worktree ↔ `HEAD`,
 /// unchanged from M2–M4).
@@ -2884,8 +3127,8 @@ mod tests {
 
     use super::test_support::app_from_fixture;
     use super::{
-        find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState, EffectiveZoom,
-        Layout, Role, Zoom, DEFAULT_OUTLINE_WIDTH,
+        build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
+        EffectiveZoom, Layout, LoadedViews, Role, Severity, Zoom, DEFAULT_OUTLINE_WIDTH,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
@@ -3101,6 +3344,238 @@ mod tests {
         assert!(!app.open_pending());
         assert_eq!(app.cursor, cursor_before);
         assert_eq!(app.scroll, scroll_before);
+    }
+
+    // ── ADR-037: the loader's request/result seam ────────────────────────────────
+
+    #[test]
+    fn build_file_views_matches_ensure_loaded_for_the_combined_role() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("tracked.txt", "line1\nline2\n", "line1\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut eager = app_from_fixture(&fixture);
+        // The file only has an unstaged change, so the default `Split` zoom would collapse to
+        // `Role::Unstaged` — force `Combined` explicitly so this test exercises the role its
+        // name promises (a separate test would be needed for the Split/sub-role shape).
+        eager.set_zoom(Zoom::Combined);
+        eager.ensure_loaded(0);
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+
+        // A SEPARATE `App` gives us `current_load_spec()` for the same file, and a SEPARATE
+        // `Repository` handle + fresh `TsHighlighter` stands in for the loader thread's own —
+        // exactly the two-handle shape `Tui::run`/`spawn_loader_thread` build for real.
+        let mut spec_app = app_from_fixture(&fixture);
+        spec_app.set_zoom(Zoom::Combined);
+        let spec = spec_app.current_load_spec();
+        let repo = fixture.repo().unwrap();
+        let loader_repo =
+            Repository::open(repo.workdir().unwrap()).expect("loader's own repo handle");
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        let LoadedViews::Single(role, Some(loader_view)) = views else {
+            panic!("expected a loaded Combined-role view");
+        };
+        assert_eq!(role, Role::Combined);
+        assert_eq!(loader_view.old_text(), eager_view.old_text());
+        assert_eq!(loader_view.new_text(), eager_view.new_text());
+        assert_eq!(loader_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn apply_file_ready_completes_a_pending_open_byte_identical_to_eager_open() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold\nl10\nl11\nl12\n",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew\nl10\nl11\nl12\n",
+            )
+            .build()
+            .unwrap();
+
+        let (mut deferred, eager) = defer_and_eager_twins(&fixture);
+        assert!(deferred.open_pending());
+
+        // The ASYNC path: take the pending spec (as `tui.rs`'s event loop would on the debounce
+        // `Tick`), build its views through a SEPARATE repo/highlighter (standing in for the
+        // loader thread's own), then apply the result — never `complete_pending_open`.
+        let (gen, cs_idx, file_idx, spec) = deferred
+            .take_pending_load_spec()
+            .expect("a fresh pending open has an undispatched spec");
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        deferred.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        assert!(
+            !deferred.open_pending(),
+            "apply_file_ready must clear the pending flag for the file it just seated"
+        );
+        assert_eq!(
+            deferred.cursor, eager.cursor,
+            "cursor must land on the same (first-hunk) row an eager open would have"
+        );
+        assert_eq!(deferred.scroll, eager.scroll);
+        let deferred_view = deferred.current_view_ref().expect("view now loaded");
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+        assert_eq!(deferred_view.old_text(), eager_view.old_text());
+        assert_eq!(deferred_view.new_text(), eager_view.new_text());
+        assert_eq!(deferred_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn take_pending_load_spec_dispatches_at_most_once_per_pending_open() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        assert!(
+            app.take_pending_load_spec().is_some(),
+            "first take dispatches"
+        );
+        assert!(
+            app.take_pending_load_spec().is_none(),
+            "a second take before the result lands must not re-dispatch"
+        );
+    }
+
+    #[test]
+    fn apply_file_ready_drops_a_stale_generation_result() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        let (gen, cs_idx, file_idx, spec) = app.take_pending_load_spec().unwrap();
+
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        // A refresh between dispatch and result bumps the generation — the result now belongs
+        // to a world that no longer exists and must be dropped outright, leaving `open_pending`
+        // untouched (a FRESH open may since be pending for a different generation).
+        app.generation += 1;
+        app.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        assert!(
+            app.open_pending(),
+            "a stale-generation result must not clear a (possibly fresh) pending open"
+        );
+        assert!(
+            app.current_view_ref().is_none(),
+            "a stale-generation result must not populate the view cache"
+        );
+    }
+
+    #[test]
+    fn apply_file_ready_caches_a_result_even_after_navigating_away() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .unstaged_file("b.txt", "two\n", "two\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_zoom(Zoom::Combined);
+        app.set_defer_loads(true);
+        app.open_current(); // a.txt: uncached — defers
+        let (gen, cs_idx, file_idx, spec) = app.take_pending_load_spec().unwrap();
+        assert_eq!(file_idx, 0);
+
+        // Navigate away from a.txt BEFORE the (simulated) loader result lands.
+        app.current = 1;
+        app.open_current();
+
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+        app.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        // Still within the same generation — the result is warmth, not staleness: a.txt's cache
+        // is populated even though the user is no longer looking at it.
+        assert!(
+            app.role_view_ref(0, Role::Combined).is_some(),
+            "a within-generation result must cache even after the user navigated away"
+        );
+    }
+
+    #[test]
+    fn apply_file_ready_discards_a_result_for_an_already_cached_file() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_zoom(Zoom::Combined);
+        app.ensure_loaded(0); // eagerly cached already
+        assert!(app.role_view_ref(0, Role::Combined).is_some());
+        let old_text_before = app
+            .role_view_ref(0, Role::Combined)
+            .unwrap()
+            .old_text()
+            .to_string();
+
+        // A result claiming NOTHING loaded for this role (e.g. a stale/racing answer) must not
+        // clobber the already-cached view — the loader is a pure cache-warmer, never an
+        // overwriter.
+        app.apply_file_ready(
+            app.generation(),
+            app.current_cs(),
+            0,
+            Ok(LoadedViews::Single(Role::Combined, None)),
+        );
+
+        let view = app.role_view_ref(0, Role::Combined).expect("still cached");
+        assert_eq!(view.old_text(), old_text_before);
+    }
+
+    #[test]
+    fn apply_file_ready_err_surfaces_a_footer_notice_and_clears_pending() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        let (gen, cs_idx, file_idx, _spec) = app.take_pending_load_spec().unwrap();
+        assert!(app.notice.is_none());
+
+        app.apply_file_ready(gen, cs_idx, file_idx, Err("boom".to_string()));
+
+        assert!(
+            !app.open_pending(),
+            "a failed load must not strand the placeholder pending forever"
+        );
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("a failed load surfaces a notice");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("boom"));
     }
 
     // Hunk-nav helpers below operate purely over `DisplayRow` vectors — no fixture repo needed.
