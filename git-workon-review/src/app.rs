@@ -671,6 +671,72 @@ struct PaneState {
     scroll: usize,
 }
 
+/// CS6: a staging op's pre-op position, captured by [`App::capture_position`] before
+/// `coordinated_refresh` and restored by [`App::restore_position`] after — so a staging op keeps
+/// the reviewer's place instead of `reset_panes`' first-hunk reseat (that reseat still runs for
+/// every MANUAL nav: file/changeset switches, zoom cycles). `path` + `role` say WHERE (the same
+/// file, the pane the reviewer was in); `old_lineno`/`new_lineno` say WHAT (the acted-on row's
+/// position in `role`'s own coordinate frame — the two sides a role's rows are diffed against,
+/// per [`FileView::load`]'s table). Deliberately NO pre-op zoom snapshot: [`App::restore_position`]
+/// re-derives the POST-op [`EffectiveZoom`] from live state, since the op itself is exactly what
+/// invalidates a pre-op snapshot.
+struct PositionMemento {
+    path: String,
+    role: Role,
+    old_lineno: Option<u32>,
+    new_lineno: Option<u32>,
+}
+
+/// The target role's display row (active layout) whose role-native lineno is the first `>=
+/// target`, skipping [`DisplayRow::Gap`]/[`InlineRow::Gap`] rows (no lineno to compare). A row's
+/// role-native lineno prefers its NEW side, falling back to its OLD side for an unpaired Del (SBS
+/// Filler-new) or Add (SBS Filler-old) row — see [`App::restore_position`]'s doc comment for why
+/// this same new-preferred rule is correct even across a role change.
+///
+/// Falls back to the LAST row carrying any lineno when `target` is past the view's end (staging
+/// the acted-on hunk can shrink the file out from under the old lineno). `None` only when the
+/// view has no rows with a lineno at all (a to-be-added-content-only file collapsed to nothing —
+/// shouldn't happen in practice, but keeps this total).
+fn find_nearest_row(view: &FileView, layout: Layout, target: u32) -> Option<usize> {
+    let linenos: Vec<(usize, u32)> = match layout {
+        Layout::Sbs => view
+            .display
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                let DisplayRow::Row(r) = row else {
+                    return None;
+                };
+                let n = match r.new {
+                    Row::Line(n) => Some(n as u32),
+                    Row::Filler => match r.old {
+                        Row::Line(n) => Some(n as u32),
+                        Row::Filler => None,
+                    },
+                };
+                n.map(|n| (i, n))
+            })
+            .collect(),
+        Layout::Inline => view
+            .inline
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match row {
+                InlineRow::Context { new, .. } | InlineRow::Add { new, .. } => {
+                    Some((i, *new as u32))
+                }
+                InlineRow::Del { old, .. } => Some((i, *old as u32)),
+                InlineRow::Gap { .. } => None,
+            })
+            .collect(),
+    };
+    linenos
+        .iter()
+        .find(|(_, n)| *n >= target)
+        .or_else(|| linenos.last())
+        .map(|(i, _)| *i)
+}
+
 /// Slide `prev_scroll` the minimum amount to keep `cursor` within `[SCROLLOFF, pane_height - 1 -
 /// SCROLLOFF]` of the viewport, then clamp to `[0, rows - pane_height]` (edge wins over margin).
 /// The pure core of [`App::derive_scroll`], factored out so a split's unfocused pane can derive its
@@ -1659,6 +1725,12 @@ impl App {
     /// run on file open and zoom change. The two role coordinate spaces disagree, so carrying a
     /// raw cursor index across a role/zoom switch would be meaningless; jumping to the role's own
     /// first hunk (the same position a fresh file open lands on) is always valid and predictable.
+    ///
+    /// This is also what `coordinated_refresh` leaves behind after a staging op (via
+    /// `open_current`), since a refresh is itself a file "open" of the post-op state — CS6's
+    /// `App::restore_position` runs immediately after, overwriting this first-hunk reseat with
+    /// the reviewer's pre-op position when it can. Every OTHER caller (manual file/changeset
+    /// nav, zoom cycles) has no such follow-up, so first-hunk-on-open is still what they see.
     fn reset_panes(&mut self) {
         // Any file open / zoom change reshapes the coordinate space an active selection is keyed
         // in, so drop it (see [`Self::selection_anchor`]).
@@ -3042,7 +3114,9 @@ impl App {
     /// Enqueue `op`, drain the queue on the same beat, then act on the outcome: a failure or panic
     /// surfaces on the footer and skips the refresh (the index is now in whatever partial state
     /// the failed op left it in — the user resolves with `r`); a `Completed` drain refreshes,
-    /// rebuilding the views + attribution from the new index (locked decision #5).
+    /// rebuilding the views + attribution from the new index (locked decision #5), then restores
+    /// the reviewer's pre-op position (CS6) — a staging op is the ONE nav path that does not reset
+    /// to the role's first hunk; every manual nav still does, via `reset_panes` unchanged.
     ///
     /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]) or a (possibly
     /// multi-hunk) line selection ([`LineSelectionOp`], which applies as ONE merged patch rather
@@ -3050,6 +3124,7 @@ impl App {
     /// way exactly one op is ever in flight, so the queue's trap-4 live-index staleness doesn't
     /// apply — the queue is here for its lock-retry and panic isolation.
     fn run_op(&mut self, op: impl StagingOp + 'static) {
+        let memento = self.capture_position();
         self.queue.enqueue(op);
         // Distinct fields (`queue` mutable, `repo`/`applier` shared) — the borrow checker permits
         // the disjoint borrows in one call, so the queue needn't be taken out and put back.
@@ -3061,8 +3136,105 @@ impl App {
         });
         match failure {
             Some(message) => self.notify(message, Severity::Error),
-            None => self.coordinated_refresh(),
+            None => {
+                self.coordinated_refresh();
+                if let Some(memento) = memento {
+                    self.restore_position(memento);
+                }
+            }
         }
+    }
+
+    /// Snapshot the focused pane's file/role/position ahead of a staging op, for
+    /// [`Self::restore_position`] to reseat after the op's `coordinated_refresh` (CS6). `None`
+    /// when there's no current file, the current view is the combined role (never a staging
+    /// target — [`Self::staging_role`]), or the focused role's view isn't loaded; restore is then
+    /// a no-op and today's `reset_panes` first-hunk behavior stands.
+    fn capture_position(&self) -> Option<PositionMemento> {
+        let path = self.files().get(self.current)?.path.clone();
+        let role = self.staging_role()?;
+        let view = self.role_view_ref(self.current, role)?;
+        let (old_lineno, new_lineno) = match self.layout {
+            Layout::Sbs => match view.display.get(self.cursor) {
+                Some(DisplayRow::Row(row)) => (
+                    match row.old {
+                        Row::Line(n) => Some(n as u32),
+                        Row::Filler => None,
+                    },
+                    match row.new {
+                        Row::Line(n) => Some(n as u32),
+                        Row::Filler => None,
+                    },
+                ),
+                _ => (None, None),
+            },
+            Layout::Inline => match view.inline.get(self.cursor) {
+                Some(InlineRow::Context { old, new }) => (Some(*old as u32), Some(*new as u32)),
+                Some(InlineRow::Del { old, .. }) => (Some(*old as u32), None),
+                Some(InlineRow::Add { new, .. }) => (None, Some(*new as u32)),
+                _ => (None, None),
+            },
+        };
+        Some(PositionMemento {
+            path,
+            role,
+            old_lineno,
+            new_lineno,
+        })
+    }
+
+    /// Reseat the focused pane to a pre-staging-op position after `coordinated_refresh` rebuilds
+    /// the views (CS6) — the staging-path counterpart to `reset_panes`' first-hunk reseat, which
+    /// this deliberately leaves untouched for every manual nav (file/changeset switch, zoom
+    /// cycle). Falls back to whatever `reset_panes` already produced (today's first-hunk
+    /// behavior) when the acted-on file's path is gone (fully discarded) or its memento carried
+    /// no lineno at all (the cursor sat on a `Gap` row pre-op — nothing to search for).
+    fn restore_position(&mut self, m: PositionMemento) {
+        if self.files().get(self.current).map(|f| f.path.as_str()) != Some(m.path.as_str()) {
+            return;
+        }
+        // Force the load `reset_panes` may have deferred so the view below actually exists.
+        self.complete_pending_open();
+
+        // Target role: a still-`Split` file keeps both panes, so stay on the memento's own role
+        // (locked decision: same file, same pane, unless that pane's role is now gone). A
+        // collapsed-to-`Single` file has exactly one surviving role — THAT is the target
+        // regardless of which pane the op started in, which is what lands "fully staging a file
+        // in Split" in the staged pane of the same file.
+        let target_role = match self.effective_zoom_for(self.current) {
+            EffectiveZoom::Split => m.role,
+            EffectiveZoom::Single(role) => role,
+        };
+        if matches!(self.effective_zoom_for(self.current), EffectiveZoom::Split)
+            && self.split_focus_role() != target_role
+        {
+            // Never assign `split_focus` directly — this swaps the cursor/scroll/pane-height
+            // stashes along with it.
+            self.toggle_split_focus();
+        }
+
+        let Some(view) = self.role_view_ref(self.current, target_role) else {
+            return;
+        };
+
+        // The memento's linenos were captured in `m.role`'s own frame (new = worktree for
+        // Unstaged/Combined, new = index for Staged — see `FileView::load`'s table). Preferring
+        // new over old is correct BOTH when the role is unchanged (the common case: same pane,
+        // same frame) AND on the one role change that can happen here — unstaged -> staged after
+        // fully staging a file in Split. In that case the staged view's new side (index) now
+        // holds exactly what the unstaged view's new side (worktree) held a moment ago, because
+        // staging made index == worktree for this file; so new -> new is still the right
+        // mapping, and `find_nearest_row` falls back to a row's old side only for the rows that
+        // never had a new side to begin with (an unpaired Del).
+        let Some(target_lineno) = m.new_lineno.or(m.old_lineno) else {
+            return;
+        };
+        let Some(cursor) = find_nearest_row(view, self.layout, target_lineno) else {
+            return;
+        };
+        self.cursor = cursor;
+        self.clamp_cursor();
+        self.derive_scroll();
     }
 
     /// Start a line selection anchored at the current cursor (`v`). Refuses (a notice, no anchor
@@ -5875,6 +6047,254 @@ mod tests {
 
         let repo = fixture.repo().unwrap();
         repo.assert(predicate::repo::has_untracked_file("new.txt"));
+    }
+
+    // ---- CS6: staging preserves diff position ----------------------------------------------
+
+    /// Three single-line edits well-separated (>6 lines of pure context apart, git's own
+    /// hunk-splitting threshold) so each is its own hunk AND the context between any two
+    /// collapses to a [`DisplayRow::Gap`] — exercising both the mid-file-hunk and the
+    /// lands-in-a-gap restore paths.
+    fn three_hunk_fixture() -> Fixture {
+        let head: String = (1..=24).map(|n| format!("L{n}\n")).collect();
+        let worktree: String = (1..=24)
+            .map(|n| {
+                if n == 2 || n == 12 || n == 22 {
+                    format!("L{n}X\n")
+                } else {
+                    format!("L{n}\n")
+                }
+            })
+            .collect();
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &head, &worktree)
+            .build()
+            .unwrap()
+    }
+
+    /// The row-native lineno `App::restore_position` would target for `row` — new side,
+    /// falling back to old — used by these tests to check where the cursor actually landed
+    /// without re-deriving the production search itself.
+    fn row_lineno(row: &DisplayRow) -> Option<usize> {
+        match row {
+            DisplayRow::Row(r) => match r.new {
+                Row::Line(n) => Some(n),
+                Row::Filler => match r.old {
+                    Row::Line(n) => Some(n),
+                    Row::Filler => None,
+                },
+            },
+            DisplayRow::Gap { .. } => None,
+        }
+    }
+
+    #[test]
+    fn stage_hunk_on_a_middle_hunk_lands_the_cursor_near_it_not_at_the_first_hunk() {
+        let fixture = three_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Single(Unstaged): no staged half exists yet.
+        let first_hunk_row = app.cursor;
+
+        app.next_hunk_row(); // hunk 1 (line 2) -> hunk 2 (line 12)
+        let hunk2_row = app.cursor;
+        assert_ne!(
+            hunk2_row, first_hunk_row,
+            "test setup: must have moved off hunk 1"
+        );
+
+        app.stage_hunk(); // stages ONLY hunk 2 -> the file now has both sub-diffs again
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Split,
+            "hunks 1/3 stayed unstaged, hunk 2 is now staged — both halves exist"
+        );
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "the memento's own role (Unstaged) survives, so it stays the target"
+        );
+        assert_ne!(
+            app.cursor, first_hunk_row,
+            "must NOT reset to the first hunk (today's manual-nav-only behavior)"
+        );
+
+        let view = app.role_view_ref(app.current, Role::Unstaged).unwrap();
+        let lineno = row_lineno(&view.display[app.cursor])
+            .expect("restore must not land the cursor back on a Gap row");
+        assert!(
+            lineno > 2 && lineno < 22,
+            "expected the cursor between hunk 1 (line 2) and hunk 3 (line 22) — near hunk 2's \
+             old position (line 12) — got line {lineno}"
+        );
+    }
+
+    #[test]
+    fn fully_staging_a_file_in_split_lands_the_cursor_in_the_staged_pane_at_the_same_lines() {
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Split; focused pane defaults to Unstaged, on gamma's hunk (line 3)
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert_eq!(app.split_focus_role(), Role::Unstaged);
+
+        app.stage_hunk(); // stages the only unstaged hunk -> the file is now fully staged
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Staged),
+            "no unstaged half survives a full stage"
+        );
+
+        let view = app.role_view_ref(app.current, Role::Staged).unwrap();
+        let staged_first_hunk_row = match app.layout {
+            Layout::Sbs => view.first_hunk_row,
+            Layout::Inline => view.first_inline_hunk_row,
+        };
+        assert_ne!(
+            app.cursor, staged_first_hunk_row,
+            "must land on gamma's own row, not beta's (the staged view's first hunk)"
+        );
+        let lineno = row_lineno(&view.display[app.cursor]).expect("gamma's row has a lineno");
+        assert_eq!(
+            lineno, 3,
+            "gamma is line 3 in both HEAD and the fully-staged index"
+        );
+    }
+
+    #[test]
+    fn unstaging_in_the_staged_pane_keeps_focus_there_when_it_survives() {
+        let head: String = (1..=14).map(|n| format!("L{n}\n")).collect();
+        // Index stages two well-separated edits (lines 2 and 10); the worktree matches the
+        // index except for one MORE edit (line 14) that was never staged.
+        let index: String = (1..=14)
+            .map(|n| {
+                if n == 2 || n == 10 {
+                    format!("L{n}X\n")
+                } else {
+                    format!("L{n}\n")
+                }
+            })
+            .collect();
+        let worktree: String = (1..=14)
+            .map(|n| {
+                if n == 2 || n == 10 {
+                    format!("L{n}X\n")
+                } else if n == 14 {
+                    format!("L{n}X\n")
+                } else {
+                    format!("L{n}\n")
+                }
+            })
+            .collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", &head, &index, &worktree)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Split; focused pane defaults to Unstaged (line 14's hunk)
+        app.toggle_split_focus(); // -> Staged pane, cursor on hunk 1 (line 2)
+        let first_hunk_row = app.cursor;
+        app.next_hunk_row(); // -> hunk 2 (line 10)
+        assert_ne!(
+            app.cursor, first_hunk_row,
+            "test setup: must have moved off hunk 1"
+        );
+
+        app.stage_hunk(); // staged pane -> unstage direction: reverts line 10's index entry
+
+        assert!(
+            app.notice.is_none(),
+            "unstage must succeed: {:?}",
+            app.notice
+        );
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Split,
+            "line 2 stays staged and line 10/14 are both unstaged now — both halves survive"
+        );
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Staged,
+            "the memento's own role (Staged) survives, so focus stays there"
+        );
+
+        let view = app.role_view_ref(app.current, Role::Staged).unwrap();
+        let staged_first_hunk_row = match app.layout {
+            Layout::Sbs => view.first_hunk_row,
+            Layout::Inline => view.first_inline_hunk_row,
+        };
+        assert_ne!(
+            app.cursor, staged_first_hunk_row,
+            "must NOT reset to the (now sole) first hunk at line 2"
+        );
+    }
+
+    #[test]
+    fn discarding_the_only_file_in_the_changeset_falls_back_gracefully_without_panicking() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("only.txt", "hello\nworld\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.files().len(), 1);
+
+        app.discard_file();
+        assert!(app.pending_confirm.is_some());
+        app.resolve_confirm(true); // runs the discard through run_op -> restore_position
+
+        assert!(
+            app.notice.is_none(),
+            "discard must succeed: {:?}",
+            app.notice
+        );
+        assert!(
+            app.files().is_empty(),
+            "the untracked file's only diff vanishes once discarded"
+        );
+        assert_eq!(
+            app.cursor, 0,
+            "the path check bails out; reset_panes' fallback stands"
+        );
+    }
+
+    #[test]
+    fn staging_with_the_cursor_on_a_gap_row_falls_back_without_panicking() {
+        let fixture = three_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = {
+            let view = app.role_view_ref(app.current, Role::Unstaged).unwrap();
+            view.display
+                .iter()
+                .position(|r| matches!(r, DisplayRow::Gap { .. }))
+                .expect("three well-separated hunks must collapse a gap between them")
+        };
+        app.cursor = gap_row;
+
+        app.stage_file(); // whole-file op: ignores the cursor for WHAT it stages
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Staged),
+            "no unstaged half survives a whole-file stage"
+        );
+        // The pre-op cursor sat on a Gap row, so the memento carried no lineno — restore is a
+        // no-op and today's `reset_panes` first-hunk reseat stands.
+        let view = app.role_view_ref(app.current, Role::Staged).unwrap();
+        let expected = match app.layout {
+            Layout::Sbs => view.first_hunk_row,
+            Layout::Inline => view.first_inline_hunk_row,
+        };
+        assert_eq!(app.cursor, expected);
     }
 
     // ---- M4 staging: discard confirm flow --------------------------------------------------
