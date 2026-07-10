@@ -94,12 +94,16 @@ fn main() -> Result<()> {
     // probe (CS6), which needs the controlling tty and so lives outside the pure `theme.rs`; it is
     // bounded by a hard timeout and always yields a curated fallback on a silent/hostile terminal,
     // never a hang. `Dark`/`Light` stay CS5's I/O-free `for_theme` path.
+    // `probed` is whether a real probe conversation happened on the tty this launch — NOT just
+    // "theme was auto". `detect_auto_palette` reports `false` on a cached "silent terminal"
+    // verdict (see `probe_cache`), since a cache hit writes nothing to the tty and so owes no
+    // flush; every other path (an answered probe, a timed-out-uncached probe, a non-auto theme)
+    // is `false`/`true` exactly as before.
     let selection = ReviewConfig::new(&repo).theme();
-    let probed = matches!(selection, Ok(config::Theme::Auto));
-    let theme = match selection {
+    let (theme, probed) = match selection {
         Ok(config::Theme::Auto) => terminal_query::detect_auto_palette(),
-        Ok(selection) => Palette::for_theme(selection),
-        Err(_) => Palette::dark(),
+        Ok(selection) => (Palette::for_theme(selection), false),
+        Err(_) => (Palette::dark(), false),
     };
 
     // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,

@@ -15,12 +15,25 @@ use git_workon_fixture::prelude::*;
 
 /// Spawn the review binary in a PTY sized like a real terminal (an unsized PTY is 0×0 and
 /// ratatui draws nothing), cwd'd into the fixture's worktree.
+///
+/// `WORKON_REVIEW_PROBE_CACHE` is pinned to a file inside the fixture's own tempdir (never the
+/// real user cache dir): without this, the `theme = auto` silent-terminal cache (added alongside
+/// this comment) would read and write the developer's/CI runner's actual
+/// `dirs::cache_dir()/git-workon-review/silent-terminals.json` — a second run of the silent-PTY
+/// test on the same real terminal would then hit a live cache entry from a PRIOR run and skip
+/// the probe, breaking `theme_auto_stays_responsive_when_the_terminal_is_silent`'s timing
+/// assumptions (and leaking test state into the real cache to boot). Deriving the path from the
+/// fixture's workdir means repeat `spawn_review` calls against the SAME fixture share one cache
+/// file, while different fixtures — different tempdirs — never collide.
 pub fn spawn_review(fixture: &Fixture) -> Session<OsProcess, OsStream> {
     let repo = fixture.repo().expect("fixture repo");
     let workdir = repo.workdir().expect("fixture workdir").to_path_buf();
+    let probe_cache = workdir.join(".git-workon-review-probe-cache.json");
 
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_git-workon-review"));
-    cmd.current_dir(workdir).env("TERM", "xterm-256color");
+    cmd.current_dir(&workdir)
+        .env("TERM", "xterm-256color")
+        .env("WORKON_REVIEW_PROBE_CACHE", &probe_cache);
 
     let mut session = expectrl::Session::spawn(cmd).expect("spawn in PTY");
     session
