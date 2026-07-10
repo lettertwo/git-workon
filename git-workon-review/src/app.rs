@@ -892,6 +892,12 @@ pub struct App {
     /// ([`Self::apply_file_ready`]) — the ONLY drop rule; within a generation, results are cached
     /// even if the user navigated away (warmth, not staleness — see the ADR's "Generations").
     generation: u64,
+    /// Whether the startup wave (ADR-031's streamed launch) has already raised its one footer
+    /// notice for a `ChangesetReady { result: Err }`. Set by [`Self::apply_changeset_ready`],
+    /// never cleared in this slice (only ONE wave — startup — exists yet; the refresh path stays
+    /// synchronous, so nothing re-arms it). "the wave's first failure raises a footer notice" —
+    /// this is what makes it FIRST, not every one of a bad stack's failures.
+    wave_failure_notified: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1031,6 +1037,7 @@ impl App {
             open_pending: false,
             open_pending_dispatched: false,
             generation: 1,
+            wave_failure_notified: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1721,6 +1728,60 @@ impl App {
                     self.open_pending_dispatched = false;
                 }
             }
+        }
+    }
+
+    /// Apply one streamed-diff wave result (ADR-031's `ChangesetReady` chokepoint, the streamed-
+    /// launch counterpart to [`Self::apply_file_ready`]): dropped outright on a generation
+    /// mismatch, same rule and same reason (the world the wave was diffing no longer exists —
+    /// e.g. a refresh ran mid-wave). Otherwise replaces changeset `idx`'s slot in place:
+    ///
+    /// - `Ok(diff)` builds its `Ready` [`ChangesetView`] via [`ChangesetView::from_changeset_diff`]
+    ///   — the SAME router [`main.rs`'s lone-changeset sync path uses, so a streamed changeset's
+    ///   `DiffState`/view caches are byte-identical to what a synchronous diff would have built.
+    /// - `Err(message)` builds a `Failed` slot carrying it ([`ChangesetView::failed`]); the wave's
+    ///   FIRST failure (across the whole launch, not per-changeset) raises a footer notice — see
+    ///   [`Self::wave_failure_notified`]'s doc comment — and the review continues (a stack with one
+    ///   corrupt changeset still shows the other N-1).
+    ///
+    /// When `idx` IS the active changeset (the outline cursor already sits there — either it was
+    /// the lib-marked `current` changeset at launch, or the user navigated onto its still-`Pending`
+    /// placeholder), it's seated exactly as a fresh open would be: `current` resets to its first
+    /// file and [`Self::open_current`] runs (deferred-open semantics — CS4's placeholder shows
+    /// until the file itself loads), then the outline cursor resyncs. Nothing here requires the
+    /// user to navigate away and back for a just-readied active changeset to become interactive.
+    pub fn apply_changeset_ready(
+        &mut self,
+        gen: u64,
+        idx: usize,
+        result: Result<ChangesetDiff, String>,
+    ) {
+        if gen != self.generation {
+            return;
+        }
+        let Some(existing) = self.changesets.get(idx) else {
+            return;
+        };
+        let cs = existing.cs.clone();
+        match result {
+            Ok(diff) => {
+                self.changesets[idx] = ChangesetView::from_changeset_diff(cs, diff);
+            }
+            Err(message) => {
+                if !self.wave_failure_notified {
+                    self.notify(
+                        format!("failed to diff a changeset: {message}"),
+                        Severity::Error,
+                    );
+                    self.wave_failure_notified = true;
+                }
+                self.changesets[idx] = ChangesetView::failed(cs, message);
+            }
+        }
+        if idx == self.current_cs {
+            self.current = 0;
+            self.open_current();
+            self.sync_outline_to_current();
         }
     }
 
@@ -6331,6 +6392,120 @@ mod tests {
                 },
             ],
             "Pending/Failed changesets emit only their (marked) header, no file rows"
+        );
+    }
+
+    // ── ADR-031: the streamed-launch wave's chokepoint ───────────────────────────
+
+    #[test]
+    fn apply_changeset_ready_seats_the_active_changeset_when_its_diff_lands() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", true));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", false));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        assert!(app.is_current_pending());
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            app.generation(),
+            0,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        assert!(
+            !app.is_current_pending(),
+            "the readied ACTIVE changeset must be seated, not left Pending"
+        );
+        assert!(!app.files().is_empty());
+        assert!(
+            app.current_view_ref().is_some(),
+            "seating an active changeset opens its first file exactly like a fresh open would"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_marks_a_non_active_changeset_ready_without_disturbing_current() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", true));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", false));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            app.generation(),
+            1,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        assert_eq!(app.current_cs(), 0, "the active changeset must not move");
+        assert!(
+            app.is_current_pending(),
+            "cs-a is still Pending — only cs-b's slot changed"
+        );
+        app.next_changeset();
+        assert!(
+            !app.is_current_pending(),
+            "cs-b's slot is now Ready after navigating onto it"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_drops_a_stale_generation_result() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view = ChangesetView::pending(bare_changeset("cs-a", true));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        let stale_gen = app.generation();
+        app.generation += 1; // simulate a refresh landing between dispatch and result
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            stale_gen,
+            0,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        assert!(
+            app.is_current_pending(),
+            "a stale-generation result must not seat a changeset from a world that no longer exists"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_err_marks_failed_and_notifies_only_on_the_first_failure() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", true));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", false));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        assert!(app.notice.is_none());
+
+        app.apply_changeset_ready(app.generation(), 0, Err("first failure".to_string()));
+        assert!(
+            app.current_failure().is_some(),
+            "the active changeset's Failed slot carries the message"
+        );
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("the wave's first failure raises a footer notice");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("first failure"));
+
+        // A SECOND failure in the same wave must not raise a second notice — only the wave's
+        // FIRST failure does (see `App::wave_failure_notified`'s doc comment). The review
+        // continues: cs-b's slot still becomes Failed even though no new notice fires.
+        app.apply_changeset_ready(app.generation(), 1, Err("second failure".to_string()));
+        let notice_after = app.notice.as_ref().unwrap();
+        assert!(
+            notice_after.text.contains("first failure"),
+            "a second failure in the same wave must not overwrite the first's notice"
         );
     }
 

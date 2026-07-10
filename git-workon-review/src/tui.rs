@@ -33,6 +33,8 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
+use workon::Changeset;
+use workon_review::acquire::{diff_changeset, ChangesetDiff};
 use workon_review::app::{self, App, FileLoadSpec, LoadedViews};
 use workon_review::highlight::TsHighlighter;
 use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
@@ -60,6 +62,17 @@ pub enum AppEvent {
         cs_idx: usize,
         file_idx: usize,
         result: Result<LoadedViews, String>,
+    },
+    /// One changeset's streamed-diff result — ADR-031's streamed-launch counterpart to
+    /// `FileReady`, forwarded from the wave thread [`spawn_wave_thread`] spawns. `gen`/`idx` echo
+    /// the wave's stamp/the changeset's position in `App`'s stack; `result` is `Err` for a
+    /// changeset whose diff itself failed (a bad/garbage `Oid`, not a job panic — see
+    /// [`spawn_wave_thread`]'s doc comment). Applied at ONE chokepoint:
+    /// [`App::apply_changeset_ready`].
+    ChangesetReady {
+        gen: u64,
+        idx: usize,
+        result: Result<ChangesetDiff, String>,
     },
 }
 
@@ -214,6 +227,91 @@ fn spawn_loader_thread(
         }
     });
     req_tx
+}
+
+/// Spawn the ADR-031 startup wave: stripe `changesets` (lib-`current` first, then input order)
+/// across `available_parallelism`-many transient WORKER threads — same fan-out shape as
+/// `crate::acquire::diff_changesets` (each worker opens its own `Repository`, since
+/// `git2::Repository` is `Send` but not `Sync`) — but STREAM each result the instant it completes
+/// via `tx` rather than joining the batch. Never joined itself either — a wave straggler left
+/// running past quit is harmless (it only ever sends into an inbox nothing is listening to
+/// anymore; `tx.send` failing is the signal each worker already checks).
+///
+/// A DELIBERATELY separate set of threads from the loader thread (ADR-031 leaves this shape
+/// open — "yours to shape"): the wave never touches the loader's request queue, so an in-flight
+/// wave can never starve a `LoadFile` request behind it — they run on entirely disjoint threads
+/// with entirely disjoint work queues. The cost is a second family of `Repository` handles
+/// (`workers + 1`, alongside the loader's one) alive for the wave's brief lifetime; accepted for
+/// the starvation-freedom it buys for free.
+///
+/// A changeset whose own diff fails (a bad/garbage `Oid` — see [`diff_changeset`]'s doc comment)
+/// sends `Err` for THAT changeset only; a worker whose own `Repository::open` fails sends `Err`
+/// for every changeset in its chunk (mirroring `diff_changesets`' per-chunk failure shape) rather
+/// than silently dropping them — every index must get exactly one result, or its slot stays
+/// `Pending` forever with nothing left to complete it.
+fn spawn_wave_thread(
+    repo_path: PathBuf,
+    tx: mpsc::Sender<InboxMessage>,
+    changesets: Vec<Changeset>,
+    gen: u64,
+) {
+    thread::spawn(move || {
+        let n = changesets.len();
+        if n == 0 {
+            return;
+        }
+        // Current changeset first, then input order for the rest — the changeset the user lands
+        // on becomes interactive earliest (ADR-031's "Slots").
+        let current_idx = changesets.iter().position(|cs| cs.current);
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        order.extend(current_idx);
+        order.extend((0..n).filter(|&i| Some(i) != current_idx));
+
+        let workers = thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(n);
+        let chunk = n.div_ceil(workers.max(1));
+
+        thread::scope(|scope| {
+            for idx_chunk in order.chunks(chunk) {
+                let tx = tx.clone();
+                let changesets = &changesets;
+                let repo_path = &repo_path;
+                scope.spawn(move || {
+                    let repo = match Repository::open(repo_path) {
+                        Ok(repo) => repo,
+                        Err(err) => {
+                            let message = err.to_string();
+                            for &idx in idx_chunk {
+                                if tx
+                                    .send(Ok(AppEvent::ChangesetReady {
+                                        gen,
+                                        idx,
+                                        result: Err(message.clone()),
+                                    }))
+                                    .is_err()
+                                {
+                                    return; // main loop is gone
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    for &idx in idx_chunk {
+                        let result =
+                            diff_changeset(&repo, &changesets[idx]).map_err(|e| e.to_string());
+                        if tx
+                            .send(Ok(AppEvent::ChangesetReady { gen, idx, result }))
+                            .is_err()
+                        {
+                            return; // main loop is gone; nothing left to forward to
+                        }
+                    }
+                });
+            }
+        });
+    });
 }
 
 /// Receive the next event from `inbox`, waiting up to `timeout`. A timeout with nothing received
@@ -547,6 +645,10 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             app.apply_file_ready(gen, cs_idx, file_idx, result);
             false
         }
+        AppEvent::ChangesetReady { gen, idx, result } => {
+            app.apply_changeset_ready(gen, idx, result);
+            false
+        }
     }
 }
 
@@ -784,6 +886,33 @@ impl Tui {
         let (tx, rx) = mpsc::channel::<InboxMessage>();
         spawn_input_thread(tx.clone());
         let load_tx = spawn_loader_thread(repo_path, tx);
+        let result = event_loop(&mut self.terminal, app, keymap, theme, &rx, &load_tx);
+        let restored = self.restore();
+        result.and(restored)
+    }
+
+    /// ADR-031's streamed-launch counterpart to [`Self::run`]: for a stack of MORE than one
+    /// changeset, `main.rs` calls this instead — `app` is already constructible from
+    /// resolved-but-undiffed changesets (every slot `Pending`), and this is what starts the
+    /// diffing itself, alongside the input/loader threads `run` always spawns. No splash: the
+    /// first frame `event_loop` draws IS the live outline with `Pending` rows (see
+    /// `main.rs`'s block comment on the `changesets.len()` fork).
+    ///
+    /// `changesets` is the SAME resolved list `app`'s `Pending` slots were built from — handed
+    /// here (rather than re-read off `app`) since `App` only keeps [`workon_review::app::
+    /// ChangesetView`]s, not the bare [`Changeset`]s the wave diffs against.
+    pub fn run_streamed(
+        &mut self,
+        app: &mut App,
+        keymap: &Keymap,
+        theme: &Palette,
+        repo_path: PathBuf,
+        changesets: Vec<Changeset>,
+    ) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        spawn_input_thread(tx.clone());
+        let load_tx = spawn_loader_thread(repo_path.clone(), tx.clone());
+        spawn_wave_thread(repo_path, tx, changesets, app.generation());
         let result = event_loop(&mut self.terminal, app, keymap, theme, &rx, &load_tx);
         let restored = self.restore();
         result.and(restored)
