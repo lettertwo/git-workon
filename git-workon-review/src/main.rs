@@ -119,92 +119,124 @@ fn main() -> Result<()> {
         terminal_query::flush_pending_tty_input();
     }
 
-    // CS5: take the terminal and show launch activity while the diffs build — on a deep stack
-    // this is the bulk of the launch, and until CS5 it left the terminal dead the whole time.
-    // Everything that could print, prompt, or flush is done (see the block comment above the
-    // resolve), so from here the terminal belongs to the TUI. `Tui`'s Drop restores it, so the
-    // `?`s below put the shell back before miette prints their error.
+    // CS5: take the terminal while the diffs build — on a deep stack this used to be the bulk of
+    // the launch with the terminal dead the whole time. Everything that could print, prompt, or
+    // flush is done (see the block comment above the resolve), so from here the terminal belongs
+    // to the TUI. `Tui`'s Drop restores it, so the `?`s below put the shell back before miette
+    // prints their error.
     //
     // An acquire FAILURE (no controlling tty — CI, a test harness, a bare pipe) is carried, not
     // propagated here: a clean worktree's "nothing to review" is only detectable AFTER the diff
     // below (resolve always yields at least the uncommitted changeset), and that exit must stay
     // tty-free, exactly as it was when the terminal was only taken inside the run call. The
-    // error surfaces at the run call — the same logical point it always did. Splash failures on
-    // an acquired terminal are cosmetic (the run call will surface anything real) and ignored.
+    // error surfaces at the run call — the same logical point it always did.
     let mut tui = tui::Tui::acquire();
-    if let Ok(tui) = tui.as_mut() {
-        let noun = if changesets.len() == 1 {
-            "changeset"
-        } else {
-            "changesets"
-        };
-        let _ = tui.splash(&format!("diffing {} {noun}…", changesets.len()));
-    }
-    let diffs = diff_changesets(&repo, &changesets).into_diagnostic()?;
-    let views: Vec<ChangesetView> = changesets
-        .into_iter()
-        .zip(diffs)
-        .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
-        .collect();
 
-    // The single-uncommitted-changeset case with nothing in it only shows up in the built
-    // views' file counts — the mirror of the resolve-level empty check above, and the same
-    // "nothing to review" + exit 0 (ADR-036), never a `views` list handed to
-    // `App::from_changesets`, which panics on empty input. Restore the terminal BEFORE
-    // printing: the message must land on the normal screen, not vanish with the alternate one.
-    // A tty-less launch has no terminal to restore — the message prints exactly as before CS5.
-    if views.is_empty() || (views.len() == 1 && views[0].file_count() == 0) {
-        if let Ok(tui) = tui.as_mut() {
-            tui.restore().into_diagnostic()?;
-        }
-        match cli.source.as_deref() {
-            Some(text) => eprintln!("nothing to review in {text}"),
-            None => eprintln!("nothing to review"),
-        }
-        return Ok(());
-    }
-
-    // Captured BEFORE `repo` moves into `App` below — the ADR-037 loader thread needs its own
-    // `Repository` handle onto the same on-disk repo (`git2::Repository` is `Send` but not
-    // `Sync`, so it can't cross threads directly), opened the same way
-    // `crate::acquire::diff_changesets`'s worker threads already do: at the workdir so the
-    // uncommitted layer's index/worktree diffs resolve correctly, falling back to the gitdir for
-    // a bare repo (where only committed spans can occur).
+    // ADR-037: `main.rs` forks on `changesets.len()` — streaming's grain is per-changeset, so a
+    // lone changeset (the non-Graphite default, a ref/range, a PR) gains nothing from it and
+    // keeps today's synchronous path byte-identical (down to the `clean_worktree_prints_
+    // nothing_to_review_and_exits_success` canary, which must stay tty-free). A real stack
+    // streams instead: the outline appears immediately with every row `Pending`, diffs land
+    // as they complete, and the splash — redundant once the first frame IS the live outline —
+    // is skipped entirely.
     let repo_path = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
 
-    // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here after
-    // acquisition is done borrowing it. `App::from_changesets` opens on whichever changeset the
-    // lib marked `current` (locked decision #6).
-    let mut app = App::from_changesets(repo, views);
-    if let Some(source) = source {
-        app.set_review_source(source);
+    if changesets.len() == 1 {
+        if let Ok(tui) = tui.as_mut() {
+            let _ = tui.splash("diffing 1 changeset…");
+        }
+        let diffs = diff_changesets(&repo, &changesets).into_diagnostic()?;
+        let views: Vec<ChangesetView> = changesets
+            .into_iter()
+            .zip(diffs)
+            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+            .collect();
+
+        // The single-uncommitted-changeset case with nothing in it only shows up in the built
+        // views' file counts — the mirror of the resolve-level empty check above, and the same
+        // "nothing to review" + exit 0 (ADR-036), never a `views` list handed to
+        // `App::from_changesets`, which panics on empty input. Restore the terminal BEFORE
+        // printing: the message must land on the normal screen, not vanish with the alternate
+        // one. A tty-less launch has no terminal to restore — the message prints exactly as
+        // before CS5.
+        if views.is_empty() || (views.len() == 1 && views[0].file_count() == 0) {
+            if let Ok(tui) = tui.as_mut() {
+                tui.restore().into_diagnostic()?;
+            }
+            match cli.source.as_deref() {
+                Some(text) => eprintln!("nothing to review in {text}"),
+                None => eprintln!("nothing to review"),
+            }
+            return Ok(());
+        }
+
+        // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here
+        // after acquisition is done borrowing it. `App::from_changesets` opens on whichever
+        // changeset the lib marked `current` (locked decision #6).
+        let mut app = App::from_changesets(repo, views);
+        if let Some(source) = source {
+            app.set_review_source(source);
+        }
+        // CS4: defer file loads to the event loop's input-idle window rather than blocking here
+        // (or on any later selection change) — `app.open_current()` below marks the initial open
+        // pending instead of loading eagerly; see `tui::run`'s doc comment for the resulting
+        // startup contract.
+        app.set_defer_loads(true);
+
+        // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s
+        // setters only set the raw layout/zoom/mode/width fields, and `open_current` is what
+        // derives `cursor`/`scroll` fresh from whichever settings just landed (see each setter's
+        // doc comment).
+        let view_config_warnings = app.apply_view_config(&view_config);
+        app.open_current();
+
+        // A misconfigured keybinding or view-config setting is non-fatal: show the collected
+        // warnings as a startup notice (cleared on the first keypress, like any notice) and run
+        // with the defaults for those keys/settings.
+        let mut warnings = keymap.warnings().to_vec();
+        warnings.extend(view_config_warnings);
+        if !warnings.is_empty() {
+            app.notify(warnings.join("; "), Severity::Error);
+        }
+
+        // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
+        // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
+        tui.into_diagnostic()?
+            .run(&mut app, &keymap, &theme, repo_path)
+            .into_diagnostic()?;
+    } else {
+        // Every changeset starts `Pending` (ADR-037's "Slots") — `App` is constructible from
+        // resolved-but-undiffed changesets, so the outline's headers render on the FIRST frame,
+        // before a single byte has been diffed. No splash: the live outline IS the launch
+        // feedback.
+        let views: Vec<ChangesetView> = changesets
+            .iter()
+            .cloned()
+            .map(ChangesetView::pending)
+            .collect();
+
+        let mut app = App::from_changesets(repo, views);
+        if let Some(source) = source {
+            app.set_review_source(source);
+        }
+        app.set_defer_loads(true);
+        let view_config_warnings = app.apply_view_config(&view_config);
+        // The active changeset is `Pending` (no files yet) — `open_current` is still the right
+        // call: it's a no-op on an empty file list, and re-running it the moment the active
+        // changeset's diff lands (`Tui::run_streamed`'s `ChangesetReady` handling) is what
+        // actually seats the first real file.
+        app.open_current();
+
+        let mut warnings = keymap.warnings().to_vec();
+        warnings.extend(view_config_warnings);
+        if !warnings.is_empty() {
+            app.notify(warnings.join("; "), Severity::Error);
+        }
+
+        tui.into_diagnostic()?
+            .run_streamed(&mut app, &keymap, &theme, repo_path, changesets)
+            .into_diagnostic()?;
     }
-    // CS4: defer file loads to the event loop's input-idle window rather than blocking here (or
-    // on any later selection change) — `app.open_current()` below marks the initial open pending
-    // instead of loading eagerly; see `tui::run`'s doc comment for the resulting startup contract.
-    app.set_defer_loads(true);
-
-    // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
-    // only set the raw layout/zoom/mode/width fields, and `open_current` is what derives
-    // `cursor`/`scroll` fresh from whichever settings just landed (see each setter's doc
-    // comment).
-    let view_config_warnings = app.apply_view_config(&view_config);
-    app.open_current();
-
-    // A misconfigured keybinding or view-config setting is non-fatal: show the collected
-    // warnings as a startup notice (cleared on the first keypress, like any notice) and run with
-    // the defaults for those keys/settings.
-    let mut warnings = keymap.warnings().to_vec();
-    warnings.extend(view_config_warnings);
-    if !warnings.is_empty() {
-        app.notify(warnings.join("; "), Severity::Error);
-    }
-
-    // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
-    // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
-    tui.into_diagnostic()?
-        .run(&mut app, &keymap, &theme, repo_path)
-        .into_diagnostic()?;
 
     Ok(())
 }
