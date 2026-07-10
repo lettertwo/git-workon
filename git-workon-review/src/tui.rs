@@ -751,7 +751,7 @@ mod tests {
 
     #[test]
     fn map_terminal_event_skips_release_repeat_mouse_paste_and_focus() {
-        use crossterm::event::{KeyEventState, MouseButton, MouseEvent, MouseEventKind};
+        use crossterm::event::{KeyEventState, MouseEvent, MouseEventKind};
 
         let release = KeyEvent::new_with_kind(
             KeyCode::Char('q'),
@@ -780,7 +780,6 @@ mod tests {
         assert_eq!(map_terminal_event(Event::Paste("pasted".to_string())), None);
         assert_eq!(map_terminal_event(Event::FocusGained), None);
         assert_eq!(map_terminal_event(Event::FocusLost), None);
-        let _ = MouseButton::Left; // silence an unused-import lint if MouseButton goes unused above
     }
 
     #[test]
