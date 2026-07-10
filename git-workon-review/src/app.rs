@@ -1664,6 +1664,15 @@ impl App {
         }
         self.ensure_loaded(self.current);
         self.reset_panes();
+        // F1: an eager load or the empty-file no-op above supersedes any STALE deferred open —
+        // e.g. a pending open set before `r`, followed by a refresh that turns the active
+        // changeset `Pending` (empty files, skipping the defer branch above since there's
+        // nothing to load). Without this, the stale flags survive the refresh and wedge the
+        // idle-Tick fast-poll loop (`take_pending_load_spec` keeps returning `None` for a file
+        // that no longer exists) while the placeholder stays stuck. Mirrors
+        // [`Self::complete_pending_open`]'s tail.
+        self.open_pending = false;
+        self.open_pending_dispatched = false;
     }
 
     /// Whether the view(s) the current file's effective zoom needs are already cached, making a
@@ -5049,6 +5058,74 @@ mod tests {
                 base: root,
                 head: new_head,
             }
+        );
+    }
+
+    #[test]
+    fn refresh_that_makes_the_active_changeset_pending_clears_stale_deferred_open_flags() {
+        // F1 regression: a pending open still in flight (dispatched, awaiting a loader result)
+        // right before `r`, followed by a refresh that turns the active changeset Pending (a
+        // changed span goes through the wave, landing empty files) must not leave
+        // `open_pending`/`open_pending_dispatched` wedged. `open_current`'s empty-file guard
+        // skips the defer branch (nothing to load) after the refresh, so nothing else would
+        // clear stale flags without this fix.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, old_head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: old_head,
+            },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+        app.set_defer_loads(true);
+        app.open_current();
+        let _ = app
+            .take_pending_load_spec()
+            .expect("a fresh pending open dispatches");
+        assert!(app.open_pending(), "the open is pending, awaiting a result");
+
+        // Advance `main`, changing the span — refresh must send this through the wave, landing
+        // the active changeset Pending (empty files) rather than reusing the stale slot.
+        fixture
+            .commit("main")
+            .file("c.txt", "c\n")
+            .create("new head")
+            .unwrap();
+
+        app.refresh();
+
+        assert!(
+            app.is_current_pending(),
+            "a changed span must go Pending for the wave"
+        );
+        assert!(app.files().is_empty());
+        assert!(
+            !app.open_pending(),
+            "a stale deferred open must not survive a refresh that empties the active changeset"
+        );
+        assert!(
+            app.take_pending_load_spec().is_none(),
+            "no load spec can be produced for a Pending slot with no files"
         );
     }
 
