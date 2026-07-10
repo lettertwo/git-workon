@@ -43,6 +43,20 @@ impl OutlineMode {
     }
 }
 
+/// Which end of the stack the outline's stack-shaped modes ([`OutlineMode::Stack`]/
+/// [`OutlineMode::StackTree`]) display first — CS3 dogfooding feedback #2. Purely a display
+/// order: [`OutlineItem`]'s `cs_idx`/`file_idx` always stay TRUE indices into `App::changesets`
+/// regardless of which way the rows are painted (see [`build_items`]'s doc comment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutlineOrder {
+    /// The most recently created (head) changeset's header renders first — the CS3 default.
+    #[default]
+    HeadFirst,
+    /// The stack's base changeset renders first, matching `App::changesets`' own base -> head
+    /// storage order (today's pre-CS3 behavior).
+    BaseFirst,
+}
+
 /// A file's staged-ness for the outline's status column — a minimal indicator (locked CS3
 /// scope: NOT the prototype's X/Y two-column git-status matrix). Only meaningful for the
 /// uncommitted changeset's files; a committed changeset's files always resolve to `None`
@@ -175,23 +189,37 @@ impl OutlineItem {
     }
 }
 
-/// Build the outline's row list for `mode` from every reviewed changeset, in the same base ->
-/// head order `App::changesets` holds them.
-pub fn build_items(changesets: &[OutlineChangeset], mode: OutlineMode) -> Vec<OutlineItem> {
+/// Build the outline's row list for `mode` from every reviewed changeset. `order` controls which
+/// end of the stack displays first for the stack-shaped modes (see [`OutlineOrder`]); `cs_idx`/
+/// `file_idx` on every emitted [`OutlineItem`] are always TRUE indices into `App::changesets`
+/// (that array's own base -> head storage order never changes) regardless of `order` — only the
+/// ROW SEQUENCE the outline paints flips. [`build_tree`]'s de-dupe is order-independent (see its
+/// own doc comment), so `order` is accepted but unused there.
+pub fn build_items(
+    changesets: &[OutlineChangeset],
+    mode: OutlineMode,
+    order: OutlineOrder,
+) -> Vec<OutlineItem> {
     match mode {
-        OutlineMode::Flat => build_flat(changesets),
-        OutlineMode::Stack => build_stack(changesets),
+        OutlineMode::Flat => build_flat(changesets, order),
+        OutlineMode::Stack => build_stack(changesets, order),
         OutlineMode::Tree => build_tree(changesets),
-        OutlineMode::StackTree => build_stack_tree(changesets),
+        OutlineMode::StackTree => build_stack_tree(changesets, order),
     }
 }
 
 /// [`OutlineMode::Stack`]: a header per changeset, then its files in order — no de-duplication,
 /// every changeset's own copy of a path (if touched more than once across the stack) gets its
-/// own row under its own header.
-fn build_stack(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
+/// own row under its own header. `order` picks which end of the stack paints first; `cs_idx`/
+/// `file_idx` are computed from the ORIGINAL (base -> head) enumeration before any reversal, so
+/// they stay true indices into `App::changesets` either way.
+fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+    let mut entries: Vec<(usize, &OutlineChangeset)> = changesets.iter().enumerate().collect();
+    if order == OutlineOrder::HeadFirst {
+        entries.reverse();
+    }
     let mut items = Vec::new();
-    for (cs_idx, cs) in changesets.iter().enumerate() {
+    for (cs_idx, cs) in entries {
         items.push(OutlineItem::Header {
             cs_idx,
             label: cs.label.clone(),
@@ -213,24 +241,31 @@ fn build_stack(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
     items
 }
 
-/// [`OutlineMode::Flat`]: every changed path once, in FIRST-appearance order (a stable, readable
-/// order that doesn't reshuffle just because a later changeset re-touches an earlier path), but
-/// pointing at its LAST (newest / closest-to-head) occurrence — "last-write-wins" per the locked
-/// design: a path touched by both an earlier committed changeset and the uncommitted layer
-/// should jump to (and show the staged-ness of) the uncommitted layer's copy, not the stale
-/// committed one.
-fn build_flat(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
-    let mut order: Vec<String> = Vec::new();
-    let mut latest: HashMap<String, (usize, usize, StagedStatus)> = HashMap::new();
-    for (cs_idx, cs) in changesets.iter().enumerate() {
-        for (file_idx, file) in cs.files.iter().enumerate() {
-            if !latest.contains_key(&file.path) {
-                order.push(file.path.clone());
+/// [`OutlineMode::Flat`]: every changed path once, in FIRST-appearance order UNDER `order`'s
+/// display scan (a stable, readable order that doesn't reshuffle just because a later-scanned
+/// changeset re-touches an earlier path), but pointing at its closest-to-head occurrence —
+/// "last-write-wins" per the locked design: a path touched by both an earlier committed
+/// changeset and the uncommitted layer should jump to (and show the staged-ness of) the
+/// uncommitted layer's copy, not the stale committed one. This head-wins target resolution is
+/// independent of `order` — [`latest_by_path`] always scans base -> head regardless of which way
+/// the row list is displayed, so the resolution below reuses it rather than re-deriving from the
+/// (possibly reversed) `order` scan used for display order.
+fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+    let latest = latest_by_path(changesets);
+    let mut entries: Vec<(usize, &OutlineChangeset)> = changesets.iter().enumerate().collect();
+    if order == OutlineOrder::HeadFirst {
+        entries.reverse();
+    }
+    let mut order_list: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (_, cs) in entries {
+        for file in &cs.files {
+            if seen.insert(file.path.as_str()) {
+                order_list.push(file.path.clone());
             }
-            latest.insert(file.path.clone(), (cs_idx, file_idx, file.status));
         }
     }
-    order
+    order_list
         .into_iter()
         .map(|path| {
             let (cs_idx, file_idx, status) = latest[&path];
@@ -266,7 +301,7 @@ fn latest_by_path(
 #[derive(Debug, Default)]
 struct TrieNode {
     file: Option<(usize, usize, StagedStatus)>,
-    /// Insertion order is irrelevant — [`emit`] re-sorts children (dirs-after-files, alpha
+    /// Insertion order is irrelevant — [`emit`] re-sorts children (dirs-before-files, alpha
     /// within group) every time it flattens a node.
     children: Vec<(String, TrieNode)>,
 }
@@ -293,12 +328,11 @@ impl TrieNode {
     }
 }
 
-/// Flatten `node`'s children into `items`, depth-first, in "dirs after files at each level,
-/// alpha within group" order (matches the `~/.config/nvim/lua/app/review/ui/outline.lua`
-/// prototype's `_build_path_tree`/`_emit_tree_node`: files read before directories at a given
-/// level, so a directory's own contents don't visually separate its sibling files from the
-/// directory listing above them). `ancestors_last` is the growing guide vector — see
-/// [`OutlineItem`]'s doc comment for how rendering consumes it.
+/// Flatten `node`'s children into `items`, depth-first, in "dirs before files at each level,
+/// alpha within group" order (CS3 dogfooding feedback #7: directories read before files at a
+/// given level, matching the conventional file-tree convention of grouping folders above
+/// loose files). `ancestors_last` is the growing guide vector — see [`OutlineItem`]'s doc
+/// comment for how rendering consumes it.
 fn emit(node: &TrieNode, ancestors_last: &[bool], items: &mut Vec<OutlineItem>) {
     let mut files: Vec<&(String, TrieNode)> = node
         .children
@@ -312,7 +346,7 @@ fn emit(node: &TrieNode, ancestors_last: &[bool], items: &mut Vec<OutlineItem>) 
         .collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
     dirs.sort_by(|a, b| a.0.cmp(&b.0));
-    let ordered: Vec<&(String, TrieNode)> = files.into_iter().chain(dirs).collect();
+    let ordered: Vec<&(String, TrieNode)> = dirs.into_iter().chain(files).collect();
     let n = ordered.len();
     for (i, (name, child)) in ordered.into_iter().enumerate() {
         let is_last = i == n - 1;
@@ -340,7 +374,10 @@ fn emit(node: &TrieNode, ancestors_last: &[bool], items: &mut Vec<OutlineItem>) 
 }
 
 /// [`OutlineMode::Tree`]: [`build_flat`]'s de-duped path set, rendered as a single directory
-/// trie spanning the whole stack (no changeset headers).
+/// trie spanning the whole stack (no changeset headers). Alpha-sorted by path segment at every
+/// level ([`emit`]), not by stack position, and [`latest_by_path`]'s de-dupe always resolves to
+/// the closest-to-head occurrence regardless of scan order — so [`OutlineOrder`] has nothing to
+/// affect here, and unlike the stack-shaped builders this one takes no `order` parameter.
 fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
     let latest = latest_by_path(changesets);
     let mut root = TrieNode::default();
@@ -356,10 +393,15 @@ fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
 /// [`OutlineMode::StackTree`]: [`build_stack`]'s per-changeset header grouping, but each
 /// changeset's own files are flattened into their own nested trie (no cross-changeset dedup —
 /// each changeset trie is built from just that changeset's files, matching `build_stack`'s "every
-/// changeset's own copy gets its own row" rule).
-fn build_stack_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
+/// changeset's own copy gets its own row" rule). `order` picks which end of the stack paints
+/// first, same as [`build_stack`]; `cs_idx`/`file_idx` stay true indices regardless.
+fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+    let mut entries: Vec<(usize, &OutlineChangeset)> = changesets.iter().enumerate().collect();
+    if order == OutlineOrder::HeadFirst {
+        entries.reverse();
+    }
     let mut items = Vec::new();
-    for (cs_idx, cs) in changesets.iter().enumerate() {
+    for (cs_idx, cs) in entries {
         items.push(OutlineItem::Header {
             cs_idx,
             label: cs.label.clone(),
@@ -423,7 +465,10 @@ mod tests {
             cs("cs-a", false, false, &[("a1.txt", StagedStatus::None)]),
             cs("cs-b", true, true, &[("b1.txt", StagedStatus::None)]),
         ];
-        let items = build_items(&changesets, OutlineMode::Stack);
+        // BaseFirst pins the base -> head structural rule (header-then-files per changeset)
+        // independent of display order; head-first order coverage lives in the dedicated
+        // `stack_mode_*_order` tests below.
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
         assert_eq!(
             items,
             vec![
@@ -469,7 +514,7 @@ mod tests {
             cs_slot("cs-pending", true, false),
             cs_slot("cs-failed", false, true),
         ];
-        let items = build_items(&changesets, OutlineMode::Stack);
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
         assert_eq!(
             items,
             vec![
@@ -506,7 +551,7 @@ mod tests {
                 ("a2.txt", StagedStatus::None),
             ],
         )];
-        let items = build_items(&changesets, OutlineMode::Flat);
+        let items = build_items(&changesets, OutlineMode::Flat, OutlineOrder::HeadFirst);
         assert!(items
             .iter()
             .all(|it| matches!(it, OutlineItem::File { .. })));
@@ -524,7 +569,7 @@ mod tests {
                 &[("shared.txt", StagedStatus::Unstaged)],
             ),
         ];
-        let items = build_items(&changesets, OutlineMode::Flat);
+        let items = build_items(&changesets, OutlineMode::Flat, OutlineOrder::HeadFirst);
         assert_eq!(items.len(), 1, "the shared path must appear exactly once");
         assert_eq!(
             items[0],
@@ -553,7 +598,10 @@ mod tests {
             ),
             cs("cs-b", true, false, &[("shared.txt", StagedStatus::Staged)]),
         ];
-        let items = build_items(&changesets, OutlineMode::Flat);
+        // BaseFirst scans cs-a before cs-b, so "first appearance" here means base -> head scan
+        // order; the head-first display-order variant lives in
+        // `flat_mode_head_first_scans_head_to_base_but_keeps_head_wins_target` below.
+        let items = build_items(&changesets, OutlineMode::Flat, OutlineOrder::BaseFirst);
         let paths: Vec<&str> = items
             .iter()
             .map(|it| match it {
@@ -565,6 +613,53 @@ mod tests {
             paths,
             vec!["first.txt", "shared.txt"],
             "display order follows first appearance, not the retargeted changeset"
+        );
+    }
+
+    /// CS3: [`OutlineOrder::HeadFirst`] flips [`build_flat`]'s DISPLAY scan (first-appearance
+    /// order now reads head -> base), but [`latest_by_path`]'s "closest-to-head wins" TARGET
+    /// resolution never changes — a path touched by two changesets must resolve to the head-most
+    /// one under BOTH orders.
+    #[test]
+    fn flat_mode_head_first_scans_head_to_base_but_keeps_head_wins_target() {
+        let changesets = vec![
+            cs(
+                "cs-a",
+                false,
+                false,
+                &[
+                    ("first.txt", StagedStatus::None),
+                    ("shared.txt", StagedStatus::None),
+                ],
+            ),
+            cs("cs-b", true, false, &[("shared.txt", StagedStatus::Staged)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::Flat, OutlineOrder::HeadFirst);
+        let paths: Vec<&str> = items
+            .iter()
+            .map(|it| match it {
+                OutlineItem::File { path, .. } => path.as_str(),
+                OutlineItem::Header { .. } | OutlineItem::Dir { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["shared.txt", "first.txt"],
+            "head-first display scans cs-b (head) before cs-a (base), so shared.txt is seen \
+             first"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .find(|it| matches!(it, OutlineItem::File { path, .. } if path == "shared.txt")),
+            Some(&OutlineItem::File {
+                cs_idx: 1,
+                file_idx: 0,
+                path: "shared.txt".to_string(),
+                status: StagedStatus::Staged,
+                guides: Vec::new(),
+            }),
+            "target resolution stays head-wins (cs-b) regardless of display order"
         );
     }
 
@@ -589,7 +684,7 @@ mod tests {
 
     /// Deep-path fixture used by the tree-mode tests: a top-level file, a top-level directory
     /// with both its own file and a nested subdirectory of two more files — enough to exercise
-    /// depth > 1 and the dirs-after-files/alpha-within-group ordering at every level.
+    /// depth > 1 and the dirs-before-files/alpha-within-group ordering at every level.
     fn deep_path_changeset(label: &str, current: bool, needs_restack: bool) -> OutlineChangeset {
         cs(
             label,
@@ -605,56 +700,56 @@ mod tests {
     }
 
     #[test]
-    fn tree_mode_builds_dirs_after_files_alpha_within_group_with_correct_depth_and_guides() {
+    fn tree_mode_builds_dirs_before_files_alpha_within_group_with_correct_depth_and_guides() {
         let changesets = vec![deep_path_changeset("cs-a", true, false)];
-        let items = build_items(&changesets, OutlineMode::Tree);
+        let items = build_items(&changesets, OutlineMode::Tree, OutlineOrder::HeadFirst);
         assert_eq!(
             items,
             vec![
-                OutlineItem::File {
-                    cs_idx: 0,
-                    file_idx: 0,
-                    path: "top.rs".to_string(),
-                    status: StagedStatus::None,
+                OutlineItem::Dir {
+                    name: "src".to_string(),
                     guides: vec![false],
                 },
                 OutlineItem::Dir {
-                    name: "src".to_string(),
-                    guides: vec![true],
-                },
-                OutlineItem::File {
-                    cs_idx: 0,
-                    file_idx: 3,
-                    path: "d.rs".to_string(),
-                    status: StagedStatus::None,
-                    guides: vec![true, false],
-                },
-                OutlineItem::Dir {
                     name: "a".to_string(),
-                    guides: vec![true, true],
+                    guides: vec![false, false],
                 },
                 OutlineItem::File {
                     cs_idx: 0,
                     file_idx: 1,
                     path: "b.rs".to_string(),
                     status: StagedStatus::None,
-                    guides: vec![true, true, false],
+                    guides: vec![false, false, false],
                 },
                 OutlineItem::File {
                     cs_idx: 0,
                     file_idx: 2,
                     path: "c.rs".to_string(),
                     status: StagedStatus::None,
-                    guides: vec![true, true, true],
+                    guides: vec![false, false, true],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 3,
+                    path: "d.rs".to_string(),
+                    status: StagedStatus::None,
+                    guides: vec![false, true],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 0,
+                    path: "top.rs".to_string(),
+                    status: StagedStatus::None,
+                    guides: vec![true],
                 },
             ],
-            "root: top.rs (file) then src/ (dir); under src/: d.rs (file) then a/ (dir); \
-             under src/a/: b.rs then c.rs — files-before-dirs, alpha within each group"
+            "root: src/ (dir) then top.rs (file); under src/: a/ (dir) then d.rs (file); \
+             under src/a/: b.rs then c.rs — dirs-before-files, alpha within each group"
         );
-        assert_eq!(items[0].depth(), 0, "top.rs is a root-level row");
-        assert_eq!(items[1].depth(), 0, "src/ is a root-level row");
-        assert_eq!(items[2].depth(), 1, "src/d.rs is one level deep");
-        assert_eq!(items[4].depth(), 2, "src/a/b.rs is two levels deep");
+        assert_eq!(items[0].depth(), 0, "src/ is a root-level row");
+        assert_eq!(items[1].depth(), 1, "src/a/ is one level deep");
+        assert_eq!(items[2].depth(), 2, "src/a/b.rs is two levels deep");
+        assert_eq!(items[5].depth(), 0, "top.rs is a root-level row");
     }
 
     #[test]
@@ -663,7 +758,7 @@ mod tests {
             cs("cs-a", false, false, &[("shared.txt", StagedStatus::None)]),
             cs("cs-b", true, false, &[("shared.txt", StagedStatus::Staged)]),
         ];
-        let items = build_items(&changesets, OutlineMode::Tree);
+        let items = build_items(&changesets, OutlineMode::Tree, OutlineOrder::HeadFirst);
         assert_eq!(
             items,
             vec![OutlineItem::File {
@@ -683,7 +778,7 @@ mod tests {
             cs("cs-a", false, false, &[("x/y.txt", StagedStatus::None)]),
             cs("cs-b", true, true, &[("z.txt", StagedStatus::Unstaged)]),
         ];
-        let items = build_items(&changesets, OutlineMode::StackTree);
+        let items = build_items(&changesets, OutlineMode::StackTree, OutlineOrder::BaseFirst);
         assert_eq!(
             items,
             vec![
@@ -724,6 +819,96 @@ mod tests {
             ],
             "each changeset's files form their own trie nested under that changeset's header, \
              with no cross-changeset dedup"
+        );
+    }
+
+    /// CS3: [`OutlineOrder::HeadFirst`] (the new default) shows the LAST changeset's ([`cs-c`],
+    /// index 2 — the true, base-> head `App::changesets` index) header FIRST, while its `cs_idx`
+    /// still equals its true index into `changesets` (2), never a display-order index (0).
+    #[test]
+    fn stack_mode_head_first_shows_last_changesets_header_first_with_true_cs_idx() {
+        let changesets = vec![
+            cs("cs-a", false, false, &[("a1.txt", StagedStatus::None)]),
+            cs("cs-b", false, false, &[("b1.txt", StagedStatus::None)]),
+            cs("cs-c", true, false, &[("c1.txt", StagedStatus::None)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::HeadFirst);
+        assert_eq!(
+            items[0],
+            OutlineItem::Header {
+                cs_idx: 2,
+                label: "cs-c".to_string(),
+                current: true,
+                needs_restack: false,
+                loading: false,
+                failed: false,
+            },
+            "head-first: the LAST (head) changeset's header renders first, carrying its TRUE \
+             index (2) into `changesets`, not a display-order index"
+        );
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|it| match it {
+                OutlineItem::Header { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["cs-c", "cs-b", "cs-a"],
+            "head-first header order is exactly the reverse of `changesets`' base -> head order"
+        );
+    }
+
+    /// CS3: [`OutlineOrder::BaseFirst`] restores the pre-CS3 base -> head header order.
+    #[test]
+    fn stack_mode_base_first_restores_base_to_head_header_order() {
+        let changesets = vec![
+            cs("cs-a", false, false, &[("a1.txt", StagedStatus::None)]),
+            cs("cs-b", true, false, &[("b1.txt", StagedStatus::None)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
+        let labels: Vec<&str> = items
+            .iter()
+            .filter_map(|it| match it {
+                OutlineItem::Header { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["cs-a", "cs-b"]);
+    }
+
+    /// [`OutlineMode::StackTree`] analog of
+    /// `stack_mode_head_first_shows_last_changesets_header_first_with_true_cs_idx`.
+    #[test]
+    fn stack_tree_mode_head_first_shows_last_changesets_header_first_with_true_cs_idx() {
+        let changesets = vec![
+            cs("cs-a", false, false, &[("x/y.txt", StagedStatus::None)]),
+            cs("cs-b", true, false, &[("z.txt", StagedStatus::None)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::StackTree, OutlineOrder::HeadFirst);
+        assert_eq!(
+            items[0],
+            OutlineItem::Header {
+                cs_idx: 1,
+                label: "cs-b".to_string(),
+                current: true,
+                needs_restack: false,
+                loading: false,
+                failed: false,
+            },
+            "head-first: cs-b's header renders first, carrying its true index (1)"
+        );
+        assert_eq!(
+            items[1],
+            OutlineItem::File {
+                cs_idx: 1,
+                file_idx: 0,
+                path: "z.txt".to_string(),
+                status: StagedStatus::None,
+                guides: vec![true],
+            },
+            "cs-b's own file follows immediately under its head-first header"
         );
     }
 }

@@ -31,6 +31,7 @@
 //! [workon "review.outline"]
 //!   width = 32
 //!   mode = tree
+//!   order = base-first         ; head-first | base-first (default: head-first)
 //!
 //! [workon "review.diff"]
 //!   layout = split
@@ -101,6 +102,7 @@ pub struct RawBinding {
 pub struct RawViewConfig {
     pub outline_width: Option<i64>,
     pub outline_mode: Option<String>,
+    pub outline_order: Option<String>,
     pub diff_layout: Option<String>,
     pub diff_zoom: Option<String>,
 }
@@ -203,6 +205,11 @@ impl<'repo> ReviewConfig<'repo> {
         self.get_view_string(View::Outline, "mode")
     }
 
+    /// Get `workon.review.outline.order`, raw. `None` if unset.
+    pub fn outline_order(&self) -> Result<Option<String>, git2::Error> {
+        self.get_view_string(View::Outline, "order")
+    }
+
     /// Get `workon.review.diff.layout`, raw. `None` if unset.
     pub fn diff_layout(&self) -> Result<Option<String>, git2::Error> {
         self.get_view_string(View::Diff, "layout")
@@ -224,6 +231,7 @@ impl<'repo> ReviewConfig<'repo> {
         RawViewConfig {
             outline_width: self.outline_width().ok().flatten(),
             outline_mode: self.outline_mode().ok().flatten(),
+            outline_order: self.outline_order().ok().flatten(),
             diff_layout: self.diff_layout().ok().flatten(),
             diff_zoom: self.diff_zoom().ok().flatten(),
         }
@@ -407,6 +415,7 @@ mod tests {
         let fixture = FixtureBuilder::new()
             .config("workon.review.outline.width", "40")
             .config("workon.review.outline.mode", "tree")
+            .config("workon.review.outline.order", "base-first")
             .config("workon.review.diff.layout", "split")
             .config("workon.review.diff.zoom", "staged")
             .build()
@@ -418,6 +427,10 @@ mod tests {
         assert_eq!(
             config.outline_mode().expect("mode"),
             Some("tree".to_string())
+        );
+        assert_eq!(
+            config.outline_order().expect("order"),
+            Some("base-first".to_string())
         );
         assert_eq!(
             config.diff_layout().expect("layout"),
@@ -437,6 +450,7 @@ mod tests {
 
         assert_eq!(config.outline_width().expect("width"), None);
         assert_eq!(config.outline_mode().expect("mode"), None);
+        assert_eq!(config.outline_order().expect("order"), None);
         assert_eq!(config.diff_layout().expect("layout"), None);
         assert_eq!(config.diff_zoom().expect("zoom"), None);
     }
