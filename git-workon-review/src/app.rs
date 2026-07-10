@@ -590,6 +590,10 @@ pub struct OutlineState {
     /// The outline pane's column width — `workon.review.outline.width` (CS7), defaulting to
     /// [`DEFAULT_OUTLINE_WIDTH`]. Read by `render.rs` in place of the old fixed const.
     pub width: u16,
+    /// Top-of-viewport row index into [`App::outline_items`]'s row list, derived from `cursor`
+    /// via the same scrolloff discipline as [`App::scroll`] (see [`App::derive_outline_scroll`]) —
+    /// never written directly.
+    pub scroll: usize,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -815,6 +819,9 @@ pub struct App {
     /// [`Self::pane_height`] — [`Self::derive_alt_scroll`] derives the unfocused pane's scroll
     /// against THIS, not the focused pane's height.
     pub(crate) alt_height: usize,
+    /// Content height of the outline pane, written by the renderer each frame — same discipline
+    /// as [`Self::pane_height`]. Read by [`Self::derive_outline_scroll`].
+    pub outline_height: usize,
     /// Label for the old side of the diff, shown next to a rename's `old_path` in the header.
     /// M4 only reviews the uncommitted (`HEAD` ↔ worktree) diffs, so this is always `"HEAD"`
     /// today; M5's committed-changeset zoom will want the changeset's actual base rev.
@@ -1017,6 +1024,7 @@ impl App {
             cursor: 0,
             mode: OutlineMode::default(),
             width: DEFAULT_OUTLINE_WIDTH,
+            scroll: 0,
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -1041,6 +1049,7 @@ impl App {
             pane_height: 20,
             alt: PaneState::default(),
             alt_height: 20,
+            outline_height: 20,
             base_label,
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
@@ -2115,6 +2124,12 @@ impl App {
         self.outline.cursor
     }
 
+    /// Top-of-viewport row index into [`Self::outline_items`]'s row list — see
+    /// [`Self::derive_outline_scroll`].
+    pub fn outline_scroll(&self) -> usize {
+        self.outline.scroll
+    }
+
     /// The outline pane's column width — `workon.review.outline.width` (CS7), or
     /// [`DEFAULT_OUTLINE_WIDTH`] if never set. Read by `render.rs` in place of the old fixed
     /// const.
@@ -2237,6 +2252,42 @@ impl App {
                 idx += step;
             }
         }
+        self.derive_outline_scroll();
+    }
+
+    /// `g`/`G` while the outline has focus: jump the cursor straight to row `idx` (clamped into
+    /// the current row list), landing on it in one step — unlike [`Self::outline_move_by`], there
+    /// is NO burst back-scan here: a jump to a HEADER/DIR row simply doesn't move the diff (`g`
+    /// typically lands on the stack's first header), and a jump to a FILE row jumps the diff
+    /// straight there (`G` typically lands on the last file). Used by [`Self::outline_top`]/
+    /// [`Self::outline_bottom`].
+    fn outline_move_to(&mut self, idx: usize) {
+        let items = self.outline_items();
+        if items.is_empty() {
+            self.outline.cursor = 0;
+            self.derive_outline_scroll();
+            return;
+        }
+        let idx = idx.min(items.len() - 1);
+        self.outline.cursor = idx;
+        if let OutlineItem::File {
+            cs_idx, file_idx, ..
+        } = &items[idx]
+        {
+            self.switch_changeset(*cs_idx, *file_idx);
+        }
+        self.derive_outline_scroll();
+    }
+
+    /// `g` while the outline has focus: jump the cursor to the first row.
+    pub fn outline_top(&mut self) {
+        self.outline_move_to(0);
+    }
+
+    /// `G` while the outline has focus: jump the cursor to the last row.
+    pub fn outline_bottom(&mut self) {
+        let last = self.outline_items().len().saturating_sub(1);
+        self.outline_move_to(last);
     }
 
     /// `Enter` while the outline has focus: jump the diff to the row under the outline cursor (a
@@ -2284,6 +2335,7 @@ impl App {
         let items = self.outline_items();
         if items.is_empty() {
             self.outline.cursor = 0;
+            self.derive_outline_scroll();
             return;
         }
         if let Some(idx) = items.iter().position(|it| {
@@ -2297,6 +2349,7 @@ impl App {
         } else {
             self.outline.cursor = self.outline.cursor.min(items.len() - 1);
         }
+        self.derive_outline_scroll();
     }
 
     /// Row count of file `idx`'s `role` view in the active layout's space (0 if absent/unloaded).
@@ -2351,6 +2404,21 @@ impl App {
         let rows = self.role_row_count(self.current, role);
         self.alt.scroll =
             derive_scroll_value(self.alt.cursor, self.alt.scroll, rows, self.alt_height);
+    }
+
+    /// Re-derive the outline pane's `scroll` from its `cursor` — the outline's counterpart to
+    /// [`Self::derive_scroll`], reusing the same [`derive_scroll_value`] core against
+    /// [`Self::outline_height`]. Called after every outline-cursor mutation (mirroring how every
+    /// diff-cursor mutator ends with `derive_scroll`); the renderer also re-derives each frame,
+    /// which covers resizes.
+    pub(crate) fn derive_outline_scroll(&mut self) {
+        let rows = self.outline_items().len();
+        self.outline.scroll = derive_scroll_value(
+            self.outline.cursor,
+            self.outline.scroll,
+            rows,
+            self.outline_height,
+        );
     }
 
     /// The `(scroll, cursor)` a split pane renders with: the focused pane contributes its own
@@ -7494,6 +7562,196 @@ mod tests {
         assert!(app.outline_open() && !app.outline_focused());
         app.toggle_outline();
         assert!(!app.outline_open());
+    }
+
+    // ── CS2: outline scrolloff viewport + g/G jumps ─────────────────────────────
+
+    /// Four committed changesets of three files each — Stack mode (the default) yields 16 rows
+    /// (header + 3 files, ×4), long enough to exercise [`App::derive_outline_scroll`]'s margin
+    /// behavior against a small `outline_height`, unlike the 5-row
+    /// [`two_committed_changesets_two_and_one_files`] fixture used elsewhere in this module.
+    fn four_committed_changesets_three_files_each() -> App {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut base = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mut changesets = Vec::new();
+        for cs_num in 0..4 {
+            let head = fixture
+                .commit("main")
+                .file(&format!("cs{cs_num}_a.txt"), "a\n")
+                .file(&format!("cs{cs_num}_b.txt"), "b\n")
+                .file(&format!("cs{cs_num}_c.txt"), "c\n")
+                .create(&format!("cs{cs_num}"))
+                .unwrap();
+            changesets.push(Changeset {
+                name: format!("cs-{cs_num}"),
+                span: ChangesetSpan::Committed { base, head },
+                title: None,
+                current: cs_num == 0,
+                needs_restack: false,
+            });
+            base = head;
+        }
+        let repo = fixture.repo().unwrap();
+        let views = changesets
+            .into_iter()
+            .map(|cs| {
+                let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+                ChangesetView::from_changeset_diff(cs, diff)
+            })
+            .collect();
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.open_current();
+        app.outline.mode = OutlineMode::Stack;
+        assert_eq!(app.outline_items().len(), 16, "4 x (1 header + 3 files)");
+        app
+    }
+
+    #[test]
+    fn outline_move_by_keeps_cursor_within_the_scrolloff_margin() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5; // bottom_margin = 5 - 1 - SCROLLOFF(2) = 2
+        app.outline.cursor = 0;
+        app.derive_outline_scroll();
+        assert_eq!(app.outline_scroll(), 0);
+
+        // Walk down one row at a time; the scroll must follow to keep the cursor within
+        // `[scroll, scroll + bottom_margin]`, never snapping straight to the cursor.
+        for _ in 0..8 {
+            app.outline_move_by(1);
+            let scroll = app.outline_scroll();
+            let cursor = app.outline_cursor();
+            assert!(
+                cursor >= scroll && cursor <= scroll + 2,
+                "cursor {cursor} must stay within the scrolloff-margined viewport at scroll {scroll}"
+            );
+        }
+        assert!(
+            app.outline_scroll() > 0,
+            "scrolling down must have moved the viewport"
+        );
+
+        // Walking back up must scroll up minimally, not snap to zero.
+        let scroll_at_bottom = app.outline_scroll();
+        app.outline_move_by(-1);
+        assert!(
+            app.outline_scroll() <= scroll_at_bottom,
+            "moving up must not increase scroll"
+        );
+        assert!(
+            app.outline_scroll() > 0,
+            "a single step up from deep in the list must not snap scroll to zero"
+        );
+    }
+
+    #[test]
+    fn outline_scroll_clamps_at_both_ends() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5;
+
+        app.outline.cursor = 0;
+        app.derive_outline_scroll();
+        assert_eq!(
+            app.outline_scroll(),
+            0,
+            "top row 0 must be visible at start"
+        );
+
+        let last = app.outline_items().len() - 1;
+        app.outline.cursor = last;
+        app.derive_outline_scroll();
+        let scroll = app.outline_scroll();
+        assert!(
+            last >= scroll && last < scroll + app.outline_height,
+            "the last row must be visible once the cursor reaches it"
+        );
+        assert!(
+            scroll <= app.outline_items().len().saturating_sub(app.outline_height),
+            "scroll must never run past the point where the last row leaves the viewport"
+        );
+    }
+
+    #[test]
+    fn outline_top_lands_cursor_zero_and_does_not_jump_a_header() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline_height = 3;
+        app.next_changeset(); // move the diff off its start so a stray jump would be observable
+        let (cs_before, file_before) = (app.current_cs(), app.current);
+
+        app.outline.cursor = 4; // b1.txt's row
+        app.outline_top();
+
+        assert_eq!(app.outline_cursor(), 0, "g lands on row 0");
+        assert!(
+            matches!(app.outline_items()[0], OutlineItem::Header { .. }),
+            "row 0 in Stack mode is cs-a's header"
+        );
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (cs_before, file_before),
+            "landing on a Header must not jump the diff"
+        );
+    }
+
+    #[test]
+    fn outline_bottom_lands_on_the_last_row_and_jumps_a_file() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline_height = 3;
+        assert_eq!(app.current_cs(), 0, "starts on cs-a");
+
+        app.outline_bottom();
+
+        let last = app.outline_items().len() - 1;
+        assert_eq!(app.outline_cursor(), last, "G lands on the last row");
+        assert!(
+            matches!(app.outline_items()[last], OutlineItem::File { .. }),
+            "the last row in Stack mode is cs-b's only file, b1.txt"
+        );
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (1, 0),
+            "landing on a File must switch the diff there"
+        );
+    }
+
+    #[test]
+    fn outline_cycle_mode_and_sync_leave_scroll_consistent() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 4;
+        // Push the cursor (and scroll) deep into Stack mode's row list first.
+        for _ in 0..10 {
+            app.outline_move_by(1);
+        }
+        assert!(
+            app.outline_scroll() > 0,
+            "precondition: scrolled away from the top"
+        );
+
+        app.outline_cycle_mode(); // -> Tree
+        let cursor = app.outline_cursor();
+        let scroll = app.outline_scroll();
+        assert!(
+            cursor >= scroll && cursor < scroll + app.outline_height,
+            "outline_cycle_mode must leave the cursor visible within the new mode's scroll"
+        );
+
+        app.next_changeset(); // diff-initiated nav -> sync_outline_to_current
+        let cursor = app.outline_cursor();
+        let scroll = app.outline_scroll();
+        assert!(
+            cursor >= scroll && cursor < scroll + app.outline_height,
+            "sync_outline_to_current must leave the cursor visible within scroll"
+        );
     }
 
     // ── CS7: view-config (`apply_view_config`) ─────────────────────────────────
