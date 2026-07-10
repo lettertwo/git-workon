@@ -66,15 +66,81 @@ impl Fixture {
         Ok(())
     }
 
-    /// Update a branch to point to a specific commit
+    /// Update a branch to point to a specific commit, then cascade the move into any Graphite
+    /// branch-metadata entry that recorded `branch`'s OLD tip as its `parentBranchRevision` —
+    /// mirroring what a real `gt` restack does when a parent moves: every child's recorded
+    /// parent revision follows. Entries whose recorded revision does NOT match the old tip
+    /// (e.g. a deliberately stale fixture built via `branch_metadata_at`) are left untouched.
+    ///
+    /// Without this, `branch_metadata`'s revisions are resolved once at `build()` time (see its
+    /// doc comment) — a later `update_branch` on a branch that already has children recorded
+    /// against its pre-move tip leaves every child's `parentBranchRevision` pointing at a
+    /// commit `branch` no longer occupies, so `resolve_graphite_base` computes the wrong base
+    /// for every one of them.
     pub fn update_branch(&self, branch: &str, commit_oid: Oid) -> Result<()> {
         let repo = self.repo()?;
 
         let mut local_branch = repo.find_branch(branch, git2::BranchType::Local)?;
+        let old_tip = local_branch.get().target();
 
         local_branch
             .get_mut()
             .set_target(commit_oid, &format!("Update {} to {}", branch, commit_oid))?;
+
+        if let Some(old_tip) = old_tip {
+            self.cascade_parent_revision(branch, old_tip, commit_oid)?;
+        }
+        Ok(())
+    }
+
+    /// The cascading half of [`Self::update_branch`]: rewrite `parentBranchRevision` for every
+    /// metadata entry whose `parentBranchName == branch` and whose recorded revision equals
+    /// `old_tip`, in whichever on-disk format is present (gt < 1.8 `refs/branch-metadata/*`
+    /// blobs, gt >= 1.8's `.graphite_metadata.db`) — a fixture only ever writes one format, but
+    /// checking both keeps this correct regardless of which `FixtureBuilder::metadata_format`
+    /// selection built it.
+    fn cascade_parent_revision(&self, branch: &str, old_tip: Oid, new_tip: Oid) -> Result<()> {
+        let repo = self.repo()?;
+        let old_tip = old_tip.to_string();
+        let new_tip = new_tip.to_string();
+
+        let mut ref_rewrites: Vec<(String, String)> = Vec::new();
+        for reference in repo.references_glob("refs/branch-metadata/*")? {
+            let reference = reference?;
+            let Ok(refname) = reference.name().map(str::to_string) else {
+                continue;
+            };
+            let Ok(object) = reference.peel(git2::ObjectType::Blob) else {
+                continue;
+            };
+            let Ok(blob) = object.into_blob() else {
+                continue;
+            };
+            let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(blob.content()) else {
+                continue;
+            };
+            let is_match = json.get("parentBranchName").and_then(|v| v.as_str()) == Some(branch)
+                && json.get("parentBranchRevision").and_then(|v| v.as_str()) == Some(&old_tip);
+            if is_match {
+                json["parentBranchRevision"] = serde_json::Value::String(new_tip.clone());
+                ref_rewrites.push((refname, json.to_string()));
+            }
+        }
+        for (refname, content) in ref_rewrites {
+            let oid = repo.blob(content.as_bytes())?;
+            repo.reference(&refname, oid, true, "cascade parentBranchRevision")?;
+        }
+
+        let db_path = repo.path().join(".graphite_metadata.db");
+        if db_path.exists() {
+            let conn = rusqlite::Connection::open(&db_path)?;
+            conn.execute(
+                "UPDATE branch_metadata SET parent_branch_revision = ?1 \
+                 WHERE parent_branch_name = ?2 AND parent_branch_revision = ?3",
+                rusqlite::params![new_tip, branch, old_tip],
+            )?;
+        }
+
         Ok(())
     }
 
