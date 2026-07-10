@@ -2599,4 +2599,198 @@ mod tests {
             "splash frame must show the launch-activity message, got: {top_row:?}"
         );
     }
+
+    // ── ADR-037: real-thread integration smoke ─────────────────────────────────
+
+    /// ADR-037's Testing layer 3, part one: the ONE test in this module that spawns the REAL
+    /// [`spawn_loader_thread`]/[`spawn_wave_thread`] against real `mpsc` channels — everything
+    /// else in this file drives `update`/`update_batch` with synthetic events specifically to
+    /// avoid real threads (see the ADR's "Testing" decision: layers 1-2 are thread-free by
+    /// design). This is the one exception, confined here.
+    ///
+    /// Mirrors `main.rs`'s streamed-launch shape exactly: `App::from_changesets` over
+    /// all-`Pending` slots, `set_defer_loads(true)`, `open_current()`, then the same
+    /// `spawn_wave_thread` call `Tui::run_streamed` makes. From there this test plays the event
+    /// loop's OWN role by hand — draining the shared inbox and routing `ChangesetReady`/
+    /// `FileReady` through the exact chokepoints `update`'s match arms call
+    /// (`App::apply_changeset_ready`/`App::apply_file_ready`), plus the same post-batch
+    /// `take_pending_load_spec` dispatch `event_loop` runs on every idle tick while an open is
+    /// pending — except here it's driven the instant the active changeset seats, not gated behind
+    /// a real debounce `Tick`, since nothing here is racing real terminal input.
+    ///
+    /// Bounded by `recv_timeout` per receive (not a wall-clock test deadline): a wedged thread
+    /// times out and fails loudly rather than hanging the suite, but a healthy run's actual
+    /// duration is however long the real diff/load work takes — no sleeping, no fixed budget, so
+    /// this stays load-tolerant enough to run unconditionally (unlike `pty_responsiveness.rs`'s
+    /// `#[ignore]` siblings, which assert actual elapsed wall-clock time).
+    #[test]
+    fn real_threads_stream_a_wave_and_complete_a_deferred_file_open() {
+        use git_workon_fixture::prelude::*;
+        use workon::{Changeset, ChangesetSpan};
+        use workon_review::app::ChangesetView;
+
+        // A 4-changeset committed stack, each adding one file — the streamed-launch "multi-
+        // changeset fixture stack" the plan calls for, deep enough that the wave has real
+        // fan-out work (`spawn_wave_thread` stripes across `available_parallelism` workers) and
+        // that the ACTIVE (last, `current: true`) changeset has a real, uncached file for the
+        // deferred-open assertion.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let c1 = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("c1")
+            .unwrap();
+        let c2 = fixture
+            .commit("main")
+            .file("b.txt", "b\n")
+            .create("c2")
+            .unwrap();
+        let c3 = fixture
+            .commit("main")
+            .file("c.txt", "c\n")
+            .create("c3")
+            .unwrap();
+        let c4 = fixture
+            .commit("main")
+            .file("d.txt", "d\n")
+            .create("c4")
+            .unwrap();
+
+        let bare = |name: &str, base, head, current| Changeset {
+            name: name.to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current,
+            needs_restack: false,
+        };
+        let changesets = vec![
+            bare("cs-1", root, c1, false),
+            bare("cs-2", c1, c2, false),
+            bare("cs-3", c2, c3, false),
+            bare("cs-4", c3, c4, true),
+        ];
+
+        let repo = fixture.repo().unwrap();
+        let repo_path = repo.workdir().unwrap().to_path_buf();
+        let owned = Repository::open(&repo_path).unwrap();
+
+        let pending_views: Vec<ChangesetView> = changesets
+            .iter()
+            .cloned()
+            .map(ChangesetView::pending)
+            .collect();
+        let mut app = App::from_changesets(owned, pending_views);
+        app.set_defer_loads(true);
+        app.open_current();
+
+        let active_idx = app.current_cs();
+        assert_eq!(
+            active_idx, 3,
+            "the lib-current changeset (cs-4) opens active"
+        );
+        assert!(app.is_current_pending(), "every slot starts Pending");
+
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        let load_tx = spawn_loader_thread(repo_path.clone(), tx.clone());
+        let to_diff: Vec<(usize, Changeset)> = changesets.into_iter().enumerate().collect();
+        spawn_wave_thread(
+            repo_path.clone(),
+            tx.clone(),
+            to_diff,
+            app.generation(),
+            Some(active_idx),
+        );
+        drop(tx); // this test's only senders now are the two spawned threads
+
+        let deadline_per_recv = Duration::from_secs(15);
+        let mut changesets_ready = vec![false; app.changeset_count()];
+        let mut active_file_loaded = false;
+        let mut dispatched_active_load = false;
+
+        loop {
+            if changesets_ready.iter().all(|&r| r) && active_file_loaded {
+                break;
+            }
+            let event = rx
+                .recv_timeout(deadline_per_recv)
+                .expect("loader/wave thread must answer within the deadline")
+                .expect("neither real thread should forward a read error in this test");
+
+            match event {
+                AppEvent::ChangesetReady { gen, idx, result } => {
+                    assert!(
+                        result.is_ok(),
+                        "a committed changeset diff must not fail here"
+                    );
+                    app.apply_changeset_ready(gen, idx, result);
+                    changesets_ready[idx] = true;
+                }
+                AppEvent::FileReady {
+                    gen,
+                    cs_idx,
+                    file_idx,
+                    result,
+                } => {
+                    assert!(result.is_ok(), "a real file load must not fail here");
+                    app.apply_file_ready(gen, cs_idx, file_idx, result);
+                    if cs_idx == active_idx && file_idx == 0 {
+                        active_file_loaded = true;
+                    }
+                }
+                other => panic!("unexpected event in the real-thread smoke: {other:?}"),
+            }
+
+            // The same post-batch checkpoint `event_loop` runs on every idle `Tick` while an
+            // open is pending — dispatched here the instant it's possible (right after the
+            // active changeset seats) rather than gated behind a real debounce, since nothing in
+            // this test races real terminal input.
+            if !dispatched_active_load && app.open_pending() {
+                if let Some((gen, cs_idx, file_idx, spec)) = app.take_pending_load_spec() {
+                    load_tx
+                        .send(LoadRequest {
+                            gen,
+                            cs_idx,
+                            file_idx,
+                            spec,
+                        })
+                        .expect("loader thread must still be alive to receive the dispatch");
+                    dispatched_active_load = true;
+                }
+            }
+        }
+
+        assert!(
+            changesets_ready.iter().all(|&r| r),
+            "every slot must land Ready: {changesets_ready:?}"
+        );
+        assert!(
+            !app.is_current_pending(),
+            "the active changeset must be seated once its wave result lands"
+        );
+        assert_eq!(
+            app.current_cs(),
+            active_idx,
+            "seating must not move which changeset is active"
+        );
+        assert!(
+            active_file_loaded,
+            "the active changeset's deferred file open must complete via a real FileReady"
+        );
+        assert!(
+            !app.open_pending(),
+            "a completed FileReady must clear the pending-open flag"
+        );
+        assert!(
+            app.current_view_ref().is_some(),
+            "the active file's view must be cached after its FileReady lands"
+        );
+    }
 }
