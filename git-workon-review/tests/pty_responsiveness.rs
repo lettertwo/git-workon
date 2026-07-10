@@ -70,19 +70,27 @@ const BURST_FILES: usize = 36;
 const BURST_FILE_LINES: usize = 2_000;
 
 /// Upper bound on spawn→quit for `streamed_startup_lands_before_a_full_wave_could_have_finished`
-/// (ADR-037). Sized from real measurements on this fixture (debug build, `q` sent right after
+/// (ADR-037). Sized from real measurements on this fixture (`q` sent right after
 /// alternate-screen entry — same protocol as `LAUNCH_RESPONSIVE`, so `q` buffers in the PTY
 /// until the event loop actually starts polling input):
 ///
-/// - The CURRENT (streamed) binary: ~1.1-1.4s — dominated by fixed per-launch costs
-///   (`gt --version`'s ~350ms subprocess spawn, checking out `STREAMED_STACK_SIZE` branches'
-///   worth of files) plus ONE changeset's diff (the active one, streamed first).
-/// - The PRE-ADR-037 binary (commit `2214558`, built and run against the identical fixture):
-///   ~6.4s — it blocks on the full stack's diff wave before the event loop ever starts, so `q`
-///   sits in the PTY the whole time.
+/// - The CURRENT (streamed) binary: ~1.0-1.3s (debug build; ~1.0s release) — dominated by fixed
+///   per-launch costs (`gt --version`'s ~350ms subprocess spawn, checking out
+///   `STREAMED_STARTUP_STACK_SIZE` branches' worth of files) plus entering the alternate screen
+///   and starting the event loop, which — this is the whole point of ADR-037 — happens BEFORE
+///   any changeset is diffed: the wave runs on a background thread, off the spawn→interactive
+///   critical path entirely. Re-measured after fixing the fixture setup (F4) that was building
+///   every `cs{i}`'s base against main's tip instead of its own predecessor's head; since none
+///   of a changeset's diff cost is on this critical path either way, the number barely moved —
+///   confirming spawn→quit here really is a fixed-cost bound, not a diff-size one.
+/// - The PRE-ADR-037 binary (commit `2214558`, built and run against an equivalent fixture
+///   pre-F4): ~6.4s — it blocks on the full stack's diff wave before the event loop ever starts,
+///   so `q` sits in the PTY the whole time. Not re-measured against the F4-corrected fixture
+///   (would need rebuilding that historical commit); a synchronous full-wave wait over 150
+///   real per-changeset diffs is unambiguously far past this bound either way.
 ///
-/// This bound sits roughly 2× above the healthy number and comfortably (~2×) below the
-/// regressed one — the same blunt, load-tolerant margin philosophy as `LAUNCH_RESPONSIVE`/
+/// This bound sits comfortably (~2-3×) above the healthy number and well below the regressed
+/// one — the same blunt, load-tolerant margin philosophy as `LAUNCH_RESPONSIVE`/
 /// `BURST_RESPONSIVE`, just re-measured for this fixture rather than reused, since the streamed
 /// path's fixed costs (checkout of a much deeper stack) differ from the single-changeset launch
 /// test's.
@@ -287,14 +295,45 @@ fn streamed_startup_lands_before_a_full_wave_could_have_finished() {
         UncommittedLayer::Include,
     )
     .expect("assemble the real Graphite stack");
+    let cs_changesets: Vec<&workon::Changeset> = changesets
+        .iter()
+        .filter(|c| c.name.starts_with("cs"))
+        .collect();
     assert_eq!(
-        changesets
-            .iter()
-            .filter(|c| c.name.starts_with("cs"))
-            .count(),
+        cs_changesets.len(),
         n,
         "fixture setup must produce every tracked changeset"
     );
+    // F4: pin the intended shape — each `cs{i}`'s span is base→head against its OWN immediate
+    // predecessor (cs0's base is main's tip), not every changeset cumulatively based on main.
+    // `branch_metadata`'s revisions resolve once at `build()` time (before the `update_branch`
+    // loop above moves any ref), so a fixture that doesn't keep those recorded revisions in
+    // sync makes `resolve_graphite_base` fall back to main's tip for every one of them —
+    // cumulative 150-file spans and `needs_restack = true` everywhere, contradicting both this
+    // shape and the "one changeset's diff" cost this test's bound is sized against.
+    let mut expected_base = main_tip;
+    for (i, cs) in cs_changesets.iter().enumerate() {
+        assert_eq!(
+            cs.name,
+            format!("cs{i}"),
+            "changesets must come back in base→head order"
+        );
+        match cs.span {
+            workon::ChangesetSpan::Committed { base, head } => {
+                assert_eq!(
+                    base, expected_base,
+                    "cs{i}'s base must be its own predecessor's head, not main's tip"
+                );
+                expected_base = head;
+            }
+            other => panic!("cs{i} must be a Committed span, got {other:?}"),
+        }
+        assert!(
+            !cs.needs_restack,
+            "cs{i} must not need a restack — its recorded parent revision must track its \
+             parent's live tip"
+        );
+    }
 
     // Check out the tip branch as HEAD — the real binary's no-argument auto-detect reads
     // `repo.head()`'s shorthand, not an explicit `[SOURCE]` argument.
