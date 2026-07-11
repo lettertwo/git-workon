@@ -92,15 +92,20 @@ pub enum AppEvent {
 
 impl PartialEq for AppEvent {
     /// Manual, deliberately PARTIAL equality (can't derive — `FileReady`'s `LoadedViews` payload
-    /// isn't `PartialEq`, see the enum's doc comment): `Key`/`Resize`/`Tick` compare structurally,
-    /// exactly like the pre-ADR-037 derive did, for the input-thread tests that still assert
-    /// mapped-event shape via `assert_eq!`. Two `FileReady` events are never considered equal —
-    /// there's no sound definition of "the same loader result" once `FileView` can't be compared,
-    /// and nothing needs one; tests that care about a `FileReady`'s fields match on them directly.
+    /// isn't `PartialEq`, see the enum's doc comment): `Key`/`Resize`/`Mouse`/`Tick` compare
+    /// structurally, exactly like the pre-ADR-037 derive did, for the input-thread tests that
+    /// still assert mapped-event shape via `assert_eq!`. Two `FileReady` events are never
+    /// considered equal — there's no sound definition of "the same loader result" once `FileView`
+    /// can't be compared, and nothing needs one; tests that care about a `FileReady`'s fields
+    /// match on them directly. Every fully-comparable variant needs its own arm here: the
+    /// `_ => false` catch-all exists ONLY for `FileReady`/`ChangesetReady`, and letting a
+    /// comparable variant fall into it silently breaks reflexivity (`Mouse` did exactly that
+    /// when CS10 first added it — crossterm's `MouseEvent` derives `PartialEq` fine).
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (AppEvent::Key(a), AppEvent::Key(b)) => a == b,
             (AppEvent::Resize(w1, h1), AppEvent::Resize(w2, h2)) => w1 == w2 && h1 == h2,
+            (AppEvent::Mouse(a), AppEvent::Mouse(b)) => a == b,
             (AppEvent::Tick, AppEvent::Tick) => true,
             _ => false,
         }
