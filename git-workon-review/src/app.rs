@@ -271,10 +271,10 @@ impl FileView {
         else {
             return false;
         };
+        // Non-empty by construction: `gap_hidden_range` returns `None` (never an empty range)
+        // once an expansion covers the whole run — see its `effective_before + effective_after
+        // >= run_len` arm.
         let hidden = &self.aligned[hidden_start..hidden_end];
-        if hidden.is_empty() {
-            return false;
-        }
 
         let lineno_of =
             |row: &AlignedRow| row_lineno(if anchor_prefers_new { row.new } else { row.old });
