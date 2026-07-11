@@ -30,20 +30,11 @@ use crate::wordiff::Span as WordSpan;
 // The on-tint colors (diff add/del gradient + staged variants, cursor/selection washes, and syntax
 // foreground) come from a [`Palette`] threaded through render (ADR-035). The canvas background and
 // default/dim/gutter chrome foreground ALSO now come from the palette (`theme.background`/
-// `theme.foreground`/`theme.dim`/`theme.gutter`) — see the theme module's revised hybrid-boundary
-// doc comment — so a curated theme fully controls the look. Only semantic chrome that is never a
-// theme knob (error/warn/current-marker) stays ANSI-named / const below.
-
-/// Footer text color for an [`Severity::Error`] [`Notice`] — a clearly-red tone that reads on
-/// both light and dark terminal themes.
-const FG_ERROR: Color = Color::Rgb(220, 60, 60);
-/// Warning tone for the winbar's needs-restack marker (locked decision #9) — an amber, distinct
-/// from [`FG_ERROR`]'s red: a stale-parent changeset is a heads-up to `gt restack`, not a failure.
-const FG_WARN: Color = Color::Rgb(214, 158, 46);
-/// Tone for the outline's "this is the lib-marked `current` changeset" marker (locked decision
-/// #9's outline half) — a green, distinct from every other marker color in this module so
-/// "current" reads unambiguously at a glance.
-const FG_CURRENT: Color = Color::Rgb(96, 200, 128);
+// `theme.foreground`/`theme.dim`/`theme.gutter`), as does the semantic chrome that used to be
+// const here — error/warn/current-marker are now `theme.error_fg`/`theme.warn_fg`/
+// `theme.current_fg` (CS2, revising ADR-035's hybrid boundary) — see the theme module's revised
+// hybrid-boundary doc comment. A curated theme now fully controls the look; nothing in this
+// module hardcodes a semantic color anymore.
 
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
@@ -470,7 +461,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 
 /// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
 /// carry the changeset's position marker (green ● for `cs.current`) and needs-restack glyph
-/// (amber ⚠, [`FG_WARN`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
+/// (amber ⚠, [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
 /// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
 /// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
 /// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
@@ -563,7 +554,7 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
             let marker = if *current { "\u{25CF} " } else { "  " };
             let mut spans = vec![TSpan::styled(
                 marker.to_string(),
-                Style::default().fg(FG_CURRENT),
+                Style::default().fg(theme.current_fg),
             )];
             spans.push(TSpan::styled(
                 label.clone(),
@@ -572,12 +563,18 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
                     .add_modifier(Modifier::BOLD),
             ));
             if *needs_restack {
-                spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
+                spans.push(TSpan::styled(
+                    " \u{26A0}",
+                    Style::default().fg(theme.warn_fg),
+                ));
             }
             // ADR-037: a Failed changeset's marker wins over Pending's (a slot is never both,
             // but Failed is the more actionable state to surface if it somehow were).
             if *failed {
-                spans.push(TSpan::styled(" \u{2717}", Style::default().fg(FG_ERROR)));
+                spans.push(TSpan::styled(
+                    " \u{2717}",
+                    Style::default().fg(theme.error_fg),
+                ));
             } else if *loading {
                 spans.push(TSpan::styled(" \u{2026}", Style::default().fg(theme.dim)));
             }
@@ -705,7 +702,9 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     if cs.needs_restack {
         spans.push(TSpan::styled(
             "  ⚠ needs restack",
-            Style::default().fg(FG_WARN).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warn_fg)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     let fidx = app.current + 1;
@@ -726,7 +725,7 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, theme: &Palette) {
     if let Some(confirm) = &app.pending_confirm {
         frame.render_widget(
-            Paragraph::new(confirm.prompt.as_str()).style(Style::default().fg(FG_ERROR)),
+            Paragraph::new(confirm.prompt.as_str()).style(Style::default().fg(theme.error_fg)),
             area,
         );
         return;
@@ -734,7 +733,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
     match &app.notice {
         Some(Notice { text, severity }) => {
             let fg = match severity {
-                Severity::Error => FG_ERROR,
+                Severity::Error => theme.error_fg,
                 Severity::Info => theme.foreground,
             };
             frame.render_widget(
@@ -918,7 +917,7 @@ fn changeset_summary_lines(
 
     let mut title_spans = vec![TSpan::styled(
         if summary.current { "\u{25CF} " } else { "  " },
-        Style::default().fg(FG_CURRENT),
+        Style::default().fg(theme.current_fg),
     )];
     title_spans.push(TSpan::styled(
         summary.label.clone(),
@@ -927,7 +926,10 @@ fn changeset_summary_lines(
             .add_modifier(Modifier::BOLD),
     ));
     if summary.needs_restack {
-        title_spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
+        title_spans.push(TSpan::styled(
+            " \u{26A0}",
+            Style::default().fg(theme.warn_fg),
+        ));
     }
     lines.push(Line::from(title_spans));
 
@@ -938,7 +940,7 @@ fn changeset_summary_lines(
             .unwrap_or("(no error message)");
         lines.push(Line::from(TSpan::styled(
             format!("\u{2717} {msg}"),
-            Style::default().fg(FG_ERROR),
+            Style::default().fg(theme.error_fg),
         )));
         return lines;
     }
@@ -1012,7 +1014,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     if let Some(message) = app.current_failure() {
         let msg = format!("Failed to load this changeset: {message}");
         frame.render_widget(
-            Paragraph::new(msg).style(Style::default().fg(FG_ERROR)),
+            Paragraph::new(msg).style(Style::default().fg(theme.error_fg)),
             area,
         );
         return;
@@ -2298,7 +2300,7 @@ mod tests {
         );
         assert_eq!(
             buf.cell((0, footer_y)).unwrap().style().fg,
-            Some(super::FG_ERROR),
+            Some(Palette::dark().error_fg),
             "expected the error notice to render in the error fg color"
         );
     }
@@ -2438,7 +2440,7 @@ mod tests {
         let marker_x = header.find('⚠').expect("restack glyph present") as u16;
         assert_eq!(
             buf.cell((marker_x, 0)).unwrap().style().fg,
-            Some(super::FG_WARN),
+            Some(Palette::dark().warn_fg),
             "expected the restack glyph to carry the warning color, not the plain header color"
         );
     }
@@ -2650,8 +2652,8 @@ mod tests {
         let marker_x = content[row].find('\u{25CF}').unwrap() as u16;
         assert_eq!(
             buf.cell((marker_x, row as u16)).unwrap().style().fg,
-            Some(super::FG_CURRENT),
-            "expected the outline's current marker to carry FG_CURRENT"
+            Some(Palette::dark().current_fg),
+            "expected the outline's current marker to carry Palette::dark().current_fg"
         );
     }
 
@@ -2672,8 +2674,8 @@ mod tests {
         let marker_x = content[row].find('\u{26A0}').unwrap() as u16;
         assert_eq!(
             buf.cell((marker_x, row as u16)).unwrap().style().fg,
-            Some(super::FG_WARN),
-            "expected the outline's restack glyph to carry FG_WARN"
+            Some(Palette::dark().warn_fg),
+            "expected the outline's restack glyph to carry Palette::dark().warn_fg"
         );
     }
 
