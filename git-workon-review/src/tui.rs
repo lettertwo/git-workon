@@ -413,6 +413,8 @@ enum Action {
     DiscardHunk,
     DiscardFile,
     StartSelection,
+    ExpandGap,
+    ExpandGapAll,
     ToggleOutline,
     OutlineMoveBy(i64),
     OutlineConfirm,
@@ -451,6 +453,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::DiscardHunk => Action::DiscardHunk,
         Command::DiscardFile => Action::DiscardFile,
         Command::StartSelection => Action::StartSelection,
+        Command::ExpandGap => Action::ExpandGap,
+        Command::ExpandGapAll => Action::ExpandGapAll,
         Command::NextFile => Action::NextFile,
         Command::PrevFile => Action::PrevFile,
         Command::NextHunk => Action::NextHunk,
@@ -539,6 +543,8 @@ fn action_needs_loaded_view(action: Action) -> bool {
             | Action::DiscardFile
             | Action::StartSelection
             | Action::ToggleSplitFocus
+            | Action::ExpandGap
+            | Action::ExpandGapAll
     )
 }
 
@@ -574,6 +580,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::DiscardHunk => app.discard_hunk(),
         Action::DiscardFile => app.discard_file(),
         Action::StartSelection => app.start_selection(),
+        Action::ExpandGap => app.expand_gap_at_cursor(false),
+        Action::ExpandGapAll => app.expand_gap_at_cursor(true),
         Action::ToggleOutline => app.toggle_outline(),
         Action::OutlineMoveBy(delta) => app.outline_move_by(delta),
         Action::OutlineConfirm => app.outline_confirm(),
@@ -1337,6 +1345,37 @@ mod tests {
         assert_eq!(
             map_key(&km, &mut pending, key(KeyCode::Char('G')), 20, false, true),
             Action::ScrollBottom
+        );
+    }
+
+    #[test]
+    fn enter_and_shift_e_map_to_expand_gap_in_diff_context() {
+        // CS8: `enter`/`E` are bound in View::Diff only (`expand-gap`/`expand-gap-all`) — Enter
+        // stays `OutlineConfirm` when the outline has focus (see the next test).
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Enter), 20, false, false),
+            Action::ExpandGap
+        );
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('E')), 20, false, false),
+            Action::ExpandGapAll
+        );
+        // Still diff-scoped even with the outline open, as long as it isn't focused.
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Enter), 20, false, true),
+            Action::ExpandGap
+        );
+    }
+
+    #[test]
+    fn enter_still_maps_to_outline_confirm_when_outline_focused() {
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Enter), 20, true, true),
+            Action::OutlineConfirm
         );
     }
 

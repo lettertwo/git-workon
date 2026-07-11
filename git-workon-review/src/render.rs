@@ -753,9 +753,9 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
     }
 }
 
-/// Write a gap row's `··· N unchanged lines ···` marker across the FULL body width (both panes
-/// and the divider column) — unlike a per-pane content row, a gap hides the same span on both
-/// sides, so it isn't "about" one side or the other.
+/// Write a gap row's `··· N unchanged lines (Enter to expand) ···` marker across the FULL body
+/// width (both panes and the divider column) — unlike a per-pane content row, a gap hides the
+/// same span on both sides, so it isn't "about" one side or the other.
 fn render_gap_row(
     buf: &mut Buffer,
     area: Rect,
@@ -765,7 +765,7 @@ fn render_gap_row(
     is_selected: bool,
     theme: &Palette,
 ) {
-    let msg = format!("··· {skipped} unchanged lines ···");
+    let msg = format!("··· {skipped} unchanged lines (Enter to expand) ···");
     let line = Line::from(TSpan::styled(msg, Style::default().fg(theme.dim)));
     // Cursor wins over selection on the same row.
     let line = if is_cursor {
@@ -1253,7 +1253,7 @@ fn render_pane_sbs(
         let is_cursor = cursor == Some(row_idx);
         let is_selected = selection.is_some_and(|(lo, hi)| row_idx >= lo && row_idx <= hi);
         match &view.display[row_idx] {
-            DisplayRow::Gap { skipped } => {
+            DisplayRow::Gap { skipped, .. } => {
                 render_gap_row(
                     frame.buffer_mut(),
                     area,
@@ -1456,7 +1456,7 @@ fn render_pane_inline(
         let is_cursor = cursor == Some(row_idx);
         let is_selected = selection.is_some_and(|(lo, hi)| row_idx >= lo && row_idx <= hi);
         match &view.inline[row_idx] {
-            InlineRow::Gap { skipped } => {
+            InlineRow::Gap { skipped, .. } => {
                 render_gap_row(
                     frame.buffer_mut(),
                     area,
