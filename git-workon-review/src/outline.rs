@@ -57,6 +57,21 @@ pub enum OutlineOrder {
     BaseFirst,
 }
 
+/// Enumerate `changesets` in `order`'s display scan — the shared preamble of every stack-shaped
+/// builder below. Indices are always TRUE base -> head indices into the slice regardless of scan
+/// direction (enumerate happens BEFORE any reversal), which is the invariant `cs_idx`/`file_idx`
+/// consumers like `App::switch_changeset` rely on.
+fn scan_order(
+    changesets: &[OutlineChangeset],
+    order: OutlineOrder,
+) -> Vec<(usize, &OutlineChangeset)> {
+    let mut entries: Vec<(usize, &OutlineChangeset)> = changesets.iter().enumerate().collect();
+    if order == OutlineOrder::HeadFirst {
+        entries.reverse();
+    }
+    entries
+}
+
 /// A file's staged-ness for the outline's status column — a minimal indicator (locked CS3
 /// scope: NOT the prototype's X/Y two-column git-status matrix). Only meaningful for the
 /// uncommitted changeset's files; a committed changeset's files always resolve to `None`
@@ -214,12 +229,8 @@ pub fn build_items(
 /// `file_idx` are computed from the ORIGINAL (base -> head) enumeration before any reversal, so
 /// they stay true indices into `App::changesets` either way.
 fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
-    let mut entries: Vec<(usize, &OutlineChangeset)> = changesets.iter().enumerate().collect();
-    if order == OutlineOrder::HeadFirst {
-        entries.reverse();
-    }
     let mut items = Vec::new();
-    for (cs_idx, cs) in entries {
+    for (cs_idx, cs) in scan_order(changesets, order) {
         items.push(OutlineItem::Header {
             cs_idx,
             label: cs.label.clone(),
@@ -252,13 +263,9 @@ fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outl
 /// (possibly reversed) `order` scan used for display order.
 fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
     let latest = latest_by_path(changesets);
-    let mut entries: Vec<(usize, &OutlineChangeset)> = changesets.iter().enumerate().collect();
-    if order == OutlineOrder::HeadFirst {
-        entries.reverse();
-    }
     let mut order_list: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    for (_, cs) in entries {
+    for (_, cs) in scan_order(changesets, order) {
         for file in &cs.files {
             if seen.insert(file.path.as_str()) {
                 order_list.push(file.path.clone());
@@ -396,12 +403,8 @@ fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
 /// changeset's own copy gets its own row" rule). `order` picks which end of the stack paints
 /// first, same as [`build_stack`]; `cs_idx`/`file_idx` stay true indices regardless.
 fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
-    let mut entries: Vec<(usize, &OutlineChangeset)> = changesets.iter().enumerate().collect();
-    if order == OutlineOrder::HeadFirst {
-        entries.reverse();
-    }
     let mut items = Vec::new();
-    for (cs_idx, cs) in entries {
+    for (cs_idx, cs) in scan_order(changesets, order) {
         items.push(OutlineItem::Header {
             cs_idx,
             label: cs.label.clone(),
