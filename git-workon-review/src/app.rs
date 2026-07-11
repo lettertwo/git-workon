@@ -625,6 +625,51 @@ pub enum Summary {
     Dir(summary::DirSummary),
 }
 
+/// CS7: a stable identity for an outline File/Dir row, captured BEFORE a staging/discard op's
+/// `coordinated_refresh` rebuilds [`App::outline_items`]'s row list, so the row can be re-found
+/// (or gracefully lost, e.g. a fully-discarded file) afterward — see
+/// [`App::restore_outline_position`]. `cs_idx`/`path` mirror the row's own fields, EXCEPT a
+/// [`OutlineItem::File`]'s `path` here is always the FULL path (from the underlying
+/// [`FileChange`]), never the Tree/StackTree leaf-only segment the row itself may display — two
+/// rows in different directories can share a leaf name, so the leaf alone isn't a stable key.
+/// [`OutlineItem::Dir`]'s own `path` field is already full regardless of mode, so it's reused
+/// as-is. No [`OutlineItem::Header`] variant: a header row is never a staging/discard target (see
+/// [`App::outline_row_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutlineRowIdentity {
+    File { cs_idx: usize, path: String },
+    Dir { cs_idx: Option<usize>, path: String },
+}
+
+impl OutlineRowIdentity {
+    /// Whether outline row `item` is the same row this identity was captured from. A
+    /// [`OutlineItem::File`]'s displayed `path` may be leaf-only (Tree/StackTree) — that's
+    /// resolved through [`App::outline_row_targets`]'s `(cs_idx, file_idx)` lookup instead of
+    /// comparing against the row's own `path` field.
+    fn matches_file(&self, item_cs_idx: usize, full_path: &str) -> bool {
+        matches!(
+            self,
+            OutlineRowIdentity::File { cs_idx, path }
+                if *cs_idx == item_cs_idx && path == full_path
+        )
+    }
+
+    /// Whether outline row `item` is the same row this identity was captured from.
+    fn matches_dir(&self, item: &OutlineItem) -> bool {
+        match (self, item) {
+            (
+                OutlineRowIdentity::Dir { cs_idx, path },
+                OutlineItem::Dir {
+                    cs_idx: item_cs_idx,
+                    path: item_path,
+                    ..
+                },
+            ) => cs_idx == item_cs_idx && path == item_path,
+            _ => false,
+        }
+    }
+}
+
 /// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
 /// than the diff) currently has keyboard focus, its own cursor (an index into
 /// [`App::outline_items`]'s row list — a wholly separate coordinate space from [`App::cursor`]),
@@ -1066,6 +1111,18 @@ pub enum PendingOp {
     DiscardLines {
         file_idx: usize,
         selections: Vec<(usize, LineSelection)>,
+    },
+    /// CS7: discard every `(cs_idx, file_idx)` in `targets` from the worktree — an outline File
+    /// row's single target, or a Dir row's every file under its path. `identity` is the acted-on
+    /// outline row's [`OutlineRowIdentity`], captured at request-time (before the confirm modal),
+    /// so [`App::resolve_confirm`] can hand it to [`App::outline_run_ops`] for the post-op outline
+    /// cursor restore — by the time `y`/`n` answers the modal, the outline cursor may not still be
+    /// resting on the row that requested the discard (nothing else moves it in between today, but
+    /// baking the identity in here rather than re-reading `self.outline.cursor` avoids relying on
+    /// that).
+    DiscardOutlineFiles {
+        targets: Vec<(usize, usize)>,
+        identity: OutlineRowIdentity,
     },
 }
 
@@ -2556,6 +2613,224 @@ impl App {
         self.outline.focused = false;
     }
 
+    // ── Outline staging (CS7) ───────────────────────────────────────────────────
+
+    /// Whether the changeset at `cs_idx` is a committed range rather than the uncommitted
+    /// worktree layer — the per-index counterpart to [`Self::is_committed`] (which only reads the
+    /// ACTIVE changeset). CS7's outline verbs need this because the acted-on row's changeset is
+    /// whichever one the outline cursor rests on, not necessarily the diff's current changeset.
+    fn is_committed_at(&self, cs_idx: usize) -> bool {
+        self.changesets.get(cs_idx).is_some_and(|view| {
+            matches!(
+                view.cs.span,
+                ChangesetSpan::Committed { .. } | ChangesetSpan::CommittedRoot { .. }
+            )
+        })
+    }
+
+    /// Resolve the outline row at `idx` to its [`OutlineRowIdentity`] plus the `(cs_idx,
+    /// file_idx)` pairs an outline stage/discard verb applies to — `None` for a
+    /// [`OutlineItem::Header`] row (never a staging target) or an out-of-range `idx`.
+    ///
+    /// A [`OutlineItem::File`] row resolves to its own single target. A [`OutlineItem::Dir`] row
+    /// resolves to every file under its `path` (segment-boundary match, [`summary::path_is_under`]
+    /// — the same rule the summary panel's [`summary::dir_summary`] uses): scoped to that row's own
+    /// changeset in [`OutlineMode::StackTree`] (`cs_idx: Some`), or to the cross-stack
+    /// last-write-wins de-duped set [`outline::latest_by_path`] returns in [`OutlineMode::Tree`]
+    /// (`cs_idx: None`) — mirrors [`Self::summary_for`]'s own Dir-row branching.
+    fn outline_row_targets(&self, idx: usize) -> Option<(OutlineRowIdentity, Vec<(usize, usize)>)> {
+        let items = self.outline_items();
+        match items.get(idx)? {
+            OutlineItem::Header { .. } => None,
+            OutlineItem::File {
+                cs_idx, file_idx, ..
+            } => {
+                let path = self
+                    .changesets
+                    .get(*cs_idx)?
+                    .files()
+                    .get(*file_idx)?
+                    .path
+                    .clone();
+                Some((
+                    OutlineRowIdentity::File {
+                        cs_idx: *cs_idx,
+                        path,
+                    },
+                    vec![(*cs_idx, *file_idx)],
+                ))
+            }
+            OutlineItem::Dir { path, cs_idx, .. } => {
+                let identity = OutlineRowIdentity::Dir {
+                    cs_idx: *cs_idx,
+                    path: path.clone(),
+                };
+                let targets = match cs_idx {
+                    Some(cs_idx) => self
+                        .changesets
+                        .get(*cs_idx)?
+                        .files()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| summary::path_is_under(&f.path, path))
+                        .map(|(file_idx, _)| (*cs_idx, file_idx))
+                        .collect(),
+                    None => {
+                        let snapshot = self.outline_snapshot();
+                        let latest = outline::latest_by_path(&snapshot);
+                        latest
+                            .iter()
+                            .filter(|(p, _)| summary::path_is_under(p, path))
+                            .map(|(_, &(cs_idx, file_idx, _, _))| (cs_idx, file_idx))
+                            .collect()
+                    }
+                };
+                Some((identity, targets))
+            }
+        }
+    }
+
+    /// Per-file verb selection by [`outline::StagedStatus`] — mirrors [`Self::verb_for_role`]'s
+    /// toggle direction (unstaged stages, staged unstages), but keyed off the FILE's own status
+    /// rather than a pane role, since a Dir row's files can each carry a different status.
+    /// [`outline::StagedStatus::None`] shouldn't normally occur on the uncommitted changeset's own
+    /// file (a changed file always has SOME status) — treated as a Stage attempt so the op surfaces
+    /// whatever git reports rather than silently refusing.
+    fn outline_target_verb(&self, cs_idx: usize, file_idx: usize) -> StageVerb {
+        match self.changesets[cs_idx].staged_status(file_idx) {
+            outline::StagedStatus::Staged => StageVerb::Unstage,
+            outline::StagedStatus::Unstaged
+            | outline::StagedStatus::Partial
+            | outline::StagedStatus::None => StageVerb::Stage,
+        }
+    }
+
+    /// Footer refusal for an outline stage/discard verb — parallels [`Self::notify_combined_refusal`]
+    /// but for the two CS7-specific refusal reasons: `committed` (the row's changeset — or, for a
+    /// Dir row, at least one file under it — is a committed range, not the uncommitted worktree
+    /// layer) or not (the cursor sits on a [`OutlineItem::Header`] row, which is never a target).
+    fn notify_outline_refusal(&mut self, verb: &str, committed: bool) {
+        if committed {
+            self.notify(
+                format!("changeset is already committed — nothing to {verb}"),
+                Severity::Error,
+            );
+        } else {
+            self.notify(
+                format!("select a file or directory to {verb}"),
+                Severity::Error,
+            );
+        }
+    }
+
+    /// `s` while the outline has focus: stage or unstage the file/directory under the cursor. A
+    /// [`OutlineItem::File`] row stages or unstages per its own [`Self::outline_target_verb`]; a
+    /// [`OutlineItem::Dir`] row applies the same per-file verb selection to every file under it
+    /// (each file stages or unstages independently — a mixed-status directory is not an all-stage
+    /// or all-unstage op). Refuses on a [`OutlineItem::Header`] row or when any target belongs to
+    /// a committed changeset (see [`Self::notify_outline_refusal`]).
+    pub fn outline_stage(&mut self) {
+        let idx = self.outline.cursor;
+        let Some((identity, targets)) = self.outline_row_targets(idx) else {
+            self.notify_outline_refusal("stage", false);
+            return;
+        };
+        if targets
+            .iter()
+            .any(|&(cs_idx, _)| self.is_committed_at(cs_idx))
+        {
+            self.notify_outline_refusal("stage", true);
+            return;
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let ops: Vec<Box<dyn StagingOp>> = targets
+            .iter()
+            .filter_map(|&(cs_idx, file_idx)| {
+                let file = self.changesets.get(cs_idx)?.files().get(file_idx)?.clone();
+                let verb = self.outline_target_verb(cs_idx, file_idx);
+                Some(Box::new(FileStagingOp::file(file, verb)) as Box<dyn StagingOp>)
+            })
+            .collect();
+        self.outline_run_ops(ops, identity);
+    }
+
+    /// `d` while the outline has focus: request confirmation to discard the file/directory under
+    /// the cursor from the worktree — a [`OutlineItem::File`] row discards just that file; a
+    /// [`OutlineItem::Dir`] row discards every file under it, and the confirm prompt names the
+    /// scope. Same refusal gates as [`Self::outline_stage`]. The discard itself runs when the user
+    /// answers `y` (see [`Self::resolve_confirm`]'s [`PendingOp::DiscardOutlineFiles`] arm).
+    pub fn outline_discard(&mut self) {
+        let idx = self.outline.cursor;
+        let Some((identity, targets)) = self.outline_row_targets(idx) else {
+            self.notify_outline_refusal("discard", false);
+            return;
+        };
+        if targets
+            .iter()
+            .any(|&(cs_idx, _)| self.is_committed_at(cs_idx))
+        {
+            self.notify_outline_refusal("discard", true);
+            return;
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let prompt = match &identity {
+            OutlineRowIdentity::File { path, .. } => {
+                format!("Discard all changes to `{path}`? (y/n)")
+            }
+            OutlineRowIdentity::Dir { path, .. } => format!(
+                "Discard changes to {} files under {path}/? (y/n)",
+                targets.len()
+            ),
+        };
+        self.request_confirm(prompt, PendingOp::DiscardOutlineFiles { targets, identity });
+    }
+
+    /// The outline-facing counterpart to [`Self::run_op`]: drain `ops` through [`Self::run_ops`],
+    /// then — on success — restore the OUTLINE cursor to (or nearest to) `identity`'s row rather
+    /// than a diff-pane position (CS6's [`PositionMemento`]/[`Self::restore_position`] only make
+    /// sense when the diff pane, not the outline, was the focused surface the op started from).
+    /// [`Self::coordinated_refresh`] (inside `run_ops`) itself calls `sync_outline_to_current`,
+    /// which can leave the outline cursor on a wholly unrelated row (wherever the DIFF's current
+    /// file happens to be) — this runs after that and overwrites it with the acted-on row's own
+    /// position, or the nearest surviving row if it's gone (e.g. a fully-discarded file).
+    fn outline_run_ops(&mut self, ops: Vec<Box<dyn StagingOp>>, identity: OutlineRowIdentity) {
+        if self.run_ops(ops).is_ok() {
+            self.restore_outline_position(&identity);
+        }
+    }
+
+    /// Re-find `identity`'s row in the freshly rebuilt [`Self::outline_items`] and reseat
+    /// [`OutlineState::cursor`] there; clamps into bounds instead when the row is gone (a fully
+    /// discarded file drops out of the combined diff — and with it its row — entirely). Does not
+    /// touch [`OutlineState::focused`] — an outline-initiated op
+    /// only ever runs while the outline already has focus, and nothing here changes that.
+    fn restore_outline_position(&mut self, identity: &OutlineRowIdentity) {
+        let items = self.outline_items();
+        let found = items.iter().position(|item| match item {
+            OutlineItem::File {
+                cs_idx, file_idx, ..
+            } => {
+                let full_path = self
+                    .changesets
+                    .get(*cs_idx)
+                    .and_then(|v| v.files().get(*file_idx))
+                    .map(|f| f.path.as_str());
+                full_path.is_some_and(|p| identity.matches_file(*cs_idx, p))
+            }
+            OutlineItem::Dir { .. } => identity.matches_dir(item),
+            OutlineItem::Header { .. } => false,
+        });
+        match found {
+            Some(idx) => self.outline.cursor = idx,
+            None => self.outline.cursor = self.outline.cursor.min(items.len().saturating_sub(1)),
+        }
+        self.derive_outline_scroll();
+    }
+
     /// Reposition (never rebuild/refocus) the outline cursor onto the row matching the CURRENT
     /// diff changeset+file, or clamp it into bounds if no such row exists (e.g. Flat mode
     /// deduped the current file's changeset out of the list). The sync-follow discipline's echo
@@ -3104,6 +3379,17 @@ impl App {
                 };
                 self.run_op(LineSelectionOp::new(file, selections, StageVerb::Discard));
             }
+            PendingOp::DiscardOutlineFiles { targets, identity } => {
+                let ops: Vec<Box<dyn StagingOp>> = targets
+                    .iter()
+                    .filter_map(|&(cs_idx, file_idx)| {
+                        let file = self.changesets.get(cs_idx)?.files().get(file_idx)?.clone();
+                        Some(Box::new(FileStagingOp::file(file, StageVerb::Discard))
+                            as Box<dyn StagingOp>)
+                    })
+                    .collect();
+                self.outline_run_ops(ops, identity);
+            }
         }
     }
 
@@ -3111,17 +3397,39 @@ impl App {
     /// surfaces on the footer and skips the refresh (the index is now in whatever partial state
     /// the failed op left it in — the user resolves with `r`); a `Completed` drain refreshes,
     /// rebuilding the views + attribution from the new index (locked decision #5), then restores
-    /// the reviewer's pre-op position (CS6) — a staging op is the ONE nav path that does not reset
-    /// to the role's first hunk; every manual nav still does, via `reset_panes` unchanged.
+    /// the reviewer's pre-op DIFF position (CS6) — a staging op is the ONE nav path that does not
+    /// reset to the role's first hunk; every manual nav still does, via `reset_panes` unchanged.
     ///
-    /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]) or a (possibly
-    /// multi-hunk) line selection ([`LineSelectionOp`], which applies as ONE merged patch rather
-    /// than enqueueing one op per hunk — see that type's docs for why splitting is wrong). Either
-    /// way exactly one op is ever in flight, so the queue's trap-4 live-index staleness doesn't
-    /// apply — the queue is here for its lock-retry and panic isolation.
+    /// A thin diff-facing wrapper over [`Self::run_ops`] (one op, one memento) — the diff pane's
+    /// staging verbs (`s`/`S`/`d`/`D`) are the only callers, so the shared drain/refresh core
+    /// lives on `run_ops` and this just supplies the diff-position memento CS7's outline verbs
+    /// don't want (see [`Self::outline_run_ops`], which restores the OUTLINE cursor instead).
     fn run_op(&mut self, op: impl StagingOp + 'static) {
         let memento = self.capture_position();
-        self.queue.enqueue(op);
+        if self.run_ops(vec![Box::new(op)]).is_ok() {
+            if let Some(memento) = memento {
+                self.restore_position(memento);
+            }
+        }
+    }
+
+    /// Enqueue every op in `ops`, drain the queue on the same beat, and — on success — run a
+    /// [`Self::coordinated_refresh`]. Returns `Err` with a footer-ready message on the first
+    /// failure/panic in the drain (matching [`Self::run_op`]'s single-op failure contract: notice
+    /// text, no refresh, the index left in whatever partial state the failed op produced) and
+    /// `Ok(())` after a successful refresh. Callers own what happens next (a diff-position or
+    /// outline-cursor restore, or nothing) — this only owns the queue mechanics.
+    ///
+    /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]), a (possibly
+    /// multi-hunk) line selection ([`LineSelectionOp`], which applies as ONE merged patch rather
+    /// than enqueueing one op per hunk — see that type's docs for why splitting is wrong), or
+    /// (CS7) several independent whole-file ops from an outline Dir row. The queue's trap-4
+    /// live-index staleness doesn't apply here: every op resolves its own direction from the live
+    /// index inside `run` (see `queue.rs`'s module doc), so draining several back-to-back is safe.
+    fn run_ops(&mut self, ops: Vec<Box<dyn StagingOp>>) -> Result<(), ()> {
+        for op in ops {
+            self.queue.enqueue(op);
+        }
         // Distinct fields (`queue` mutable, `repo`/`applier` shared) — the borrow checker permits
         // the disjoint borrows in one call, so the queue needn't be taken out and put back.
         let outcomes = self.queue.drain(&self.repo, &self.applier);
@@ -3131,12 +3439,13 @@ impl App {
             OpOutcome::Completed(_) => None,
         });
         match failure {
-            Some(message) => self.notify(message, Severity::Error),
+            Some(message) => {
+                self.notify(message, Severity::Error);
+                Err(())
+            }
             None => {
                 self.coordinated_refresh();
-                if let Some(memento) = memento {
-                    self.restore_position(memento);
-                }
+                Ok(())
             }
         }
     }
@@ -8774,5 +9083,320 @@ mod tests {
         assert_eq!(summary.path, "src");
         let paths: Vec<&str> = summary.files.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(paths, vec!["src/a.txt", "src/b.txt"]);
+    }
+
+    // ── CS7: stage/unstage/discard from outline rows ─────────────────────────────
+
+    /// Find the [`OutlineItem::File`] row index whose full path is `path` (in the CURRENT outline
+    /// mode/order) — the CS7 tests' stand-in for "click the row named X", since a row's raw index
+    /// shifts with mode/order and none of these tests want to hardcode it.
+    fn outline_file_row(app: &App, path: &str) -> usize {
+        app.outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path: p, .. } if p == path))
+            .unwrap_or_else(|| panic!("no outline File row for {path:?}"))
+    }
+
+    #[test]
+    fn outline_stage_on_an_unstaged_file_row_stages_it_and_keeps_the_cursor_there() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "a.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_stage();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_staged_file("a.txt"));
+        assert!(
+            app.outline_focused(),
+            "outline must keep focus across the op"
+        );
+        match &app.outline_items()[app.outline_cursor()] {
+            OutlineItem::File { path, status, .. } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(
+                    *status,
+                    StagedStatus::Staged,
+                    "row now shows the staged glyph"
+                );
+            }
+            other => panic!("expected the cursor to stay on a.txt's File row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outline_stage_on_a_staged_file_row_unstages_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("new.txt", "hello\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "new.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_stage();
+
+        assert!(
+            app.notice.is_none(),
+            "unstage must succeed: {:?}",
+            app.notice
+        );
+        let repo = fixture.repo().unwrap();
+        // An Added file has no HEAD entry, so unstaging it lands as untracked — same outcome
+        // `stage_file_in_staged_pane_unstages_whole_file` pins for the diff-pane path.
+        repo.assert(predicate::repo::has_untracked_file("new.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_a_dir_row_stages_every_unstaged_file_under_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("src/a.txt", "a\n", "a\nCHANGED\n")
+            .unstaged_file("src/b.txt", "b\n", "b\nCHANGED\n")
+            .unstaged_file("top.txt", "t\n", "t\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.mode = OutlineMode::StackTree;
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { path, .. } if path == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+
+        app.outline_stage();
+
+        assert!(
+            app.notice.is_none(),
+            "dir stage must succeed: {:?}",
+            app.notice
+        );
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_staged_file("src/a.txt"));
+        repo.assert(predicate::repo::has_staged_file("src/b.txt"));
+        // The file outside `src/` must be left alone.
+        repo.assert(predicate::repo::has_unstaged_file("top.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_a_dir_row_applies_each_files_own_verb_under_mixed_status() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("src/a.txt", "a\n", "a\nCHANGED\n")
+            .staged_file("src/b.txt", "b\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.mode = OutlineMode::StackTree;
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { path, .. } if path == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+
+        app.outline_stage();
+
+        assert!(
+            app.notice.is_none(),
+            "mixed-status dir stage must succeed: {:?}",
+            app.notice
+        );
+        let repo = fixture.repo().unwrap();
+        // The unstaged file stages...
+        repo.assert(predicate::repo::has_staged_file("src/a.txt"));
+        // ...and the already-staged (Added, no HEAD entry) file unstages to untracked — each
+        // file's own verb, not a single direction applied to the whole directory.
+        repo.assert(predicate::repo::has_untracked_file("src/b.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_the_header_row_refuses_without_touching_the_index() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        // Index 0 in Stack mode is always the changeset Header row.
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        assert!(matches!(app.outline_items()[0], OutlineItem::Header { .. }));
+
+        app.outline_stage();
+
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("staging a Header row must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_unstaged_file("a.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_a_committed_changesets_file_row_refuses_with_committed_wording() {
+        let mut app = committed_and_uncommitted_stack();
+        // `BaseFirst` order + Stack mode: Header(committed) 0, File(committed/c1.txt) 1,
+        // Header(uncommitted) 2, File(uncommitted/u1.txt) 3.
+        open_focused_outline(&mut app, OutlineMode::Stack, 1);
+        assert!(matches!(
+            &app.outline_items()[1],
+            OutlineItem::File { cs_idx, path, .. } if *cs_idx == 0 && path == "c1.txt"
+        ));
+
+        app.outline_stage();
+
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("staging a committed changeset's row must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("already committed"),
+            "got: {:?}",
+            notice.text
+        );
+    }
+
+    #[test]
+    fn outline_discard_on_a_file_row_requests_confirm_then_y_reverts_the_worktree() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "ONE\ntwo\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "a.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_discard();
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("discard must request a confirm");
+        assert!(
+            confirm.prompt.contains("a.txt"),
+            "got: {:?}",
+            confirm.prompt
+        );
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "ONE\ntwo\n"));
+
+        app.resolve_confirm(true);
+
+        assert!(app.pending_confirm.is_none(), "y must clear the confirm");
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
+    }
+
+    #[test]
+    fn outline_discard_confirm_n_cancels_and_leaves_the_worktree_unchanged() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "ONE\ntwo\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "a.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_discard();
+        app.resolve_confirm(false);
+
+        assert!(app.pending_confirm.is_none(), "n must clear the confirm");
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "ONE\ntwo\n"));
+    }
+
+    #[test]
+    fn outline_discard_on_a_dir_row_names_the_scope_then_y_discards_every_file_under_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("src/a.txt", "a\n", "A\n")
+            .unstaged_file("src/b.txt", "b\n", "B\n")
+            .unstaged_file("top.txt", "t\n", "T\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.mode = OutlineMode::StackTree;
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { path, .. } if path == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+
+        app.outline_discard();
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("dir discard must request a confirm");
+        assert!(
+            confirm.prompt.contains('2') && confirm.prompt.contains("src"),
+            "prompt must name the file count and the scoped path, got: {:?}",
+            confirm.prompt
+        );
+
+        app.resolve_confirm(true);
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("src/a.txt", "a\n"));
+        repo.assert(predicate::repo::workdir_file_equals("src/b.txt", "b\n"));
+        // The file outside `src/` must be left untouched.
+        repo.assert(predicate::repo::workdir_file_equals("top.txt", "T\n"));
+    }
+
+    #[test]
+    fn outline_stage_in_a_multi_file_outline_keeps_the_cursor_on_the_acted_on_row_not_the_diffs_current_file(
+    ) {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "a\n", "a\nCHANGED\n")
+            .unstaged_file("b.txt", "b\n", "b\nCHANGED\n")
+            .unstaged_file("c.txt", "c\n", "c\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.files()[app.current].path,
+            "a.txt",
+            "the diff opens on the first file, a.txt — never touched by this test"
+        );
+        let idx = outline_file_row(&app, "b.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_stage();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        match &app.outline_items()[app.outline_cursor()] {
+            OutlineItem::File { path, status, .. } => {
+                assert_eq!(
+                    path, "b.txt",
+                    "the cursor must stay on the acted-on row, not drift to the diff's own \
+                     current file (a.txt, via sync_outline_to_current inside coordinated_refresh)"
+                );
+                assert_eq!(*status, StagedStatus::Staged);
+            }
+            other => panic!("expected the cursor on b.txt's File row, got {other:?}"),
+        }
     }
 }

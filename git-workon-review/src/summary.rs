@@ -123,7 +123,11 @@ pub struct DirSummary {
 /// Segment-boundary match: `file_path` is "under" `dir_path` only when `dir_path` is a full path
 /// SEGMENT prefix of `file_path` — `"src"` matches `"src/a.rs"` but must NOT match `"src2/b.rs"`
 /// (a raw [`str::starts_with`] would wrongly match the latter).
-fn path_is_under(file_path: &str, dir_path: &str) -> bool {
+///
+/// `pub(crate)`: CS7's `App::outline_row_targets` reuses this to resolve a Dir row's files
+/// (`s`/`d` in the outline), the same segment-boundary rule [`dir_summary`] already relies on —
+/// rather than re-deriving it in `app.rs`.
+pub(crate) fn path_is_under(file_path: &str, dir_path: &str) -> bool {
     file_path
         .strip_prefix(dir_path)
         .and_then(|rest| rest.strip_prefix('/'))

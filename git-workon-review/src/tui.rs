@@ -421,6 +421,8 @@ enum Action {
     FocusDiff,
     OutlineTop,
     OutlineBottom,
+    OutlineStage,
+    OutlineDiscard,
     None,
 }
 
@@ -463,6 +465,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::FocusDiff => Action::FocusDiff,
         Command::OutlineTop => Action::OutlineTop,
         Command::OutlineBottom => Action::OutlineBottom,
+        Command::OutlineStage => Action::OutlineStage,
+        Command::OutlineDiscard => Action::OutlineDiscard,
     }
 }
 
@@ -578,6 +582,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::FocusDiff => app.focus_diff(),
         Action::OutlineTop => app.outline_top(),
         Action::OutlineBottom => app.outline_bottom(),
+        Action::OutlineStage => app.outline_stage(),
+        Action::OutlineDiscard => app.outline_discard(),
         Action::None => {}
     }
     false

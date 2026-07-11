@@ -72,6 +72,8 @@ pub enum Command {
     FocusDiff,
     OutlineTop,
     OutlineBottom,
+    OutlineStage,
+    OutlineDiscard,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -320,6 +322,20 @@ pub static REGISTRY: &[Registered] = &[
         name: "scroll-bottom",
         default_keys: "G",
         description: "Jump to the bottom of the outline",
+    },
+    Registered {
+        command: Command::OutlineStage,
+        view: View::Outline,
+        name: "stage",
+        default_keys: "s",
+        description: "Stage or unstage the file/directory under the cursor",
+    },
+    Registered {
+        command: Command::OutlineDiscard,
+        view: View::Outline,
+        name: "discard",
+        default_keys: "d",
+        description: "Discard the file/directory under the cursor",
     },
 ];
 
