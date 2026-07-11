@@ -587,11 +587,11 @@ enum KeyOutcome {
 }
 
 /// Resolve one `Key` event to a [`KeyOutcome`], given the caller has already ruled out the two
-/// modal cases (a pending discard confirm, the help overlay) — this is cases 3-5 of `update`'s
+/// modal cases (a pending discard confirm, the help overlay) — this is cases 3-6 of `update`'s
 /// documented Esc-precedence cascade, extracted so [`update`] and [`update_batch`] share the exact
 /// same resolution instead of duplicating it.
 ///
-/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 3-5 do (the
+/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 3-6 do (the
 /// confirm/help modals deliberately do not — that stays in their own arms, not here).
 fn resolve_key(
     app: &mut App,
