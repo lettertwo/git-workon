@@ -62,6 +62,8 @@ pub enum Command {
     PrevHunk,
     NextChangeset,
     PrevChangeset,
+    ExpandGap,
+    ExpandGapAll,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -272,6 +274,20 @@ pub static REGISTRY: &[Registered] = &[
         name: "focus-outline",
         default_keys: "h left",
         description: "Focus the outline",
+    },
+    Registered {
+        command: Command::ExpandGap,
+        view: View::Diff,
+        name: "expand-gap",
+        default_keys: "enter",
+        description: "Reveal more of the collapsed gap under the cursor",
+    },
+    Registered {
+        command: Command::ExpandGapAll,
+        view: View::Diff,
+        name: "expand-gap-all",
+        default_keys: "E",
+        description: "Reveal the whole collapsed gap under the cursor",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {

@@ -16,7 +16,10 @@ use git2::Repository;
 use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
-use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
+use crate::align::{
+    align_file, collapse_gaps_with_expansions, inline_rows, AlignedRow, CellKind, DisplayRow,
+    GapExpansion, InlineRow, Row,
+};
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
 use crate::highlight::{FgSpan, TsHighlighter};
@@ -52,6 +55,20 @@ const SCROLLOFF: usize = 2;
 /// staged/unstaged split zoom).
 #[derive(Debug)]
 pub struct FileView {
+    /// The pre-collapse row list [`Self::display`]/[`Self::inline`] derive from — retained (CS8)
+    /// so a gap can be re-collapsed with a wider [`GapExpansion`] window without re-diffing the
+    /// file. `AlignedRow` is small/`Copy`, so cloning the whole vector per expansion is cheap
+    /// relative to re-running `align_file`.
+    aligned: Vec<AlignedRow>,
+    /// Per-gap expansion requests, keyed by the hidden run's start index in [`Self::aligned`]
+    /// (the same key [`DisplayRow::Gap`]/[`InlineRow::Gap`] carry). Reset to empty on every
+    /// [`Self::load`] — expansions are NOT preserved across a refresh; the view rebuilds from
+    /// scratch and every gap re-collapses to its base window. See [`Self::expand_gap`].
+    expansions: HashMap<usize, GapExpansion>,
+    /// The file's hunks, retained (CS8) alongside [`Self::aligned`] so [`Self::rebuild_rows`] can
+    /// recompute [`Self::display_hunk`]/[`Self::inline_hunk`] after an expansion without needing
+    /// the original [`FileChange`] back.
+    hunks: Vec<Hunk>,
     old_text: String,
     new_text: String,
     old_lines: Vec<String>,
@@ -136,9 +153,45 @@ impl FileView {
         let old_lines: Vec<String> = old_text.lines().map(str::to_string).collect();
         let new_lines: Vec<String> = new_text.lines().map(str::to_string).collect();
 
-        let aligned = align_file(&file.hunks, old_lines.len(), new_lines.len());
-        let display = collapse_gaps(&aligned.rows);
-        let first_hunk_row = display
+        let aligned = align_file(&file.hunks, old_lines.len(), new_lines.len()).rows;
+        let old_hl = ts.highlight_file(old_source_path, &old_text);
+        let new_hl = ts.highlight_file(&file.path, &new_text);
+
+        let mut view = Self {
+            aligned,
+            expansions: HashMap::new(),
+            hunks: file.hunks.clone(),
+            old_text,
+            new_text,
+            old_lines,
+            new_lines,
+            display: Vec::new(),
+            first_hunk_row: 0,
+            first_inline_hunk_row: 0,
+            old_hl,
+            new_hl,
+            word_spans: HashMap::new(),
+            inline: Vec::new(),
+            inline_word_spans: HashMap::new(),
+            display_hunk: Vec::new(),
+            inline_hunk: Vec::new(),
+        };
+        view.rebuild_rows();
+        view
+    }
+
+    /// Recompute [`Self::display`]/[`Self::inline`] (and everything derived from them) from
+    /// [`Self::aligned`] + [`Self::expansions`] — called once at [`Self::load`] and again after
+    /// every [`Self::expand_gap`]. Row-keyed word-span caches are cleared: an expansion changes
+    /// which display/inline index a given content row lands at, so a cached span keyed by the OLD
+    /// index would silently mismatch the row it renders under. The highlight caches
+    /// ([`Self::old_hl`]/[`Self::new_hl`]) are source-line-indexed (one entry per line of the full
+    /// old/new text), not row-indexed, so an expansion — which only changes how many already-hl'd
+    /// lines are VISIBLE — never invalidates them.
+    fn rebuild_rows(&mut self) {
+        self.display = collapse_gaps_with_expansions(&self.aligned, &self.expansions);
+        self.first_hunk_row = self
+            .display
             .iter()
             .position(|row| {
                 matches!(
@@ -148,45 +201,47 @@ impl FileView {
             })
             .unwrap_or(0);
 
-        let old_hl = ts.highlight_file(old_source_path, &old_text);
-        let new_hl = ts.highlight_file(&file.path, &new_text);
-        let inline = inline_rows(&display);
-        let first_inline_hunk_row = inline
+        self.inline = inline_rows(&self.display);
+        self.first_inline_hunk_row = self
+            .inline
             .iter()
             .position(is_inline_hunk_content_row)
             .unwrap_or(0);
 
-        let display_hunk = display
+        self.display_hunk = self
+            .display
             .iter()
             .map(|row| {
                 let (old, new) = display_row_linenos(row);
-                hunk_for_linenos(&file.hunks, old, new)
+                hunk_for_linenos(&self.hunks, old, new)
             })
             .collect();
-        let inline_hunk = inline
+        self.inline_hunk = self
+            .inline
             .iter()
             .map(|row| {
                 let (old, new) = inline_row_linenos(row);
-                hunk_for_linenos(&file.hunks, old, new)
+                hunk_for_linenos(&self.hunks, old, new)
             })
             .collect();
 
-        Self {
-            old_text,
-            new_text,
-            old_lines,
-            new_lines,
-            display,
-            first_hunk_row,
-            first_inline_hunk_row,
-            old_hl,
-            new_hl,
-            word_spans: HashMap::new(),
-            inline,
-            inline_word_spans: HashMap::new(),
-            display_hunk,
-            inline_hunk,
-        }
+        self.word_spans.clear();
+        self.inline_word_spans.clear();
+    }
+
+    /// Accumulate an expansion request for the gap keyed `key` (CS8's progressive reveal) and
+    /// rebuild the derived rows. `more_before`/`more_after` ADD to whatever was already revealed
+    /// at that edge (repeated `Enter` presses widen further); `full` is sticky — once set for this
+    /// gap it stays set. A `key` with no matching gap in the current `display` is harmless: the
+    /// entry simply sits unused in the map until a gap with that key exists again (it never will,
+    /// since keys are stable pre-collapse indices — this is just defensive, not reachable from
+    /// [`App::expand_gap_at_cursor`], which validates the cursor row first).
+    pub fn expand_gap(&mut self, key: usize, more_before: usize, more_after: usize, full: bool) {
+        let entry = self.expansions.entry(key).or_default();
+        entry.before += more_before;
+        entry.after += more_after;
+        entry.full |= full;
+        self.rebuild_rows();
     }
 
     /// The hunk (index into the file's `hunks`) whose span covers display row `row`, or `None`
@@ -3037,6 +3092,39 @@ impl App {
         }
     }
 
+    /// Reveal more of the collapsed gap under the cursor (`Enter`), or the WHOLE gap (`E`, when
+    /// `full`) — CS8's progressive unfold. A silent no-op when the cursor isn't on a `Gap` row (or
+    /// there's no loaded view): unlike a staging refusal this isn't a mode error worth
+    /// interrupting the user over, same precedent as [`Self::next_hunk_row`] finding no later
+    /// hunk. Each edge widens by 10 rows per press; repeated presses on the same gap accumulate
+    /// (see [`FileView::expand_gap`]).
+    ///
+    /// `self.cursor`'s INDEX is left untouched. Rows revealed at the gap's leading edge insert
+    /// immediately before the gap's own row (shifting the gap marker — and everything after it —
+    /// down), so after [`FileView::rebuild_rows`] the row now sitting at the old index is the
+    /// first newly revealed line rather than the gap marker itself: the cursor visually lands on
+    /// the start of the revealed region without this method needing to compute a new index.
+    pub fn expand_gap_at_cursor(&mut self, full: bool) {
+        let cursor = self.cursor;
+        let layout = self.layout;
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        let key = match layout {
+            Layout::Sbs => match view.display.get(cursor) {
+                Some(DisplayRow::Gap { key, .. }) => *key,
+                _ => return,
+            },
+            Layout::Inline => match view.inline.get(cursor) {
+                Some(InlineRow::Gap { key, .. }) => *key,
+                _ => return,
+            },
+        };
+        view.expand_gap(key, 10, 10, full);
+        self.derive_scroll();
+        self.clamp_cursor();
+    }
+
     /// Toggle between side-by-side and inline layouts (`L`). Deliberately does not try to
     /// re-derive an exactly equivalent `cursor` position for the new layout — the two layouts'
     /// row vectors track the same underlying content in a different shape, and translating
@@ -4707,7 +4795,7 @@ mod tests {
     }
 
     fn gap_row(skipped: usize) -> DisplayRow {
-        DisplayRow::Gap { skipped }
+        DisplayRow::Gap { key: 0, skipped }
     }
 
     #[test]
@@ -9467,5 +9555,200 @@ mod tests {
             }
             other => panic!("expected the cursor on b.txt's File row, got {other:?}"),
         }
+    }
+
+    // ── CS8: progressive gap expansion ──────────────────────────────────────
+
+    /// A single-file fixture with two hunks separated by a wide (40-line) unchanged run — wide
+    /// enough that even a full 10/10 [`App::expand_gap_at_cursor`] press still leaves a
+    /// surviving [`DisplayRow::Gap`] (`40 - 2*3 - 2*10 = 14` rows still hidden), unlike
+    /// [`two_hunk_fixture`]'s much narrower gap.
+    fn two_hunks_with_a_wide_gap_fixture() -> Fixture {
+        let mut committed = String::from("OLD_HUNK_A\n");
+        let mut modified = String::from("NEW_HUNK_A\n");
+        for i in 1..=40 {
+            committed.push_str(&format!("ctx{i}\n"));
+            modified.push_str(&format!("ctx{i}\n"));
+        }
+        committed.push_str("OLD_HUNK_B\n");
+        modified.push_str("NEW_HUNK_B\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    /// The display-row index of the current file's ONLY gap row — the fixture shape every CS8
+    /// expansion test below relies on.
+    fn only_gap_row(app: &App) -> usize {
+        app.current_view_ref()
+            .expect("loaded view")
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Gap { .. }))
+            .expect("expected exactly one gap row")
+    }
+
+    #[test]
+    fn expand_gap_at_cursor_on_a_gap_row_reveals_more_rows() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        let before_len = app.current_view_ref().unwrap().display.len();
+        app.cursor = gap_row;
+
+        app.expand_gap_at_cursor(false);
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            view.display.len() > before_len,
+            "expanding must reveal more rows: {before_len} -> {}",
+            view.display.len()
+        );
+        assert!(
+            app.cursor < view.display.len(),
+            "cursor must stay in bounds"
+        );
+        assert!(
+            matches!(view.display[app.cursor], DisplayRow::Row(_)),
+            "the cursor's old index (the gap's leading edge) must now hold a revealed row, not \
+             the gap marker: {:?}",
+            view.display[app.cursor]
+        );
+        // The gap is wide enough (40 hidden rows) that a single 10/10 press doesn't consume it.
+        assert!(
+            view.display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "a partial expansion of this fixture must still leave a gap row"
+        );
+    }
+
+    #[test]
+    fn expand_gap_at_cursor_on_a_non_gap_row_is_a_no_op() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // cursor lands on hunk A's row, not the gap
+
+        let before_len = app.current_view_ref().unwrap().display.len();
+        let before_cursor = app.cursor;
+        assert!(
+            !matches!(
+                app.current_view_ref().unwrap().display[before_cursor],
+                DisplayRow::Gap { .. }
+            ),
+            "precondition: cursor starts on hunk A, not the gap"
+        );
+
+        app.expand_gap_at_cursor(false);
+
+        assert_eq!(app.cursor, before_cursor, "no-op must not move the cursor");
+        assert_eq!(
+            app.current_view_ref().unwrap().display.len(),
+            before_len,
+            "no-op must not change the row count"
+        );
+        assert!(app.notice.is_none(), "a no-op must not raise a notice");
+    }
+
+    #[test]
+    fn stage_hunk_after_expanding_a_gap_stages_the_intended_hunk() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+
+        // Move to hunk B (the LATER hunk) through the freshly rebuilt `display`/`display_hunk` —
+        // this is the coordinate-space desync CS8 must not introduce: `display_hunk` is
+        // recomputed by `rebuild_rows` from the SAME `aligned`/`hunks` every time, so the row
+        // under the cursor must still resolve to the right hunk index after an expansion.
+        app.next_hunk_row();
+        app.stage_hunk();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        let repo = fixture.repo().unwrap();
+        let mut expected_index = String::from("OLD_HUNK_A\n");
+        let mut expected_workdir = String::from("NEW_HUNK_A\n");
+        for i in 1..=40 {
+            expected_index.push_str(&format!("ctx{i}\n"));
+            expected_workdir.push_str(&format!("ctx{i}\n"));
+        }
+        expected_index.push_str("NEW_HUNK_B\n");
+        expected_workdir.push_str("NEW_HUNK_B\n");
+        // The index picks up ONLY hunk B; hunk A must stay unstaged.
+        repo.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            expected_index.as_str(),
+        ));
+        repo.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            expected_workdir.as_str(),
+        ));
+    }
+
+    #[test]
+    fn expanding_a_gap_clears_the_row_keyed_word_span_cache() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // cursor on hunk A's row — a word-diff pair
+
+        let hunk_a_row = app.cursor;
+        app.current_view().unwrap().word_spans_for_row(hunk_a_row);
+        assert!(
+            !app.current_view_ref().unwrap().word_spans.is_empty(),
+            "precondition: the cache must be populated before expanding"
+        );
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+
+        assert!(
+            app.current_view_ref().unwrap().word_spans.is_empty(),
+            "rebuild_rows must clear the row-keyed word-span cache — a stale entry would \
+             mismatch the row it renders under post-expansion"
+        );
+        // The cache is still USABLE post-clear, not just permanently empty — re-populating it
+        // must not panic and must produce a non-empty span for the still-word-diffable row.
+        let (old_spans, new_spans) = app.current_view().unwrap().word_spans_for_row(hunk_a_row);
+        assert!(
+            !old_spans.is_empty() || !new_spans.is_empty(),
+            "hunk A is still a word-diff pair after the rebuild"
+        );
+    }
+
+    #[test]
+    fn refresh_resets_a_files_gap_expansions() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+        let expanded_len = app.current_view_ref().unwrap().display.len();
+
+        app.refresh(); // ends with its own `open_current`, same as every other refresh path
+
+        let view = app.current_view_ref().expect("view survives refresh");
+        assert!(
+            view.display.len() < expanded_len,
+            "a fresh view must re-collapse to the base gap window, not carry over the prior \
+             expansion: expanded {expanded_len}, post-refresh {}",
+            view.display.len()
+        );
+        assert!(
+            view.display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "the gap must be back in its base (still-collapsed) form"
+        );
     }
 }
