@@ -2129,12 +2129,11 @@ impl App {
     /// `o`: a pure show/hide toggle — closed -> open+focused (+[`Self::sync_outline_to_current`]),
     /// open (regardless of focus) -> closed+diff-focused. Focus itself is now a separate concern
     /// handled by [`Self::focus_outline`]/[`Self::focus_diff`] (`h`/`l`) — `o` only ever changes
-    /// visibility.
+    /// visibility. The opening arm IS `focus_outline`'s closed-case behavior, so it delegates
+    /// there rather than restating it.
     pub fn toggle_outline(&mut self) {
         if !self.outline.open {
-            self.outline.open = true;
-            self.outline.focused = true;
-            self.sync_outline_to_current();
+            self.focus_outline();
         } else {
             self.outline.open = false;
             self.outline.focused = false;
