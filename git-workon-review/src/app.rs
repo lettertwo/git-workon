@@ -1125,8 +1125,8 @@ pub struct App {
     /// [`Self::toggle_split_focus`]). Meaningless outside [`EffectiveZoom::Split`].
     alt: PaneState,
     /// Content height of the unfocused split pane, written by the renderer alongside
-    /// [`Self::pane_height`] — [`Self::derive_alt_scroll`] derives the unfocused pane's scroll
-    /// against THIS, not the focused pane's height.
+    /// [`Self::pane_height`] — the unfocused pane's scroll is clamped/derived against THIS, not
+    /// the focused pane's height (see [`Self::clamp_alt_scroll`]).
     pub(crate) alt_height: usize,
     /// Content height of the outline pane, written by the renderer each frame — same discipline
     /// as [`Self::pane_height`]. Read by [`Self::derive_outline_scroll`].
@@ -2699,10 +2699,10 @@ impl App {
 
     /// Mouse wheel at terminal `(col, row)` with `delta` = ±3 rows (`tui::update` maps
     /// `ScrollDown`/`ScrollUp` to +3/-3). Focuses whichever region the pointer sits over first —
-    /// same rule as [`Self::handle_click`] — then moves that pane's cursor by `delta`
-    /// ([`Self::outline_move_by`] for the outline, [`Self::move_cursor_by`] otherwise); scroll
-    /// simply follows via the normal derive discipline rather than a decoupled scroll state.
-    /// Outside every recorded region: no-op.
+    /// same rule as [`Self::handle_click`] — then scrolls that pane's VIEWPORT by `delta`,
+    /// leaving the cursor exactly where it was (the peek model: a wheel is "look elsewhere",
+    /// never "select elsewhere") — see [`Self::scroll_viewport_by`]. Outside every recorded
+    /// region: no-op.
     pub fn handle_wheel(&mut self, col: u16, row: u16, delta: i64) {
         let Some((pane, _region)) = self.hit_test(col, row) else {
             return;
@@ -2710,17 +2710,46 @@ impl App {
         match pane {
             HitPane::Outline => {
                 self.focus_outline();
-                self.outline_move_by(delta);
+                self.outline_scroll_viewport_by(delta);
             }
             HitPane::Single => {
                 self.focus_diff_pane(None);
-                self.move_cursor_by(delta);
+                self.scroll_viewport_by(delta);
             }
             HitPane::Split(target) => {
                 self.focus_diff_pane(Some(target));
-                self.move_cursor_by(delta);
+                self.scroll_viewport_by(delta);
             }
         }
+    }
+
+    /// Scroll the focused pane's viewport by `delta` rows (mouse wheel), clamped to the row
+    /// list. The cursor is deliberately NOT touched (the peek model: a wheel is "look
+    /// elsewhere", never "select elsewhere"), so it can sit outside the viewport — the next
+    /// cursor-driven op re-derives the scroll and snaps the view back to it, which is the
+    /// peek model's recovery gesture, not a bug. This is the one place `scroll` is written
+    /// directly rather than derived from the cursor; the renderer's bounds-clamp (see
+    /// [`Self::clamp_scroll`]) is what lets the wheeled position survive frames.
+    fn scroll_viewport_by(&mut self, delta: i64) {
+        let rows = self.row_count();
+        if rows == 0 {
+            return;
+        }
+        let max_scroll = rows.saturating_sub(self.pane_height.max(1)) as i64;
+        self.scroll = (self.scroll as i64 + delta).clamp(0, max_scroll.max(0)) as usize;
+    }
+
+    /// The outline counterpart of [`Self::scroll_viewport_by`] — same peek model: the outline
+    /// cursor never moves (so wheeling past File rows can't jump the diff, and the summary
+    /// panel's target stays put); the next outline cursor op snaps the view back to it.
+    fn outline_scroll_viewport_by(&mut self, delta: i64) {
+        let rows = self.outline_items().len();
+        if rows == 0 {
+            return;
+        }
+        let max_scroll = rows.saturating_sub(self.outline_height.max(1)) as i64;
+        self.outline.scroll =
+            (self.outline.scroll as i64 + delta).clamp(0, max_scroll.max(0)) as usize;
     }
 
     /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
@@ -3198,13 +3227,45 @@ impl App {
     }
 
     /// Re-derive the UNFOCUSED split pane's scroll against its own cursor, row count, and
-    /// [`Self::alt_height`] — called by the renderer each split frame, after the pane heights are
-    /// known.
+    /// [`Self::alt_height`]. Test-only since the wheel's peek model (CS10): the renderer now
+    /// bounds-clamps instead of deriving (see [`Self::clamp_alt_scroll`]), and no production
+    /// path derives the unfocused pane's scroll — the pair re-derives naturally once focus
+    /// swaps back onto it and a cursor op runs.
+    #[cfg(test)]
     pub(crate) fn derive_alt_scroll(&mut self) {
         let role = self.unfocused_split_role();
         let rows = self.role_row_count(self.current, role);
         self.alt.scroll =
             derive_scroll_value(self.alt.cursor, self.alt.scroll, rows, self.alt_height);
+    }
+
+    /// Bounds-only clamp of the focused pane's scroll — the renderer's per-frame check under
+    /// the wheel's peek model (CS10). Unlike [`Self::derive_scroll`] it does NOT follow the
+    /// cursor, so a wheel-scrolled viewport (cursor possibly outside it) survives frames; it
+    /// only keeps `scroll` inside the row list when a resize/zoom shrinks it.
+    pub(crate) fn clamp_scroll(&mut self) {
+        let rows = self.row_count();
+        self.scroll = self
+            .scroll
+            .min(rows.saturating_sub(self.pane_height.max(1)));
+    }
+
+    /// [`Self::clamp_scroll`] for the unfocused split pane.
+    pub(crate) fn clamp_alt_scroll(&mut self) {
+        let role = self.unfocused_split_role();
+        let rows = self.role_row_count(self.current, role);
+        self.alt.scroll = self
+            .alt
+            .scroll
+            .min(rows.saturating_sub(self.alt_height.max(1)));
+    }
+
+    /// [`Self::clamp_scroll`] for the outline pane.
+    pub(crate) fn clamp_outline_scroll(&mut self, rows: usize) {
+        self.outline.scroll = self
+            .outline
+            .scroll
+            .min(rows.saturating_sub(self.outline_height.max(1)));
     }
 
     /// Re-derive the outline pane's `scroll` from its `cursor` — the outline's counterpart to
@@ -4535,7 +4596,7 @@ mod tests {
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
         EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity, Summary,
-        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH,
+        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
@@ -10361,9 +10422,9 @@ mod tests {
     }
 
     #[test]
-    fn wheel_over_the_outline_focuses_it_and_moves_the_cursor_by_delta_with_scrolloff() {
+    fn wheel_over_the_outline_scrolls_the_viewport_without_moving_cursor_or_diff() {
         let mut app = four_committed_changesets_three_files_each();
-        app.outline_height = 5; // bottom_margin = 5 - 1 - SCROLLOFF(2) = 2
+        app.outline_height = 5;
         app.outline.cursor = 0;
         app.derive_outline_scroll(app.outline_items().len());
         app.hit_regions.outline = Some(Region {
@@ -10373,20 +10434,40 @@ mod tests {
             h: 5,
         });
         assert!(!app.outline_focused());
+        let (cs_before, file_before) = (app.current_cs(), app.current);
 
         app.handle_wheel(5, 2, 3);
 
         assert!(app.outline_focused(), "a wheel event focuses its pane");
-        assert_eq!(app.outline_cursor(), 3);
-        let scroll = app.outline_scroll();
-        assert!(
-            app.outline_cursor() >= scroll && app.outline_cursor() <= scroll + 2,
-            "the outline scroll must follow the wheel-moved cursor via the normal scrolloff derive"
+        assert_eq!(
+            app.outline_scroll(),
+            3,
+            "the wheel moves the VIEWPORT by delta"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            0,
+            "peek model: the cursor never moves with the wheel, even out of the viewport"
+        );
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (cs_before, file_before),
+            "no cursor move means no diff jump, ever"
+        );
+
+        // The recovery gesture: the next cursor op re-derives the scroll and snaps the view
+        // back to the (wheel-abandoned) cursor.
+        app.outline_move_by(1);
+        assert_eq!(app.outline_cursor(), 1);
+        assert_eq!(
+            app.outline_scroll(),
+            0,
+            "a cursor op after a wheel peek snaps the viewport back to the cursor"
         );
     }
 
     #[test]
-    fn wheel_over_the_focused_diff_pane_moves_the_cursor_by_delta() {
+    fn wheel_over_the_focused_diff_pane_scrolls_the_viewport_and_leaves_the_cursor() {
         // Same 40-line fixture as the click test above — enough rows that a ±3 wheel move never
         // clamps against a tiny real diff.
         let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
@@ -10398,7 +10479,7 @@ mod tests {
         let mut app = app_from_fixture(&fixture);
         app.open_current();
         app.pane_height = 10;
-        app.cursor = 5;
+        app.cursor = 8;
         app.scroll = 0;
         app.hit_regions.single = Some(Region {
             x: 0,
@@ -10406,13 +10487,24 @@ mod tests {
             w: 40,
             h: 10,
         });
-        let cursor_before = app.cursor;
 
         app.handle_wheel(10, 3, 3);
-        assert_eq!(app.cursor, cursor_before + 3);
+        app.handle_wheel(10, 3, 3);
+        app.handle_wheel(10, 3, 3);
+        assert_eq!(app.scroll, 9, "three wheel presses move the viewport 3x3");
+        assert_eq!(
+            app.cursor, 8,
+            "peek model: the cursor stays put even once the viewport has scrolled past it"
+        );
 
-        app.handle_wheel(10, 3, -3);
-        assert_eq!(app.cursor, cursor_before);
+        // The recovery gesture: any cursor op re-derives and snaps the view back.
+        app.move_cursor_by(1);
+        assert_eq!(app.cursor, 9);
+        assert_eq!(
+            app.scroll,
+            9 - SCROLLOFF,
+            "a cursor op after a wheel peek snaps the viewport back to the cursor's window"
+        );
     }
 
     #[test]
