@@ -683,50 +683,46 @@ struct PaneState {
 struct PositionMemento {
     path: String,
     role: Role,
-    old_lineno: Option<u32>,
-    new_lineno: Option<u32>,
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
 }
 
-/// The target role's display row (active layout) whose role-native lineno is the first `>=
-/// target`, skipping [`DisplayRow::Gap`]/[`InlineRow::Gap`] rows (no lineno to compare). A row's
-/// role-native lineno prefers its NEW side, falling back to its OLD side for an unpaired Del (SBS
-/// Filler-new) or Add (SBS Filler-old) row — see [`App::restore_position`]'s doc comment for why
-/// this same new-preferred rule is correct even across a role change.
+/// The target role's display row (active layout) whose lineno IN `new_frame`'s coordinate frame
+/// (`true` = new side, `false` = old side — the frame the memento's target lineno was captured
+/// in) is the first `>= target`. Rows with no lineno on that side — gaps, and the unpaired
+/// Del/Add rows whose only lineno lives on the OTHER side — are skipped rather than compared:
+/// old-side and new-side numbering diverge as soon as a file has any insertion or deletion above
+/// the row, so mixing frames in one monotonic scan would let e.g. a deletion hunk's old-side
+/// numbers (which run ahead of the surrounding new-side numbers) capture the cursor first.
 ///
-/// Falls back to the LAST row carrying any lineno when `target` is past the view's end (staging
-/// the acted-on hunk can shrink the file out from under the old lineno). `None` only when the
-/// view has no rows with a lineno at all (a to-be-added-content-only file collapsed to nothing —
-/// shouldn't happen in practice, but keeps this total).
-fn find_nearest_row(view: &FileView, layout: Layout, target: u32) -> Option<usize> {
-    let linenos: Vec<(usize, u32)> = match layout {
+/// Falls back to the LAST row carrying a lineno in that frame when `target` is past the view's
+/// end (staging the acted-on hunk can shrink the file out from under the old lineno). `None`
+/// only when NO row carries a lineno in that frame (e.g. anchoring old-frame in an added-only
+/// file) — the caller keeps `reset_panes`' first-hunk position then.
+fn find_nearest_row(
+    view: &FileView,
+    layout: Layout,
+    target: usize,
+    new_frame: bool,
+) -> Option<usize> {
+    let in_frame = |old: Option<usize>, new: Option<usize>| if new_frame { new } else { old };
+    let linenos: Vec<(usize, usize)> = match layout {
         Layout::Sbs => view
             .display
             .iter()
             .enumerate()
             .filter_map(|(i, row)| {
-                let DisplayRow::Row(r) = row else {
-                    return None;
-                };
-                let n = match r.new {
-                    Row::Line(n) => Some(n as u32),
-                    Row::Filler => match r.old {
-                        Row::Line(n) => Some(n as u32),
-                        Row::Filler => None,
-                    },
-                };
-                n.map(|n| (i, n))
+                let (old, new) = display_row_linenos(row);
+                in_frame(old, new).map(|n| (i, n))
             })
             .collect(),
         Layout::Inline => view
             .inline
             .iter()
             .enumerate()
-            .filter_map(|(i, row)| match row {
-                InlineRow::Context { new, .. } | InlineRow::Add { new, .. } => {
-                    Some((i, *new as u32))
-                }
-                InlineRow::Del { old, .. } => Some((i, *old as u32)),
-                InlineRow::Gap { .. } => None,
+            .filter_map(|(i, row)| {
+                let (old, new) = inline_row_linenos(row);
+                in_frame(old, new).map(|n| (i, n))
             })
             .collect(),
     };
@@ -3154,26 +3150,19 @@ impl App {
         let path = self.files().get(self.current)?.path.clone();
         let role = self.staging_role()?;
         let view = self.role_view_ref(self.current, role)?;
+        // Reuse the same row -> lineno extraction `FileView::load` builds its hunk maps from
+        // (a Gap row yields (None, None), which restore treats as nothing-to-search-for).
         let (old_lineno, new_lineno) = match self.layout {
-            Layout::Sbs => match view.display.get(self.cursor) {
-                Some(DisplayRow::Row(row)) => (
-                    match row.old {
-                        Row::Line(n) => Some(n as u32),
-                        Row::Filler => None,
-                    },
-                    match row.new {
-                        Row::Line(n) => Some(n as u32),
-                        Row::Filler => None,
-                    },
-                ),
-                _ => (None, None),
-            },
-            Layout::Inline => match view.inline.get(self.cursor) {
-                Some(InlineRow::Context { old, new }) => (Some(*old as u32), Some(*new as u32)),
-                Some(InlineRow::Del { old, .. }) => (Some(*old as u32), None),
-                Some(InlineRow::Add { new, .. }) => (None, Some(*new as u32)),
-                _ => (None, None),
-            },
+            Layout::Sbs => view
+                .display
+                .get(self.cursor)
+                .map(display_row_linenos)
+                .unwrap_or((None, None)),
+            Layout::Inline => view
+                .inline
+                .get(self.cursor)
+                .map(inline_row_linenos)
+                .unwrap_or((None, None)),
         };
         Some(PositionMemento {
             path,
@@ -3224,12 +3213,15 @@ impl App {
         // fully staging a file in Split. In that case the staged view's new side (index) now
         // holds exactly what the unstaged view's new side (worktree) held a moment ago, because
         // staging made index == worktree for this file; so new -> new is still the right
-        // mapping, and `find_nearest_row` falls back to a row's old side only for the rows that
-        // never had a new side to begin with (an unpaired Del).
-        let Some(target_lineno) = m.new_lineno.or(m.old_lineno) else {
-            return;
+        // mapping. Whichever side supplies the target, the SEARCH stays in that same frame —
+        // `find_nearest_row` never falls back across sides (see its doc for why mixing frames
+        // mis-lands the cursor).
+        let (target_lineno, new_frame) = match (m.new_lineno, m.old_lineno) {
+            (Some(n), _) => (n, true),
+            (None, Some(o)) => (o, false),
+            (None, None) => return,
         };
-        let Some(cursor) = find_nearest_row(view, self.layout, target_lineno) else {
+        let Some(cursor) = find_nearest_row(view, self.layout, target_lineno, new_frame) else {
             return;
         };
         self.cursor = cursor;
