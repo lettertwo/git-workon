@@ -613,7 +613,9 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
 /// Render a tree-guide prefix from an [`OutlineItem::Dir`]/[`OutlineItem::File`] `guides`
 /// vector: every element but the last draws a continuing `│` (if that ancestor level was NOT
 /// its parent's last child) or blank space (if it was), and the last element draws the row's own
-/// `└─`/`├─` connector.
+/// `╰─`/`├─` connector — CS4 rounds the last-child corner (`╰`, U+2570) from the square `└`
+/// (U+2514); there's no widely-supported rounded "tee" glyph, so the non-last `├─` connector is
+/// unchanged.
 fn tree_prefix(guides: &[bool]) -> String {
     let mut s = String::new();
     let Some((&is_last, ancestors)) = guides.split_last() else {
@@ -623,7 +625,7 @@ fn tree_prefix(guides: &[bool]) -> String {
         s.push_str(if last { "   " } else { "\u{2502}  " });
     }
     s.push_str(if is_last {
-        "\u{2514}\u{2500} "
+        "\u{2570}\u{2500} "
     } else {
         "\u{251C}\u{2500} "
     });
@@ -702,23 +704,35 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
             let letter = change.letter();
             // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
             // non-empty `guides` (Tree/StackTree modes) draws tree connectors instead — see
-            // `OutlineItem`'s doc comment for why emptiness is the mode signal.
-            let prefix = if guides.is_empty() {
-                "  ".to_string()
-            } else {
-                tree_prefix(guides)
-            };
-            let mut spans = vec![
-                TSpan::styled(
-                    format!("{prefix}{glyph}"),
+            // `OutlineItem`'s doc comment for why emptiness is the mode signal. CS4: a non-empty
+            // prefix (real tree connectors) gets its own `theme.dim`-styled span — matching the
+            // Dir row's already-dim guides — so the guide lines read as quiet structure, not part
+            // of the file's own status glyph; the empty two-space indent has nothing visible to
+            // dim, so it stays bundled with the glyph span below.
+            let mut spans = Vec::new();
+            if guides.is_empty() {
+                spans.push(TSpan::styled(
+                    format!("  {glyph}"),
                     Style::default().fg(theme.foreground),
-                ),
-                TSpan::styled(
-                    letter.to_string(),
-                    Style::default().fg(change_letter_color(*change, theme)),
-                ),
-                TSpan::styled(" ".to_string(), Style::default().fg(theme.foreground)),
-            ];
+                ));
+            } else {
+                spans.push(TSpan::styled(
+                    tree_prefix(guides),
+                    Style::default().fg(theme.dim),
+                ));
+                spans.push(TSpan::styled(
+                    glyph.to_string(),
+                    Style::default().fg(theme.foreground),
+                ));
+            }
+            spans.push(TSpan::styled(
+                letter.to_string(),
+                Style::default().fg(change_letter_color(*change, theme)),
+            ));
+            spans.push(TSpan::styled(
+                " ".to_string(),
+                Style::default().fg(theme.foreground),
+            ));
             if icons == OutlineIcons::Nerd {
                 let (icon, color) = crate::icons::icon_for_path(
                     path,
@@ -779,15 +793,22 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
 }
 
 /// The multi-changeset winbar (locked decisions #8 + #9): `[i/n] <title-or-name>
-/// <restack-marker>  —  <path> (fidx/nfiles)`, where `i/n` is the changeset's position in the
-/// stack and `fidx/nfiles` the active file's position within it. Only reached when
+/// <restack-marker>  <diffstat>  —  <path> (fidx/nfiles)`, where `i/n` is the changeset's position
+/// in the stack and `fidx/nfiles` the active file's position within it. Only reached when
 /// [`App::changeset_count`] > 1 (see [`render_header`]) — a lone uncommitted changeset never
 /// shows this, keeping the M4 full-width look.
+///
+/// CS4 polish: a tight `+A -D` diffstat for the ACTIVE changeset (there wasn't one before),
+/// tinted with the same [`Palette::add_strong`]/[`Palette::del_strong`] the summary panel's own
+/// totals line uses; in [`OutlineIcons::Nerd`] mode the restack marker and diffstat prefixes swap
+/// to their nerd glyphs (same consts `build_outline_line`/`push_summary_body` use), and the
+/// active file's path gets its devicons file icon.
 fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
     let title = cs.title.as_deref().unwrap_or(cs.name.as_str());
+    let icons = app.outline_icons();
 
     let mut spans = vec![TSpan::styled(
         format!("[{i}/{n}] {title}"),
@@ -799,16 +820,60 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     // from the plain title so a stale-parent changeset reads as a heads-up at a glance.
     if cs.needs_restack {
         spans.push(TSpan::styled(
-            "  ⚠ needs restack",
+            format!("  {} needs restack", warn_marker(icons)),
             Style::default()
                 .fg(theme.warn_fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // A pending/failed changeset's `files()` is always empty (ADR-037) — skip the diffstat
+    // segment entirely rather than show a misleading "+0 -0".
+    if !app.files().is_empty() {
+        let (adds, dels) = app
+            .files()
+            .iter()
+            .map(crate::summary::file_diffstat)
+            .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
+        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
+        spans.push(TSpan::raw("  "));
+        spans.push(TSpan::styled(
+            format!("{added_prefix}{adds}"),
+            Style::default()
+                .fg(theme.add_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(TSpan::raw(" "));
+        spans.push(TSpan::styled(
+            format!("{removed_prefix}{dels}"),
+            Style::default()
+                .fg(theme.del_strong)
                 .add_modifier(Modifier::BOLD),
         ));
     }
     let fidx = app.current + 1;
     let nfiles = app.files().len();
     spans.push(TSpan::styled(
-        format!("  —  {} ({fidx}/{nfiles})", current_file_label(app)),
+        "  —  ".to_string(),
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if icons == OutlineIcons::Nerd {
+        if let Some(f) = app.files().get(app.current) {
+            let (icon, color) = crate::icons::icon_for_path(
+                &f.path,
+                crate::theme::is_light_background(theme.background),
+            );
+            spans.push(TSpan::styled(
+                format!("{icon} "),
+                Style::default()
+                    .fg(color.unwrap_or(theme.foreground))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    spans.push(TSpan::styled(
+        format!("{} ({fidx}/{nfiles})", current_file_label(app)),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
@@ -2556,6 +2621,49 @@ mod tests {
     }
 
     #[test]
+    fn winbar_shows_a_tight_diffstat_for_the_active_changeset() {
+        // CS4: the winbar previously showed no diffstat at all — cs-b adds a single line
+        // (`b.txt`, one-line file, committed with no prior content) with nothing deleted.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected a tight '+N -M' diffstat fragment for cs-b's single added file, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn winbar_nerd_mode_swaps_the_restack_marker_and_diffstat_glyphs_and_shows_a_file_icon() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains(super::NERD_WARN_MARKER) && !header.contains('\u{26A0}'),
+            "expected the nerd restack marker, not the plain unicode one, got: {header:?}"
+        );
+        assert!(
+            header.contains(super::NERD_DIFF_ADDED) && header.contains(super::NERD_DIFF_REMOVED),
+            "expected nerd diffstat glyphs in the winbar, got: {header:?}"
+        );
+        assert!(
+            header.contains(crate::icons::icon_for_path("b.txt", false).0),
+            "expected the active file's (b.txt) devicons icon in the winbar, got: {header:?}"
+        );
+    }
+
+    #[test]
     fn winbar_uses_title_when_present() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -2911,15 +3019,41 @@ mod tests {
             content.join("\n")
         );
         assert!(
-            content[2].contains('\u{2514}') && content[2].contains("a.txt"),
-            "expected row 2 to be src/a.txt, indented under src/ with its own last-child '└─' \
-             guide, got:\n{}",
+            content[2].contains('\u{2570}') && content[2].contains("a.txt"),
+            "expected row 2 to be src/a.txt, indented under src/ with its own last-child \
+             rounded '╰─' guide, got:\n{}",
             content.join("\n")
         );
         assert!(
-            content[3].contains('\u{2514}') && content[3].contains("top.txt"),
-            "expected row 3 to be top.txt with a last-child '└─' guide, got:\n{}",
+            content[3].contains('\u{2570}') && content[3].contains("top.txt"),
+            "expected row 3 to be top.txt with a last-child rounded '╰─' guide, got:\n{}",
             content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_file_row_tree_guide_carries_the_dim_color() {
+        // CS4: a File row's tree-guide connector (distinct from its status glyph, which keeps
+        // `theme.foreground`) is styled `theme.dim`, matching the Dir row's already-dim guides.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> Tree
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Row 3 is top.txt (see the test above) — a File row with a non-empty guide vector.
+        let row = outline_row(&buf, 3);
+        let guide_x = row.find('\u{2570}').expect("rounded guide present") as u16;
+        assert_eq!(
+            buf.cell((guide_x, 3)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the File row's tree-guide connector to carry theme.dim, got: {row:?}"
         );
     }
 
