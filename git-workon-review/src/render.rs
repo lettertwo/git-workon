@@ -479,9 +479,9 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// transient bottom-anchor scroll computed fresh each frame.
 fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     app.outline_height = area.height as usize;
-    app.derive_outline_scroll();
-
     let items = app.outline_items();
+    app.derive_outline_scroll(items.len());
+
     let cursor = app.outline_cursor();
     let focused = app.outline_focused();
     let scroll = app.outline_scroll();

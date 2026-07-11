@@ -2252,7 +2252,7 @@ impl App {
                 idx += step;
             }
         }
-        self.derive_outline_scroll();
+        self.derive_outline_scroll(items.len());
     }
 
     /// `g`/`G` while the outline has focus: jump the cursor straight to row `idx` (clamped into
@@ -2265,7 +2265,7 @@ impl App {
         let items = self.outline_items();
         if items.is_empty() {
             self.outline.cursor = 0;
-            self.derive_outline_scroll();
+            self.derive_outline_scroll(0);
             return;
         }
         let idx = idx.min(items.len() - 1);
@@ -2276,7 +2276,7 @@ impl App {
         {
             self.switch_changeset(*cs_idx, *file_idx);
         }
-        self.derive_outline_scroll();
+        self.derive_outline_scroll(items.len());
     }
 
     /// `g` while the outline has focus: jump the cursor to the first row.
@@ -2335,7 +2335,7 @@ impl App {
         let items = self.outline_items();
         if items.is_empty() {
             self.outline.cursor = 0;
-            self.derive_outline_scroll();
+            self.derive_outline_scroll(0);
             return;
         }
         if let Some(idx) = items.iter().position(|it| {
@@ -2349,7 +2349,7 @@ impl App {
         } else {
             self.outline.cursor = self.outline.cursor.min(items.len() - 1);
         }
-        self.derive_outline_scroll();
+        self.derive_outline_scroll(items.len());
     }
 
     /// Row count of file `idx`'s `role` view in the active layout's space (0 if absent/unloaded).
@@ -2410,9 +2410,10 @@ impl App {
     /// [`Self::derive_scroll`], reusing the same [`derive_scroll_value`] core against
     /// [`Self::outline_height`]. Called after every outline-cursor mutation (mirroring how every
     /// diff-cursor mutator ends with `derive_scroll`); the renderer also re-derives each frame,
-    /// which covers resizes.
-    pub(crate) fn derive_outline_scroll(&mut self) {
-        let rows = self.outline_items().len();
+    /// which covers resizes. Takes the outline row count from the caller — every call site has
+    /// just built (or is about to paint from) [`Self::outline_items`], and rebuilding the whole
+    /// snapshot here again just for `.len()` would double the work on every keypress and frame.
+    pub(crate) fn derive_outline_scroll(&mut self, rows: usize) {
         self.outline.scroll = derive_scroll_value(
             self.outline.cursor,
             self.outline.scroll,
@@ -7620,7 +7621,7 @@ mod tests {
         let mut app = four_committed_changesets_three_files_each();
         app.outline_height = 5; // bottom_margin = 5 - 1 - SCROLLOFF(2) = 2
         app.outline.cursor = 0;
-        app.derive_outline_scroll();
+        app.derive_outline_scroll(app.outline_items().len());
         assert_eq!(app.outline_scroll(), 0);
 
         // Walk down one row at a time; the scroll must follow to keep the cursor within
@@ -7658,7 +7659,7 @@ mod tests {
         app.outline_height = 5;
 
         app.outline.cursor = 0;
-        app.derive_outline_scroll();
+        app.derive_outline_scroll(app.outline_items().len());
         assert_eq!(
             app.outline_scroll(),
             0,
@@ -7667,7 +7668,7 @@ mod tests {
 
         let last = app.outline_items().len() - 1;
         app.outline.cursor = last;
-        app.derive_outline_scroll();
+        app.derive_outline_scroll(app.outline_items().len());
         let scroll = app.outline_scroll();
         assert!(
             last >= scroll && last < scroll + app.outline_height,
