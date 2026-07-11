@@ -14,7 +14,7 @@ use ratatui::Frame;
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{
-    App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role, Severity, Summary,
+    App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role, Severity, Summary,
 };
 use crate::attribute::Attribution;
 use crate::config::View;
@@ -452,6 +452,11 @@ fn build_pane_line(
 pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette) {
     let area = frame.area();
 
+    // CS10: reset every recorded hit region at the start of the frame — a region only survives
+    // this frame if one of the panes below actually painted it again. Prevents a stale rect from
+    // an earlier frame's layout (e.g. the outline just closed) from staying hit-testable.
+    app.hit_regions = Default::default();
+
     // Paint the whole screen with the theme's background FIRST — a curated theme (light/dark)
     // controls the canvas outright; `auto` leaves `paint_canvas` false so the terminal's own
     // background (and any transparency) shows through instead. Everything drawn below only sets
@@ -506,6 +511,17 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
 
     if app.help_visible {
         render_help_overlay(frame, app, keymap, area);
+    }
+}
+
+/// Convert a ratatui [`Rect`] into the [`Region`] shape [`App::hit_regions`] stores (CS10) —
+/// `app.rs` has no ratatui dependency, so every write into `hit_regions` goes through this.
+fn region_from(area: Rect) -> Region {
+    Region {
+        x: area.x,
+        y: area.y,
+        w: area.width,
+        h: area.height,
     }
 }
 
@@ -582,6 +598,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// transient bottom-anchor scroll computed fresh each frame.
 fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     app.outline_height = area.height as usize;
+    app.hit_regions.outline = Some(region_from(area));
     let items = app.outline_items();
     app.derive_outline_scroll(items.len());
 
@@ -1233,6 +1250,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     match app.effective_zoom_for(idx) {
         EffectiveZoom::Single(role) => {
             app.pane_height = area.height as usize;
+            app.hit_regions.single = Some(region_from(area));
             let scroll = app.scroll;
             let cursor = Some(app.cursor);
             // The single pane is the focused one, so it shows any active selection.
@@ -1292,6 +1310,8 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     };
     app.pane_height = focused_h as usize;
     app.alt_height = unfocused_h as usize;
+    app.hit_regions.unstaged = Some(region_from(unstaged_content));
+    app.hit_regions.staged = Some(region_from(staged_content));
     app.derive_scroll();
     app.derive_alt_scroll();
 
