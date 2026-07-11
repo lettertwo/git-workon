@@ -600,7 +600,9 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     app.outline_height = area.height as usize;
     app.hit_regions.outline = Some(region_from(area));
     let items = app.outline_items();
-    app.derive_outline_scroll(items.len());
+    // Bounds-clamp only — NOT a cursor-following derive: under the wheel's peek model a
+    // scrolled-away viewport must survive the frame; cursor ops re-derive on their own.
+    app.clamp_outline_scroll(items.len());
 
     let cursor = app.outline_cursor();
     let focused = app.outline_focused();
@@ -1312,8 +1314,10 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     app.alt_height = unfocused_h as usize;
     app.hit_regions.unstaged = Some(region_from(unstaged_content));
     app.hit_regions.staged = Some(region_from(staged_content));
-    app.derive_scroll();
-    app.derive_alt_scroll();
+    // Bounds-clamp only (peek model — see render_outline's identical note); this also brings
+    // the split arm in line with the Single arm, which never re-derived at render time.
+    app.clamp_scroll();
+    app.clamp_alt_scroll();
 
     render_caption(frame.buffer_mut(), unstaged_caption, "UNSTAGED", theme);
     render_caption(frame.buffer_mut(), staged_caption, "STAGED", theme);
@@ -2914,6 +2918,46 @@ mod tests {
             buf.cell((marker_x, row as u16)).unwrap().style().fg,
             Some(Palette::dark().warn_fg),
             "expected the outline's restack glyph to carry Palette::dark().warn_fg"
+        );
+    }
+
+    #[test]
+    fn render_preserves_a_wheel_scrolled_outline_viewport() {
+        // The peek model's load-bearing render change: `render_outline` bounds-CLAMPS the
+        // outline scroll instead of re-deriving it from the cursor, so a wheel-scrolled
+        // viewport (cursor left outside it) survives the frame instead of snapping back.
+        use crate::app::Region;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open());
+        // A 5-row frame leaves a 3-row outline viewport over this fixture's 4 outline rows
+        // (2 headers + 2 files): max scroll = 1.
+        app.outline_height = 3;
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 1,
+            w: 34,
+            h: 3,
+        });
+        let cursor_before = app.outline_cursor();
+
+        app.handle_wheel(2, 2, 3); // clamps to max scroll = 1
+        assert_eq!(app.outline_scroll(), 1, "the wheel scrolled the viewport");
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before,
+            "peek model: the wheel never moves the outline cursor"
+        );
+
+        render_once(&mut app, OUTLINE_TEST_WIDTH, 5);
+        assert_eq!(
+            app.outline_scroll(),
+            1,
+            "a frame must not re-derive the wheeled scroll back to the cursor"
         );
     }
 
