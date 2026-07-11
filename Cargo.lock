@@ -564,6 +564,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "devicons"
+version = "0.6.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830e47e2f330cf4fdd5a958dcef921b9523ffc21ab6713aa5e77ba2cce03904b"
+dependencies = [
+ "lazy_static",
+]
+
+[[package]]
 name = "dialoguer"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -964,6 +973,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "crossterm",
+ "devicons",
  "dirs",
  "expectrl",
  "git-workon-fixture",
