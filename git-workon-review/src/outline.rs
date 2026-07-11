@@ -308,13 +308,13 @@ fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outli
     order_list
         .into_iter()
         .map(|path| {
-            let (cs_idx, file_idx, status, change) = latest[&path];
+            let occ = latest[&path];
             OutlineItem::File {
-                cs_idx,
-                file_idx,
+                cs_idx: occ.cs_idx,
+                file_idx: occ.file_idx,
                 path,
-                status,
-                change,
+                status: occ.status,
+                change: occ.change,
                 guides: Vec::new(),
             }
         })
@@ -329,19 +329,34 @@ fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outli
 /// [`OutlineMode::Tree`] directory's files (`cs_idx: None` on that mode's [`OutlineItem::Dir`]
 /// rows) over the same last-write-wins de-duped set the Tree outline itself displays, rather than
 /// re-deriving the dedup logic in `app.rs`.
-pub(crate) fn latest_by_path(
-    changesets: &[OutlineChangeset],
-) -> HashMap<String, (usize, usize, StagedStatus, FileStatus)> {
+pub(crate) fn latest_by_path(changesets: &[OutlineChangeset]) -> HashMap<String, FileOccurrence> {
     let mut latest = HashMap::new();
     for (cs_idx, cs) in changesets.iter().enumerate() {
         for (file_idx, file) in cs.files.iter().enumerate() {
             latest.insert(
                 file.path.clone(),
-                (cs_idx, file_idx, file.status, file.change),
+                FileOccurrence {
+                    cs_idx,
+                    file_idx,
+                    status: file.status,
+                    change: file.change,
+                },
             );
         }
     }
     latest
+}
+
+/// The file a de-duped path (or a trie leaf) resolves to: its true `(cs_idx, file_idx)` address
+/// into `App::changesets` plus the two per-file status axes the outline renders — staged-ness
+/// ([`StagedStatus`], CS3) and change kind ([`FileStatus`], CS5). Named because the bare 4-tuple
+/// it replaced had to be re-explained (and type-annotated) at every use site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileOccurrence {
+    pub cs_idx: usize,
+    pub file_idx: usize,
+    pub status: StagedStatus,
+    pub change: FileStatus,
 }
 
 /// A node in the path trie the tree modes build. A node with `file.is_some()` is a leaf (a
@@ -349,22 +364,14 @@ pub(crate) fn latest_by_path(
 /// collide a file and a directory at the same path, so a node is never both.
 #[derive(Debug, Default)]
 struct TrieNode {
-    file: Option<(usize, usize, StagedStatus, FileStatus)>,
+    file: Option<FileOccurrence>,
     /// Insertion order is irrelevant — [`emit`] re-sorts children (dirs-before-files, alpha
     /// within group) every time it flattens a node.
     children: Vec<(String, TrieNode)>,
 }
 
 impl TrieNode {
-    #[allow(clippy::too_many_arguments)]
-    fn insert(
-        &mut self,
-        segments: &[&str],
-        cs_idx: usize,
-        file_idx: usize,
-        status: StagedStatus,
-        change: FileStatus,
-    ) {
+    fn insert(&mut self, segments: &[&str], occ: FileOccurrence) {
         let (head, rest) = segments
             .split_first()
             .expect("insert is never called with an empty segment list");
@@ -378,9 +385,9 @@ impl TrieNode {
         let child = &mut self.children[idx].1;
         if rest.is_empty() {
             // Last-write-wins: a later insert of the same full path overwrites the leaf data.
-            child.file = Some((cs_idx, file_idx, status, change));
+            child.file = Some(occ);
         } else {
-            child.insert(rest, cs_idx, file_idx, status, change);
+            child.insert(rest, occ);
         }
     }
 }
@@ -416,13 +423,13 @@ fn emit(
         let mut guides = ancestors_last.to_vec();
         guides.push(is_last);
         match child.file {
-            Some((cs_idx, file_idx, status, change)) => {
+            Some(occ) => {
                 items.push(OutlineItem::File {
-                    cs_idx,
-                    file_idx,
+                    cs_idx: occ.cs_idx,
+                    file_idx: occ.file_idx,
                     path: name.clone(),
-                    status,
-                    change,
+                    status: occ.status,
+                    change: occ.change,
                     guides,
                 });
             }
@@ -452,9 +459,9 @@ fn emit(
 fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
     let latest = latest_by_path(changesets);
     let mut root = TrieNode::default();
-    for (path, (cs_idx, file_idx, status, change)) in &latest {
+    for (path, occ) in &latest {
         let segments: Vec<&str> = path.split('/').collect();
-        root.insert(&segments, *cs_idx, *file_idx, *status, *change);
+        root.insert(&segments, *occ);
     }
     let mut items = Vec::new();
     emit(&root, &[], "", None, &mut items);
@@ -480,7 +487,15 @@ fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec
         let mut root = TrieNode::default();
         for (file_idx, file) in cs.files.iter().enumerate() {
             let segments: Vec<&str> = file.path.split('/').collect();
-            root.insert(&segments, cs_idx, file_idx, file.status, file.change);
+            root.insert(
+                &segments,
+                FileOccurrence {
+                    cs_idx,
+                    file_idx,
+                    status: file.status,
+                    change: file.change,
+                },
+            );
         }
         emit(&root, &[], "", Some(cs_idx), &mut items);
     }

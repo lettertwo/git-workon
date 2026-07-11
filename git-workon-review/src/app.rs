@@ -2243,15 +2243,12 @@ impl App {
                 // the same alpha order the Tree outline itself paints (`emit`'s own sort).
                 let snapshot = self.outline_snapshot();
                 let latest = outline::latest_by_path(&snapshot);
-                let mut entries: Vec<(
-                    &String,
-                    &(usize, usize, outline::StagedStatus, FileStatus),
-                )> = latest.iter().collect();
+                let mut entries: Vec<(&String, &outline::FileOccurrence)> = latest.iter().collect();
                 entries.sort_by(|a, b| a.0.cmp(b.0));
                 let files: Vec<&FileChange> = entries
                     .into_iter()
-                    .filter_map(|(_, &(cs_idx, file_idx, _, _))| {
-                        self.changesets[cs_idx].files().get(file_idx)
+                    .filter_map(|(_, occ)| {
+                        self.changesets[occ.cs_idx].files().get(occ.file_idx)
                     })
                     .collect();
                 Summary::Dir(summary::dir_summary(path, &files))
