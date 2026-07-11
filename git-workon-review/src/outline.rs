@@ -124,6 +124,19 @@ impl StagedStatus {
             StagedStatus::Partial => '\u{25D0}', // ◐
         }
     }
+
+    /// The nerd-font equivalent of [`StagedStatus::glyph`] (CS3, `workon.review.outline.icons =
+    /// nerd`) — picked from the classic BMP `fa` set for wider font compatibility (see
+    /// `icons.rs`'s module doc). [`StagedStatus::None`] stays a blank space, same as
+    /// [`StagedStatus::glyph`], since there's no status to convey.
+    pub fn nerd_glyph(self) -> char {
+        match self {
+            StagedStatus::None => ' ',
+            StagedStatus::Unstaged => '\u{f067}', // nf-fa-plus
+            StagedStatus::Staged => '\u{f00c}',   // nf-fa-check
+            StagedStatus::Partial => '\u{f042}',  // nf-fa-adjust
+        }
+    }
 }
 
 /// One file's outline-relevant data, as extracted from its owning changeset by
