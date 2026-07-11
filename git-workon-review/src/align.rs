@@ -333,6 +333,59 @@ fn collapse_gaps_inner(
     out
 }
 
+/// The currently-hidden [`AlignedRow`] sub-range `[start, end)` for the gap keyed `key`, given
+/// its current `expansion` (if any) — used by [`crate::app::FileView::scope_expand_gap`] (CS9) to
+/// measure how much of a gap's hidden run a candidate tree-sitter scope range would additionally
+/// uncover. `None` when `key` no longer denotes an actual gap: not a context-run start, the run is
+/// too short to have collapsed in the first place, or `expansion` already reveals the whole run.
+///
+/// Mirrors the run-measuring steps in [`collapse_gaps_inner`] (same `keep_before`/`keep_after`/
+/// `effective_before`/`effective_after` derivation) rather than sharing code with it, because that
+/// function additionally needs `run_end` and the row slices themselves to emit `DisplayRow`s,
+/// while this one only needs the hidden index range for a `key` a caller already has — keep both
+/// in sync if the collapse rule ever changes.
+pub(crate) fn gap_hidden_range(
+    rows: &[AlignedRow],
+    key: usize,
+    expansions: &HashMap<usize, GapExpansion>,
+) -> Option<(usize, usize)> {
+    let is_context = |row: &AlignedRow| {
+        matches!(
+            (row.old_kind, row.new_kind),
+            (CellKind::Context, CellKind::Context)
+        )
+    };
+
+    let run_start = key;
+    if run_start >= rows.len() || !is_context(&rows[run_start]) {
+        return None;
+    }
+    let mut run_end = run_start;
+    while run_end < rows.len() && is_context(&rows[run_end]) {
+        run_end += 1;
+    }
+    let run_len = run_end - run_start;
+
+    let keep_before = if run_start == 0 { 0 } else { CONTEXT_LINES };
+    let keep_after = if run_end == rows.len() {
+        0
+    } else {
+        CONTEXT_LINES
+    };
+    if (keep_before == 0 && keep_after == 0) || run_len <= keep_before + keep_after {
+        return None;
+    }
+
+    let expansion = expansions.get(&key).copied().unwrap_or_default();
+    let effective_before = (keep_before + expansion.before).min(run_len);
+    let effective_after = (keep_after + expansion.after).min(run_len - effective_before);
+    if expansion.full || effective_before + effective_after >= run_len {
+        return None;
+    }
+
+    Some((run_start + effective_before, run_end - effective_after))
+}
+
 /// One row of the inline (unified, single-column) display.
 ///
 /// Built by [`inline_rows`] from the SAME gap-collapsed [`DisplayRow`] vector [`collapse_gaps`]

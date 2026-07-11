@@ -17,18 +17,19 @@ use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{
-    align_file, collapse_gaps_with_expansions, inline_rows, AlignedRow, CellKind, DisplayRow,
-    GapExpansion, InlineRow, Row,
+    align_file, collapse_gaps_with_expansions, gap_hidden_range, inline_rows, AlignedRow, CellKind,
+    DisplayRow, GapExpansion, InlineRow, Row,
 };
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
-use crate::highlight::{FgSpan, TsHighlighter};
+use crate::highlight::{lang_key_for_ext, FgSpan, TsHighlighter};
 use crate::icons::OutlineIcons;
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
 use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
+use crate::scope::enclosing_scope_lines;
 use crate::source::{resolve_source, Source};
 use crate::stage_op::{FileStagingOp, LineSelectionOp};
 use crate::summary;
@@ -242,6 +243,59 @@ impl FileView {
         entry.after += more_after;
         entry.full |= full;
         self.rebuild_rows();
+    }
+
+    /// CS9's scope-reveal: widen the gap keyed `key` to uncover a tree-sitter scope range
+    /// `[scope_start, scope_end]` (1-based, inclusive — as returned by
+    /// [`crate::scope::enclosing_scope_lines`]) that encloses the gap's anchor line, in
+    /// `anchor_prefers_new`'s frame (new-side lineno when `true`, old-side when `false` — see
+    /// [`App::expand_gap_at_cursor`]'s anchor selection). Only the gap's TRAILING edge (`after`)
+    /// is ever widened: the anchor sits at the gap's following edge and `scope_start` is what
+    /// climbs upward from it toward the gap; `scope_end` falls among rows already visible after
+    /// the gap by construction (the anchor line is inside the scope), so the leading edge never
+    /// has anything new to reveal here.
+    ///
+    /// Returns `true` when this widened the gap (grew `after`, or revealed the whole run because
+    /// the scope covers it entirely); `false` when the scope added nothing new — either the gap
+    /// is already fully revealed/not a gap at all, or `scope_start` doesn't reach far enough
+    /// upward to uncover any currently-hidden row. The caller's signal to fall back to the flat
+    /// +10 reveal, so repeated presses always widen.
+    pub fn scope_expand_gap(
+        &mut self,
+        key: usize,
+        scope_start: usize,
+        anchor_prefers_new: bool,
+    ) -> bool {
+        let Some((hidden_start, hidden_end)) =
+            gap_hidden_range(&self.aligned, key, &self.expansions)
+        else {
+            return false;
+        };
+        let hidden = &self.aligned[hidden_start..hidden_end];
+        if hidden.is_empty() {
+            return false;
+        }
+
+        let lineno_of =
+            |row: &AlignedRow| row_lineno(if anchor_prefers_new { row.new } else { row.old });
+        // Context rows always carry a lineno on both sides (see the module doc's lineno
+        // invariant), and linenos increase monotonically through a run, so counting from the
+        // trailing edge backward while the scope still covers each row is safe.
+        let count = hidden
+            .iter()
+            .rev()
+            .take_while(|row| lineno_of(row).is_some_and(|n| n >= scope_start))
+            .count();
+
+        if count == 0 {
+            return false;
+        }
+        if count >= hidden.len() {
+            self.expand_gap(key, 0, 0, true);
+        } else {
+            self.expand_gap(key, 0, count, false);
+        }
+        true
     }
 
     /// The hunk (index into the file's `hunks`) whose span covers display row `row`, or `None`
@@ -3093,20 +3147,40 @@ impl App {
     }
 
     /// Reveal more of the collapsed gap under the cursor (`Enter`), or the WHOLE gap (`E`, when
-    /// `full`) — CS8's progressive unfold. A silent no-op when the cursor isn't on a `Gap` row (or
-    /// there's no loaded view): unlike a staging refusal this isn't a mode error worth
-    /// interrupting the user over, same precedent as [`Self::next_hunk_row`] finding no later
-    /// hunk. Each edge widens by 10 rows per press; repeated presses on the same gap accumulate
-    /// (see [`FileView::expand_gap`]).
+    /// `full`) — CS8's progressive unfold, extended by CS9 with a two-tier `Enter`: A silent
+    /// no-op when the cursor isn't on a `Gap` row (or there's no loaded view): unlike a staging
+    /// refusal this isn't a mode error worth interrupting the user over, same precedent as
+    /// [`Self::next_hunk_row`] finding no later hunk.
     ///
-    /// `self.cursor`'s INDEX is left untouched. Rows revealed at the gap's leading edge insert
-    /// immediately before the gap's own row (shifting the gap marker — and everything after it —
-    /// down), so after [`FileView::rebuild_rows`] the row now sitting at the old index is the
-    /// first newly revealed line rather than the gap marker itself: the cursor visually lands on
-    /// the start of the revealed region without this method needing to compute a new index.
+    /// - `full` (`E`): unchanged from CS8 — always the flat full-run reveal via
+    ///   [`FileView::expand_gap`], regardless of grammar.
+    /// - `!full` (`Enter`, CS9): FIRST tries a tree-sitter scope-reveal —
+    ///   [`gap_scope_start`] resolves the gap's anchor (the following row's new-side lineno,
+    ///   preferring new like CS6's [`Self::restore_position`], old-side for delete-only files)
+    ///   to the smallest enclosing [`crate::scope`] node, and [`FileView::scope_expand_gap`]
+    ///   widens the gap's trailing edge to uncover it. Falls back to the flat +10/+10 reveal
+    ///   (same as CS8) when: the file's extension has no bundled grammar, no allowlisted
+    ///   ancestor encloses the anchor, or the scope reveals nothing new (already fully visible)
+    ///   — so repeated `Enter` presses always widen the gap, uniformly.
+    ///
+    /// `self.cursor`'s INDEX is left untouched either way. Rows revealed at the gap's leading
+    /// edge insert immediately before the gap's own row (shifting the gap marker — and
+    /// everything after it — down), so after [`FileView::rebuild_rows`] the row now sitting at
+    /// the old index is the first newly revealed line rather than the gap marker itself: the
+    /// cursor visually lands on the start of the revealed region without this method needing to
+    /// compute a new index. The scope-reveal path only ever widens the TRAILING edge (see
+    /// [`FileView::scope_expand_gap`]'s doc for why), so this holds there too.
     pub fn expand_gap_at_cursor(&mut self, full: bool) {
         let cursor = self.cursor;
         let layout = self.layout;
+        // Read out before taking `current_view()`'s exclusive borrow — `gap_scope_start` only
+        // needs the path strings, not the file, so cloning two short `String`s here avoids a
+        // `self.cur()`/`self.current_view()` borrow conflict for the whole rest of the method.
+        let anchor_paths = self.cur().diff.files.get(self.current).map(|f| {
+            let new_path = f.path.clone();
+            let old_path = f.old_path.clone().unwrap_or_else(|| f.path.clone());
+            (new_path, old_path)
+        });
         let Some(view) = self.current_view() else {
             return;
         };
@@ -3120,11 +3194,25 @@ impl App {
                 _ => return,
             },
         };
-        view.expand_gap(key, 10, 10, full);
-        // The expansion just reshaped the focused pane's row space — cancel any active selection
-        // rather than translating it, per `selection_anchor`'s invariant (same rule as layout
-        // toggles, zoom changes, file switches, and split-focus swaps). Only reached when a gap
-        // actually expanded; the non-gap no-op above leaves a selection alone.
+
+        let scope_revealed = !full
+            && anchor_paths
+                .as_ref()
+                .and_then(|(new_path, old_path)| {
+                    gap_scope_start(view, layout, cursor, new_path, old_path)
+                })
+                .is_some_and(|(scope_start, anchor_prefers_new)| {
+                    view.scope_expand_gap(key, scope_start, anchor_prefers_new)
+                });
+
+        if !scope_revealed {
+            view.expand_gap(key, 10, 10, full);
+        }
+        // The expansion just reshaped the focused pane's row space — whichever tier did it —
+        // so cancel any active selection rather than translating it, per `selection_anchor`'s
+        // invariant (same rule as layout toggles, zoom changes, file switches, and split-focus
+        // swaps). Only reached when a gap actually expanded; the non-gap no-op above leaves a
+        // selection alone.
         self.cancel_selection();
         self.derive_scroll();
         self.clamp_cursor();
@@ -4165,6 +4253,43 @@ fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
         DisplayRow::Row(r) => (row_lineno(r.old), row_lineno(r.new)),
         DisplayRow::Gap { .. } => (None, None),
     }
+}
+
+/// CS9's tree-sitter scope-reveal inputs for the gap at `gap_cursor`: the anchor line and which
+/// side it's in (`true` = new, `false` = old), resolved from the row immediately FOLLOWING the
+/// gap in `layout`'s row vector — the plan's rationale: the next hunk is what you're reading
+/// toward, so its enclosing scope is what's worth revealing. Prefers the new-side lineno when
+/// present, falling back to old (CS6's [`App::restore_position`] convention) for the rows a
+/// delete-only file's `Filler` new side never populates.
+///
+/// Returns `None` when: there's no row after the gap (a trailing gap with nothing beyond it to
+/// anchor on), the anchor path's extension has no bundled grammar, or
+/// [`enclosing_scope_lines`] finds no enclosing scope for the anchor line — every case the
+/// caller treats identically, falling back to the flat +10/+10 reveal.
+fn gap_scope_start(
+    view: &FileView,
+    layout: Layout,
+    gap_cursor: usize,
+    new_path: &str,
+    old_path: &str,
+) -> Option<(usize, bool)> {
+    let (old, new) = match layout {
+        Layout::Sbs => display_row_linenos(view.display.get(gap_cursor + 1)?),
+        Layout::Inline => inline_row_linenos(view.inline.get(gap_cursor + 1)?),
+    };
+
+    let (anchor_line, anchor_prefers_new, text, lang_path) = match new {
+        Some(n) => (n, true, view.new_text(), new_path),
+        None => (old?, false, view.old_text(), old_path),
+    };
+
+    let ext = Path::new(lang_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let lang_key = lang_key_for_ext(ext)?;
+    let (scope_start, _scope_end) = enclosing_scope_lines(lang_key, text, anchor_line)?;
+    Some((scope_start, anchor_prefers_new))
 }
 
 /// Inline-coordinate analog of [`display_row_linenos`].
@@ -9780,6 +9905,156 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, DisplayRow::Gap { .. })),
             "the gap must be back in its base (still-collapsed) form"
+        );
+    }
+
+    // ── CS9: reveal gaps to the enclosing tree-sitter scope ─────────────────
+
+    /// A `.rs` fixture where both edits sit inside the SAME long function, with a 40-line
+    /// unchanged run between them wide enough that even a +10/+10 press would still leave a
+    /// gap (mirrors [`two_hunks_with_a_wide_gap_fixture`]'s width) — but because the whole
+    /// hidden run lies inside `long_function`'s body, a scope-reveal press should uncover it
+    /// ENTIRELY (the function encloses the whole gap), unlike +10/+10.
+    fn function_with_a_wide_internal_gap_fixture() -> Fixture {
+        let mut committed = String::from("fn long_function() {\n    let a = OLD_A;\n");
+        let mut modified = String::from("fn long_function() {\n    let a = NEW_A;\n");
+        for i in 1..=40 {
+            committed.push_str(&format!("    ctx{i}();\n"));
+            modified.push_str(&format!("    ctx{i}();\n"));
+        }
+        committed.push_str("    let b = OLD_B;\n}\n");
+        modified.push_str("    let b = NEW_B;\n}\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.rs", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    /// A `.rs` fixture where both edits sit at the TOP LEVEL (no enclosing function/impl/etc —
+    /// only comment lines separate them), so [`crate::scope::enclosing_scope_lines`] finds no
+    /// allowlisted ancestor around the anchor and a press must fall back to +10/+10 exactly like
+    /// a grammar-less file.
+    fn top_level_edits_with_a_wide_gap_fixture() -> Fixture {
+        let mut committed = String::from("static A: i32 = OLD_A;\n");
+        let mut modified = String::from("static A: i32 = NEW_A;\n");
+        for i in 1..=40 {
+            committed.push_str(&format!("// ctx{i}\n"));
+            modified.push_str(&format!("// ctx{i}\n"));
+        }
+        committed.push_str("static B: i32 = OLD_B;\n");
+        modified.push_str("static B: i32 = NEW_B;\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.rs", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    /// The `skipped` count of the current file's only [`DisplayRow::Gap`], found by scanning
+    /// `display` (NOT via `app.cursor` — expanding the gap's leading edge shifts the gap marker
+    /// to a later index, same as [`only_gap_row`] re-finds it after an expansion in the CS8
+    /// tests above). Panics if there isn't exactly one gap row.
+    fn gap_skipped(app: &App) -> usize {
+        let row = only_gap_row(app);
+        match app.current_view_ref().expect("loaded view").display[row] {
+            DisplayRow::Gap { skipped, .. } => skipped,
+            other => panic!("expected a Gap row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_reveal_uncovers_the_whole_gap_when_the_enclosing_function_covers_it() {
+        let fixture = function_with_a_wide_internal_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+
+        app.expand_gap_at_cursor(false);
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "the enclosing function covers the ENTIRE hidden run, so a single scope-reveal press \
+             must consume the gap completely — unlike a flat +10/+10 press, which would still \
+             leave one on this fixture's 40-row gap: {:?}",
+            view.display
+        );
+    }
+
+    #[test]
+    fn a_grammarless_file_falls_back_to_the_flat_plus_ten_reveal() {
+        // Reuse CS8's `.txt` fixture (no bundled grammar for that extension) — the scope-reveal
+        // path must find no lang key and fall straight through to +10/+10, same as before CS9.
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        let skipped_before = gap_skipped(&app);
+
+        app.expand_gap_at_cursor(false);
+
+        let skipped_after = gap_skipped(&app);
+        assert_eq!(
+            skipped_before - skipped_after,
+            20,
+            "no grammar for .txt: exactly the flat 10-before/10-after reveal, same as CS8"
+        );
+    }
+
+    #[test]
+    fn a_scope_with_nothing_new_falls_back_to_the_flat_plus_ten_reveal() {
+        // Both edits are top-level `static`s with no enclosing function/impl/etc — the anchor
+        // line has no allowlisted ancestor, so scope-reveal finds nothing and must fall back to
+        // +10/+10 exactly like the grammarless case, even though this file DOES have a grammar.
+        let fixture = top_level_edits_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        let skipped_before = gap_skipped(&app);
+
+        app.expand_gap_at_cursor(false);
+
+        let skipped_after = gap_skipped(&app);
+        assert_eq!(
+            skipped_before - skipped_after,
+            20,
+            "no enclosing scope at the top level: falls back to the flat 10-before/10-after reveal"
+        );
+    }
+
+    #[test]
+    fn full_expand_ignores_scope_reveal_regardless_of_grammar() {
+        // `E` (full=true) must stay pure CS8 behavior even on a file with a grammar and a scope
+        // that would otherwise apply — scope-reveal is an `Enter`-only (CS9) refinement.
+        let fixture = function_with_a_wide_internal_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+
+        app.expand_gap_at_cursor(true);
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "E must fully expand the gap: {:?}",
+            view.display
         );
     }
 }
