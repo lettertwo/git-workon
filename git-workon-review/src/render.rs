@@ -36,6 +36,114 @@ use crate::wordiff::Span as WordSpan;
 // hybrid-boundary doc comment. A curated theme now fully controls the look; nothing in this
 // module hardcodes a semantic color anymore.
 
+// CS3's nerd-mode status/header/summary glyphs (gated on `OutlineIcons::Nerd`; the plain unicode
+// defaults below stay byte-identical when `icons = none` — see icons.rs's module doc for why no
+// auto-detection ever picks Nerd for the user). Picked from the classic BMP nerd-font sets
+// (`fa`/`oct`) rather than devicons' broader (partly supplementary-plane) table, for wider
+// font compatibility — see `icons.rs`'s v3 doc note.
+/// Nerd-mode "this is the current changeset" marker, replacing the plain `●` (U+25CF).
+const NERD_CURRENT_MARKER: char = '\u{f111}'; // nf-fa-circle
+/// Nerd-mode needs-restack marker, replacing the plain `⚠` (U+26A0).
+const NERD_WARN_MARKER: char = '\u{f071}'; // nf-fa-warning
+/// Nerd-mode failed-changeset marker, replacing the plain `✗` (U+2717).
+const NERD_ERROR_MARKER: char = '\u{f00d}'; // nf-fa-times
+/// Nerd-mode loading marker, replacing the plain `…` (U+2026).
+const NERD_LOADING_MARKER: char = '\u{f141}'; // nf-fa-ellipsis-h
+/// Nerd-mode branch glyph prepended to a changeset header row's title (both the outline's Header
+/// row and the summary panel's changeset title) — purely decorative (dim-colored), so it carries
+/// no semantic color of its own.
+const NERD_BRANCH_ICON: char = '\u{f418}'; // nf-oct-git-branch
+/// Nerd-mode diffstat glyph for the summary panel's added-lines count, replacing the plain `+`.
+const NERD_DIFF_ADDED: char = '\u{f457}'; // nf-oct-diff-added
+/// Nerd-mode diffstat glyph for the summary panel's deleted-lines count, replacing the plain `-`.
+const NERD_DIFF_REMOVED: char = '\u{f458}'; // nf-oct-diff-removed
+
+/// The current-changeset marker for the active icon strategy. These four one-switch helpers are
+/// the single source of each semantic marker's glyph pair — the outline's Header arm and the
+/// summary panel (and, upstack, the winbar) deliberately draw the SAME markers, so the selection
+/// lives in one place instead of a hand-synced `match` per call site.
+fn current_marker(icons: OutlineIcons) -> char {
+    match icons {
+        OutlineIcons::Nerd => NERD_CURRENT_MARKER,
+        OutlineIcons::None => '\u{25CF}',
+    }
+}
+
+/// The needs-restack marker for the active icon strategy (see [`current_marker`]).
+fn warn_marker(icons: OutlineIcons) -> char {
+    match icons {
+        OutlineIcons::Nerd => NERD_WARN_MARKER,
+        OutlineIcons::None => '\u{26A0}',
+    }
+}
+
+/// The failed-changeset marker for the active icon strategy (see [`current_marker`]).
+fn error_marker(icons: OutlineIcons) -> char {
+    match icons {
+        OutlineIcons::Nerd => NERD_ERROR_MARKER,
+        OutlineIcons::None => '\u{2717}',
+    }
+}
+
+/// The loading marker for the active icon strategy (see [`current_marker`]).
+fn loading_marker(icons: OutlineIcons) -> char {
+    match icons {
+        OutlineIcons::Nerd => NERD_LOADING_MARKER,
+        OutlineIcons::None => '\u{2026}',
+    }
+}
+
+/// The diffstat `+`/`-` prefixes for the active icon strategy (nerd: the oct diff glyphs) —
+/// shared by the summary panel's totals line and any other diffstat surface.
+fn diffstat_prefixes(icons: OutlineIcons) -> (String, String) {
+    match icons {
+        OutlineIcons::Nerd => (
+            format!("{NERD_DIFF_ADDED} "),
+            format!("{NERD_DIFF_REMOVED} "),
+        ),
+        OutlineIcons::None => ("+".to_string(), "-".to_string()),
+    }
+}
+
+/// The shared changeset-title span run — `[current-marker] [branch-icon] label [warn-marker]` —
+/// drawn identically by `build_outline_line`'s Header arm and [`changeset_summary_lines`] (whose
+/// doc comment promises exactly that sameness); extracting it makes the promise structural
+/// instead of hand-synced. Failed/loading markers are NOT included: the two call sites place
+/// them differently (trailing spans on the header row vs. a line of their own in the summary).
+fn changeset_title_spans(
+    label: &str,
+    current: bool,
+    needs_restack: bool,
+    theme: &Palette,
+    icons: OutlineIcons,
+) -> Vec<TSpan<'static>> {
+    let marker = if current {
+        format!("{} ", current_marker(icons))
+    } else {
+        "  ".to_string()
+    };
+    let mut spans = vec![TSpan::styled(marker, Style::default().fg(theme.current_fg))];
+    if icons == OutlineIcons::Nerd {
+        spans.push(TSpan::styled(
+            format!("{NERD_BRANCH_ICON} "),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    spans.push(TSpan::styled(
+        label.to_string(),
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if needs_restack {
+        spans.push(TSpan::styled(
+            format!(" {}", warn_marker(icons)),
+            Style::default().fg(theme.warn_fg),
+        ));
+    }
+    spans
+}
+
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
 /// a wash over the whole row, not a mask. `None` (a context/gap cell with no bg span at all)
@@ -551,32 +659,19 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
             failed,
             ..
         } => {
-            let marker = if *current { "\u{25CF} " } else { "  " };
-            let mut spans = vec![TSpan::styled(
-                marker.to_string(),
-                Style::default().fg(theme.current_fg),
-            )];
-            spans.push(TSpan::styled(
-                label.clone(),
-                Style::default()
-                    .fg(theme.foreground)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            if *needs_restack {
-                spans.push(TSpan::styled(
-                    " \u{26A0}",
-                    Style::default().fg(theme.warn_fg),
-                ));
-            }
+            let mut spans = changeset_title_spans(label, *current, *needs_restack, theme, icons);
             // ADR-031: a Failed changeset's marker wins over Pending's (a slot is never both,
             // but Failed is the more actionable state to surface if it somehow were).
             if *failed {
                 spans.push(TSpan::styled(
-                    " \u{2717}",
+                    format!(" {}", error_marker(icons)),
                     Style::default().fg(theme.error_fg),
                 ));
             } else if *loading {
-                spans.push(TSpan::styled(" \u{2026}", Style::default().fg(theme.dim)));
+                spans.push(TSpan::styled(
+                    format!(" {}", loading_marker(icons)),
+                    Style::default().fg(theme.dim),
+                ));
             }
             Line::from(spans)
         }
@@ -600,7 +695,10 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
             guides,
             ..
         } => {
-            let glyph = status.glyph();
+            let glyph = match icons {
+                OutlineIcons::Nerd => status.nerd_glyph(),
+                OutlineIcons::None => status.glyph(),
+            };
             let letter = change.letter();
             // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
             // non-empty `guides` (Tree/StackTree modes) draws tree connectors instead — see
@@ -882,11 +980,13 @@ fn push_summary_body(
     total_dels: usize,
     height: usize,
     theme: &Palette,
+    icons: OutlineIcons,
 ) {
     lines.push(Line::from(""));
     let footer_budget = 1; // the totals line always shows
     let file_budget = height.saturating_sub(lines.len() + footer_budget);
     push_summary_file_rows(lines, files, file_budget, theme);
+    let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
     lines.push(Line::from(vec![
         TSpan::styled(
             format!("{} files", files.len()),
@@ -894,44 +994,35 @@ fn push_summary_body(
         ),
         TSpan::raw("  "),
         TSpan::styled(
-            format!("+{total_adds}"),
+            format!("{added_prefix}{total_adds}"),
             Style::default().fg(theme.add_strong),
         ),
         TSpan::raw(" "),
         TSpan::styled(
-            format!("-{total_dels}"),
+            format!("{removed_prefix}{total_dels}"),
             Style::default().fg(theme.del_strong),
         ),
     ]));
 }
 
-/// Build a [`ChangesetSummary`]'s lines: title line (carrying the same current/needs-restack/
-/// failed markers `build_outline_line`'s Header arm draws), a loading/failed line OR the per-file
-/// list + totals line.
+/// Build a [`ChangesetSummary`]'s lines: title line (the same current/needs-restack markers
+/// `build_outline_line`'s Header arm draws — structurally shared via [`changeset_title_spans`]),
+/// a loading/failed line OR the per-file list + totals line.
 fn changeset_summary_lines(
     summary: &ChangesetSummary,
     height: usize,
     theme: &Palette,
+    icons: OutlineIcons,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    let mut title_spans = vec![TSpan::styled(
-        if summary.current { "\u{25CF} " } else { "  " },
-        Style::default().fg(theme.current_fg),
-    )];
-    title_spans.push(TSpan::styled(
-        summary.label.clone(),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
-    ));
-    if summary.needs_restack {
-        title_spans.push(TSpan::styled(
-            " \u{26A0}",
-            Style::default().fg(theme.warn_fg),
-        ));
-    }
-    lines.push(Line::from(title_spans));
+    lines.push(Line::from(changeset_title_spans(
+        &summary.label,
+        summary.current,
+        summary.needs_restack,
+        theme,
+        icons,
+    )));
 
     if summary.failed {
         let msg = summary
@@ -939,14 +1030,14 @@ fn changeset_summary_lines(
             .as_deref()
             .unwrap_or("(no error message)");
         lines.push(Line::from(TSpan::styled(
-            format!("\u{2717} {msg}"),
+            format!("{} {msg}", error_marker(icons)),
             Style::default().fg(theme.error_fg),
         )));
         return lines;
     }
     if summary.loading {
         lines.push(Line::from(TSpan::styled(
-            "Loading\u{2026}",
+            format!("Loading{}", loading_marker(icons)),
             Style::default().fg(theme.dim),
         )));
         return lines;
@@ -959,15 +1050,27 @@ fn changeset_summary_lines(
         summary.total_dels,
         height,
         theme,
+        icons,
     );
     lines
 }
 
 /// Build a [`DirSummary`]'s lines: a bold path title, a blank line, the per-file list, and the
 /// totals line — no current/restack/loading/failed markers (a directory carries none of those).
-fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Vec<Line<'static>> {
+/// The title gets [`crate::icons::DIR_ICON`] in [`OutlineIcons::Nerd`] mode, matching the
+/// outline's own [`OutlineItem::Dir`] row (`build_outline_line`).
+fn dir_summary_lines(
+    summary: &DirSummary,
+    height: usize,
+    theme: &Palette,
+    icons: OutlineIcons,
+) -> Vec<Line<'static>> {
+    let dir_icon = match icons {
+        OutlineIcons::Nerd => format!("{} ", crate::icons::DIR_ICON),
+        OutlineIcons::None => String::new(),
+    };
     let mut lines = vec![Line::from(TSpan::styled(
-        format!("{}/", summary.path),
+        format!("{dir_icon}{}/", summary.path),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
@@ -979,6 +1082,7 @@ fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Ve
         summary.total_dels,
         height,
         theme,
+        icons,
     );
     lines
 }
@@ -988,11 +1092,17 @@ fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Ve
 /// line, per-file `"path  +N -M"` rows (truncated to the pane height), and a totals line. A
 /// loading/failed Header shows its own inline state instead of a file list (see
 /// [`changeset_summary_lines`]).
-fn render_summary(frame: &mut Frame, summary: &Summary, area: Rect, theme: &Palette) {
+fn render_summary(
+    frame: &mut Frame,
+    summary: &Summary,
+    area: Rect,
+    theme: &Palette,
+    icons: OutlineIcons,
+) {
     let height = area.height as usize;
     let lines = match summary {
-        Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme),
-        Summary::Dir(dir) => dir_summary_lines(dir, height, theme),
+        Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme, icons),
+        Summary::Dir(dir) => dir_summary_lines(dir, height, theme, icons),
     };
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -1004,7 +1114,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     // diff-body rendering; `summary_target` returns `None` in both cases).
     if let Some(target) = app.summary_target() {
         let summary = app.summary_for(target);
-        render_summary(frame, &summary, area, theme);
+        render_summary(frame, &summary, area, theme, app.outline_icons());
         return;
     }
     // ADR-031: the active changeset's diff hasn't been acquired (or failed to acquire) yet —
@@ -2955,6 +3065,103 @@ mod tests {
                 .any(|r| r.contains(crate::icons::DEFAULT_ICON)),
             "icons=none must never render the default file icon, got:\n{}",
             content.join("\n")
+        );
+    }
+
+    // ── CS3: nerd-mode status/header/summary iconography ────────────────────────
+
+    #[test]
+    fn outline_header_nerd_markers_replace_the_unicode_defaults() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: it's the full-width winbar, which ALSO renders a (still-unicode, CS4's job)
+        // "⚠ needs restack" marker — an unskipped search would false-positive on it.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let joined = content.join("\n");
+
+        assert!(
+            joined.contains(super::NERD_CURRENT_MARKER),
+            "expected the nerd current-changeset marker, got:\n{joined}"
+        );
+        assert!(
+            joined.contains(super::NERD_WARN_MARKER),
+            "expected the nerd needs-restack marker, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains('\u{25CF}') && !joined.contains('\u{26A0}'),
+            "nerd mode must not leave the plain unicode markers behind in the outline pane, got:\n{joined}"
+        );
+        assert!(
+            joined.contains(super::NERD_BRANCH_ICON),
+            "expected a branch glyph on the changeset header row, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn outline_file_status_nerd_glyph_replaces_the_plain_glyph() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("a.txt", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let joined = content.join("\n");
+
+        assert!(
+            joined.contains(crate::outline::StagedStatus::Staged.nerd_glyph()),
+            "expected the nerd staged glyph (fa-check), got:\n{joined}"
+        );
+        assert!(
+            !joined.contains(crate::outline::StagedStatus::Staged.glyph()),
+            "nerd mode must not leave the plain ✓ glyph behind, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn summary_panel_nerd_mode_renders_the_dir_icon_and_diffstat_glyphs() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        app.focus_outline(); // opens (a lone changeset defaults closed) and focuses
+        app.outline_cycle_mode(); // Stack -> Tree, so a Dir row exists to focus
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { .. }))
+            .expect("a Dir row present in Tree mode") as i64;
+        let delta = dir_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        assert!(matches!(
+            app.outline_items()[app.outline_cursor()],
+            OutlineItem::Dir { .. }
+        ));
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let body = body_text(&buf);
+        assert!(
+            body.contains(crate::icons::DIR_ICON),
+            "expected the summary panel's dir title to carry the nerd dir icon, got:\n{body}"
+        );
+        assert!(
+            body.contains(super::NERD_DIFF_ADDED) && body.contains(super::NERD_DIFF_REMOVED),
+            "expected nerd diffstat glyphs in the summary panel's totals line, got:\n{body}"
         );
     }
 
