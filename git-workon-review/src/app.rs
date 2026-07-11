@@ -1049,6 +1049,47 @@ impl ChangesetView {
     }
 }
 
+/// One content region the renderer painted this frame, in terminal cell coordinates (CS10). A
+/// deliberately tiny local shape rather than `ratatui::layout::Rect`: `app.rs` has no ratatui
+/// dependency today, and this keeps it that way — `render.rs` (which already depends on
+/// ratatui) converts a `Rect`'s content area into this when it writes [`App::hit_regions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl Region {
+    fn contains(&self, col: u16, row: u16) -> bool {
+        col >= self.x && col < self.x + self.w && row >= self.y && row < self.y + self.h
+    }
+}
+
+/// The content regions the last frame painted (CS10), written by `render::render` (which clears
+/// this to `Default` at the top of every frame first) and read by [`App::handle_click`]/
+/// [`App::handle_wheel`] to hit-test a mouse event's `(col, row)` against the region under the
+/// pointer. A `None` field simply wasn't painted this frame — the outline is closed, or the
+/// current file isn't in [`EffectiveZoom::Split`], etc. — never a stale rect from an earlier
+/// frame's layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HitRegions {
+    pub outline: Option<Region>,
+    pub single: Option<Region>,
+    pub unstaged: Option<Region>,
+    pub staged: Option<Region>,
+}
+
+/// Which content region a mouse event hit-tested into (CS10's `App::hit_test`) — the outline,
+/// the single-zoom diff pane, or one half of a split, tagged with which [`SplitPane`] so the
+/// click/wheel handlers know whether to `toggle_split_focus` first.
+enum HitPane {
+    Outline,
+    Single,
+    Split(SplitPane),
+}
+
 /// Review session state: the active changeset's file list, per-file lazily loaded views, and
 /// navigation/scroll state. One long-lived [`TsHighlighter`] lives here (not per file) — its
 /// language-config cache is keyed per-instance, so a fresh highlighter per file would rebuild
@@ -1090,6 +1131,10 @@ pub struct App {
     /// Content height of the outline pane, written by the renderer each frame — same discipline
     /// as [`Self::pane_height`]. Read by [`Self::derive_outline_scroll`].
     pub outline_height: usize,
+    /// The content regions the last frame painted (CS10 mouse support) — see [`HitRegions`]'s
+    /// doc comment. Cleared and re-written by `render::render` every frame; read by
+    /// [`Self::handle_click`]/[`Self::handle_wheel`].
+    pub hit_regions: HitRegions,
     /// Label for the old side of the diff, shown next to a rename's `old_path` in the header.
     /// M4 only reviews the uncommitted (`HEAD` ↔ worktree) diffs, so this is always `"HEAD"`
     /// today; M5's committed-changeset zoom will want the changeset's actual base rev.
@@ -1337,6 +1382,7 @@ impl App {
             alt: PaneState::default(),
             alt_height: 20,
             outline_height: 20,
+            hit_regions: HitRegions::default(),
             base_label,
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
@@ -2561,6 +2607,120 @@ impl App {
     /// focus, never visibility (that's `o`/[`Self::toggle_outline`]'s job).
     pub fn focus_diff(&mut self) {
         self.outline.focused = false;
+    }
+
+    // ── Mouse (CS10) ─────────────────────────────────────────────────────────────
+
+    /// Hit-test `(col, row)` against [`Self::hit_regions`] — outline first, then the single diff
+    /// pane, then the split's two halves — returning the matched region tagged with which
+    /// [`HitPane`] it was. `None` when the pointer is over a header/footer/divider/caption row
+    /// (recorded regions cover content only).
+    fn hit_test(&self, col: u16, row: u16) -> Option<(HitPane, Region)> {
+        if let Some(region) = self.hit_regions.outline {
+            if region.contains(col, row) {
+                return Some((HitPane::Outline, region));
+            }
+        }
+        if let Some(region) = self.hit_regions.single {
+            if region.contains(col, row) {
+                return Some((HitPane::Single, region));
+            }
+        }
+        if let Some(region) = self.hit_regions.unstaged {
+            if region.contains(col, row) {
+                return Some((HitPane::Split(SplitPane::Unstaged), region));
+            }
+        }
+        if let Some(region) = self.hit_regions.staged {
+            if region.contains(col, row) {
+                return Some((HitPane::Split(SplitPane::Staged), region));
+            }
+        }
+        None
+    }
+
+    /// Focus the diff pane a click/wheel landed in, mirroring the keyboard focus rules: if the
+    /// outline had focus, `focus_diff()` moves focus onto whichever split pane already has it; if
+    /// the event landed in the OTHER split pane, `toggle_split_focus()` flips onto it next (never
+    /// assigning `split_focus` directly — see that method's doc comment). `target` is `None` for
+    /// the single-zoom pane, where there is no second half to flip to.
+    fn focus_diff_pane(&mut self, target: Option<SplitPane>) {
+        if self.outline_focused() {
+            self.focus_diff();
+        }
+        if let Some(target) = target {
+            if self.split_focus != target {
+                self.toggle_split_focus();
+            }
+        }
+    }
+
+    /// Set the (now-focused) pane's cursor to the row under a click, offset from `region`'s top by
+    /// `row` and clamped into the current row list, then re-derive `scroll`. A no-op on an empty
+    /// file list, matching [`Self::move_cursor_by`]'s empty-list behavior.
+    fn set_cursor_from_click(&mut self, region: Region, row: u16) {
+        let rows = self.row_count();
+        if rows == 0 {
+            return;
+        }
+        let offset = (row - region.y) as usize;
+        self.cursor = (self.scroll + offset).min(rows - 1);
+        self.derive_scroll();
+    }
+
+    /// Left-click at terminal `(col, row)` (CS10): focus + select whatever content region the
+    /// click landed in, matching the keyboard-driven equivalent for that region. Outline: focuses
+    /// the outline and jumps the cursor to the clicked row via [`Self::outline_move_to`] — a File
+    /// row jumps the diff there (same single-jump semantics `g`/`G` use), a Header/Dir row just
+    /// selects (the summary panel follows via [`Self::summary_target`]). Diff pane (single or
+    /// split): focuses that pane (flipping `split_focus` first if the click landed in the
+    /// unfocused half) and moves its cursor to the clicked row. Outside every recorded region
+    /// (header/footer/divider/captions): no-op.
+    pub fn handle_click(&mut self, col: u16, row: u16) {
+        let Some((pane, region)) = self.hit_test(col, row) else {
+            return;
+        };
+        match pane {
+            HitPane::Outline => {
+                self.focus_outline();
+                let idx = self.outline.scroll + (row - region.y) as usize;
+                self.outline_move_to(idx);
+            }
+            HitPane::Single => {
+                self.focus_diff_pane(None);
+                self.set_cursor_from_click(region, row);
+            }
+            HitPane::Split(target) => {
+                self.focus_diff_pane(Some(target));
+                self.set_cursor_from_click(region, row);
+            }
+        }
+    }
+
+    /// Mouse wheel at terminal `(col, row)` with `delta` = ±3 rows (`tui::update` maps
+    /// `ScrollDown`/`ScrollUp` to +3/-3). Focuses whichever region the pointer sits over first —
+    /// same rule as [`Self::handle_click`] — then moves that pane's cursor by `delta`
+    /// ([`Self::outline_move_by`] for the outline, [`Self::move_cursor_by`] otherwise); scroll
+    /// simply follows via the normal derive discipline rather than a decoupled scroll state.
+    /// Outside every recorded region: no-op.
+    pub fn handle_wheel(&mut self, col: u16, row: u16, delta: i64) {
+        let Some((pane, _region)) = self.hit_test(col, row) else {
+            return;
+        };
+        match pane {
+            HitPane::Outline => {
+                self.focus_outline();
+                self.outline_move_by(delta);
+            }
+            HitPane::Single => {
+                self.focus_diff_pane(None);
+                self.move_cursor_by(delta);
+            }
+            HitPane::Split(target) => {
+                self.focus_diff_pane(Some(target));
+                self.move_cursor_by(delta);
+            }
+        }
     }
 
     /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
@@ -4374,8 +4534,8 @@ mod tests {
     use super::test_support::app_from_fixture;
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        EffectiveZoom, Layout, LoadedViews, Role, Severity, Summary, SummaryTarget, Zoom,
-        DEFAULT_OUTLINE_WIDTH,
+        EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity, Summary,
+        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
@@ -10056,5 +10216,238 @@ mod tests {
             "E must fully expand the gap: {:?}",
             view.display
         );
+    }
+
+    // ── CS10: mouse (click-to-focus, wheel scrolling) ────────────────────────────
+
+    #[test]
+    fn click_on_an_outline_file_row_focuses_selects_and_jumps_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        // BaseFirst Stack order: header(cs-a)=0, a1.txt=1, a2.txt=2, header(cs-b)=3, b1.txt=4.
+        app.outline_height = 10;
+        app.derive_outline_scroll();
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        });
+        assert!(!app.outline_focused(), "starts unfocused (locked default)");
+
+        // Row 2 (a2.txt) at the outline's top-of-viewport (scroll 0) is screen row 2.
+        app.handle_click(5, 2);
+
+        assert!(app.outline_focused(), "a click on the outline focuses it");
+        assert_eq!(app.outline_cursor(), 2);
+        assert_eq!(app.current_cs(), 0);
+        assert_eq!(
+            app.files()[app.current].path,
+            "a2.txt",
+            "a File row's click must jump the diff there, like outline_move_to"
+        );
+    }
+
+    #[test]
+    fn click_on_an_outline_header_row_selects_without_jumping_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline_height = 10;
+        app.derive_outline_scroll();
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        });
+        let before_cs = app.current_cs();
+        let before_file = app.current;
+
+        // Row 3 is cs-b's header.
+        app.handle_click(5, 3);
+
+        assert!(app.outline_focused());
+        assert_eq!(app.outline_cursor(), 3);
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (before_cs, before_file),
+            "a Header row's click must not jump the diff"
+        );
+        assert!(
+            app.summary_target().is_some(),
+            "selecting a Header row (outline open + focused) must surface the summary panel"
+        );
+    }
+
+    #[test]
+    fn click_in_the_single_diff_pane_focuses_it_and_moves_the_cursor_to_the_clicked_row() {
+        // 40 single-line rows (mirrors `derive_scroll_keeps_scrolloff_margin_and_slides_minimally`
+        // above) — long enough that clicking row 4 lands there without clamping against a tiny
+        // real diff.
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.focus_outline();
+        assert!(app.outline_focused());
+        app.pane_height = 10;
+        app.cursor = 0;
+        app.scroll = 0;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+
+        app.handle_click(10, 4);
+
+        assert!(
+            !app.outline_focused(),
+            "a click in the diff pane must return focus to the diff"
+        );
+        assert_eq!(
+            app.cursor, 4,
+            "the cursor must land on the clicked row (scroll 0 + offset 4)"
+        );
+    }
+
+    #[test]
+    fn click_in_the_unfocused_split_pane_flips_split_focus_and_moves_its_cursor() {
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Split; focused pane defaults to Unstaged
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert_eq!(app.split_focus_role(), Role::Unstaged);
+
+        app.pane_height = 5;
+        app.alt_height = 5;
+        app.derive_scroll();
+        app.derive_alt_scroll();
+        app.hit_regions.unstaged = Some(Region {
+            x: 0,
+            y: 1,
+            w: 40,
+            h: 5,
+        });
+        app.hit_regions.staged = Some(Region {
+            x: 0,
+            y: 7,
+            w: 40,
+            h: 5,
+        });
+
+        // Row 1 inside the staged region (y=7, height 5) — the currently UNFOCUSED pane. `f.txt`
+        // is a 3-line file (alpha/beta/gamma), so offset 1 stays within its row count either way.
+        app.handle_click(3, 8);
+
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Staged,
+            "a click in the unfocused pane must flip split_focus onto it"
+        );
+        let (_, cursor) = app.pane_render_state(Role::Staged);
+        assert_eq!(
+            cursor,
+            Some(1),
+            "the newly-focused pane's cursor must land on the clicked row (offset 1 into the region)"
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_outline_focuses_it_and_moves_the_cursor_by_delta_with_scrolloff() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5; // bottom_margin = 5 - 1 - SCROLLOFF(2) = 2
+        app.outline.cursor = 0;
+        app.derive_outline_scroll();
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 5,
+        });
+        assert!(!app.outline_focused());
+
+        app.handle_wheel(5, 2, 3);
+
+        assert!(app.outline_focused(), "a wheel event focuses its pane");
+        assert_eq!(app.outline_cursor(), 3);
+        let scroll = app.outline_scroll();
+        assert!(
+            app.outline_cursor() >= scroll && app.outline_cursor() <= scroll + 2,
+            "the outline scroll must follow the wheel-moved cursor via the normal scrolloff derive"
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_focused_diff_pane_moves_the_cursor_by_delta() {
+        // Same 40-line fixture as the click test above — enough rows that a ±3 wheel move never
+        // clamps against a tiny real diff.
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.cursor = 5;
+        app.scroll = 0;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+        let cursor_before = app.cursor;
+
+        app.handle_wheel(10, 3, 3);
+        assert_eq!(app.cursor, cursor_before + 3);
+
+        app.handle_wheel(10, 3, -3);
+        assert_eq!(app.cursor, cursor_before);
+    }
+
+    #[test]
+    fn click_outside_every_hit_region_is_a_no_op() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline_height = 10;
+        app.pane_height = 10;
+        app.hit_regions = HitRegions {
+            outline: Some(Region {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 10,
+            }),
+            single: Some(Region {
+                x: 21,
+                y: 0,
+                w: 40,
+                h: 10,
+            }),
+            unstaged: None,
+            staged: None,
+        };
+        let outline_focused_before = app.outline_focused();
+        let cursor_before = app.cursor;
+        let outline_cursor_before = app.outline_cursor();
+        let current_before = (app.current_cs(), app.current);
+
+        // Row 0 sits above both content regions (a header row at y=0 in either would collide —
+        // pick a column between the two panes' widths, on the divider itself).
+        app.handle_click(20, 0);
+
+        assert_eq!(app.outline_focused(), outline_focused_before);
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(app.outline_cursor(), outline_cursor_before);
+        assert_eq!((app.current_cs(), app.current), current_before);
     }
 }

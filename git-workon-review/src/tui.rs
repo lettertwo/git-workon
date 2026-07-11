@@ -15,6 +15,13 @@
 //! `event::poll`'s timeout to the channel's. The M4 index watcher's *semantics* are exactly
 //! unchanged by this move: it still compares [`workon_review::refresh::IndexSignature`] and
 //! re-diffs in place via [`App::on_tick`] on every `Tick`; only the beat's mechanism moved.
+//!
+//! CS10 turns the mouse on: [`Tui::acquire`] enables capture for the whole session (undone by
+//! [`Tui::restore`] and, unconditionally, the panic hook), and [`map_terminal_event`] maps a
+//! left-click or wheel-scroll into an [`AppEvent::Mouse`] the loop dispatches to
+//! [`workon_review::app::App::handle_click`]/[`workon_review::app::App::handle_wheel`] — every
+//! other mouse kind (drag, move, non-left buttons, button-up) is still dropped, same as key
+//! release/repeat.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -23,7 +30,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -52,6 +62,10 @@ use workon_review::theme::Palette;
 pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
+    /// A left-click or wheel-scroll (CS10) — the only [`MouseEventKind`]s [`map_terminal_event`]
+    /// maps; drag, move, non-left buttons, and up events are dropped at the mapping step, exactly
+    /// like key release/repeat.
+    Mouse(MouseEvent),
     Tick,
     /// One [`LoadRequest`]'s result — ADR-037's loader-result variant. `gen`/`cs_idx`/`file_idx`
     /// echo the request's stamp; `result` is `Err` for a job that panicked or otherwise failed
@@ -98,15 +112,25 @@ impl PartialEq for AppEvent {
 /// still observable, just relayed rather than swallowed). `Tick` never appears here.
 type InboxMessage = io::Result<AppEvent>;
 
-/// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press and
-/// resize map; key release/repeat, mouse, paste, and focus events are skipped (`None`), exactly
-/// like this module's pre-ADR-037 `next_event`/`drain_pending` read arms did. Pure and
-/// independent of any thread or channel, so it's unit-tested directly; the input thread's loop
-/// body is a thin wrapper around it.
+/// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press,
+/// resize, and (CS10) a left-click or wheel-scroll map; key release/repeat, every other mouse
+/// kind (drag, move, non-left buttons, button-up), paste, and focus events are skipped (`None`).
+/// Pure and independent of any thread or channel, so it's unit-tested directly; the input
+/// thread's loop body is a thin wrapper around it.
 fn map_terminal_event(event: Event) -> Option<AppEvent> {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => Some(AppEvent::Key(key)),
         Event::Resize(w, h) => Some(AppEvent::Resize(w, h)),
+        Event::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+            ) =>
+        {
+            Some(AppEvent::Mouse(m))
+        }
         _ => None,
     }
 }
@@ -695,6 +719,19 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             KeyOutcome::Handled => false,
             KeyOutcome::Action(action) => apply_action(app, action),
         },
+        // CS10: both modals swallow mouse input exactly like they swallow keys (cases 1-2 above)
+        // — a click/wheel while a discard confirm or the help overlay is up does nothing.
+        AppEvent::Mouse(_) if app.pending_confirm.is_some() || app.help_visible => false,
+        AppEvent::Mouse(m) => {
+            app.clear_notice();
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => app.handle_click(m.column, m.row),
+                MouseEventKind::ScrollDown => app.handle_wheel(m.column, m.row, 3),
+                MouseEventKind::ScrollUp => app.handle_wheel(m.column, m.row, -3),
+                _ => {}
+            }
+            false
+        }
         AppEvent::Tick => {
             app.on_tick();
             false
@@ -878,7 +915,11 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut out = terminal_writer();
-        let _ = execute!(out, LeaveAlternateScreen);
+        // CS10: disable mouse capture unconditionally, same as `Tui::restore` — a stray disable
+        // sequence when capture was never enabled (a panic before `Tui::acquire` reaches its own
+        // `EnableMouseCapture`) is harmless, and there's no cheaper way from here to know whether
+        // capture is currently on.
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
         default_hook(info);
     }));
 }
@@ -903,7 +944,10 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode()?;
         let mut out = terminal_writer();
-        execute!(out, EnterAlternateScreen)?;
+        // CS10: capture the mouse for the whole session — `map_terminal_event` only ever lets a
+        // left-click or wheel-scroll through, so this doesn't cost the terminal's normal
+        // text-selection UX beyond what most terminals' shift-click bypass already covers.
+        execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(out);
         let terminal = Terminal::new(backend)?;
         Ok(Self {
@@ -1014,7 +1058,14 @@ impl Tui {
         }
         self.restored = true;
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        // CS10: disable mouse capture before leaving the alternate screen — same ordering
+        // convention as the raw-mode/alternate-screen pair, undone in the reverse order acquire
+        // set them up in.
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
         self.terminal.show_cursor()
     }
 }
@@ -1144,9 +1195,18 @@ mod tests {
         );
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 5,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     #[test]
-    fn map_terminal_event_skips_release_repeat_mouse_paste_and_focus() {
-        use crossterm::event::{KeyEventState, MouseEvent, MouseEventKind};
+    fn map_terminal_event_skips_release_repeat_paste_and_focus() {
+        use crossterm::event::KeyEventState;
 
         let release = KeyEvent::new_with_kind(
             KeyCode::Char('q'),
@@ -1163,18 +1223,55 @@ mod tests {
         );
         assert_eq!(map_terminal_event(Event::Key(repeat)), None);
 
-        assert_eq!(
-            map_terminal_event(Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Moved,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            })),
-            None
-        );
         assert_eq!(map_terminal_event(Event::Paste("pasted".to_string())), None);
         assert_eq!(map_terminal_event(Event::FocusGained), None);
         assert_eq!(map_terminal_event(Event::FocusLost), None);
+    }
+
+    /// CS10: `map_terminal_event` maps ONLY a left-click-down or a wheel-scroll to
+    /// `AppEvent::Mouse`; every other mouse kind — drag, move, button-up, and non-left buttons —
+    /// is still dropped, exactly like the pre-CS10 version dropped every mouse event outright.
+    /// This supersedes the old `map_terminal_event_skips_release_repeat_mouse_paste_and_focus`
+    /// pin (split above into the non-mouse skip cases, which are unchanged by CS10).
+    #[test]
+    fn map_terminal_event_maps_left_down_and_scroll_but_drops_other_mouse_kinds() {
+        let left_down = mouse(MouseEventKind::Down(MouseButton::Left));
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(left_down)),
+            Some(AppEvent::Mouse(m)) if m == left_down
+        ));
+
+        let scroll_up = mouse(MouseEventKind::ScrollUp);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_up)),
+            Some(AppEvent::Mouse(m)) if m == scroll_up
+        ));
+
+        let scroll_down = mouse(MouseEventKind::ScrollDown);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_down)),
+            Some(AppEvent::Mouse(m)) if m == scroll_down
+        ));
+
+        // Dropped: drag, move, button-up, and a right-click-down.
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left)))),
+            None
+        );
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Moved))),
+            None
+        );
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Up(MouseButton::Left)))),
+            None
+        );
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Down(
+                MouseButton::Right
+            )))),
+            None
+        );
     }
 
     /// `AppEvent` dropped `PartialEq`/`Eq` in ADR-037 (`FileReady`'s `LoadedViews` payload wraps
@@ -1879,6 +1976,50 @@ mod tests {
         assert!(app.pending_confirm.is_none(), "y must resolve the confirm");
         let repo = fixture.repo().unwrap();
         repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
+    }
+
+    /// CS10: a pending discard confirm swallows a mouse event exactly like it swallows a key —
+    /// mirrors `pending_confirm_captures_y_and_n_and_ignores_other_keys` above. A click inside a
+    /// live hit region must not move the cursor or resolve the confirm.
+    #[test]
+    fn pending_confirm_swallows_a_mouse_click() {
+        use workon_review::app::{PendingOp, Region};
+
+        let fixture = git_workon_fixture::prelude::FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\nthree\n", "one\nCHANGED\nthree\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+        let cursor_before = app.cursor;
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Mouse(mouse(MouseEventKind::Down(MouseButton::Left))),
+        );
+
+        assert!(!quit);
+        assert!(
+            app.pending_confirm.is_some(),
+            "a mouse event must not resolve the confirm"
+        );
+        assert_eq!(
+            app.cursor, cursor_before,
+            "a swallowed click must not move the cursor"
+        );
     }
 
     // ── M5 CS3: outline pane key routing ─────────────────────────────────────
