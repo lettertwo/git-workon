@@ -3121,6 +3121,11 @@ impl App {
             },
         };
         view.expand_gap(key, 10, 10, full);
+        // The expansion just reshaped the focused pane's row space — cancel any active selection
+        // rather than translating it, per `selection_anchor`'s invariant (same rule as layout
+        // toggles, zoom changes, file switches, and split-focus swaps). Only reached when a gap
+        // actually expanded; the non-gap no-op above leaves a selection alone.
+        self.cancel_selection();
         self.derive_scroll();
         self.clamp_cursor();
     }
@@ -9589,6 +9594,32 @@ mod tests {
             .iter()
             .position(|r| matches!(r, DisplayRow::Gap { .. }))
             .expect("expected exactly one gap row")
+    }
+
+    #[test]
+    fn expand_gap_cancels_an_active_selection_but_a_non_gap_press_leaves_it_alone() {
+        // An expansion reshapes the focused pane's row space, so `selection_anchor`'s invariant
+        // (cancel, never translate) applies — a selection made before the expand would silently
+        // cover different lines after it. The non-gap no-op path must NOT cancel: nothing
+        // reshaped.
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.start_selection();
+        assert!(app.selection_anchor.is_some(), "selection must start");
+        app.expand_gap_at_cursor(false); // cursor sits on the first hunk, not a gap: no-op
+        assert!(
+            app.selection_anchor.is_some(),
+            "a no-op press on a non-gap row must leave the selection alone"
+        );
+
+        app.cursor = only_gap_row(&app);
+        app.expand_gap_at_cursor(false);
+        assert!(
+            app.selection_anchor.is_none(),
+            "an actual expansion reshapes the row space and must cancel the selection"
+        );
     }
 
     #[test]
