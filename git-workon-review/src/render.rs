@@ -613,11 +613,7 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
             } else {
                 tree_prefix(guides)
             };
-            let icon = match icons {
-                OutlineIcons::Nerd => format!("{} ", crate::icons::icon_for_path(path)),
-                OutlineIcons::None => String::new(),
-            };
-            Line::from(vec![
+            let mut spans = vec![
                 TSpan::styled(
                     format!("{prefix}{glyph}"),
                     Style::default().fg(theme.foreground),
@@ -626,11 +622,23 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
                     letter.to_string(),
                     Style::default().fg(change_letter_color(*change, theme)),
                 ),
-                TSpan::styled(
-                    format!(" {icon}{path}"),
-                    Style::default().fg(theme.foreground),
-                ),
-            ])
+                TSpan::styled(" ".to_string(), Style::default().fg(theme.foreground)),
+            ];
+            if icons == OutlineIcons::Nerd {
+                let (icon, color) = crate::icons::icon_for_path(
+                    path,
+                    crate::theme::is_light_background(theme.background),
+                );
+                spans.push(TSpan::styled(
+                    format!("{icon} "),
+                    Style::default().fg(color.unwrap_or(theme.foreground)),
+                ));
+            }
+            spans.push(TSpan::styled(
+                path.clone(),
+                Style::default().fg(theme.foreground),
+            ));
+            Line::from(spans)
         }
     }
 }
@@ -2908,7 +2916,7 @@ mod tests {
             .find(|r| r.contains("main.rs"))
             .expect("main.rs file row present");
         assert!(
-            file_row.contains(crate::icons::icon_for_path("main.rs")),
+            file_row.contains(crate::icons::icon_for_path("main.rs", false).0),
             "expected the rust file icon before main.rs, got: {file_row:?}"
         );
     }
