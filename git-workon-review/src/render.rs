@@ -824,6 +824,39 @@ fn push_summary_file_rows(
     )));
 }
 
+/// Append the shared summary body — spacer, height-budgeted per-file rows, and the
+/// `"{N} files  +A -D"` totals line — used verbatim by both [`changeset_summary_lines`] and
+/// [`dir_summary_lines`], which differ only in their title line and early-return states.
+fn push_summary_body(
+    lines: &mut Vec<Line<'static>>,
+    files: &[SummaryFileRow],
+    total_adds: usize,
+    total_dels: usize,
+    height: usize,
+    theme: &Palette,
+) {
+    lines.push(Line::from(""));
+    let footer_budget = 1; // the totals line always shows
+    let file_budget = height.saturating_sub(lines.len() + footer_budget);
+    push_summary_file_rows(lines, files, file_budget, theme);
+    lines.push(Line::from(vec![
+        TSpan::styled(
+            format!("{} files", files.len()),
+            Style::default().fg(theme.foreground),
+        ),
+        TSpan::raw("  "),
+        TSpan::styled(
+            format!("+{total_adds}"),
+            Style::default().fg(theme.add_strong),
+        ),
+        TSpan::raw(" "),
+        TSpan::styled(
+            format!("-{total_dels}"),
+            Style::default().fg(theme.del_strong),
+        ),
+    ]));
+}
+
 /// Build a [`ChangesetSummary`]'s lines: title line (carrying the same current/needs-restack/
 /// failed markers `build_outline_line`'s Header arm draws), a loading/failed line OR the per-file
 /// list + totals line.
@@ -868,26 +901,14 @@ fn changeset_summary_lines(
         return lines;
     }
 
-    lines.push(Line::from(""));
-    let footer_budget = 1; // the totals line always shows
-    let file_budget = height.saturating_sub(lines.len() + footer_budget);
-    push_summary_file_rows(&mut lines, &summary.files, file_budget, theme);
-    lines.push(Line::from(vec![
-        TSpan::styled(
-            format!("{} files", summary.files.len()),
-            Style::default().fg(theme.foreground),
-        ),
-        TSpan::raw("  "),
-        TSpan::styled(
-            format!("+{}", summary.total_adds),
-            Style::default().fg(theme.add_strong),
-        ),
-        TSpan::raw(" "),
-        TSpan::styled(
-            format!("-{}", summary.total_dels),
-            Style::default().fg(theme.del_strong),
-        ),
-    ]));
+    push_summary_body(
+        &mut lines,
+        &summary.files,
+        summary.total_adds,
+        summary.total_dels,
+        height,
+        theme,
+    );
     lines
 }
 
@@ -900,26 +921,14 @@ fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Ve
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
     ))];
-    lines.push(Line::from(""));
-    let footer_budget = 1;
-    let file_budget = height.saturating_sub(lines.len() + footer_budget);
-    push_summary_file_rows(&mut lines, &summary.files, file_budget, theme);
-    lines.push(Line::from(vec![
-        TSpan::styled(
-            format!("{} files", summary.files.len()),
-            Style::default().fg(theme.foreground),
-        ),
-        TSpan::raw("  "),
-        TSpan::styled(
-            format!("+{}", summary.total_adds),
-            Style::default().fg(theme.add_strong),
-        ),
-        TSpan::raw(" "),
-        TSpan::styled(
-            format!("-{}", summary.total_dels),
-            Style::default().fg(theme.del_strong),
-        ),
-    ]));
+    push_summary_body(
+        &mut lines,
+        &summary.files,
+        summary.total_adds,
+        summary.total_dels,
+        height,
+        theme,
+    );
     lines
 }
 
