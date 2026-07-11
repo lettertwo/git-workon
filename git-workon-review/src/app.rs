@@ -1112,16 +1112,17 @@ pub enum PendingOp {
         file_idx: usize,
         selections: Vec<(usize, LineSelection)>,
     },
-    /// CS7: discard every `(cs_idx, file_idx)` in `targets` from the worktree — an outline File
-    /// row's single target, or a Dir row's every file under its path. `identity` is the acted-on
-    /// outline row's [`OutlineRowIdentity`], captured at request-time (before the confirm modal),
-    /// so [`App::resolve_confirm`] can hand it to [`App::outline_run_ops`] for the post-op outline
-    /// cursor restore — by the time `y`/`n` answers the modal, the outline cursor may not still be
-    /// resting on the row that requested the discard (nothing else moves it in between today, but
-    /// baking the identity in here rather than re-reading `self.outline.cursor` avoids relying on
-    /// that).
+    /// CS7: discard every file in `files` — `(changeset name, file path)` pairs — from the
+    /// worktree: an outline File row's single target, or a Dir row's every file under its path.
+    /// Stored by NAME + PATH rather than raw `(cs_idx, file_idx)` indices because the confirm
+    /// modal doesn't stop the tick beat: an external index change (e.g. `git add` from another
+    /// terminal) can run a full refresh between `d` and `y`, rebuilding the per-changeset file
+    /// lists and shifting positions — [`App::resolve_confirm`] re-resolves each pair against the
+    /// LIVE changesets at answer time (silently skipping any that vanished) so a stale index can
+    /// never discard the wrong file. `identity` is the acted-on outline row's
+    /// [`OutlineRowIdentity`], captured at request-time for the post-op outline cursor restore.
     DiscardOutlineFiles {
-        targets: Vec<(usize, usize)>,
+        files: Vec<(String, String)>,
         identity: OutlineRowIdentity,
     },
 }
@@ -2723,6 +2724,32 @@ impl App {
         }
     }
 
+    /// The shared resolve-and-gate preamble of the outline staging verbs (`s`/`d`): resolve the
+    /// row under the outline cursor to its identity + targets, refusing (with `verb` naming the
+    /// action in the notice) on a Header row or when any target belongs to a committed changeset,
+    /// and bailing silently on an empty target list. One helper so the two verbs' gates can't
+    /// drift apart.
+    fn outline_verb_targets(
+        &mut self,
+        verb: &str,
+    ) -> Option<(OutlineRowIdentity, Vec<(usize, usize)>)> {
+        let Some((identity, targets)) = self.outline_row_targets(self.outline.cursor) else {
+            self.notify_outline_refusal(verb, false);
+            return None;
+        };
+        if targets
+            .iter()
+            .any(|&(cs_idx, _)| self.is_committed_at(cs_idx))
+        {
+            self.notify_outline_refusal(verb, true);
+            return None;
+        }
+        if targets.is_empty() {
+            return None;
+        }
+        Some((identity, targets))
+    }
+
     /// `s` while the outline has focus: stage or unstage the file/directory under the cursor. A
     /// [`OutlineItem::File`] row stages or unstages per its own [`Self::outline_target_verb`]; a
     /// [`OutlineItem::Dir`] row applies the same per-file verb selection to every file under it
@@ -2730,21 +2757,9 @@ impl App {
     /// or all-unstage op). Refuses on a [`OutlineItem::Header`] row or when any target belongs to
     /// a committed changeset (see [`Self::notify_outline_refusal`]).
     pub fn outline_stage(&mut self) {
-        let idx = self.outline.cursor;
-        let Some((identity, targets)) = self.outline_row_targets(idx) else {
-            self.notify_outline_refusal("stage", false);
+        let Some((identity, targets)) = self.outline_verb_targets("stage") else {
             return;
         };
-        if targets
-            .iter()
-            .any(|&(cs_idx, _)| self.is_committed_at(cs_idx))
-        {
-            self.notify_outline_refusal("stage", true);
-            return;
-        }
-        if targets.is_empty() {
-            return;
-        }
         let ops: Vec<Box<dyn StagingOp>> = targets
             .iter()
             .filter_map(|&(cs_idx, file_idx)| {
@@ -2762,21 +2777,9 @@ impl App {
     /// scope. Same refusal gates as [`Self::outline_stage`]. The discard itself runs when the user
     /// answers `y` (see [`Self::resolve_confirm`]'s [`PendingOp::DiscardOutlineFiles`] arm).
     pub fn outline_discard(&mut self) {
-        let idx = self.outline.cursor;
-        let Some((identity, targets)) = self.outline_row_targets(idx) else {
-            self.notify_outline_refusal("discard", false);
+        let Some((identity, targets)) = self.outline_verb_targets("discard") else {
             return;
         };
-        if targets
-            .iter()
-            .any(|&(cs_idx, _)| self.is_committed_at(cs_idx))
-        {
-            self.notify_outline_refusal("discard", true);
-            return;
-        }
-        if targets.is_empty() {
-            return;
-        }
         let prompt = match &identity {
             OutlineRowIdentity::File { path, .. } => {
                 format!("Discard all changes to `{path}`? (y/n)")
@@ -2786,11 +2789,19 @@ impl App {
                 targets.len()
             ),
         };
-        self.request_confirm(prompt, PendingOp::DiscardOutlineFiles { targets, identity });
+        let files: Vec<(String, String)> = targets
+            .iter()
+            .filter_map(|&(cs_idx, file_idx)| {
+                let view = self.changesets.get(cs_idx)?;
+                let path = view.files().get(file_idx)?.path.clone();
+                Some((view.cs.name.clone(), path))
+            })
+            .collect();
+        self.request_confirm(prompt, PendingOp::DiscardOutlineFiles { files, identity });
     }
 
     /// The outline-facing counterpart to [`Self::run_op`]: drain `ops` through [`Self::run_ops`],
-    /// then — on success — restore the OUTLINE cursor to (or nearest to) `identity`'s row rather
+    /// then restore the OUTLINE cursor to (or nearest to) `identity`'s row rather
     /// than a diff-pane position (CS6's [`PositionMemento`]/[`Self::restore_position`] only make
     /// sense when the diff pane, not the outline, was the focused surface the op started from).
     /// [`Self::coordinated_refresh`] (inside `run_ops`) itself calls `sync_outline_to_current`,
@@ -2798,9 +2809,12 @@ impl App {
     /// file happens to be) — this runs after that and overwrites it with the acted-on row's own
     /// position, or the nearest surviving row if it's gone (e.g. a fully-discarded file).
     fn outline_run_ops(&mut self, ops: Vec<Box<dyn StagingOp>>, identity: OutlineRowIdentity) {
-        if self.run_ops(ops).is_ok() {
-            self.restore_outline_position(&identity);
-        }
+        let pre_op_cursor = self.outline.cursor;
+        // Restore after BOTH outcomes: `run_ops` refreshes (and thereby yanks the outline cursor
+        // via `sync_outline_to_current`) even on a partial failure, and the acted-on row is where
+        // the user is looking either way.
+        let _ = self.run_ops(ops);
+        self.restore_outline_position(&identity, pre_op_cursor);
     }
 
     /// Re-find `identity`'s row in the freshly rebuilt [`Self::outline_items`] and reseat
@@ -2808,7 +2822,7 @@ impl App {
     /// discarded file drops out of the combined diff — and with it its row — entirely). Does not
     /// touch [`OutlineState::focused`] — an outline-initiated op
     /// only ever runs while the outline already has focus, and nothing here changes that.
-    fn restore_outline_position(&mut self, identity: &OutlineRowIdentity) {
+    fn restore_outline_position(&mut self, identity: &OutlineRowIdentity, pre_op_cursor: usize) {
         let items = self.outline_items();
         let found = items.iter().position(|item| match item {
             OutlineItem::File {
@@ -2826,7 +2840,12 @@ impl App {
         });
         match found {
             Some(idx) => self.outline.cursor = idx,
-            None => self.outline.cursor = self.outline.cursor.min(items.len().saturating_sub(1)),
+            // Row gone (the NORMAL outcome of a successful discard — the file left the combined
+            // diff and took its row with it): stay near where the user was ACTING, not wherever
+            // the refresh's `sync_outline_to_current` just parked the cursor (the diff's current
+            // file, unrelated to the acted-on row). `pre_op_cursor` is the acted-on row's own
+            // pre-op position; clamping it lands on the nearest surviving neighbor.
+            None => self.outline.cursor = pre_op_cursor.min(items.len().saturating_sub(1)),
         }
         self.derive_outline_scroll();
     }
@@ -3379,11 +3398,16 @@ impl App {
                 };
                 self.run_op(LineSelectionOp::new(file, selections, StageVerb::Discard));
             }
-            PendingOp::DiscardOutlineFiles { targets, identity } => {
-                let ops: Vec<Box<dyn StagingOp>> = targets
+            PendingOp::DiscardOutlineFiles { files, identity } => {
+                // Re-resolve each (changeset name, path) pair against the LIVE changesets — an
+                // intervening tick refresh may have shifted every index since `d` was pressed
+                // (see the variant's doc); a pair that no longer resolves is silently skipped
+                // (its file already left the diff, so there's nothing left to discard).
+                let ops: Vec<Box<dyn StagingOp>> = files
                     .iter()
-                    .filter_map(|&(cs_idx, file_idx)| {
-                        let file = self.changesets.get(cs_idx)?.files().get(file_idx)?.clone();
+                    .filter_map(|(cs_name, path)| {
+                        let view = self.changesets.iter().find(|v| v.cs.name == *cs_name)?;
+                        let file = view.files().iter().find(|f| f.path == *path)?.clone();
                         Some(Box::new(FileStagingOp::file(file, StageVerb::Discard))
                             as Box<dyn StagingOp>)
                     })
@@ -3394,11 +3418,11 @@ impl App {
     }
 
     /// Enqueue `op`, drain the queue on the same beat, then act on the outcome: a failure or panic
-    /// surfaces on the footer and skips the refresh (the index is now in whatever partial state
-    /// the failed op left it in — the user resolves with `r`); a `Completed` drain refreshes,
-    /// rebuilding the views + attribution from the new index (locked decision #5), then restores
-    /// the reviewer's pre-op DIFF position (CS6) — a staging op is the ONE nav path that does not
-    /// reset to the role's first hunk; every manual nav still does, via `reset_panes` unchanged.
+    /// surfaces on the footer (and the views still refresh — see [`Self::run_ops`] for why); a
+    /// `Completed` drain refreshes, rebuilding the views + attribution from the new index (locked
+    /// decision #5), then restores the reviewer's pre-op DIFF position (CS6) — a staging op is
+    /// the ONE nav path that does not reset to the role's first hunk; every manual nav still
+    /// does, via `reset_panes` unchanged.
     ///
     /// A thin diff-facing wrapper over [`Self::run_ops`] (one op, one memento) — the diff pane's
     /// staging verbs (`s`/`S`/`d`/`D`) are the only callers, so the shared drain/refresh core
@@ -3413,11 +3437,11 @@ impl App {
         }
     }
 
-    /// Enqueue every op in `ops`, drain the queue on the same beat, and — on success — run a
-    /// [`Self::coordinated_refresh`]. Returns `Err` with a footer-ready message on the first
-    /// failure/panic in the drain (matching [`Self::run_op`]'s single-op failure contract: notice
-    /// text, no refresh, the index left in whatever partial state the failed op produced) and
-    /// `Ok(())` after a successful refresh. Callers own what happens next (a diff-position or
+    /// Enqueue every op in `ops`, drain the queue on the same beat, then run a
+    /// [`Self::coordinated_refresh`] REGARDLESS of outcome — the drain never stops on a failure,
+    /// so a partial multi-op batch has already mutated the index/worktree and the views must
+    /// re-read that reality even while a failure notice shows. Returns `Err` after notifying the
+    /// first failure/panic, `Ok(())` otherwise. Callers own what happens next (a diff-position or
     /// outline-cursor restore, or nothing) — this only owns the queue mechanics.
     ///
     /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]), a (possibly
@@ -3438,15 +3462,18 @@ impl App {
             OpOutcome::Panicked(_) => Some("staging operation panicked".to_string()),
             OpOutcome::Completed(_) => None,
         });
+        // Refresh in BOTH arms: the queue's drain never stops on a failure (`pump` runs every
+        // queued op regardless), so in a multi-op batch a single failure still leaves up to N-1
+        // other ops applied to the index/worktree — the views must re-read that reality even
+        // while the failure notice shows. (For a single-op batch the refresh is a harmless
+        // re-read of unchanged state.)
+        self.coordinated_refresh();
         match failure {
             Some(message) => {
                 self.notify(message, Severity::Error);
                 Err(())
             }
-            None => {
-                self.coordinated_refresh();
-                Ok(())
-            }
+            None => Ok(()),
         }
     }
 
@@ -9304,6 +9331,50 @@ mod tests {
         assert!(app.pending_confirm.is_none(), "y must clear the confirm");
         let repo = fixture.repo().unwrap();
         repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
+    }
+
+    #[test]
+    fn outline_discard_survives_an_intervening_refresh_that_shifts_file_indices() {
+        // The confirm modal doesn't stop the tick beat: an external index change can trigger a
+        // full refresh between `d` and `y`, shifting every (cs_idx, file_idx). The pending op
+        // stores (changeset name, path) pairs and re-resolves at answer time, so the discard
+        // must still hit the file it was requested on — not whatever now sits at its old index.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("b.txt", "one\ntwo\n", "ONE\ntwo\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "b.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_discard();
+        assert!(app.pending_confirm.is_some());
+
+        // A new modified file that sorts BEFORE b.txt enters the diff while the confirm is up,
+        // then a refresh rebuilds the file lists — b.txt's file_idx shifts by one.
+        let repo = fixture.repo().unwrap();
+        let workdir = repo.workdir().unwrap();
+        std::fs::write(workdir.join("a.txt"), "NEW\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        std::fs::write(workdir.join("a.txt"), "NEW\nCHANGED\n").unwrap();
+        app.refresh();
+        assert!(
+            app.pending_confirm.is_some(),
+            "the refresh must not consume the pending confirm"
+        );
+
+        app.resolve_confirm(true);
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("b.txt", "one\ntwo\n"));
+        repo.assert(predicate::repo::workdir_file_equals(
+            "a.txt",
+            "NEW\nCHANGED\n",
+        ));
     }
 
     #[test]
