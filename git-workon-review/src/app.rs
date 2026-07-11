@@ -10229,7 +10229,7 @@ mod tests {
         app.outline.order = OutlineOrder::BaseFirst;
         // BaseFirst Stack order: header(cs-a)=0, a1.txt=1, a2.txt=2, header(cs-b)=3, b1.txt=4.
         app.outline_height = 10;
-        app.derive_outline_scroll();
+        app.derive_outline_scroll(app.outline_items().len());
         app.hit_regions.outline = Some(Region {
             x: 0,
             y: 0,
@@ -10257,7 +10257,7 @@ mod tests {
         app.outline.mode = OutlineMode::Stack;
         app.outline.order = OutlineOrder::BaseFirst;
         app.outline_height = 10;
-        app.derive_outline_scroll();
+        app.derive_outline_scroll(app.outline_items().len());
         app.hit_regions.outline = Some(Region {
             x: 0,
             y: 0,
@@ -10367,7 +10367,7 @@ mod tests {
         let mut app = four_committed_changesets_three_files_each();
         app.outline_height = 5; // bottom_margin = 5 - 1 - SCROLLOFF(2) = 2
         app.outline.cursor = 0;
-        app.derive_outline_scroll();
+        app.derive_outline_scroll(app.outline_items().len());
         app.hit_regions.outline = Some(Region {
             x: 0,
             y: 0,
