@@ -252,6 +252,7 @@ pub fn collapse_gaps_with_expansions(
 }
 
 /// Same as [`collapse_gaps_with_expansions`] but with an explicit context-line count, for testing.
+#[cfg(test)]
 fn collapse_gaps_with(rows: &[AlignedRow], context: usize) -> Vec<DisplayRow> {
     collapse_gaps_inner(rows, context, &HashMap::new())
 }
