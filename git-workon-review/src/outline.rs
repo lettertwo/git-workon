@@ -184,7 +184,7 @@ pub struct OutlineChangeset {
 /// nesting level from the shallowest ancestor down to the row itself, `true` meaning "this
 /// level is its parent's last child". Rendering uses every-element-but-the-last to decide
 /// whether to draw a continuing `│` or blank space at that column, and the last element to draw
-/// `└─`/`├─` for the row's own connector. [`OutlineMode::Flat`]/[`OutlineMode::Stack`] rows carry
+/// `╰─`/`├─` for the row's own connector (CS4 rounds the last-child corner). [`OutlineMode::Flat`]/[`OutlineMode::Stack`] rows carry
 /// an EMPTY `guides` — that's the signal to `render::build_outline_line` to fall back to the
 /// flat two-space indent instead of drawing tree connectors; a non-empty `guides` of length 1
 /// means "top-level tree row" (depth 0), so emptiness and depth-0 are deliberately distinguishable.
