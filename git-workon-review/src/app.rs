@@ -2373,9 +2373,7 @@ impl App {
                 entries.sort_by(|a, b| a.0.cmp(b.0));
                 let files: Vec<&FileChange> = entries
                     .into_iter()
-                    .filter_map(|(_, occ)| {
-                        self.changesets[occ.cs_idx].files().get(occ.file_idx)
-                    })
+                    .filter_map(|(_, occ)| self.changesets[occ.cs_idx].files().get(occ.file_idx))
                     .collect();
                 Summary::Dir(summary::dir_summary(path, &files))
             }
@@ -2682,7 +2680,7 @@ impl App {
                         latest
                             .iter()
                             .filter(|(p, _)| summary::path_is_under(p, path))
-                            .map(|(_, &(cs_idx, file_idx, _, _))| (cs_idx, file_idx))
+                            .map(|(_, occ)| (occ.cs_idx, occ.file_idx))
                             .collect()
                     }
                 };
@@ -2847,7 +2845,7 @@ impl App {
             // pre-op position; clamping it lands on the nearest surviving neighbor.
             None => self.outline.cursor = pre_op_cursor.min(items.len().saturating_sub(1)),
         }
-        self.derive_outline_scroll();
+        self.derive_outline_scroll(items.len());
     }
 
     /// Reposition (never rebuild/refocus) the outline cursor onto the row matching the CURRENT
