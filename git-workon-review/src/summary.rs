@@ -43,10 +43,14 @@ pub struct SummaryFileRow {
 
 /// Build the per-file row list plus its `(total_adds, total_dels)` from `files` — shared by
 /// [`changeset_summary`] and [`dir_summary`], the only difference between the two being which
-/// files the caller has already filtered down to.
-fn file_rows(files: &[FileChange]) -> (Vec<SummaryFileRow>, usize, usize) {
+/// files the caller has already filtered down to. Borrows only — a summary reads `path` and the
+/// hunk line kinds, so no caller should ever need to clone a `FileChange` (with its full hunk
+/// content bytes) just to build one.
+fn file_rows<'a>(
+    files: impl IntoIterator<Item = &'a FileChange>,
+) -> (Vec<SummaryFileRow>, usize, usize) {
     let rows: Vec<SummaryFileRow> = files
-        .iter()
+        .into_iter()
         .map(|f| {
             let (adds, dels) = file_diffstat(f);
             SummaryFileRow {
@@ -128,14 +132,14 @@ fn path_is_under(file_path: &str, dir_path: &str) -> bool {
 
 /// Build a [`DirSummary`] for `path`, filtering `files` (already scoped by the caller to
 /// whichever changeset(s) the selected [`crate::outline::OutlineItem::Dir`] row's `cs_idx`
-/// covers — see `App::summary_for`) down to the ones under `path`.
-pub fn dir_summary(path: String, files: &[FileChange]) -> DirSummary {
-    let scoped: Vec<FileChange> = files
+/// covers — see `App::summary_for`) down to the ones under `path`. Takes refs — see
+/// [`file_rows`]'s doc for why no `FileChange` is ever cloned here.
+pub fn dir_summary(path: String, files: &[&FileChange]) -> DirSummary {
+    let scoped = files
         .iter()
-        .filter(|f| path_is_under(&f.path, &path))
-        .cloned()
-        .collect();
-    let (files, total_adds, total_dels) = file_rows(&scoped);
+        .copied()
+        .filter(|f| path_is_under(&f.path, &path));
+    let (files, total_adds, total_dels) = file_rows(scoped);
     DirSummary {
         path,
         files,
@@ -267,7 +271,7 @@ mod tests {
             file("src2/b.rs", 5, 5, 0),
             file("top.rs", 1, 1, 0),
         ];
-        let summary = dir_summary("src".to_string(), &files);
+        let summary = dir_summary("src".to_string(), &files.iter().collect::<Vec<_>>());
         let paths: Vec<&str> = summary.files.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(
             paths,
@@ -281,7 +285,7 @@ mod tests {
     #[test]
     fn dir_summary_matches_nested_paths_under_the_dir() {
         let files = vec![file("src/a/b.rs", 2, 0, 0), file("src/c.rs", 0, 2, 0)];
-        let summary = dir_summary("src".to_string(), &files);
+        let summary = dir_summary("src".to_string(), &files.iter().collect::<Vec<_>>());
         assert_eq!(summary.files.len(), 2);
         assert_eq!(summary.total_adds, 2);
         assert_eq!(summary.total_dels, 2);

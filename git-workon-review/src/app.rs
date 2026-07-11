@@ -2210,7 +2210,10 @@ impl App {
                 // the aggregate to that changeset's own files (mirrors `build_stack_tree`'s "no
                 // cross-changeset dedup" rule).
                 let view = &self.changesets[cs_idx];
-                Summary::Dir(summary::dir_summary(path, view.files()))
+                Summary::Dir(summary::dir_summary(
+                    path,
+                    &view.files().iter().collect::<Vec<_>>(),
+                ))
             }
             SummaryTarget::Dir { cs_idx: None, path } => {
                 // Tree mode: the dir row's trie spans the whole stack with no single owning
@@ -2224,10 +2227,10 @@ impl App {
                 let mut entries: Vec<(&String, &(usize, usize, outline::StagedStatus))> =
                     latest.iter().collect();
                 entries.sort_by(|a, b| a.0.cmp(b.0));
-                let files: Vec<FileChange> = entries
+                let files: Vec<&FileChange> = entries
                     .into_iter()
                     .filter_map(|(_, &(cs_idx, file_idx, _))| {
-                        self.changesets[cs_idx].files().get(file_idx).cloned()
+                        self.changesets[cs_idx].files().get(file_idx)
                     })
                     .collect();
                 Summary::Dir(summary::dir_summary(path, &files))
