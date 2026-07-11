@@ -67,7 +67,10 @@ pub fn capture_index(name: &str) -> Option<usize> {
     HIGHLIGHT_NAMES.iter().position(|n| *n == name)
 }
 
-fn lang_key_for_ext(ext: &str) -> Option<&'static str> {
+/// Maps a file extension to the [`build_config`]/[`language_for_key`] key for its grammar, or
+/// `None` when no bundled grammar covers it. `pub(crate)` so [`crate::app`] can resolve a gap's
+/// anchor file to a scope-lookup language (CS9) without duplicating this table.
+pub(crate) fn lang_key_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
         "rs" => Some("rust"),
         "lua" => Some("lua"),
@@ -79,6 +82,26 @@ fn lang_key_for_ext(ext: &str) -> Option<&'static str> {
         "md" | "markdown" => Some("markdown"),
         _ => None,
     }
+}
+
+/// The raw `tree_sitter::Language` for a [`lang_key_for_ext`] key, with no highlight query
+/// configuration attached — [`build_config`] below wraps the same grammar constructors together
+/// with a language's highlight/injection/locals queries for `TsHighlighter`; [`crate::scope`]
+/// needs only the grammar (it parses to walk node kinds, not to highlight), so it shares this
+/// smaller constructor instead of duplicating the `LANGUAGE.into()` calls.
+pub(crate) fn language_for_key(key: &str) -> Option<tree_sitter::Language> {
+    let language = match key {
+        "rust" => tree_sitter_rust::LANGUAGE.into(),
+        "lua" => tree_sitter_lua::LANGUAGE.into(),
+        "json" => tree_sitter_json::LANGUAGE.into(),
+        "toml" => tree_sitter_toml_ng::LANGUAGE.into(),
+        "javascript" => tree_sitter_javascript::LANGUAGE.into(),
+        "typescript" => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+        "tsx" => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        "markdown" => tree_sitter_md::LANGUAGE.into(),
+        _ => return None,
+    };
+    Some(language)
 }
 
 fn build_config(key: &'static str) -> Option<HighlightConfiguration> {
