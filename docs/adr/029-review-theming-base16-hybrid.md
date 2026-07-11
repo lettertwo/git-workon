@@ -132,6 +132,18 @@ read left untested (see `terminal_query.rs`).
   to render; `FgSpan` loses its `Color` field in favor of a capture index. Existing render
   tests that assert concrete colors must resolve through a fixed test `Palette`.
 
+## Revised (CS2, visual-polish pass)
+
+The "chrome that is never a theme knob (error/warn/current-marker) stays ANSI/const in
+`render.rs`" clause above is superseded. Those three colors are now `Palette` fields
+(`error_fg`/`warn_fg`/`current_fg`, mapped to base08/base0A/base0B) rather than module
+consts — the user explicitly approved revisiting this boundary during the icons/semantic-fg
+polish pass. `dark()` keeps the shipped RGB values verbatim (the same pixel-identity
+precedent the diff/cursor tints follow); `light()` takes `ONE_LIGHT`'s base08/base0A/base0B;
+`from_terminal()` takes the probed scheme's base08/base0A/base0B directly, same reasoning as
+the syntax slots (matching the terminal, not curated-tint-borrowing). No other part of the
+hybrid boundary changes: this only moves three named colors from `const` to palette fields.
+
 ## References
 
 - [ADR-028](028-review-git-native-config-schema.md) — `workon.review.theme` config key
