@@ -125,7 +125,7 @@ impl StagedStatus {
         }
     }
 
-    /// The nerd-font equivalent of [`StagedStatus::glyph`] (CS3, `workon.review.outline.icons =
+    /// The nerd-font equivalent of [`StagedStatus::glyph`] (CS3, `workon.review.icons =
     /// nerd`) — picked from the classic BMP `fa` set for wider font compatibility (see
     /// `icons.rs`'s module doc). [`StagedStatus::None`] stays a blank space, same as
     /// [`StagedStatus::glyph`], since there's no status to convey.

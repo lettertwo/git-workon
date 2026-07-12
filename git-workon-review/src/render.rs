@@ -19,7 +19,7 @@ use crate::app::{
 use crate::attribute::Attribution;
 use crate::config::View;
 use crate::highlight::FgSpan;
-use crate::icons::OutlineIcons;
+use crate::icons::IconMode;
 use crate::keymap::{footer_hint, help_sections, Keymap};
 use crate::model::FileStatus;
 use crate::outline::OutlineItem;
@@ -36,7 +36,7 @@ use crate::wordiff::Span as WordSpan;
 // hybrid-boundary doc comment. A curated theme now fully controls the look; nothing in this
 // module hardcodes a semantic color anymore.
 
-// CS3's nerd-mode status/header/summary glyphs (gated on `OutlineIcons::Nerd`; the plain unicode
+// CS3's nerd-mode status/header/summary glyphs (gated on `IconMode::Nerd`; the plain unicode
 // defaults below stay byte-identical when `icons = none` — see icons.rs's module doc for why no
 // auto-detection ever picks Nerd for the user). Picked from the classic BMP nerd-font sets
 // (`fa`/`oct`) rather than devicons' broader (partly supplementary-plane) table, for wider
@@ -62,46 +62,46 @@ const NERD_DIFF_REMOVED: char = '\u{f458}'; // nf-oct-diff-removed
 /// the single source of each semantic marker's glyph pair — the outline's Header arm and the
 /// summary panel (and, upstack, the winbar) deliberately draw the SAME markers, so the selection
 /// lives in one place instead of a hand-synced `match` per call site.
-fn current_marker(icons: OutlineIcons) -> char {
+fn current_marker(icons: IconMode) -> char {
     match icons {
-        OutlineIcons::Nerd => NERD_CURRENT_MARKER,
-        OutlineIcons::None => '\u{25CF}',
+        IconMode::Nerd => NERD_CURRENT_MARKER,
+        IconMode::None => '\u{25CF}',
     }
 }
 
 /// The needs-restack marker for the active icon strategy (see [`current_marker`]).
-fn warn_marker(icons: OutlineIcons) -> char {
+fn warn_marker(icons: IconMode) -> char {
     match icons {
-        OutlineIcons::Nerd => NERD_WARN_MARKER,
-        OutlineIcons::None => '\u{26A0}',
+        IconMode::Nerd => NERD_WARN_MARKER,
+        IconMode::None => '\u{26A0}',
     }
 }
 
 /// The failed-changeset marker for the active icon strategy (see [`current_marker`]).
-fn error_marker(icons: OutlineIcons) -> char {
+fn error_marker(icons: IconMode) -> char {
     match icons {
-        OutlineIcons::Nerd => NERD_ERROR_MARKER,
-        OutlineIcons::None => '\u{2717}',
+        IconMode::Nerd => NERD_ERROR_MARKER,
+        IconMode::None => '\u{2717}',
     }
 }
 
 /// The loading marker for the active icon strategy (see [`current_marker`]).
-fn loading_marker(icons: OutlineIcons) -> char {
+fn loading_marker(icons: IconMode) -> char {
     match icons {
-        OutlineIcons::Nerd => NERD_LOADING_MARKER,
-        OutlineIcons::None => '\u{2026}',
+        IconMode::Nerd => NERD_LOADING_MARKER,
+        IconMode::None => '\u{2026}',
     }
 }
 
 /// The diffstat `+`/`-` prefixes for the active icon strategy (nerd: the oct diff glyphs) —
 /// shared by the summary panel's totals line and any other diffstat surface.
-fn diffstat_prefixes(icons: OutlineIcons) -> (String, String) {
+fn diffstat_prefixes(icons: IconMode) -> (String, String) {
     match icons {
-        OutlineIcons::Nerd => (
+        IconMode::Nerd => (
             format!("{NERD_DIFF_ADDED} "),
             format!("{NERD_DIFF_REMOVED} "),
         ),
-        OutlineIcons::None => ("+".to_string(), "-".to_string()),
+        IconMode::None => ("+".to_string(), "-".to_string()),
     }
 }
 
@@ -115,7 +115,7 @@ fn changeset_title_spans(
     current: bool,
     needs_restack: bool,
     theme: &Palette,
-    icons: OutlineIcons,
+    icons: IconMode,
 ) -> Vec<TSpan<'static>> {
     let marker = if current {
         format!("{} ", current_marker(icons))
@@ -123,7 +123,7 @@ fn changeset_title_spans(
         "  ".to_string()
     };
     let mut spans = vec![TSpan::styled(marker, Style::default().fg(theme.current_fg))];
-    if icons == OutlineIcons::Nerd {
+    if icons == IconMode::Nerd {
         spans.push(TSpan::styled(
             format!("{NERD_BRANCH_ICON} "),
             Style::default().fg(theme.dim),
@@ -588,7 +588,7 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     let cursor = app.outline_cursor();
     let focused = app.outline_focused();
     let scroll = app.outline_scroll();
-    let icons = app.outline_icons();
+    let icons = app.icon_mode();
 
     let buf = frame.buffer_mut();
     for row in 0..area.height {
@@ -648,10 +648,10 @@ fn change_letter_color(change: FileStatus, theme: &Palette) -> Color {
 }
 
 /// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
-/// marker rules. `icons` (CS5, `workon.review.outline.icons`) is [`OutlineIcons::None`] by
+/// marker rules. `icons` (CS5, `workon.review.icons`) is [`IconMode::None`] by
 /// default, which reproduces the pre-CS5 row text exactly (no icon glyph, no extra space); only
-/// [`OutlineIcons::Nerd`] inserts an icon before the name/path.
-fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) -> Line<'static> {
+/// [`IconMode::Nerd`] inserts an icon before the name/path.
+fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> Line<'static> {
     match item {
         OutlineItem::Header {
             label,
@@ -679,8 +679,8 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
         }
         OutlineItem::Dir { name, guides, .. } => {
             let icon = match icons {
-                OutlineIcons::Nerd => format!("{} ", crate::icons::DIR_ICON),
-                OutlineIcons::None => String::new(),
+                IconMode::Nerd => format!("{} ", crate::icons::DIR_ICON),
+                IconMode::None => String::new(),
             };
             let text = format!("{}{icon}{name}/", tree_prefix(guides));
             Line::from(TSpan::styled(
@@ -698,8 +698,8 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
             ..
         } => {
             let glyph = match icons {
-                OutlineIcons::Nerd => status.nerd_glyph(),
-                OutlineIcons::None => status.glyph(),
+                IconMode::Nerd => status.nerd_glyph(),
+                IconMode::None => status.glyph(),
             };
             let letter = change.letter();
             // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
@@ -733,7 +733,7 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
                 " ".to_string(),
                 Style::default().fg(theme.foreground),
             ));
-            if icons == OutlineIcons::Nerd {
+            if icons == IconMode::Nerd {
                 let (icon, color) = crate::icons::icon_for_path(
                     path,
                     crate::theme::is_light_background(theme.background),
@@ -800,7 +800,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
 ///
 /// CS4 polish: a tight `+A -D` diffstat for the ACTIVE changeset (there wasn't one before),
 /// tinted with the same [`Palette::add_strong`]/[`Palette::del_strong`] the summary panel's own
-/// totals line uses; in [`OutlineIcons::Nerd`] mode the restack marker and diffstat prefixes swap
+/// totals line uses; in [`IconMode::Nerd`] mode the restack marker and diffstat prefixes swap
 /// to their nerd glyphs (same consts `build_outline_line`/`push_summary_body` use), and the
 /// active file's path gets its devicons file icon.
 fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
@@ -808,7 +808,7 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
     let title = cs.title.as_deref().unwrap_or(cs.name.as_str());
-    let icons = app.outline_icons();
+    let icons = app.icon_mode();
 
     let mut spans = vec![TSpan::styled(
         format!("[{i}/{n}] {title}"),
@@ -858,7 +858,7 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
     ));
-    if icons == OutlineIcons::Nerd {
+    if icons == IconMode::Nerd {
         if let Some(f) = app.files().get(app.current) {
             let (icon, color) = crate::icons::icon_for_path(
                 &f.path,
@@ -1045,7 +1045,7 @@ fn push_summary_body(
     total_dels: usize,
     height: usize,
     theme: &Palette,
-    icons: OutlineIcons,
+    icons: IconMode,
 ) {
     lines.push(Line::from(""));
     let footer_budget = 1; // the totals line always shows
@@ -1077,7 +1077,7 @@ fn changeset_summary_lines(
     summary: &ChangesetSummary,
     height: usize,
     theme: &Palette,
-    icons: OutlineIcons,
+    icons: IconMode,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
@@ -1122,17 +1122,17 @@ fn changeset_summary_lines(
 
 /// Build a [`DirSummary`]'s lines: a bold path title, a blank line, the per-file list, and the
 /// totals line — no current/restack/loading/failed markers (a directory carries none of those).
-/// The title gets [`crate::icons::DIR_ICON`] in [`OutlineIcons::Nerd`] mode, matching the
+/// The title gets [`crate::icons::DIR_ICON`] in [`IconMode::Nerd`] mode, matching the
 /// outline's own [`OutlineItem::Dir`] row (`build_outline_line`).
 fn dir_summary_lines(
     summary: &DirSummary,
     height: usize,
     theme: &Palette,
-    icons: OutlineIcons,
+    icons: IconMode,
 ) -> Vec<Line<'static>> {
     let dir_icon = match icons {
-        OutlineIcons::Nerd => format!("{} ", crate::icons::DIR_ICON),
-        OutlineIcons::None => String::new(),
+        IconMode::Nerd => format!("{} ", crate::icons::DIR_ICON),
+        IconMode::None => String::new(),
     };
     let mut lines = vec![Line::from(TSpan::styled(
         format!("{dir_icon}{}/", summary.path),
@@ -1162,7 +1162,7 @@ fn render_summary(
     summary: &Summary,
     area: Rect,
     theme: &Palette,
-    icons: OutlineIcons,
+    icons: IconMode,
 ) {
     let height = area.height as usize;
     let lines = match summary {
@@ -1179,7 +1179,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     // diff-body rendering; `summary_target` returns `None` in both cases).
     if let Some(target) = app.summary_target() {
         let summary = app.summary_for(target);
-        render_summary(frame, &summary, area, theme, app.outline_icons());
+        render_summary(frame, &summary, area, theme, app.icon_mode());
         return;
     }
     // ADR-037: the active changeset's diff hasn't been acquired (or failed to acquire) yet —
@@ -2645,7 +2645,7 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
-        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
 
         let buf = render_once(&mut app, 80, 20);
         let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
@@ -3100,7 +3100,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_icons_nerd_renders_the_rust_file_icon_and_the_dir_icon() {
+    fn icon_mode_nerd_renders_the_rust_file_icon_and_the_dir_icon() {
         use git2::Repository;
         use workon::{Changeset, ChangesetSpan};
 
@@ -3140,7 +3140,7 @@ mod tests {
         }
         app.outline_cycle_mode(); // Stack -> Tree, so `src/` renders as its own Dir row
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
-        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
         let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
@@ -3168,7 +3168,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_icons_none_renders_neither_icon() {
+    fn icon_mode_none_renders_neither_icon() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -3180,8 +3180,8 @@ mod tests {
         app.outline_cycle_mode(); // Stack -> Tree
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
         assert_eq!(
-            app.outline_icons(),
-            crate::icons::OutlineIcons::None,
+            app.icon_mode(),
+            crate::icons::IconMode::None,
             "sanity: icons default to None"
         );
 
@@ -3211,7 +3211,7 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
-        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
         // Skip y=0: it's the full-width winbar, which ALSO renders a (still-unicode, CS4's job)
@@ -3245,7 +3245,7 @@ mod tests {
             .build()
             .unwrap();
         let mut app = app_from_fixture(&fixture);
-        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
         if !app.outline_open() {
             app.toggle_outline();
         }
@@ -3271,7 +3271,7 @@ mod tests {
             .build()
             .unwrap();
         let mut app = changeset_with_nested_paths(&fixture);
-        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
         app.focus_outline(); // opens (a lone changeset defaults closed) and focuses
         app.outline_cycle_mode(); // Stack -> Tree, so a Dir row exists to focus
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
