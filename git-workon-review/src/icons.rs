@@ -3,7 +3,7 @@
 //!
 //! A terminal cannot report which font (patched with the nerd-font private-use glyphs or not)
 //! the user has configured, so there is NO auto-detection here or anywhere else in the crate —
-//! icons are strictly opt-in via `workon.review.outline.icons = nerd` (see `config.rs`'s schema
+//! icons are strictly opt-in via `workon.review.icons = nerd` (see `config.rs`'s schema
 //! doc block and `App::apply_view_config`). With the config left at its default (`none`),
 //! nothing in this module is ever called from `render.rs`.
 //!
@@ -14,7 +14,7 @@
 //! picks one from the active [`crate::theme::Palette`] (see [`icon_for_path`]'s doc comment).
 //! **Nerd-font v3 requirement:** devicons' glyphs are drawn from nerd-font v3's private-use
 //! codepoints, roughly a fifth of which sit in a Unicode supplementary plane (outside the BMP).
-//! The crate's own `OutlineIcons::Nerd` glyphs picked in CS3 (status/header markers) stay
+//! The crate's own `IconMode::Nerd` glyphs picked in CS3 (status/header markers) stay
 //! BMP-only for wider font compatibility, but a per-file icon from devicons may require a v3
 //! nerd-font — this is the same "no auto-detection" opt-in tradeoff as the rest of this module.
 //! devicons does not cover directories (it is a per-file mapper), so [`DIR_ICON`] is still ours.
@@ -22,12 +22,13 @@
 use devicons::{icon_for_file, FileIcon, Theme as DeviconsTheme};
 use ratatui::style::Color;
 
-/// Which of the outline's icon strategies is active — `workon.review.outline.icons`
-/// (`nerd`/`none`), read once at startup by `App::apply_view_config` (CS5 mirrors CS3's
-/// `OutlineOrder` plumbing exactly: `RawViewConfig` field -> `ReviewConfig` getter ->
-/// `parse_outline_icons` -> warn-and-fallback in `apply_view_config` -> `OutlineState` field).
+/// Which iconography strategy is active TUI-wide — `workon.review.icons` (`nerd`/`none`),
+/// read once at startup by `App::apply_view_config` (`RawViewConfig` field -> `ReviewConfig`
+/// getter -> `parse_icon_mode` -> warn-and-fallback in `apply_view_config` -> `App` field).
+/// Top-level like the theme, not an outline setting: it gates the outline's file/dir icons,
+/// the summary panel's glyphs, and the winbar's marker/diffstat/file icons alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutlineIcons {
+pub enum IconMode {
     /// No icon glyph — today's plain `[glyph][letter] path` row (CS5's unconditional part only).
     #[default]
     None,
@@ -37,7 +38,7 @@ pub enum OutlineIcons {
 }
 
 /// The directory-row icon (nerd-font `nf-fa-folder`, U+F07B) — used for every
-/// [`crate::outline::OutlineItem::Dir`] row when [`OutlineIcons::Nerd`] is active. devicons is a
+/// [`crate::outline::OutlineItem::Dir`] row when [`IconMode::Nerd`] is active. devicons is a
 /// per-file mapper (it has no directory entries), so this stays our own constant.
 pub const DIR_ICON: char = '\u{f07b}'; // nf-fa-folder
 

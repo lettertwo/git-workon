@@ -23,7 +23,7 @@ use crate::align::{
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
 use crate::highlight::{lang_key_for_ext, FgSpan, TsHighlighter};
-use crate::icons::OutlineIcons;
+use crate::icons::IconMode;
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
 use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder};
@@ -674,14 +674,14 @@ fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
     }
 }
 
-/// Parse `workon.review.outline.icons` (CS5) into an [`OutlineIcons`]. Canonical strings mirror
+/// Parse `workon.review.icons` (CS5) into an [`IconMode`]. Canonical strings mirror
 /// the variant names, kebab-cased: `nerd`, `none`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`OutlineIcons::default`] (also `none` — CS5's
+/// [`App::apply_view_config`] falls back to [`IconMode::default`] (also `none` — CS5's
 /// no-auto-detection default) and warns.
-fn parse_outline_icons(raw: &str) -> Option<OutlineIcons> {
+fn parse_icon_mode(raw: &str) -> Option<IconMode> {
     match raw {
-        "nerd" => Some(OutlineIcons::Nerd),
-        "none" => Some(OutlineIcons::None),
+        "nerd" => Some(IconMode::Nerd),
+        "none" => Some(IconMode::None),
         _ => None,
     }
 }
@@ -800,10 +800,6 @@ pub struct OutlineState {
     /// Which end of the stack the stack-shaped modes display first — `workon.review.outline.order`
     /// (CS3), defaulting to [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
     pub order: OutlineOrder,
-    /// CS5: opt-in nerd-font file/dir icons — `workon.review.outline.icons`, defaulting to
-    /// [`OutlineIcons::None`] (no auto-detection story exists — a terminal can't report the
-    /// user's font). Read by `render::build_outline_line`.
-    pub icons: OutlineIcons,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1144,6 +1140,11 @@ pub struct App {
     /// rebuilt-from-scratch — `open`/`focused`/`mode` persist, like [`Self::layout`]/
     /// [`Self::zoom`]) by every diff-initiated nav and by [`Self::refresh`].
     outline: OutlineState,
+    /// Opt-in nerd-font iconography — `workon.review.icons`, defaulting to [`IconMode::None`]
+    /// (no auto-detection story exists — a terminal can't report the user's font). A TUI-wide
+    /// appearance mode like the theme, not an outline view setting: it gates the outline's
+    /// file/dir icons AND the summary panel's and winbar's glyphs (see `render.rs`).
+    icon_mode: IconMode,
     /// Whether the `?` help overlay is showing (CS3). While `true`, `tui::update` intercepts
     /// every key as a modal (mirroring [`Self::pending_confirm`]'s capture) — see its doc comment
     /// for the precedence between the two modals.
@@ -1311,7 +1312,6 @@ impl App {
             width: DEFAULT_OUTLINE_WIDTH,
             scroll: 0,
             order: OutlineOrder::default(),
-            icons: OutlineIcons::default(),
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -1349,6 +1349,7 @@ impl App {
             selection_anchor: None,
             refresh_coordinator,
             outline,
+            icon_mode: IconMode::default(),
             help_visible: false,
             review_source: None,
             defer_loads: false,
@@ -2524,10 +2525,10 @@ impl App {
         self.outline.order
     }
 
-    /// CS5: whether the outline renders nerd-font icons — `workon.review.outline.icons`, or
-    /// [`OutlineIcons::default`] (`None`) if never set.
-    pub fn outline_icons(&self) -> OutlineIcons {
-        self.outline.icons
+    /// The nerd-font iconography mode — `workon.review.icons`, or [`IconMode::default`]
+    /// (`None`) if never set. TUI-wide: read by the outline, summary panel, and winbar renderers.
+    pub fn icon_mode(&self) -> IconMode {
+        self.icon_mode
     }
 
     /// `o`: a pure show/hide toggle — closed -> open+focused (+[`Self::sync_outline_to_current`]),
@@ -2602,12 +2603,11 @@ impl App {
         self.outline.order = order;
     }
 
-    /// Set the outline icons setting directly — the config-startup (CS5) counterpart; there is
-    /// no interactive key for this (icons are a static config choice, not something to toggle
-    /// mid-session). Same non-resync posture as [`Self::set_outline_mode`]/
-    /// [`Self::set_outline_order`].
-    pub fn set_outline_icons(&mut self, icons: OutlineIcons) {
-        self.outline.icons = icons;
+    /// Set the icon mode directly — the config-startup counterpart; there is no interactive
+    /// key for this (icons are a static config choice, not something to toggle mid-session).
+    /// Same non-resync posture as [`Self::set_outline_mode`]/[`Self::set_outline_order`].
+    pub fn set_icon_mode(&mut self, icons: IconMode) {
+        self.icon_mode = icons;
     }
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
@@ -3314,16 +3314,16 @@ impl App {
         };
         self.set_outline_order(order);
 
-        let icons = match &raw.outline_icons {
-            Some(i) => parse_outline_icons(i).unwrap_or_else(|| {
+        let icons = match &raw.icons {
+            Some(i) => parse_icon_mode(i).unwrap_or_else(|| {
                 warnings.push(format!(
-                    "workon.review.outline.icons = '{i}' unrecognized; using default"
+                    "workon.review.icons = '{i}' unrecognized; using default"
                 ));
-                OutlineIcons::default()
+                IconMode::default()
             }),
-            None => OutlineIcons::default(),
+            None => IconMode::default(),
         };
-        self.set_outline_icons(icons);
+        self.set_icon_mode(icons);
 
         let layout = match &raw.diff_layout {
             Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
@@ -4379,7 +4379,7 @@ mod tests {
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
-    use crate::icons::OutlineIcons;
+    use crate::icons::IconMode;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
 
@@ -8992,7 +8992,7 @@ mod tests {
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(app.outline_mode(), OutlineMode::default());
         assert_eq!(app.outline_order(), OutlineOrder::default());
-        assert_eq!(app.outline_icons(), OutlineIcons::default());
+        assert_eq!(app.icon_mode(), IconMode::default());
         assert_eq!(app.layout, Layout::default());
         assert_eq!(app.zoom, Zoom::default());
     }
@@ -9091,9 +9091,9 @@ mod tests {
     }
 
     #[test]
-    fn outline_icons_overrides_default_when_set() {
+    fn icon_mode_overrides_default_when_set() {
         let fixture = FixtureBuilder::new()
-            .config("workon.review.outline.icons", "nerd")
+            .config("workon.review.icons", "nerd")
             .build()
             .unwrap();
         let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
@@ -9102,13 +9102,13 @@ mod tests {
         let warnings = app.apply_view_config(&config);
 
         assert!(warnings.is_empty());
-        assert_eq!(app.outline_icons(), OutlineIcons::Nerd);
+        assert_eq!(app.icon_mode(), IconMode::Nerd);
     }
 
     #[test]
-    fn outline_icons_invalid_falls_back_to_default_with_warning() {
+    fn icon_mode_invalid_falls_back_to_default_with_warning() {
         let fixture = FixtureBuilder::new()
-            .config("workon.review.outline.icons", "bogus")
+            .config("workon.review.icons", "bogus")
             .build()
             .unwrap();
         let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
@@ -9116,9 +9116,9 @@ mod tests {
 
         let warnings = app.apply_view_config(&config);
 
-        assert_eq!(app.outline_icons(), OutlineIcons::default());
+        assert_eq!(app.icon_mode(), IconMode::default());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("outline.icons"));
+        assert!(warnings[0].contains("workon.review.icons"));
     }
 
     #[test]

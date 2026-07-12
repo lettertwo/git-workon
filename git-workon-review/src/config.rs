@@ -18,6 +18,7 @@
 //! ```gitconfig
 //! [workon "review"]
 //!   theme = dark               ; auto | dark | light (default: auto)
+//!   icons = nerd               ; nerd | none (default: none)
 //!
 //! [workon "review.diff.bind"]
 //!   stage-hunk = s x           ; action = key tokens (space-separated)
@@ -32,19 +33,20 @@
 //!   width = 32
 //!   mode = tree
 //!   order = base-first         ; head-first | base-first (default: head-first)
-//!   icons = nerd               ; nerd | none (default: none)
 //!
 //! [workon "review.diff"]
 //!   layout = split
 //!   zoom = combined
 //! ```
 //!
-//! ## `outline.icons` (CS5)
+//! ## `icons`
 //!
-//! Opt-in nerd-font file/dir icons in the outline pane. There is deliberately NO auto-detection
+//! Opt-in nerd-font iconography — top-level next to `theme` (`workon.review.icons`), NOT an
+//! outline setting: the mode gates the outline's file/dir icons, the summary panel's glyphs,
+//! and the winbar's marker/diffstat/file icons alike. There is deliberately NO auto-detection
 //! — a terminal cannot report whether the user's font is patched with the nerd-font glyphs, so
 //! guessing would silently render tofu/mojibake for anyone without one. Default is `none`
-//! (today's plain text); set `icons = nerd` explicitly once your terminal font supports it. See
+//! (plain text); set `icons = nerd` explicitly once your terminal font supports it. See
 //! [`crate::icons`] for the glyph table.
 
 use git2::Repository;
@@ -112,7 +114,7 @@ pub struct RawViewConfig {
     pub outline_width: Option<i64>,
     pub outline_mode: Option<String>,
     pub outline_order: Option<String>,
-    pub outline_icons: Option<String>,
+    pub icons: Option<String>,
     pub diff_layout: Option<String>,
     pub diff_zoom: Option<String>,
 }
@@ -220,10 +222,15 @@ impl<'repo> ReviewConfig<'repo> {
         self.get_view_string(View::Outline, "order")
     }
 
-    /// Get `workon.review.outline.icons`, raw. `None` if unset — callers apply the current
-    /// default ([`crate::icons::OutlineIcons::None`], CS5: no auto-detection story exists).
-    pub fn outline_icons(&self) -> Result<Option<String>, git2::Error> {
-        self.get_view_string(View::Outline, "icons")
+    /// Get `workon.review.icons`, raw. `None` if unset — callers apply the current default
+    /// ([`crate::icons::IconMode::None`]; no auto-detection story exists). Top-level like
+    /// `theme`, not a view setting: icon mode gates the outline, summary panel, AND winbar.
+    pub fn icons(&self) -> Result<Option<String>, git2::Error> {
+        let config = self.repo.config()?;
+        match config.get_string("workon.review.icons") {
+            Ok(val) => Ok(Some(val)),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Get `workon.review.diff.layout`, raw. `None` if unset.
@@ -248,7 +255,7 @@ impl<'repo> ReviewConfig<'repo> {
             outline_width: self.outline_width().ok().flatten(),
             outline_mode: self.outline_mode().ok().flatten(),
             outline_order: self.outline_order().ok().flatten(),
-            outline_icons: self.outline_icons().ok().flatten(),
+            icons: self.icons().ok().flatten(),
             diff_layout: self.diff_layout().ok().flatten(),
             diff_zoom: self.diff_zoom().ok().flatten(),
         }
@@ -433,7 +440,7 @@ mod tests {
             .config("workon.review.outline.width", "40")
             .config("workon.review.outline.mode", "tree")
             .config("workon.review.outline.order", "base-first")
-            .config("workon.review.outline.icons", "nerd")
+            .config("workon.review.icons", "nerd")
             .config("workon.review.diff.layout", "split")
             .config("workon.review.diff.zoom", "staged")
             .build()
@@ -450,10 +457,7 @@ mod tests {
             config.outline_order().expect("order"),
             Some("base-first".to_string())
         );
-        assert_eq!(
-            config.outline_icons().expect("icons"),
-            Some("nerd".to_string())
-        );
+        assert_eq!(config.icons().expect("icons"), Some("nerd".to_string()));
         assert_eq!(
             config.diff_layout().expect("layout"),
             Some("split".to_string())
@@ -473,7 +477,7 @@ mod tests {
         assert_eq!(config.outline_width().expect("width"), None);
         assert_eq!(config.outline_mode().expect("mode"), None);
         assert_eq!(config.outline_order().expect("order"), None);
-        assert_eq!(config.outline_icons().expect("icons"), None);
+        assert_eq!(config.icons().expect("icons"), None);
         assert_eq!(config.diff_layout().expect("layout"), None);
         assert_eq!(config.diff_zoom().expect("zoom"), None);
     }
