@@ -805,6 +805,14 @@ pub struct OutlineState {
     /// Which end of the stack the stack-shaped modes display first — `workon.review.outline.order`
     /// (CS3), defaulting to [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
     pub order: OutlineOrder,
+    /// Column pan offset (display columns) for the outline pane — the outline's own analog of
+    /// [`App::hscroll`], since a long path is hard-clipped at the outline's fixed width just like
+    /// a long diff line. Floored at `0` by [`App::outline_hscroll_left`]/
+    /// [`App::outline_hscroll_right`]; the upper clamp is render-side (`render_outline`, mirroring
+    /// [`App::clamp_outline_scroll`]'s own per-frame bounds-clamp under the wheel peek model), not
+    /// here. Reset to `0` by [`App::outline_cycle_mode`] — the row list (and therefore the set of
+    /// paths on screen) changes shape there, the same reason that resyncs the cursor.
+    pub hscroll: usize,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1369,6 +1377,7 @@ impl App {
             width: DEFAULT_OUTLINE_WIDTH,
             scroll: 0,
             order: OutlineOrder::default(),
+            hscroll: 0,
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -2571,6 +2580,14 @@ impl App {
         self.outline.scroll
     }
 
+    /// The outline pane's column pan offset — see [`OutlineState::hscroll`]'s doc comment. Read
+    /// by `render.rs`'s `render_outline`, which also owns the render-side upper clamp (mirroring
+    /// [`Self::clamp_outline_scroll`]'s own per-frame bounds-clamp) via
+    /// [`Self::clamp_outline_hscroll`].
+    pub fn outline_hscroll(&self) -> usize {
+        self.outline.hscroll
+    }
+
     /// The outline pane's column width — `workon.review.outline.width` (CS7), or
     /// [`DEFAULT_OUTLINE_WIDTH`] if never set. Read by `render.rs` in place of the old fixed
     /// const.
@@ -2740,6 +2757,49 @@ impl App {
         }
     }
 
+    /// Horizontal mouse wheel (trackpad h-scroll, or a shift-wheel the terminal reports as
+    /// `ScrollLeft`/`ScrollRight`) at terminal `(col, row)` with `delta` = ±4 columns per tick
+    /// (`tui::map_key`'s caller maps `ScrollLeft`/`ScrollRight` to -4/+4 — finer than
+    /// [`HSCROLL_STEP`] since trackpads emit streams of ticks). Same peek-model framing and
+    /// region-focus rule as [`Self::handle_wheel`] — the difference is WHAT gets panned: unlike
+    /// the vertical wheel (which always scrolls whichever pane's own row-list viewport), this
+    /// pans a COLUMN offset shared per PANE KIND — the outline's own `outline.hscroll` over the
+    /// outline, or the diff panes' shared [`Self::hscroll`] over a diff pane (both halves of a
+    /// split share the one offset, same as [`Self::hscroll_left`]/[`Self::hscroll_right`]).
+    /// Outside every recorded region: no-op.
+    pub fn handle_hwheel(&mut self, col: u16, row: u16, delta: i64) {
+        let Some((pane, _region)) = self.hit_test(col, row) else {
+            return;
+        };
+        match pane {
+            HitPane::Outline => {
+                self.focus_outline();
+                self.outline.hscroll = (self.outline.hscroll as i64 + delta).max(0) as usize;
+                // No upper clamp here — render-side, mirroring `outline_hscroll_right`'s own
+                // doc comment.
+            }
+            HitPane::Single => {
+                self.focus_diff_pane(None);
+                self.pan_hscroll_by(delta);
+            }
+            HitPane::Split(target) => {
+                self.focus_diff_pane(Some(target));
+                self.pan_hscroll_by(delta);
+            }
+        }
+    }
+
+    /// Pan the shared diff [`Self::hscroll`] by `delta` columns (floored at `0`), clamping
+    /// against the current view's longest row on a RIGHTWARD pan only — the same clamp
+    /// [`Self::hscroll_right`] applies, factored out here so [`Self::handle_hwheel`] doesn't
+    /// clamp a leftward pan against a bound that only matters when panning right.
+    fn pan_hscroll_by(&mut self, delta: i64) {
+        self.hscroll = (self.hscroll as i64 + delta).max(0) as usize;
+        if delta > 0 {
+            self.clamp_hscroll();
+        }
+    }
+
     /// Scroll the focused pane's viewport by `delta` rows (mouse wheel), clamped to the row
     /// list. The cursor is deliberately NOT touched (the peek model: a wheel is "look
     /// elsewhere", never "select elsewhere"), so it can sit outside the viewport — the next
@@ -2778,9 +2838,12 @@ impl App {
 
     /// `i` while the outline has focus: cycle [`OutlineMode`], then reposition the cursor onto
     /// the row matching the current diff position in the NEW mode's row list (the row layout
-    /// just changed shape, so the raw index would otherwise point at an unrelated row).
+    /// just changed shape, so the raw index would otherwise point at an unrelated row). Also
+    /// resets [`OutlineState::hscroll`] to `0` — the row list's shape (and therefore its longest
+    /// path) just changed too, so a stale pan offset could easily land past the new mode's content.
     pub fn outline_cycle_mode(&mut self) {
         self.outline.mode = self.outline.mode.cycle();
+        self.outline.hscroll = 0;
         self.sync_outline_to_current();
     }
 
@@ -3285,6 +3348,17 @@ impl App {
             .min(rows.saturating_sub(self.outline_height.max(1)));
     }
 
+    /// Render-side upper clamp for [`OutlineState::hscroll`] — the outline analog of
+    /// [`Self::clamp_hscroll`], but taken from the caller rather than computed here:
+    /// `render_outline` already builds every item's line to paint it, so it's cheaper for it to
+    /// pass the max width it just measured than for this method to rebuild the whole outline a
+    /// second time. `max_line_width` is the widest rendered outline row's display-column width;
+    /// the `-1` keeps at least one column of the longest row visible, same as
+    /// [`Self::clamp_hscroll`].
+    pub(crate) fn clamp_outline_hscroll(&mut self, max_line_width: usize) {
+        self.outline.hscroll = self.outline.hscroll.min(max_line_width.saturating_sub(1));
+    }
+
     /// The widest display-column row currently in the active file's view(s) — both roles when
     /// split, since [`Self::hscroll`] pans every content pane together (locked decision #1).
     /// Walks the already-built [`FileView::display`] row list (shared by both the SBS and inline
@@ -3336,6 +3410,22 @@ impl App {
     pub fn hscroll_right(&mut self) {
         self.hscroll = self.hscroll.saturating_add(HSCROLL_STEP);
         self.clamp_hscroll();
+    }
+
+    /// `outline-hscroll-left`: pan the outline pane left by [`HSCROLL_STEP`] columns (floored at
+    /// `0`) — the outline's own analog of [`Self::hscroll_left`].
+    pub fn outline_hscroll_left(&mut self) {
+        self.outline.hscroll = self.outline.hscroll.saturating_sub(HSCROLL_STEP);
+    }
+
+    /// `outline-hscroll-right`: pan the outline pane right by [`HSCROLL_STEP`] columns. Unlike
+    /// [`Self::hscroll_right`] this has NO upper clamp here — the outline's row list (every
+    /// item's rendered line, built by `render.rs`'s `build_outline_line`) isn't cheaply available
+    /// to `App` the way a [`FileView`]'s rows are, so the clamp is render-side instead
+    /// (`render::render_outline`, mirroring how [`Self::clamp_outline_scroll`] already
+    /// bounds-clamps `outline.scroll` once per frame under the wheel peek model).
+    pub fn outline_hscroll_right(&mut self) {
+        self.outline.hscroll = self.outline.hscroll.saturating_add(HSCROLL_STEP);
     }
 
     /// Re-derive the outline pane's `scroll` from its `cursor` — the outline's counterpart to
@@ -4666,7 +4756,7 @@ mod tests {
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
         EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity, Summary,
-        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, SCROLLOFF,
+        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
@@ -8490,6 +8580,38 @@ mod tests {
     }
 
     #[test]
+    fn outline_cycle_mode_resets_outline_hscroll() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.hscroll = 5;
+        app.outline_cycle_mode();
+        assert_eq!(
+            app.outline_hscroll(),
+            0,
+            "a mode cycle reshapes the row list, so a stale pan offset must reset"
+        );
+    }
+
+    #[test]
+    fn outline_hscroll_left_floors_at_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        assert_eq!(app.outline_hscroll(), 0);
+        app.outline_hscroll_left();
+        assert_eq!(app.outline_hscroll(), 0, "cannot pan left of column 0");
+    }
+
+    #[test]
+    fn outline_hscroll_right_has_no_upper_clamp_in_the_method_itself() {
+        // Locked decision #2: `outline_hscroll_right` floors at 0 but does NOT clamp against the
+        // outline's content width — that clamp is render-side (`render_outline`), covered in
+        // `render.rs`'s tests.
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline_hscroll_right();
+        assert_eq!(app.outline_hscroll(), HSCROLL_STEP);
+        app.outline_hscroll_right();
+        assert_eq!(app.outline_hscroll(), HSCROLL_STEP * 2);
+    }
+
+    #[test]
     fn stack_mode_outline_items_carry_current_and_restack_markers() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -10678,6 +10800,121 @@ mod tests {
             9 - SCROLLOFF,
             "a cursor op after a wheel peek snaps the viewport back to the cursor's window"
         );
+    }
+
+    // ── mouse h-wheel + outline hscroll follow-up ─────────────────────────────────
+
+    #[test]
+    fn handle_hwheel_over_the_outline_pans_outline_hscroll_not_diff() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5;
+        app.derive_outline_scroll(app.outline_items().len());
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 5,
+        });
+        assert_eq!(app.outline_hscroll(), 0);
+        assert_eq!(app.hscroll, 0);
+
+        app.handle_hwheel(5, 2, 4);
+
+        assert!(
+            app.outline_focused(),
+            "an h-wheel event over the outline focuses it, like the vertical wheel"
+        );
+        assert_eq!(
+            app.outline_hscroll(),
+            4,
+            "the outline's own pan offset must move"
+        );
+        assert_eq!(app.hscroll, 0, "the diff's shared pan offset must not move");
+    }
+
+    #[test]
+    fn handle_hwheel_over_the_diff_pane_pans_app_hscroll_not_outline() {
+        // "l1".."l40" — the widest rows ("l10".."l40") are 3 columns, so the clamp
+        // (`max_row_width - 1`) is 2.
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+        assert_eq!(app.hscroll, 0);
+
+        app.handle_hwheel(10, 3, 4);
+
+        assert_eq!(
+            app.hscroll, 2,
+            "the diff's shared pan offset moves, clamped like `hscroll_right`"
+        );
+        assert_eq!(
+            app.outline_hscroll(),
+            0,
+            "the outline's own pan offset must not move"
+        );
+    }
+
+    #[test]
+    fn handle_hwheel_floors_at_zero() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5;
+        app.derive_outline_scroll(app.outline_items().len());
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 5,
+        });
+
+        app.handle_hwheel(5, 2, -4);
+
+        assert_eq!(app.outline_hscroll(), 0, "cannot pan left of column 0");
+    }
+
+    #[test]
+    fn handle_hwheel_outside_every_region_is_a_no_op() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline_height = 10;
+        app.pane_height = 10;
+        app.hit_regions = HitRegions {
+            outline: Some(Region {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 10,
+            }),
+            single: Some(Region {
+                x: 21,
+                y: 0,
+                w: 40,
+                h: 10,
+            }),
+            unstaged: None,
+            staged: None,
+        };
+        let outline_focused_before = app.outline_focused();
+        let hscroll_before = app.hscroll;
+        let outline_hscroll_before = app.outline_hscroll();
+
+        // On the divider, outside both recorded regions — same column CS10's click no-op test
+        // uses.
+        app.handle_hwheel(20, 0, 4);
+
+        assert_eq!(app.outline_focused(), outline_focused_before);
+        assert_eq!(app.hscroll, hscroll_before);
+        assert_eq!(app.outline_hscroll(), outline_hscroll_before);
     }
 
     #[test]

@@ -78,6 +78,8 @@ pub enum Command {
     OutlineBottom,
     OutlineStage,
     OutlineDiscard,
+    OutlineHscrollLeft,
+    OutlineHscrollRight,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -368,6 +370,20 @@ pub static REGISTRY: &[Registered] = &[
         name: "discard",
         default_keys: "d",
         description: "Discard the file/directory under the cursor",
+    },
+    Registered {
+        command: Command::OutlineHscrollLeft,
+        view: View::Outline,
+        name: "outline-hscroll-left",
+        default_keys: "<",
+        description: "Pan the outline left",
+    },
+    Registered {
+        command: Command::OutlineHscrollRight,
+        view: View::Outline,
+        name: "outline-hscroll-right",
+        default_keys: ">",
+        description: "Pan the outline right",
     },
 ];
 

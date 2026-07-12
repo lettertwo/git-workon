@@ -118,10 +118,11 @@ impl PartialEq for AppEvent {
 type InboxMessage = io::Result<AppEvent>;
 
 /// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press,
-/// resize, and (CS10) a left-click or wheel-scroll map; key release/repeat, every other mouse
-/// kind (drag, move, non-left buttons, button-up), paste, and focus events are skipped (`None`).
-/// Pure and independent of any thread or channel, so it's unit-tested directly; the input
-/// thread's loop body is a thin wrapper around it.
+/// resize, and (CS10, extended by the mouse h-wheel follow-up) a left-click or vertical/
+/// horizontal wheel-scroll map; key release/repeat, every other mouse kind (drag, move, non-left
+/// buttons, button-up), paste, and focus events are skipped (`None`). Pure and independent of any
+/// thread or channel, so it's unit-tested directly; the input thread's loop body is a thin wrapper
+/// around it.
 fn map_terminal_event(event: Event) -> Option<AppEvent> {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => Some(AppEvent::Key(key)),
@@ -132,6 +133,8 @@ fn map_terminal_event(event: Event) -> Option<AppEvent> {
                 MouseEventKind::Down(MouseButton::Left)
                     | MouseEventKind::ScrollUp
                     | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
             ) =>
         {
             Some(AppEvent::Mouse(m))
@@ -456,6 +459,8 @@ enum Action {
     OutlineBottom,
     OutlineStage,
     OutlineDiscard,
+    OutlineHscrollLeft,
+    OutlineHscrollRight,
     None,
 }
 
@@ -504,6 +509,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::OutlineBottom => Action::OutlineBottom,
         Command::OutlineStage => Action::OutlineStage,
         Command::OutlineDiscard => Action::OutlineDiscard,
+        Command::OutlineHscrollLeft => Action::OutlineHscrollLeft,
+        Command::OutlineHscrollRight => Action::OutlineHscrollRight,
     }
 }
 
@@ -639,6 +646,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::OutlineBottom => app.outline_bottom(),
         Action::OutlineStage => app.outline_stage(),
         Action::OutlineDiscard => app.outline_discard(),
+        Action::OutlineHscrollLeft => app.outline_hscroll_left(),
+        Action::OutlineHscrollRight => app.outline_hscroll_right(),
         Action::None => {}
     }
     false
@@ -751,6 +760,10 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
                 MouseEventKind::Down(MouseButton::Left) => app.handle_click(m.column, m.row),
                 MouseEventKind::ScrollDown => app.handle_wheel(m.column, m.row, 3),
                 MouseEventKind::ScrollUp => app.handle_wheel(m.column, m.row, -3),
+                // 4 columns per tick — finer than `HSCROLL_STEP` since trackpads emit streams of
+                // ticks (see `App::handle_hwheel`'s doc comment).
+                MouseEventKind::ScrollRight => app.handle_hwheel(m.column, m.row, 4),
+                MouseEventKind::ScrollLeft => app.handle_hwheel(m.column, m.row, -4),
                 _ => {}
             }
             false
@@ -1295,6 +1308,24 @@ mod tests {
             )))),
             None
         );
+    }
+
+    /// Mouse h-wheel follow-up: `ScrollLeft`/`ScrollRight` (trackpad h-scroll, or a shift-wheel
+    /// the terminal reports this way) map through exactly like the vertical `ScrollUp`/
+    /// `ScrollDown` pair above.
+    #[test]
+    fn map_terminal_event_maps_scroll_left_and_right() {
+        let scroll_left = mouse(MouseEventKind::ScrollLeft);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_left)),
+            Some(AppEvent::Mouse(m)) if m == scroll_left
+        ));
+
+        let scroll_right = mouse(MouseEventKind::ScrollRight);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_right)),
+            Some(AppEvent::Mouse(m)) if m == scroll_right
+        ));
     }
 
     /// `AppEvent` dropped `PartialEq`/`Eq` in ADR-037 (`FileReady`'s `LoadedViews` payload wraps
@@ -3294,5 +3325,49 @@ mod tests {
         // Already at column 0: the next press focuses the outline as normal.
         apply_action(&mut app, Action::FocusOutline);
         assert!(app.outline_focused());
+    }
+
+    /// Mouse h-wheel follow-up: a `ScrollRight` event reaches `App::handle_hwheel` (not the
+    /// vertical `App::handle_wheel`) when dispatched through the full `update` path — mirroring
+    /// how the existing vertical-wheel tests exercise `App::handle_wheel` directly, but this one
+    /// goes through `map_terminal_event` + `update`'s mouse arm to also pin the event mapping.
+    #[test]
+    fn scroll_right_event_reaches_handle_hwheel_via_update() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Region;
+
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(app.hscroll, 0);
+
+        let raw = MouseEvent {
+            kind: MouseEventKind::ScrollRight,
+            column: 10,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Round-trip through the real mapping first, matching how the input thread feeds `update`.
+        let mapped = map_terminal_event(Event::Mouse(raw)).expect("ScrollRight must map");
+        update(&mut app, &km, &mut pending, mapped);
+
+        assert!(
+            app.hscroll > 0,
+            "a ScrollRight event over the diff pane must pan App::hscroll via handle_hwheel"
+        );
     }
 }

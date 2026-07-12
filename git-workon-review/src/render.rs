@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as TSpan};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{
@@ -403,6 +403,70 @@ fn hscroll_cut(text: &str, col: usize) -> (usize, bool) {
     (text.len(), false)
 }
 
+/// Pan an already-built line of styled spans (diff content, or — as of the mouse/outline
+/// follow-up — an outline row) `cols` display columns to the left. The shared core
+/// [`content_spans`]/`render::render_outline` both build their spans at FULL width first, then
+/// apply this — never the other way around — so every existing style/segment computation
+/// (word-diff spans, syntax highlight, outline icon/label coloring) stays untouched by hscroll;
+/// this function only ever drops or re-slices spans, never recolors one.
+///
+/// Walks `spans` in order with a running column budget (`cols`, plus one extra reserved for the
+/// left-edge marker below): a per-span [`hscroll_cut`] call consumes as much of that budget as
+/// the span's own display width allows, carrying any remainder into the next span — exactly as
+/// if `hscroll_cut` had been called once over the whole line's concatenated text, since spans
+/// partition that text contiguously and in original order. A wide char straddling the cut is
+/// dropped whole (never half-rendered) and compensated with a one-column space pad, same as
+/// [`hscroll_cut`]'s own doc comment describes for a single string. Once the budget reaches `0`,
+/// every remaining span is pushed through unchanged.
+///
+/// When `cols == 0`, or the line has no content at all to cut, `spans` passes through unchanged
+/// (no marker, no pad) — matching [`hscroll_cut`]'s own "nothing to show" cases.
+fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TSpan<'static>> {
+    if cols == 0 {
+        return spans;
+    }
+    if spans.iter().all(|s| s.content.is_empty()) {
+        return spans;
+    }
+
+    // Reserve one extra column for the left-edge marker (decision #7's affordance) — mirrors the
+    // pre-refactor `content_spans`' own "cut at `hscroll`, then one column further for the
+    // marker" two-step.
+    let mut skip = cols + 1;
+    let mut out = Vec::with_capacity(spans.len() + 2);
+    out.push(TSpan::styled(
+        HSCROLL_MARKER.to_string(),
+        Style::default().fg(theme.dim),
+    ));
+
+    for span in spans {
+        if skip == 0 {
+            out.push(span);
+            continue;
+        }
+        let text = span.content.as_ref();
+        let (cut, straddled) = hscroll_cut(text, skip);
+        if straddled || cut < text.len() {
+            // The remaining budget was fully spent inside this span — everything from `cut`
+            // onward (possibly nothing) survives, unchanged in style.
+            skip = 0;
+            if straddled {
+                out.push(TSpan::styled(
+                    " ".to_string(),
+                    Style::default().fg(theme.foreground),
+                ));
+            }
+            if cut < text.len() {
+                out.push(TSpan::styled(text[cut..].to_string(), span.style));
+            }
+        } else {
+            // The whole span fit inside the remaining budget — drop it and keep consuming.
+            skip = skip.saturating_sub(UnicodeWidthStr::width(text));
+        }
+    }
+    out
+}
+
 /// Build the styled content spans (everything after the gutter) for one line of text, shared by
 /// [`build_pane_line`] (SBS) and [`build_inline_line`] (inline) — the two differ only in how they
 /// resolve `text`/`hl`/`emphasis` from a [`Row`] vs an [`InlineRow`] and in their gutter, not in
@@ -412,13 +476,9 @@ fn hscroll_cut(text: &str, col: usize) -> (usize, bool) {
 /// plus per-`word_spans` strong background when `is_word_pair`; whole-line strong when not paired
 /// — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at all).
 ///
-/// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans: segments are composed
-/// over the FULL, unsliced `text` exactly as before (every span offset below stays byte-based),
-/// then trimmed to start at `hscroll`'s cut point (decision #6) — dropping a segment entirely if
-/// it ends at or before the cut, else re-slicing its tail. When the cut actually removed content
-/// (`hscroll > 0` and something preceded it), the first visible column renders [`HSCROLL_MARKER`]
-/// instead (decision #7's left-edge affordance) — the real cut point in that case is one column
-/// further right, to make room for the marker.
+/// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans via [`pan_spans`] — the
+/// segments below are always composed over the FULL, unsliced `text` first (byte-identical to the
+/// pre-hscroll behavior), and [`pan_spans`] applies the cut/pad/marker afterward.
 #[allow(clippy::too_many_arguments)]
 fn content_spans(
     text: &str,
@@ -443,53 +503,21 @@ fn content_spans(
     }
 
     let segments = compose_segments(text.len(), &bg_spans, hl, theme);
-
-    // Nothing panned off yet: the common case, byte-identical to pre-hscroll behavior.
-    let (cut, pad, marker) = if hscroll == 0 {
-        (0, false, false)
-    } else {
-        let (base_cut, _) = hscroll_cut(text, hscroll);
-        if base_cut > 0 {
-            // Something was actually cut — reserve column `hscroll` for the marker by cutting
-            // one column further in.
-            let (marker_cut, pad) = hscroll_cut(text, hscroll + 1);
-            (marker_cut, pad, true)
-        } else {
-            (0, false, false)
-        }
-    };
-
-    let mut spans = Vec::with_capacity(segments.len().max(1) + 2);
-    if marker {
+    let mut spans = Vec::with_capacity(segments.len().max(1));
+    if segments.is_empty() && !text.is_empty() {
         spans.push(TSpan::styled(
-            HSCROLL_MARKER.to_string(),
-            Style::default().fg(theme.dim),
-        ));
-    }
-    if pad {
-        spans.push(TSpan::styled(
-            " ".to_string(),
-            Style::default().fg(theme.foreground),
-        ));
-    }
-    if segments.is_empty() && !text.is_empty() && cut < text.len() {
-        spans.push(TSpan::styled(
-            text[cut..].to_string(),
+            text.to_string(),
             Style::default().fg(theme.foreground),
         ));
     }
     for seg in segments {
-        if seg.end <= cut {
-            continue;
-        }
-        let start = seg.start.max(cut);
         let mut style = Style::default().fg(seg.fg);
         if let Some(bg) = seg.bg {
             style = style.bg(bg);
         }
-        spans.push(TSpan::styled(text[start..seg.end].to_string(), style));
+        spans.push(TSpan::styled(text[seg.start..seg.end].to_string(), style));
     }
-    spans
+    pan_spans(spans, hscroll, theme)
 }
 
 /// Build a single rendered line for one pane at a display row's resolved [`Row`]/[`CellKind`].
@@ -712,6 +740,17 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     let scroll = app.outline_scroll();
     let icons = app.icon_mode();
 
+    // Render-side upper clamp of the outline's own pan offset (mirroring `clamp_outline_scroll`
+    // just above) — from EVERY item's built line width, not just the visible rows: outlines are
+    // small (file trees, not file contents), so re-measuring the whole thing here is cheap.
+    let max_line_width = items
+        .iter()
+        .map(|item| build_outline_line(item, theme, icons).width())
+        .max()
+        .unwrap_or(0);
+    app.clamp_outline_hscroll(max_line_width);
+    let hscroll = app.outline_hscroll();
+
     let buf = frame.buffer_mut();
     for row in 0..area.height {
         let item_idx = scroll + row as usize;
@@ -721,6 +760,7 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
         };
         let is_cursor = item_idx == cursor;
         let line = build_outline_line(item, theme, icons);
+        let line = Line::from(pan_spans(line.spans, hscroll, theme));
         let line = if is_cursor && focused {
             apply_cursor_row(line, area.width, theme)
         } else if is_cursor {
@@ -729,6 +769,7 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
             line
         };
         buf.set_line(area.x, y, &line, area.width);
+        apply_right_edge_marker(buf, area, y, &line, theme);
     }
 }
 
@@ -1857,12 +1898,14 @@ fn render_pane_inline(
 mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Style;
+    use ratatui::text::Span as TSpan;
     use ratatui::Terminal;
 
     use git_workon_fixture::prelude::*;
     use unicode_width::UnicodeWidthChar;
 
-    use super::{hscroll_cut, render};
+    use super::{hscroll_cut, pan_spans, render};
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
@@ -3002,6 +3045,77 @@ mod tests {
         assert_eq!(&"short"[cut..], "");
     }
 
+    // ── mouse h-wheel + outline hscroll follow-up: `pan_spans` ─────────────────────
+
+    fn spans_text(spans: &[TSpan<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn span(text: &str) -> TSpan<'static> {
+        TSpan::styled(text.to_string(), Style::default())
+    }
+
+    #[test]
+    fn pan_spans_at_zero_columns_is_a_pass_through() {
+        let theme = Palette::dark();
+        let spans = vec![span("hello "), span("world")];
+        let panned = pan_spans(spans.clone(), 0, &theme);
+        assert_eq!(spans_text(&panned), "hello world");
+        assert_eq!(panned.len(), spans.len(), "unchanged, span for span");
+    }
+
+    #[test]
+    fn pan_spans_cuts_mid_span() {
+        // "hello world" panned 3 columns — the cut (plus the marker's reserved column) lands
+        // inside the FIRST span ("hello "), leaving its tail attached to the second span.
+        let theme = Palette::dark();
+        let spans = vec![span("hello "), span("world")];
+        let panned = pan_spans(spans, 3, &theme);
+        assert_eq!(spans_text(&panned), "…o world");
+    }
+
+    #[test]
+    fn pan_spans_cuts_exactly_at_a_span_boundary() {
+        // "abcdef" as three 2-char spans, panned 2 columns — the cut (plus the marker's reserved
+        // column) lands exactly on the boundary between the first and second span.
+        let theme = Palette::dark();
+        let spans = vec![span("ab"), span("cd"), span("ef")];
+        let panned = pan_spans(spans, 2, &theme);
+        assert_eq!(spans_text(&panned), "…def");
+    }
+
+    #[test]
+    fn pan_spans_wide_char_straddling_a_span_edge_drops_and_pads() {
+        // "a漢b" as two spans ("a", "漢b"), panned 1 column — the cut (plus the marker's reserved
+        // column) straddles the wide CJK glyph at the start of the second span: it's dropped
+        // whole and compensated with a one-column space.
+        let theme = Palette::dark();
+        assert_eq!(UnicodeWidthChar::width('漢'), Some(2));
+        let spans = vec![span("a"), span("漢b")];
+        let panned = pan_spans(spans, 1, &theme);
+        assert_eq!(spans_text(&panned), "… b");
+    }
+
+    #[test]
+    fn pan_spans_beyond_total_width_yields_just_the_marker() {
+        let theme = Palette::dark();
+        let spans = vec![span("ab"), span("cd")];
+        let panned = pan_spans(spans, 100, &theme);
+        assert_eq!(spans_text(&panned), "…");
+    }
+
+    #[test]
+    fn pan_spans_on_empty_content_is_a_pass_through() {
+        let theme = Palette::dark();
+        let spans = vec![span("")];
+        let panned = pan_spans(spans, 5, &theme);
+        assert_eq!(
+            spans_text(&panned),
+            "",
+            "an empty line has nothing to cut, so no marker either"
+        );
+    }
+
     /// Build a single unstaged-file `App` with one long line, for the hscroll rendering tests —
     /// long enough that panning by [`crate::app::HSCROLL_STEP`]-sized steps has real room to move
     /// (the tests don't reference that constant directly since it's private to `app.rs`; `200`
@@ -3413,6 +3527,68 @@ mod tests {
             buf.cell((guide_x, 3)).unwrap().style().fg,
             Some(Palette::dark().dim),
             "expected the File row's tree-guide connector to carry theme.dim, got: {row:?}"
+        );
+    }
+
+    // ── mouse h-wheel + outline hscroll follow-up: outline panning ─────────────────
+
+    /// A single-changeset `App` with one file whose path is far wider than the outline's fixed
+    /// 35-column width, focused into the outline — for the outline hscroll rendering tests.
+    fn app_with_a_long_outline_path() -> App {
+        let long_path = format!("{}.txt", "a".repeat(80));
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file(&long_path, "content\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.focus_outline(); // opens (a lone changeset defaults closed) and focuses.
+        app
+    }
+
+    #[test]
+    fn outline_panning_shows_the_left_marker_shifted_text_and_the_right_edge_marker() {
+        let mut app = app_with_a_long_outline_path();
+        app.outline_hscroll_right();
+        assert!(
+            app.outline_hscroll() > 0,
+            "the long path must give outline hscroll room to pan"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        // The header row (a short label) pans fully off and shows a lone marker, so select the
+        // PATH row: the one where the marker is followed by the shifted 'a…a.txt' body.
+        let row = content
+            .iter()
+            .position(|r| r.contains('…') && r.contains('a'))
+            .expect("the panned path row must show the left-edge marker plus shifted content");
+        // Column 34 is the outline's last column before the divider at 35 (see
+        // `OUTLINE_TEST_WIDTH`'s doc comment).
+        assert_eq!(
+            cell_text(&buf, 34, row as u16),
+            "…",
+            "a row wider than the outline pane must show the right-edge marker too"
+        );
+    }
+
+    #[test]
+    fn outline_render_side_clamp_caps_a_huge_pan_offset() {
+        let mut app = app_with_a_long_outline_path();
+        for _ in 0..1000 {
+            app.outline_hscroll_right();
+        }
+        assert!(
+            app.outline_hscroll() > 1000,
+            "sanity: `outline_hscroll_right` itself has no upper clamp"
+        );
+
+        render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        assert!(
+            app.outline_hscroll() < 1000,
+            "render_outline must clamp the huge offset down to the content width, got {}",
+            app.outline_hscroll()
         );
     }
 
