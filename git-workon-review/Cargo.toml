@@ -54,6 +54,7 @@ tree-sitter-md.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-toml-ng.workspace = true
 tree-sitter-typescript.workspace = true
+unicode-width.workspace = true
 
 [package.metadata.dist]
 # Redundant with publish = false today; load-bearing at the M3 flip so

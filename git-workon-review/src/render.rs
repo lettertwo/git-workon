@@ -11,6 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as TSpan};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{
@@ -193,6 +194,30 @@ fn apply_selection_row(line: Line<'static>, width: u16, theme: &Palette) -> Line
     apply_row_tint(line, width, theme.selection_bg)
 }
 
+/// Horizontal-scroll right-edge marker (decision #7): if `line` (as already blitted into `area`
+/// by the caller's `set_line`) is wider than `area`'s content width, overwrite the pane's last
+/// cell with a dim `…` so a panned-right line still signals there's more to the right. Applied
+/// AFTER `set_line` (and after any cursor/selection wash, which paints its own background first)
+/// so the marker survives on a cursor row — `Buffer::set_string`'s `Cell::set_style` only
+/// overwrites `fg` when the given style sets it (leaves `bg` untouched when it doesn't, per
+/// ratatui's `Style::patch` semantics), so this only ever changes the glyph + foreground, never
+/// erasing the wash underneath.
+fn apply_right_edge_marker(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    line: &Line<'static>,
+    theme: &Palette,
+) {
+    if area.width == 0 {
+        return;
+    }
+    if line.width() > area.width as usize {
+        let x = area.x + area.width - 1;
+        buf.set_string(x, y, HSCROLL_MARKER, Style::default().fg(theme.dim));
+    }
+}
+
 /// One resolved (bg, fg) pair for a byte range of a line.
 struct Segment {
     start: usize,
@@ -344,6 +369,40 @@ enum Side {
     New,
 }
 
+/// Horizontal-scroll left-edge marker (decision #7): replaces the first visible content column
+/// whenever a line actually had content panned off to the left. Dim-styled like the gap-row/
+/// filler markers — no new color, just `theme.dim` on the existing `…` glyph.
+const HSCROLL_MARKER: &str = "…";
+
+/// Find the byte offset that cuts `text` at display column `col` (0 for `col == 0`), for
+/// [`content_spans`]'s horizontal-scroll slicing. Column, not byte, is the unit `App::hscroll`
+/// counts in, so this walks chars accumulating [`UnicodeWidthChar`] widths rather than indexing
+/// `text` directly — indexing by column count would panic on a non-char-boundary byte offset for
+/// any multibyte UTF-8 line.
+///
+/// Returns `(byte_offset, pad)`: `pad` is `true` when a wide (2-column) char straddles the cut —
+/// e.g. `col` lands mid-CJK-glyph — in which case that char is dropped entirely (skipping it
+/// half-visible would misalign every column after it) and the caller should prepend a one-column
+/// space to keep alignment. `col` at or beyond the line's total width returns `(text.len(), false)`
+/// (nothing left to show).
+fn hscroll_cut(text: &str, col: usize) -> (usize, bool) {
+    if col == 0 {
+        return (0, false);
+    }
+    let mut acc = 0usize;
+    for (i, c) in text.char_indices() {
+        if acc >= col {
+            return (i, false);
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + w > col {
+            return (i + c.len_utf8(), true);
+        }
+        acc += w;
+    }
+    (text.len(), false)
+}
+
 /// Build the styled content spans (everything after the gutter) for one line of text, shared by
 /// [`build_pane_line`] (SBS) and [`build_inline_line`] (inline) — the two differ only in how they
 /// resolve `text`/`hl`/`emphasis` from a [`Row`] vs an [`InlineRow`] and in their gutter, not in
@@ -352,6 +411,15 @@ enum Side {
 /// `emphasis` is `Some((subtle, strong))` for a `Del`/`Add` line (whole-line subtle background,
 /// plus per-`word_spans` strong background when `is_word_pair`; whole-line strong when not paired
 /// — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at all).
+///
+/// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans: segments are composed
+/// over the FULL, unsliced `text` exactly as before (every span offset below stays byte-based),
+/// then trimmed to start at `hscroll`'s cut point (decision #6) — dropping a segment entirely if
+/// it ends at or before the cut, else re-slicing its tail. When the cut actually removed content
+/// (`hscroll > 0` and something preceded it), the first visible column renders [`HSCROLL_MARKER`]
+/// instead (decision #7's left-edge affordance) — the real cut point in that case is one column
+/// further right, to make room for the marker.
+#[allow(clippy::too_many_arguments)]
 fn content_spans(
     text: &str,
     hl: Option<&Vec<FgSpan>>,
@@ -359,6 +427,7 @@ fn content_spans(
     word_spans: &[WordSpan],
     is_word_pair: bool,
     theme: &Palette,
+    hscroll: usize,
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
     if let Some((subtle_bg, strong_bg)) = emphasis {
@@ -374,19 +443,51 @@ fn content_spans(
     }
 
     let segments = compose_segments(text.len(), &bg_spans, hl, theme);
-    let mut spans = Vec::with_capacity(segments.len().max(1));
-    if segments.is_empty() && !text.is_empty() {
+
+    // Nothing panned off yet: the common case, byte-identical to pre-hscroll behavior.
+    let (cut, pad, marker) = if hscroll == 0 {
+        (0, false, false)
+    } else {
+        let (base_cut, _) = hscroll_cut(text, hscroll);
+        if base_cut > 0 {
+            // Something was actually cut — reserve column `hscroll` for the marker by cutting
+            // one column further in.
+            let (marker_cut, pad) = hscroll_cut(text, hscroll + 1);
+            (marker_cut, pad, true)
+        } else {
+            (0, false, false)
+        }
+    };
+
+    let mut spans = Vec::with_capacity(segments.len().max(1) + 2);
+    if marker {
         spans.push(TSpan::styled(
-            text.to_string(),
+            HSCROLL_MARKER.to_string(),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    if pad {
+        spans.push(TSpan::styled(
+            " ".to_string(),
+            Style::default().fg(theme.foreground),
+        ));
+    }
+    if segments.is_empty() && !text.is_empty() && cut < text.len() {
+        spans.push(TSpan::styled(
+            text[cut..].to_string(),
             Style::default().fg(theme.foreground),
         ));
     }
     for seg in segments {
+        if seg.end <= cut {
+            continue;
+        }
+        let start = seg.start.max(cut);
         let mut style = Style::default().fg(seg.fg);
         if let Some(bg) = seg.bg {
             style = style.bg(bg);
         }
-        spans.push(TSpan::styled(text[seg.start..seg.end].to_string(), style));
+        spans.push(TSpan::styled(text[start..seg.end].to_string(), style));
     }
     spans
 }
@@ -404,6 +505,7 @@ fn build_pane_line(
     gutter_w: usize,
     content_w: usize,
     theme: &Palette,
+    hscroll: usize,
 ) -> Line<'static> {
     match row {
         Row::Filler => {
@@ -436,6 +538,7 @@ fn build_pane_line(
                 word_spans,
                 is_word_pair,
                 theme,
+                hscroll,
             ));
             Line::from(spans)
         }
@@ -801,14 +904,29 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     let idx = app.current + 1;
     let n = app.files().len();
     let text = format!("[{idx}/{n}] {}", current_file_label(app));
-    frame.render_widget(
-        Paragraph::new(text).style(
-            Style::default()
-                .fg(theme.foreground)
-                .add_modifier(Modifier::BOLD),
-        ),
-        area,
-    );
+    let mut spans = vec![TSpan::styled(
+        text,
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(span) = hscroll_indicator_span(app, theme) {
+        spans.push(span);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// While [`App::hscroll`] is panned, a small dim `»42` (the column offset) appended to the header/
+/// winbar (locked decision #8) — `None` at column `0`, matching the diffstat span's own
+/// present-or-absent pattern above/below.
+fn hscroll_indicator_span(app: &App, theme: &Palette) -> Option<TSpan<'static>> {
+    if app.hscroll == 0 {
+        return None;
+    }
+    Some(TSpan::styled(
+        format!("  »{}", app.hscroll),
+        Style::default().fg(theme.dim),
+    ))
 }
 
 /// The multi-changeset winbar (locked decisions #8 + #9): `[i/n] <title-or-name>
@@ -897,6 +1015,9 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
     ));
+    if let Some(span) = hscroll_indicator_span(app, theme) {
+        spans.push(span);
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1417,6 +1538,9 @@ fn render_pane_sbs(
     let old_area = hlayout[0];
     let div_area = hlayout[1];
     let new_area = hlayout[2];
+    // One offset shared by every content pane (locked decision #1) — read once, before any of
+    // the `app` borrows below.
+    let hscroll = app.hscroll;
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), old_area);
@@ -1492,6 +1616,7 @@ fn render_pane_sbs(
                     old_gutter_w,
                     old_area.width as usize,
                     theme,
+                    hscroll,
                 );
                 let new_line = build_pane_line(
                     view,
@@ -1504,6 +1629,7 @@ fn render_pane_sbs(
                     new_gutter_w,
                     new_area.width as usize,
                     theme,
+                    hscroll,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
@@ -1525,6 +1651,12 @@ fn render_pane_sbs(
                 frame
                     .buffer_mut()
                     .set_line(new_area.x, y, &new_line, new_area.width);
+                // Right-edge hscroll marker (decision #7) — applied AFTER `set_line` (and thus
+                // after the cursor/selection wash above, which already painted the background)
+                // so it survives on a cursor/selected row; `apply_right_edge_marker` only sets
+                // `fg`, leaving whatever background the wash left in place.
+                apply_right_edge_marker(frame.buffer_mut(), old_area, y, &old_line, theme);
+                apply_right_edge_marker(frame.buffer_mut(), new_area, y, &new_line, theme);
                 // The divider column was painted once for the whole pane height above, with the
                 // default background; re-tint just this row's divider cell so the cursor wash
                 // covers the full width (panes AND the `│` between them), like `render_gap_row`.
@@ -1557,6 +1689,7 @@ fn gutter_field(n: Option<usize>, w: usize) -> String {
 /// rows show only the old-side column, `Add` rows only the new-side column — the other column is
 /// blank rather than reused for anything, so a scan down the gutter reads as two honest,
 /// independent line-number tracks.
+#[allow(clippy::too_many_arguments)]
 fn build_inline_line(
     view: &FileView,
     row: &InlineRow,
@@ -1565,6 +1698,7 @@ fn build_inline_line(
     old_gutter_w: usize,
     new_gutter_w: usize,
     theme: &Palette,
+    hscroll: usize,
 ) -> Line<'static> {
     let (old_opt, new_opt, text, hl, kind) = match *row {
         InlineRow::Context { old, new } => (
@@ -1615,6 +1749,7 @@ fn build_inline_line(
         word_spans,
         is_word_pair,
         theme,
+        hscroll,
     ));
     Line::from(spans)
 }
@@ -1634,6 +1769,10 @@ fn render_pane_inline(
     selection: Option<(usize, usize)>,
     theme: &Palette,
 ) {
+    // One offset shared by every content pane (locked decision #1) — read once, before any of
+    // the `app` borrows below.
+    let hscroll = app.hscroll;
+
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
         return;
@@ -1695,6 +1834,7 @@ fn render_pane_inline(
                     old_gutter_w,
                     new_gutter_w,
                     theme,
+                    hscroll,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let line = if is_cursor {
@@ -1705,6 +1845,9 @@ fn render_pane_inline(
                     line
                 };
                 frame.buffer_mut().set_line(area.x, y, &line, area.width);
+                // Right-edge hscroll marker (decision #7) — see `render_pane_sbs`'s identical
+                // comment on ordering relative to the cursor/selection wash above.
+                apply_right_edge_marker(frame.buffer_mut(), area, y, &line, theme);
             }
         }
     }
@@ -1717,8 +1860,9 @@ mod tests {
     use ratatui::Terminal;
 
     use git_workon_fixture::prelude::*;
+    use unicode_width::UnicodeWidthChar;
 
-    use super::render;
+    use super::{hscroll_cut, render};
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
@@ -2803,6 +2947,157 @@ mod tests {
             !dim_adds.contains(&add_bg),
             "a committed changeset has no staged/unstaged split to color by — it must never \
              render the dim 'already staged' pair, got {add_bg:?}"
+        );
+    }
+
+    // ── diff-hscroll ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hscroll_cut_ascii() {
+        // "hello world" — cutting at column 6 lands right after the space, before "world".
+        assert_eq!(hscroll_cut("hello world", 6), (6, false));
+        assert_eq!(hscroll_cut("hello world", 0), (0, false));
+    }
+
+    #[test]
+    fn hscroll_cut_multibyte_narrow() {
+        // "café" — 'é' is a single (narrow, non-ASCII) column, so cutting at column 3 lands
+        // exactly at its 2-byte UTF-8 start.
+        let text = "café";
+        assert_eq!(UnicodeWidthChar::width('é'), Some(1));
+        let (cut, pad) = hscroll_cut(text, 3);
+        assert_eq!(&text[cut..], "é");
+        assert!(!pad);
+    }
+
+    #[test]
+    fn hscroll_cut_wide_cjk_straddling_the_cut_skips_it_and_pads() {
+        // "a漢b" — 'a' (col 0), '漢' (cols 1-2, a wide CJK glyph), 'b' (col 3). Cutting at column
+        // 2 lands mid-glyph: the whole wide char is dropped and `pad` signals the caller to
+        // insert a one-column space to keep the remaining columns aligned.
+        let text = "a漢b";
+        assert_eq!(UnicodeWidthChar::width('漢'), Some(2));
+        let (cut, pad) = hscroll_cut(text, 2);
+        assert!(
+            pad,
+            "a wide char straddling the cut must request a pad column"
+        );
+        assert_eq!(&text[cut..], "b");
+    }
+
+    #[test]
+    fn hscroll_cut_emoji() {
+        // Most terminal-emulator-relevant emoji are wide (2 columns), like CJK.
+        let text = "a🎉b";
+        let w = UnicodeWidthChar::width('🎉').unwrap_or(0);
+        let (cut, _pad) = hscroll_cut(text, 1 + w);
+        assert_eq!(&text[cut..], "b");
+    }
+
+    #[test]
+    fn hscroll_cut_beyond_line_width_yields_empty() {
+        let (cut, pad) = hscroll_cut("short", 100);
+        assert_eq!(cut, "short".len());
+        assert!(!pad);
+        assert_eq!(&"short"[cut..], "");
+    }
+
+    /// Build a single unstaged-file `App` with one long line, for the hscroll rendering tests —
+    /// long enough that panning by [`crate::app::HSCROLL_STEP`]-sized steps has real room to move
+    /// (the tests don't reference that constant directly since it's private to `app.rs`; `200`
+    /// just needs to comfortably exceed a test pane's width either way).
+    fn app_with_a_long_line() -> App {
+        let long_line = "x".repeat(200);
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("long.txt", "short\n", &format!("{long_line}\n"))
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app
+    }
+
+    #[test]
+    fn panning_right_shows_the_left_edge_marker_and_shifted_content() {
+        let mut app = app_with_a_long_line();
+        app.hscroll_right();
+        assert!(
+            app.hscroll > 0,
+            "the long line must give hscroll room to pan"
+        );
+
+        let buf = render_once(&mut app, 60, 20);
+        // divider (1) + new-side gutter ("{n:>3} ", 4 chars) — the new pane's first content
+        // column.
+        let left_w = buf.area.width.saturating_sub(1) / 2;
+        let content_x = left_w + 1 + 4;
+        let row_y = (0..buf.area.height)
+            .find(|&y| cell_text(&buf, content_x, y) == "…")
+            .expect("the panned long line's first visible content column must show the marker");
+        assert_eq!(
+            cell_text(&buf, content_x + 1, row_y),
+            "x",
+            "content immediately after the marker must be the (shifted) line body"
+        );
+    }
+
+    #[test]
+    fn a_line_wider_than_the_pane_shows_the_right_edge_marker() {
+        let mut app = app_with_a_long_line();
+        // At `hscroll == 0` the long line already overflows a narrow pane's content width.
+        assert_eq!(app.hscroll, 0);
+
+        let buf = render_once(&mut app, 60, 20);
+        let right_x = buf.area.width - 1;
+        assert!(
+            (0..buf.area.height).any(|y| cell_text(&buf, right_x, y) == "…"),
+            "a line wider than the pane must show the right-edge marker"
+        );
+    }
+
+    #[test]
+    fn winbar_shows_the_pan_offset_indicator_once_panned() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert_eq!(app.hscroll, 0);
+
+        let buf_unpanned = render_once(&mut app, 80, 20);
+        let header_unpanned: String = (0..buf_unpanned.area.width)
+            .map(|x| cell_text(&buf_unpanned, x, 0))
+            .collect();
+        assert!(
+            !header_unpanned.contains('»'),
+            "no indicator at column 0, got: {header_unpanned:?}"
+        );
+
+        // The winbar test's fixture files are tiny (`a\n`/`b\n`) — nowhere near wide enough for
+        // `hscroll_right` to actually move `hscroll` off `0`. This checks the indicator's own
+        // render logic, not the pan mechanics (covered separately in `app.rs`), so setting the
+        // field directly is the more honest test: the indicator must key off `App::hscroll`
+        // exactly, with no dependency on how it got there.
+        app.hscroll = 42;
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("»42"),
+            "expected the pan offset indicator, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn single_changeset_header_shows_the_pan_offset_indicator_once_panned() {
+        let mut app = app_with_a_long_line();
+        app.hscroll_right();
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains(&format!("»{}", app.hscroll)),
+            "expected the pan offset indicator on the lone-changeset header, got: {header:?}"
         );
     }
 

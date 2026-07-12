@@ -64,6 +64,8 @@ pub enum Command {
     PrevChangeset,
     ExpandGap,
     ExpandGapAll,
+    HscrollLeft,
+    HscrollRight,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -273,7 +275,21 @@ pub static REGISTRY: &[Registered] = &[
         view: View::Diff,
         name: "focus-outline",
         default_keys: "h left",
-        description: "Focus the outline",
+        description: "Focus the outline (pans the diff back to column 0 first, if panned)",
+    },
+    Registered {
+        command: Command::HscrollLeft,
+        view: View::Diff,
+        name: "hscroll-left",
+        default_keys: "<",
+        description: "Pan the diff content left",
+    },
+    Registered {
+        command: Command::HscrollRight,
+        view: View::Diff,
+        name: "hscroll-right",
+        default_keys: "> l right",
+        description: "Pan the diff content right",
     },
     Registered {
         command: Command::ExpandGap,
@@ -995,6 +1011,55 @@ mod tests {
         assert_eq!(
             feed(&km, true, &[key(KeyCode::Char('j'))]),
             Dispatch::Command(Command::OutlineDown)
+        );
+    }
+
+    // ── diff-hscroll: `hscroll-left`/`hscroll-right` registry rows ─────────────
+
+    #[test]
+    fn hscroll_commands_are_registered_with_no_collision_warnings() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "the new commands' defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert!(
+            !km.keys_for(Command::HscrollLeft).is_empty(),
+            "hscroll-left must resolve to at least one bound key"
+        );
+        assert!(
+            !km.keys_for(Command::HscrollRight).is_empty(),
+            "hscroll-right must resolve to at least one bound key"
+        );
+    }
+
+    #[test]
+    fn less_than_and_greater_than_dispatch_hscroll_in_the_diff_view() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('<'))]),
+            Dispatch::Command(Command::HscrollLeft)
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('>'))]),
+            Dispatch::Command(Command::HscrollRight)
+        );
+    }
+
+    /// `l`/`right` are free in the Diff view (they're only bound in the Outline view, to
+    /// `focus-diff`) — the handoff's locked decision #2 reuses them for `hscroll-right` there,
+    /// mirroring the Outline view's `l`/`right` = focus-diff.
+    #[test]
+    fn l_and_right_dispatch_hscroll_right_in_the_diff_view() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('l'))]),
+            Dispatch::Command(Command::HscrollRight)
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Right)]),
+            Dispatch::Command(Command::HscrollRight)
         );
     }
 

@@ -444,6 +444,8 @@ enum Action {
     StartSelection,
     ExpandGap,
     ExpandGapAll,
+    HscrollLeft,
+    HscrollRight,
     ToggleOutline,
     OutlineMoveBy(i64),
     OutlineConfirm,
@@ -484,6 +486,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::StartSelection => Action::StartSelection,
         Command::ExpandGap => Action::ExpandGap,
         Command::ExpandGapAll => Action::ExpandGapAll,
+        Command::HscrollLeft => Action::HscrollLeft,
+        Command::HscrollRight => Action::HscrollRight,
         Command::NextFile => Action::NextFile,
         Command::PrevFile => Action::PrevFile,
         Command::NextHunk => Action::NextHunk,
@@ -611,11 +615,25 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::StartSelection => app.start_selection(),
         Action::ExpandGap => app.expand_gap_at_cursor(false),
         Action::ExpandGapAll => app.expand_gap_at_cursor(true),
+        Action::HscrollLeft => app.hscroll_left(),
+        Action::HscrollRight => app.hscroll_right(),
         Action::ToggleOutline => app.toggle_outline(),
         Action::OutlineMoveBy(delta) => app.outline_move_by(delta),
         Action::OutlineConfirm => app.outline_confirm(),
         Action::OutlineCycleMode => app.outline_cycle_mode(),
-        Action::FocusOutline => app.focus_outline(),
+        // `h`/`left` pans the diff back to column 0 first (mirroring the outline's own home
+        // position) and only actually focuses the outline once there — see the handoff's locked
+        // decision #2. Implemented here rather than in `App::focus_outline` itself, since that
+        // method is also called from the outline toggle (`App::toggle_outline`) and the mouse
+        // click/wheel paths (`App::handle_click`/`handle_wheel`), none of which should gain pan
+        // behavior.
+        Action::FocusOutline => {
+            if app.hscroll > 0 {
+                app.hscroll_left();
+            } else {
+                app.focus_outline();
+            }
+        }
         Action::FocusDiff => app.focus_diff(),
         Action::OutlineTop => app.outline_top(),
         Action::OutlineBottom => app.outline_bottom(),
@@ -3234,5 +3252,47 @@ mod tests {
             app.current_view_ref().is_some(),
             "the active file's view must be cached after its FileReady lands"
         );
+    }
+
+    // ── diff-hscroll: `Action::FocusOutline` pans home before focusing ─────────────
+
+    /// Locked decision #2: `h`/`left` (`Action::FocusOutline`) pans the diff back toward column
+    /// `0` first while panned, and only actually focuses the outline once there — implemented in
+    /// this dispatch arm rather than in `App::focus_outline` itself (see that arm's comment), so
+    /// this is only testable at the `apply_action` layer, not through `App` alone.
+    #[test]
+    fn focus_outline_action_pans_home_before_focusing_when_panned() {
+        use git_workon_fixture::prelude::*;
+
+        let long_line = "x".repeat(200);
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "short\n", &format!("{long_line}\n"))
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.hscroll_right();
+        assert!(
+            app.hscroll > 0,
+            "the long line must give hscroll room to pan"
+        );
+        assert!(!app.outline_focused());
+
+        // Panned: the first press pans back toward column 0 rather than focusing the outline.
+        apply_action(&mut app, Action::FocusOutline);
+        assert_eq!(
+            app.hscroll, 0,
+            "one press from a single hscroll step returns to column 0"
+        );
+        assert!(
+            !app.outline_focused(),
+            "still unfocused — this press only panned"
+        );
+
+        // Already at column 0: the next press focuses the outline as normal.
+        apply_action(&mut app, Action::FocusOutline);
+        assert!(app.outline_focused());
     }
 }

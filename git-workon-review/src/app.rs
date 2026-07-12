@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use git2::Repository;
+use unicode_width::UnicodeWidthStr;
 use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
@@ -39,6 +40,10 @@ use crate::wordiff::{word_diff_spans, Span};
 /// Minimum rows kept between the cursor and the top/bottom of the pane while scrolling — see
 /// [`App::derive_scroll`].
 const SCROLLOFF: usize = 2;
+
+/// Display columns panned per `hscroll-left`/`hscroll-right` press — see [`App::hscroll_left`]/
+/// [`App::hscroll_right`].
+const HSCROLL_STEP: usize = 8;
 
 /// Loaded, aligned, highlighted view of one file's combined diff.
 ///
@@ -1118,6 +1123,13 @@ pub struct App {
     /// directly by the renderer, but never written except by [`Self::derive_scroll`] — every
     /// cursor-moving method ends by calling it, so `scroll` always reflects the CURRENT `cursor`.
     pub scroll: usize,
+    /// Column pan offset (display columns, not bytes) applied to every diff CONTENT pane — both
+    /// side-by-side halves and both split panes share this one offset; the gutter stays pinned at
+    /// column 0. Panned by [`Self::hscroll_left`]/[`Self::hscroll_right`], clamped against the
+    /// current view's longest row (see those methods), and reset to `0` on file/changeset
+    /// navigation ([`Self::next_file`]/[`Self::prev_file`]/[`Self::next_changeset`]/
+    /// [`Self::prev_changeset`]) — cursor movement within a file leaves it untouched.
+    pub hscroll: usize,
     /// Content height of the focused pane, written by the renderer each frame. In a single-pane
     /// zoom this is the whole body; in a split it's the focused half (see [`Self::alt_height`]).
     pub pane_height: usize,
@@ -1378,6 +1390,7 @@ impl App {
             current: 0,
             cursor: 0,
             scroll: 0,
+            hscroll: 0,
             pane_height: 20,
             alt: PaneState::default(),
             alt_height: 20,
@@ -2359,6 +2372,7 @@ impl App {
     /// outline-initiated jump (which sets [`OutlineState::cursor`] itself before calling
     /// `switch_changeset`/`goto_changeset` directly) never re-triggers it.
     pub fn next_file(&mut self) {
+        self.hscroll = 0;
         if self.cur().diff.files.is_empty() {
             return;
         }
@@ -2378,6 +2392,7 @@ impl App {
     /// first changeset. See [`Self::next_file`]'s doc comment for why this calls
     /// [`Self::sync_outline_to_current`] at the end.
     pub fn prev_file(&mut self) {
+        self.hscroll = 0;
         if self.cur().diff.files.is_empty() {
             return;
         }
@@ -2406,6 +2421,7 @@ impl App {
     /// DIFF-initiated entry point — see [`Self::next_file`]'s doc comment on the sync-follow
     /// discipline.
     pub fn next_changeset(&mut self) {
+        self.hscroll = 0;
         if self.current_cs + 1 < self.changesets.len() {
             self.goto_changeset(self.current_cs + 1);
         }
@@ -2415,6 +2431,7 @@ impl App {
     /// Jump to the previous changeset's first file (`[c`). A no-op at the first changeset. See
     /// [`Self::next_file`]'s doc comment on the sync-follow discipline.
     pub fn prev_changeset(&mut self) {
+        self.hscroll = 0;
         if self.current_cs > 0 {
             self.goto_changeset(self.current_cs - 1);
         }
@@ -3266,6 +3283,59 @@ impl App {
             .outline
             .scroll
             .min(rows.saturating_sub(self.outline_height.max(1)));
+    }
+
+    /// The widest display-column row currently in the active file's view(s) — both roles when
+    /// split, since [`Self::hscroll`] pans every content pane together (locked decision #1).
+    /// Walks the already-built [`FileView::display`] row list (shared by both the SBS and inline
+    /// layouts — inline just re-derives its own row list from the same text), so this is a pure
+    /// lookup over rows the renderer rebuilds every frame anyway, not a fresh scan of the file.
+    /// Used only by [`Self::clamp_hscroll`] to keep at least one column of the longest line
+    /// reachable; computed on demand rather than cached (cheap — see that method's doc comment).
+    fn max_row_width(&self) -> usize {
+        let idx = self.current;
+        let roles: Vec<Role> = match self.effective_zoom_for(idx) {
+            EffectiveZoom::Single(role) => vec![role],
+            EffectiveZoom::Split => vec![Role::Unstaged, Role::Staged],
+        };
+        let mut max = 0;
+        for role in roles {
+            let Some(view) = self.role_view_ref(idx, role) else {
+                continue;
+            };
+            for row in &view.display {
+                let DisplayRow::Row(r) = row else { continue };
+                if let Row::Line(n) = r.old {
+                    max = max.max(UnicodeWidthStr::width(view.old_line(n)));
+                }
+                if let Row::Line(n) = r.new {
+                    max = max.max(UnicodeWidthStr::width(view.new_line(n)));
+                }
+            }
+        }
+        max
+    }
+
+    /// Clamp [`Self::hscroll`] into `[0, max_row_width().saturating_sub(1)]` — the `-1` keeps at
+    /// least one column of the longest line visible (locked decision #4) rather than letting the
+    /// pan run all the way to a blank viewport.
+    fn clamp_hscroll(&mut self) {
+        let max = self.max_row_width().saturating_sub(1);
+        self.hscroll = self.hscroll.min(max);
+    }
+
+    /// `hscroll-left`: pan the diff content panes left by [`HSCROLL_STEP`] columns (floored at
+    /// `0`).
+    pub fn hscroll_left(&mut self) {
+        self.hscroll = self.hscroll.saturating_sub(HSCROLL_STEP);
+    }
+
+    /// `hscroll-right`: pan the diff content panes right by [`HSCROLL_STEP`] columns, clamped so
+    /// at least one column of the current view's longest row stays visible (see
+    /// [`Self::clamp_hscroll`]).
+    pub fn hscroll_right(&mut self) {
+        self.hscroll = self.hscroll.saturating_add(HSCROLL_STEP);
+        self.clamp_hscroll();
     }
 
     /// Re-derive the outline pane's `scroll` from its `cursor` — the outline's counterpart to
@@ -4664,6 +4734,62 @@ mod tests {
         let view = app.current_view_ref().unwrap();
         assert_eq!(view.old_text(), "bye\n");
         assert_eq!(view.new_text(), "");
+    }
+
+    // ── diff-hscroll: pan clamping ──────────────────────────────────────────────
+
+    #[test]
+    fn hscroll_left_floors_at_zero() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.hscroll, 0);
+        app.hscroll_left();
+        assert_eq!(app.hscroll, 0, "cannot pan left of column 0");
+    }
+
+    #[test]
+    fn hscroll_right_clamps_to_the_longest_row_leaving_one_column_visible() {
+        // A line well over a terminal width, so repeated `hscroll-right` presses hit the clamp
+        // rather than running out of steps first.
+        let long_line = "x".repeat(200);
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "short\n", &format!("{long_line}\n"))
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        for _ in 0..100 {
+            app.hscroll_right();
+        }
+        // `max_row_width` is 200 (the long line); the clamp keeps one column of it reachable.
+        assert_eq!(app.hscroll, 199);
+    }
+
+    #[test]
+    fn hscroll_right_on_a_file_with_no_long_rows_clamps_to_zero() {
+        // Every row is a single column wide, so `max_row_width` (1) leaves nothing to pan into —
+        // the clamp (`max_row_width - 1`) is `0`.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "a\n", "a\nb\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.hscroll_right();
+        assert_eq!(
+            app.hscroll, 0,
+            "every row already fits, so there is nothing to pan into"
+        );
     }
 
     #[test]
@@ -7912,6 +8038,53 @@ mod tests {
             "the stack's very first file must clamp, not wrap to the last changeset"
         );
         assert_eq!(app.current, 0);
+    }
+
+    // ── diff-hscroll: reset on file/changeset nav, preserved across cursor movement ──────
+
+    #[test]
+    fn next_file_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.hscroll = 5;
+        app.next_file();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn prev_file_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.goto_changeset(1);
+        app.hscroll = 5;
+        app.prev_file();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn next_changeset_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.hscroll = 5;
+        app.next_changeset();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn prev_changeset_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.goto_changeset(1);
+        app.hscroll = 5;
+        app.prev_changeset();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn cursor_movement_within_a_file_preserves_hscroll() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.hscroll = 5;
+        app.move_cursor_by(1);
+        assert_eq!(
+            app.hscroll, 5,
+            "plain cursor movement must not reset the horizontal pan"
+        );
     }
 
     /// Regression: navigating to an OLDER committed changeset and loading its combined view must
