@@ -1,8 +1,29 @@
 use crate::fixture::Fixture;
 use assert_fs::TempDir;
-use git2::{BranchType, Repository, WorktreeAddOptions};
+use git2::{BranchType, ConfigLevel, Repository, WorktreeAddOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Once;
 use workon::empty_commit;
+
+/// Point libgit2's system/global/XDG config search paths at an empty directory, once per
+/// process, so fixture repos never layer in the developer's real `~/.gitconfig` (a global
+/// `workon.*` key would otherwise poison every "unset config" assertion in the workspace).
+/// Only affects in-process git2 use — spawned `git` binaries still read the real files.
+fn isolate_ambient_git_config() {
+    static ISOLATE: Once = Once::new();
+    ISOLATE.call_once(|| {
+        let empty = TempDir::new().expect("temp dir for git config isolation");
+        for level in [ConfigLevel::System, ConfigLevel::XDG, ConfigLevel::Global] {
+            // SAFETY: mutates libgit2's process-global search paths; guarded by `ISOLATE`
+            // and called from `build()` before this fixture's repo (and, in practice, any
+            // other test's git2 work in this process) touches config discovery.
+            unsafe { git2::opts::set_search_path(level, empty.path()) }
+                .expect("set git config search path");
+        }
+        // Keep the (empty) directory alive for the whole process — the search paths hold it.
+        std::mem::forget(empty);
+    });
+}
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -324,6 +345,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
     }
 
     pub fn build(self) -> Result<Fixture> {
+        isolate_ambient_git_config();
         let tmpdir = TempDir::new()?;
         let path = tmpdir.path().join(if self.bare {
             ".bare"
