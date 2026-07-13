@@ -1,9 +1,11 @@
-//! Shared PTY-test support for the `pty_smoke` and `pty_responsiveness` test binaries.
+//! Shared PTY-test support for the `pty_smoke` and `pty_responsiveness` modules of the `pty`
+//! integration-test binary (`tests/pty/main.rs`).
 //!
-//! A `tests/<name>/mod.rs` directory module so cargo does not build it as a test binary of its
-//! own; each PTY suite declares `mod pty_support;`. Keeping the spawn setup in one place means
-//! a change to the window size, `TERM`, or expect timeout applies to every PTY suite at once —
-//! the two suites guard related regressions, so silent drift here would matter.
+//! A `tests/pty/<name>/mod.rs` directory module so cargo does not build it as a test binary of
+//! its own; `main.rs` declares `mod pty_support;` once and the suite modules reach it via
+//! `crate::pty_support`. Keeping the spawn setup in one place means a change to the window size,
+//! `TERM`, or expect timeout applies to every PTY suite at once — the two suites guard related
+//! regressions, so silent drift here would matter.
 
 use std::time::Duration;
 

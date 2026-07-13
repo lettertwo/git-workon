@@ -14,16 +14,13 @@
 //! test: re-run solo before treating a failure as a regression). Run them explicitly:
 //!
 //! ```text
-//! cargo test -p git-workon-review --test pty_smoke -- --ignored
+//! cargo test -p git-workon-review --test pty -- --ignored
 //! ```
 //!
 //! Color/SGR assertions are deliberately absent — capturing ratatui frames through a PTY is
 //! unreliable; reply *parsing* is unit-tested in `terminal_query.rs`.
 
-#![cfg(unix)]
-
-mod pty_support;
-use pty_support::spawn_review;
+use crate::pty_support::spawn_review;
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -97,7 +94,7 @@ fn assert_q_quits_promptly(mut session: Session<OsProcess, OsStream>) {
 }
 
 #[test]
-#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_smoke -- --ignored"]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
 fn theme_auto_stays_responsive_when_the_terminal_answers() {
     let fixture = auto_theme_fixture();
     let mut session = spawn_review(&fixture);
@@ -113,7 +110,7 @@ fn theme_auto_stays_responsive_when_the_terminal_answers() {
 }
 
 #[test]
-#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_smoke -- --ignored"]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
 fn theme_auto_stays_responsive_when_the_terminal_is_silent() {
     // The no-hang guarantee: a terminal that never answers (tmux without passthrough, CI) must
     // cost at most the probe deadline, then fall back to a curated theme and run normally. This
