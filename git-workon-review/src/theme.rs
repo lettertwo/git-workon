@@ -26,6 +26,11 @@
 //! precedent as its diff/cursor tints); `light()` takes `ONE_LIGHT`'s base08/base0A/base0B;
 //! `from_terminal()` takes the probed scheme's base08/base0A/base0B directly (matching the syntax
 //! slots' reasoning, not the curated-tint-borrowing the diff/cursor washes use).
+//!
+//! **CS1 addition (`outline-header-polish`):** [`Palette::heading_fg`] (base0C, cyan) is a fourth
+//! semantic-chrome field, same reasoning and same three-scheme mapping as the CS2 trio above —
+//! it's the outline's changeset-header-row accent, used only there (see
+//! `render::changeset_title_spans`'s doc comment for the outline-only gating).
 
 use ratatui::style::Color;
 
@@ -224,6 +229,12 @@ pub struct Palette {
     /// "current" reads unambiguously at a glance. Promoted from `render.rs`'s `FG_CURRENT` const
     /// (CS2).
     pub current_fg: Color,
+    /// Accent tone for a changeset header row's label (CS1, `outline-header-polish`) — a cyan
+    /// (base0C), distinct from [`Palette::current_fg`]'s green so "this is a section heading"
+    /// reads independently of "this is the current changeset." Used ONLY by the outline's Header
+    /// rows (`render::changeset_title_spans`'s `counter` param gates it) — the summary panel's
+    /// changeset title keeps the plain [`Palette::foreground`] look.
+    pub heading_fg: Color,
     /// Whether [`crate::render::render`] should paint the whole frame with [`Palette::background`]
     /// before drawing panes. `true` for the curated [`Palette::dark`]/[`Palette::light`] schemes
     /// (and the probe's curated fallback); `false` for [`Palette::from_terminal`], so `auto`
@@ -264,6 +275,9 @@ impl Palette {
             error_fg: Color::Rgb(220, 60, 60),
             warn_fg: Color::Rgb(214, 158, 46),
             current_fg: Color::Rgb(96, 200, 128),
+            // CS1: brand new (no historical `render.rs` const to reproduce), so this takes the
+            // scheme's base0C directly rather than an authored literal.
+            heading_fg: base.slot(12),
             paint_canvas: true,
         }
     }
@@ -316,6 +330,7 @@ impl Palette {
             error_fg: red,
             warn_fg: base.slot(10), // base0A
             current_fg: green,
+            heading_fg: cyan,
             paint_canvas: true,
         }
     }
@@ -359,6 +374,7 @@ impl Palette {
             error_fg: base.slot(8),
             warn_fg: base.slot(10),
             current_fg: base.slot(11),
+            heading_fg: base.slot(12),
             // Unlike the curated schemes, `auto` must NOT paint over the terminal's own
             // background — base00 here IS the probed terminal bg, so painting a solid canvas
             // would defeat terminal transparency/background images for no benefit (the probed
@@ -439,6 +455,15 @@ mod tests {
         assert_eq!(t.error_fg, Color::Rgb(220, 60, 60));
         assert_eq!(t.warn_fg, Color::Rgb(214, 158, 46));
         assert_eq!(t.current_fg, Color::Rgb(96, 200, 128));
+    }
+
+    #[test]
+    fn dark_heading_fg_takes_the_eighties_dark_cyan_accent() {
+        // CS1: no historical constant to reproduce (this field is new) — unlike
+        // `dark_semantic_fg_matches_the_historical_render_rs_constants` above, it takes base0C
+        // straight from the scheme.
+        let t = Palette::dark();
+        assert_eq!(t.heading_fg, Color::Rgb(0x66, 0xcc, 0xcc)); // base0C
     }
 
     #[test]
@@ -554,6 +579,12 @@ mod tests {
         assert_eq!(t.current_fg, Color::Rgb(0x50, 0xa1, 0x4f)); // base0B
     }
 
+    #[test]
+    fn light_heading_fg_takes_one_lights_cyan_accent() {
+        let t = Palette::light();
+        assert_eq!(t.heading_fg, Color::Rgb(0x01, 0x84, 0xbc)); // base0C
+    }
+
     /// A synthetic probed scheme with a distinct value in every slot and the given `base00`, so a
     /// test can assert `from_terminal`'s syntax slots came from the probed scheme (not a curated
     /// one) and read the base00 luminance branch.
@@ -636,6 +667,7 @@ mod tests {
         assert_eq!(palette.error_fg, probed.slot(8));
         assert_eq!(palette.warn_fg, probed.slot(10));
         assert_eq!(palette.current_fg, probed.slot(11));
+        assert_eq!(palette.heading_fg, probed.slot(12));
         assert_ne!(palette.error_fg, Palette::dark().error_fg);
     }
 

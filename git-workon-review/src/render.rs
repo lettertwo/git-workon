@@ -106,17 +106,22 @@ fn diffstat_prefixes(icons: IconMode) -> (String, String) {
     }
 }
 
-/// The shared changeset-title span run — `[current-marker] [branch-icon] label [warn-marker]` —
-/// drawn identically by `build_outline_line`'s Header arm and [`changeset_summary_lines`] (whose
-/// doc comment promises exactly that sameness); extracting it makes the promise structural
-/// instead of hand-synced. Failed/loading markers are NOT included: the two call sites place
-/// them differently (trailing spans on the header row vs. a line of their own in the summary).
+/// The shared changeset-title span run — `[current-marker] [branch-icon] ([i/n] )label
+/// [warn-marker]` — drawn by both `build_outline_line`'s Header arm and
+/// [`changeset_summary_lines`]. **The two call sites no longer render identically** (CS1,
+/// `outline-header-polish`): `counter` is `Some((cs_idx + 1, n))` for the outline's Header row
+/// only, and its presence ALSO switches the label from the plain [`Palette::foreground`] look to
+/// [`Palette::heading_fg`] + bold — the summary panel passes `None` and keeps the original
+/// foreground-bold label with no counter, matching its pre-CS1 appearance exactly. Failed/loading
+/// markers are still NOT included: the two call sites place them differently (trailing spans on
+/// the header row vs. a line of their own in the summary).
 fn changeset_title_spans(
     label: &str,
     current: bool,
     needs_restack: bool,
     theme: &Palette,
     icons: IconMode,
+    counter: Option<(usize, usize)>,
 ) -> Vec<TSpan<'static>> {
     let marker = if current {
         format!("{} ", current_marker(icons))
@@ -130,11 +135,22 @@ fn changeset_title_spans(
             Style::default().fg(theme.dim),
         ));
     }
+    // The `[i/n]` counter and the accented label are outline-only (`counter.is_some()`) — see
+    // this fn's doc comment for why the summary panel's `None` call site is unaffected.
+    let label_fg = if counter.is_some() {
+        theme.heading_fg
+    } else {
+        theme.foreground
+    };
+    if let Some((i, n)) = counter {
+        spans.push(TSpan::styled(
+            format!("[{i}/{n}] "),
+            Style::default().fg(theme.dim),
+        ));
+    }
     spans.push(TSpan::styled(
         label.to_string(),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
+        Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
     ));
     if needs_restack {
         spans.push(TSpan::styled(
@@ -715,8 +731,10 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 }
 
 /// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
-/// carry the changeset's position marker (green ● for `cs.current`) and needs-restack glyph
-/// (amber ⚠, [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
+/// carry the changeset's position marker (green ● for `cs.current`), a `[i/n]` TRUE-stack-position
+/// counter, an accented ([`Palette::heading_fg`]) bold label (CS1, `outline-header-polish` — see
+/// [`changeset_title_spans`]'s doc comment), and needs-restack glyph (amber ⚠,
+/// [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
 /// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
 /// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
 /// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
@@ -817,14 +835,22 @@ fn change_letter_color(change: FileStatus, theme: &Palette) -> Color {
 fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> Line<'static> {
     match item {
         OutlineItem::Header {
+            cs_idx,
+            n,
             label,
             current,
             needs_restack,
             loading,
             failed,
-            ..
         } => {
-            let mut spans = changeset_title_spans(label, *current, *needs_restack, theme, icons);
+            let mut spans = changeset_title_spans(
+                label,
+                *current,
+                *needs_restack,
+                theme,
+                icons,
+                Some((cs_idx + 1, *n)),
+            );
             // ADR-031: a Failed changeset's marker wins over Pending's (a slot is never both,
             // but Failed is the more actionable state to surface if it somehow were).
             if *failed {
@@ -1252,8 +1278,10 @@ fn push_summary_body(
 }
 
 /// Build a [`ChangesetSummary`]'s lines: title line (the same current/needs-restack markers
-/// `build_outline_line`'s Header arm draws — structurally shared via [`changeset_title_spans`]),
-/// a loading/failed line OR the per-file list + totals line.
+/// `build_outline_line`'s Header arm draws, structurally shared via [`changeset_title_spans`] —
+/// but passing `None` for that fn's `counter` param, so this title keeps its pre-CS1 plain-
+/// foreground look with no `[i/n]` counter; see [`changeset_title_spans`]'s doc comment), a
+/// loading/failed line OR the per-file list + totals line.
 fn changeset_summary_lines(
     summary: &ChangesetSummary,
     height: usize,
@@ -1268,6 +1296,7 @@ fn changeset_summary_lines(
         summary.needs_restack,
         theme,
         icons,
+        None,
     )));
 
     if summary.failed {
@@ -3331,6 +3360,135 @@ mod tests {
     }
 
     #[test]
+    fn outline_header_shows_true_position_counter_regardless_of_display_order() {
+        // CS1 (`outline-header-polish`): the `[i/n]` counter is the TRUE stack position
+        // (`cs_idx + 1`), never a display-order index — HeadFirst (the default) paints cs-b
+        // (true index 1) before cs-a (true index 0), so the counter must read `[2/2]` on cs-b's
+        // row and `[1/2]` on cs-a's, in that display order, not `[1/2]` then `[2/2]`.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        // Skip y=0: the full-width winbar also renders a `[i/n] <title-or-name>` fragment for the
+        // CURRENT changeset (cs-b) — an unskipped search for "[2/2]" would false-positive on it.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_b = content
+            .iter()
+            .position(|r| r.contains("[2/2]"))
+            .expect("cs-b (true index 1) must show counter [2/2]");
+        let row_a = content
+            .iter()
+            .position(|r| r.contains("[1/2]"))
+            .expect("cs-a (true index 0) must show counter [1/2]");
+        assert!(
+            row_b < row_a,
+            "HeadFirst shows cs-b's header before cs-a's, but the counter stays the true stack \
+             position, not a display-order index — got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_header_label_carries_the_heading_accent_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        // Skip y=0: the full-width winbar ALSO names cs-b (it's `current`) via its own
+        // `[i/n] <title-or-name>` fragment — in plain foreground, not the outline's heading
+        // accent — so an unskipped search for "cs-b" would false-positive onto the winbar's own
+        // label instead of the outline header row this test means to inspect. `content`'s index
+        // `i` is buffer row `i + 1` (the skip), so every `buf` query below adds 1 back.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .position(|r| r.contains("cs-b"))
+            .expect("cs-b's header row present (it has no title, so falls back to its name)");
+        // `String::find` returns a BYTE offset, not a display column — the row has multi-byte
+        // glyphs (`●`/`⚠`) ahead of/around the label, so a byte offset would target the wrong
+        // cell. Every rendered cell here is exactly one column wide, so a `chars()` (not byte)
+        // position IS the display column.
+        let label_chars: Vec<char> = "cs-b".chars().collect();
+        let row_chars: Vec<char> = content[row].chars().collect();
+        let label_x = row_chars
+            .windows(label_chars.len())
+            .position(|w| w == label_chars.as_slice())
+            .expect("cs-b's label text present in its own header row") as u16;
+        assert_eq!(
+            buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
+            Some(Palette::dark().heading_fg),
+            "expected the outline header's label to carry Palette::dark().heading_fg"
+        );
+    }
+
+    #[test]
+    fn summary_panel_title_has_no_counter_and_keeps_the_plain_foreground_look() {
+        // CS1's Gotcha: the counter + accent are outline-only — the summary panel's title (shared
+        // via `changeset_title_spans`, `counter: None`) must render exactly as it did pre-CS1.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline();
+        app.toggle_outline();
+        let header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header row present in Stack mode") as i64;
+        let delta = header_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        app.focus_outline();
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: the full-width winbar spans every column (including the body's 36.. slice),
+        // and it too names the current changeset (cs-b) — same false-positive risk as the outline
+        // tests above. `body_rows`' index `i` is buffer row `i + 1` (the skip), so every `buf`
+        // query below adds 1 back.
+        let body_rows: Vec<String> = (1..buf.area.height)
+            .map(|y| {
+                (36..buf.area.width)
+                    .map(|x| cell_text(&buf, x, y))
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = body_rows.join("\n");
+        assert!(
+            !joined.contains("[2/2]") && !joined.contains("[1/2]"),
+            "the outline-only counter must not leak into the summary panel's title, got:\n{joined}"
+        );
+        let row = body_rows
+            .iter()
+            .position(|r| r.contains("cs-b"))
+            .expect("summary panel's title (cs-b's label) present");
+        // `String::find` is a BYTE offset, not a display column (the title carries a multi-byte
+        // `●` marker ahead of the label, since cs-b is `current`) — a `chars()` position over the
+        // 36.. slice IS the column offset within that slice (every cell here is one column wide),
+        // so add the slice's own start column (36) back to get the absolute buffer column.
+        let label_chars: Vec<char> = "cs-b".chars().collect();
+        let row_chars: Vec<char> = body_rows[row].chars().collect();
+        let label_x = row_chars
+            .windows(label_chars.len())
+            .position(|w| w == label_chars.as_slice())
+            .expect("cs-b's label text present in the summary panel's title")
+            as u16
+            + 36;
+        assert_eq!(
+            buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
+            Some(Palette::dark().foreground),
+            "the summary panel's title must keep its plain foreground look, not the outline's \
+             heading accent"
+        );
+    }
+
+    #[test]
     fn render_preserves_a_wheel_scrolled_outline_viewport() {
         // The peek model's load-bearing render change: `render_outline` bounds-CLAMPS the
         // outline scroll instead of re-deriving it from the cursor, so a wheel-scrolled
@@ -3558,11 +3716,15 @@ mod tests {
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
         let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
-        // The header row (a short label) pans fully off and shows a lone marker, so select the
-        // PATH row: the one where the marker is followed by the shifted 'a…a.txt' body.
+        // The header row's own label is short, but CS1's `[i/n] ` counter widens it enough that a
+        // single hscroll step no longer pans it fully off — it can now ALSO show a lone marker
+        // plus a stray `a` (from a branch name like `main`), so a bare "contains 'a'" check no
+        // longer picks out the PATH row unambiguously. Look for a run of the synthetic path's
+        // repeated `a`s instead (`app_with_a_long_outline_path`'s path is 80 `a`s + `.txt`) — no
+        // header label plausibly contains four `a`s in a row.
         let row = content
             .iter()
-            .position(|r| r.contains('…') && r.contains('a'))
+            .position(|r| r.contains('…') && r.contains("aaaa"))
             .expect("the panned path row must show the left-edge marker plus shifted content");
         // Column 34 is the outline's last column before the divider at 35 (see
         // `OUTLINE_TEST_WIDTH`'s doc comment).

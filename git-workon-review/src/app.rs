@@ -8673,6 +8673,7 @@ mod tests {
             items[0],
             OutlineItem::Header {
                 cs_idx: 0,
+                n: 2,
                 label: "cs-a".to_string(),
                 current: false,
                 needs_restack: false,
@@ -8688,6 +8689,7 @@ mod tests {
             header_b,
             &OutlineItem::Header {
                 cs_idx: 1,
+                n: 2,
                 label: "cs-b".to_string(),
                 current: true,
                 needs_restack: true,
@@ -8783,6 +8785,7 @@ mod tests {
             vec![
                 OutlineItem::Header {
                     cs_idx: 0,
+                    n: 2,
                     label: "cs-pending".to_string(),
                     current: true,
                     needs_restack: false,
@@ -8791,6 +8794,7 @@ mod tests {
                 },
                 OutlineItem::Header {
                     cs_idx: 1,
+                    n: 2,
                     label: "cs-failed".to_string(),
                     current: false,
                     needs_restack: false,
@@ -8963,6 +8967,7 @@ mod tests {
             items_after[app.outline_cursor()],
             OutlineItem::Header {
                 cs_idx: 1,
+                n: 2,
                 label: "cs-b".to_string(),
                 current: true,
                 needs_restack: false,
