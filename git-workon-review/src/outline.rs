@@ -80,12 +80,15 @@ fn scan_order(
     entries
 }
 
-/// A file's staged-ness for the outline's status column — a minimal indicator (locked CS3
-/// scope: NOT the prototype's X/Y two-column git-status matrix). Only meaningful for the
-/// uncommitted changeset's files; a committed changeset's files always resolve to `None`
-/// because their `unstaged_idx`/`staged_idx` maps are always-empty (see
+/// A file's staged-ness for the outline's status column — the data model `render.rs` derives its
+/// git-porcelain-style X/Y two-column status matrix from (CS3, `outline-status-xy`). Only
+/// meaningful for the uncommitted changeset's files; a committed changeset's files always
+/// resolve to `None` because their `unstaged_idx`/`staged_idx` maps are always-empty (see
 /// `DiffState::from_committed`) — the same "derive, don't special-case" collapse
 /// `effective_zoom` already relies on, so no committed-specific branch is needed here either.
+/// `render::build_outline_line`'s File arm reads `None` as "render a committed single letter +
+/// pad column" and `Unstaged`/`Staged`/`Partial` as "render the X/Y matrix" — see that fn's doc
+/// comment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StagedStatus {
     /// No staged/unstaged sub-diff info for this file (a committed changeset's file, or an
@@ -110,31 +113,6 @@ impl StagedStatus {
             (true, false) => StagedStatus::Unstaged,
             (false, true) => StagedStatus::Staged,
             (false, false) => StagedStatus::None,
-        }
-    }
-
-    /// The single-character glyph the outline renders in the status column, or a blank space
-    /// for [`StagedStatus::None`] (keeps every file row's path starting at the same column
-    /// regardless of whether it carries a status).
-    pub fn glyph(self) -> char {
-        match self {
-            StagedStatus::None => ' ',
-            StagedStatus::Unstaged => '+',
-            StagedStatus::Staged => '\u{2713}',  // ✓
-            StagedStatus::Partial => '\u{25D0}', // ◐
-        }
-    }
-
-    /// The nerd-font equivalent of [`StagedStatus::glyph`] (CS3, `workon.review.icons =
-    /// nerd`) — picked from the classic BMP `fa` set for wider font compatibility (see
-    /// `icons.rs`'s module doc). [`StagedStatus::None`] stays a blank space, same as
-    /// [`StagedStatus::glyph`], since there's no status to convey.
-    pub fn nerd_glyph(self) -> char {
-        match self {
-            StagedStatus::None => ' ',
-            StagedStatus::Unstaged => '\u{f067}', // nf-fa-plus
-            StagedStatus::Staged => '\u{f00c}',   // nf-fa-check
-            StagedStatus::Partial => '\u{f042}',  // nf-fa-adjust
         }
     }
 }

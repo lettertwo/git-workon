@@ -735,8 +735,8 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// counter, an accented ([`Palette::heading_fg`]) bold label (CS1, `outline-header-polish` — see
 /// [`changeset_title_spans`]'s doc comment), and needs-restack glyph (amber ⚠,
 /// [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
-/// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
-/// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
+/// indent, a two-column git-porcelain-style status matrix (CS3, `outline-status-xy` — see
+/// [`outline_status_spans`]'s doc comment for the X/Y-vs-single-letter split), and
 /// the path — Flat/Stack rows (CS2) split it into `basename  dim/dirname` (no suffix for a
 /// root-level file); Tree/StackTree rows already carry the directory via ancestor Dir rows, so
 /// `path` there is just the bare basename. The cursor row (the outline's OWN cursor — a separate coordinate space from the
@@ -817,17 +817,82 @@ fn tree_prefix(guides: &[bool]) -> String {
     s
 }
 
-/// The [`FileStatus`] change-letter's foreground color (CS5): a create-like status (Added/
-/// Untracked) reuses the theme's `add_strong` tint, a destroy-like status (Deleted) reuses
-/// `del_strong`, and everything else (Modified/Renamed/Copied/Unmerged — a change to EXISTING
-/// content, not a create/destroy) gets the theme's neutral `foreground`. No new [`Palette`]
-/// fields — this is deliberately just a remap of tints CS4's summary rows already use.
-fn change_letter_color(change: FileStatus, theme: &Palette) -> Color {
+/// Placeholder glyph for an empty XY status column (CS3, `outline-status-xy`) — U+00B7 middle
+/// dot, always `theme.dim`, standing in for "nothing to report on this axis." Deliberately not a
+/// space: the two-column matrix should read as a grid even when one side is empty, not look like
+/// a ragged single-letter row.
+const STATUS_PLACEHOLDER: char = '\u{b7}';
+
+/// A committed changeset's single-letter status color (CS3): A green (`add_strong`), D red
+/// (`del_strong`), M/R/C (a change to EXISTING content, not a create/destroy) the dedicated amber
+/// [`Palette::modified_fg`], and `?`/`U` dim (Untracked never reaches here — see
+/// [`outline_status_spans`]'s doc comment — and Unmerged is a worktree-only conflict state a
+/// committed changeset can't carry; both fold to `dim` only so this match stays exhaustive).
+fn committed_letter_color(change: FileStatus, theme: &Palette) -> Color {
     match change {
-        FileStatus::Added | FileStatus::Untracked => theme.add_strong,
+        FileStatus::Added => theme.add_strong,
         FileStatus::Deleted => theme.del_strong,
-        FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied | FileStatus::Unmerged => {
-            theme.foreground
+        FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => theme.modified_fg,
+        FileStatus::Untracked | FileStatus::Unmerged => theme.dim,
+    }
+}
+
+/// Build a file row's two-column status matrix (CS3, `outline-status-xy`) — always exactly 2
+/// [`TSpan`]s' worth of display columns, in every mode, so committed and uncommitted rows stay
+/// aligned (the changeset's Gotcha).
+///
+/// - `change == FileStatus::Untracked` wins over everything else and renders a dim `??` — noise,
+///   not danger, regardless of `status` (see [`crate::outline::StagedStatus`]'s doc comment: an
+///   untracked worktree file is always `Unstaged`, but git's own convention for untracked is `??`,
+///   not a staged-ness-derived letter).
+/// - `StagedStatus::None` is the committed-changeset case (see that type's doc comment for why no
+///   special-casing is needed to detect it): a single [`FileStatus::letter`] colored by
+///   [`committed_letter_color`], plus a blank pad column.
+/// - `Unstaged`/`Staged`/`Partial` render the git-porcelain X/Y matrix: `letter` (from the SAME
+///   underlying [`FileStatus`] — there's only one change kind per file, not separate staged/
+///   unstaged kinds) in whichever column(s) that axis has a change, [`STATUS_PLACEHOLDER`] in the
+///   other; X (staged/index) is `add_strong` green, Y (worktree) is `del_strong` red, matching
+///   git's own status convention.
+fn outline_status_spans(
+    status: crate::outline::StagedStatus,
+    change: FileStatus,
+    theme: &Palette,
+) -> Vec<TSpan<'static>> {
+    use crate::outline::StagedStatus;
+
+    if change == FileStatus::Untracked {
+        return vec![TSpan::styled(
+            "??".to_string(),
+            Style::default().fg(theme.dim),
+        )];
+    }
+    match status {
+        StagedStatus::None => {
+            let letter = change.letter();
+            vec![
+                TSpan::styled(
+                    letter.to_string(),
+                    Style::default().fg(committed_letter_color(change, theme)),
+                ),
+                TSpan::styled(" ".to_string(), Style::default().fg(theme.foreground)),
+            ]
+        }
+        StagedStatus::Unstaged | StagedStatus::Staged | StagedStatus::Partial => {
+            let letter = change.letter();
+            let staged = matches!(status, StagedStatus::Staged | StagedStatus::Partial);
+            let unstaged = matches!(status, StagedStatus::Unstaged | StagedStatus::Partial);
+            let x_char = if staged { letter } else { STATUS_PLACEHOLDER };
+            let y_char = if unstaged { letter } else { STATUS_PLACEHOLDER };
+            let x_color = if staged { theme.add_strong } else { theme.dim };
+            let y_color = if unstaged {
+                theme.del_strong
+            } else {
+                theme.dim
+            };
+            vec![
+                TSpan::styled(x_char.to_string(), Style::default().fg(x_color)),
+                TSpan::styled(y_char.to_string(), Style::default().fg(y_color)),
+            ]
         }
     }
 }
@@ -890,22 +955,18 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> L
             guides,
             ..
         } => {
-            let glyph = match icons {
-                IconMode::Nerd => status.nerd_glyph(),
-                IconMode::None => status.glyph(),
-            };
-            let letter = change.letter();
             // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
             // non-empty `guides` (Tree/StackTree modes) draws tree connectors instead — see
             // `OutlineItem`'s doc comment for why emptiness is the mode signal. CS4: a non-empty
             // prefix (real tree connectors) gets its own `theme.dim`-styled span — matching the
             // Dir row's already-dim guides — so the guide lines read as quiet structure, not part
-            // of the file's own status glyph; the empty two-space indent has nothing visible to
-            // dim, so it stays bundled with the glyph span below.
+            // of the file's own status column. The status matrix itself (CS3,
+            // `outline_status_spans`) is always exactly 2 display columns, same width the old
+            // glyph+letter pair occupied, so this swap doesn't shift anything after it.
             let mut spans = Vec::new();
             if guides.is_empty() {
                 spans.push(TSpan::styled(
-                    format!("  {glyph}"),
+                    "  ".to_string(),
                     Style::default().fg(theme.foreground),
                 ));
             } else {
@@ -913,15 +974,8 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> L
                     tree_prefix(guides),
                     Style::default().fg(theme.dim),
                 ));
-                spans.push(TSpan::styled(
-                    glyph.to_string(),
-                    Style::default().fg(theme.foreground),
-                ));
             }
-            spans.push(TSpan::styled(
-                letter.to_string(),
-                Style::default().fg(change_letter_color(*change, theme)),
-            ));
+            spans.extend(outline_status_spans(*status, *change, theme));
             spans.push(TSpan::styled(
                 " ".to_string(),
                 Style::default().fg(theme.foreground),
@@ -1962,7 +2016,7 @@ mod tests {
     use git_workon_fixture::prelude::*;
     use unicode_width::UnicodeWidthChar;
 
-    use super::{hscroll_cut, pan_spans, render};
+    use super::{hscroll_cut, pan_spans, render, STATUS_PLACEHOLDER};
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
@@ -3951,45 +4005,325 @@ mod tests {
         );
     }
 
-    // ── CS5: file status letter + opt-in nerd-font icons ───────────────────────────
+    // ── CS3 (`outline-status-xy`): git-style X/Y status matrix ─────────────────────
 
-    #[test]
-    fn outline_file_row_shows_the_modified_change_letter_in_its_own_color() {
-        let fixture = FixtureBuilder::new()
-            .config("core.autocrlf", "false")
-            .unstaged_file("a.rs", "one\n", "one\nCHANGED\n")
-            .build()
-            .unwrap();
-        let mut app = app_from_fixture(&fixture);
+    /// Render `fixture` (a lone uncommitted changeset with one file at `path`) and return the
+    /// buffer row + its char cells for the file row matching `path`. Skips y=0 (the winbar also
+    /// names the current file, which can false-positive a `contains(path)` search).
+    fn render_outline_file_row(fixture: &Fixture, path: &str) -> (Buffer, u16, Vec<char>) {
+        let mut app = app_from_fixture(fixture);
         // A lone changeset defaults the outline closed — force it open so this render test can
         // inspect its rows (same pattern as `outline_tree_mode_renders_directory_rows_with_tree_guides`).
         if !app.outline_open() {
             app.toggle_outline();
         }
-
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
-        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
-        // Skip y=0: the full-width winbar also names the file ("[1/1] a.rs"), so an unskipped
-        // search would match it instead of the outline's own row below it.
-        let row = content
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let (row_idx, row) = content
             .iter()
             .enumerate()
-            .skip(1)
-            .find(|(_, r)| r.contains("a.rs"))
-            .map(|(i, _)| i)
+            .find(|(_, r)| r.contains(path))
+            .map(|(i, r)| (i, r.clone()))
+            .unwrap_or_else(|| panic!("{path}'s file row present"));
+        let y = row_idx as u16 + 1; // +1 to undo the y=0 skip above.
+        (buf, y, row.chars().collect())
+    }
+
+    #[test]
+    fn outline_unstaged_file_renders_the_y_column_letter_in_del_strong() {
+        // Unstaged-only (worktree change, no staged one): X is the placeholder, Y carries the
+        // change letter in del_strong (git convention: worktree column is red).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.rs", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "a.rs");
+
+        let x = row
+            .iter()
+            .position(|&c| c == STATUS_PLACEHOLDER)
+            .expect("expected the X (staged) column placeholder '·'") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            'M',
+            "expected the Y (worktree) column to carry the Modified letter right after the \
+             X placeholder, got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the empty X placeholder to carry theme.dim"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().del_strong),
+            "expected the Y column's Modified letter to carry theme.del_strong"
+        );
+    }
+
+    #[test]
+    fn outline_fully_staged_file_renders_the_x_column_letter_in_add_strong() {
+        // `staged_file` writes+stages a brand-new path (Added, not Modified — there's no prior
+        // commit for it to modify). Fully staged (index change, no worktree one): X carries the
+        // letter in add_strong, Y is the placeholder.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("a.rs", "new content\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "a.rs");
+
+        let x = row
+            .iter()
+            .position(|&c| c == 'A')
+            .expect("expected the Added letter in the X (staged) column") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            STATUS_PLACEHOLDER,
+            "expected the Y (worktree) column to be the empty placeholder, got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().add_strong),
+            "expected the X column's Added letter to carry theme.add_strong"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the empty Y placeholder to carry theme.dim"
+        );
+    }
+
+    #[test]
+    fn outline_partially_staged_file_renders_mm_with_green_x_and_red_y() {
+        // Partially staged (both a staged AND an unstaged change): both columns show the change
+        // letter, X in add_strong (green), Y in del_strong (red).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("a.rs", "one\n", "one\nSTAGED\n", "one\nSTAGED\nWORKTREE\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "a.rs");
+
+        let x = row
+            .iter()
+            .position(|&c| c == 'M')
+            .expect("expected the Modified letter in the X column") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            'M',
+            "expected the Modified letter in the Y column too (partial = both axes), got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().add_strong),
+            "expected the X (staged) column's letter to carry theme.add_strong"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().del_strong),
+            "expected the Y (worktree) column's letter to carry theme.del_strong"
+        );
+    }
+
+    #[test]
+    fn outline_untracked_file_renders_a_dim_double_question_mark() {
+        // Untracked overrides the staged-ness-derived matrix entirely: always a dim `??`, even
+        // though an untracked worktree file's StagedStatus is Unstaged under the hood.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("new.txt", "brand new\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "new.txt");
+
+        let x = row
+            .iter()
+            .position(|&c| c == '?')
+            .expect("expected the untracked '??' marker") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            '?',
+            "expected '??' (both columns), got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the untracked '?' to carry theme.dim, not an add/del tint"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected BOTH untracked '?' chars to carry theme.dim"
+        );
+    }
+
+    #[test]
+    fn outline_committed_modified_file_renders_a_single_amber_letter() {
+        // A committed changeset's file has StagedStatus::None — single letter + pad column, not
+        // the X/Y matrix. M/R/C get the dedicated `modified_fg` amber, distinct from `warn_fg`.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("a.rs", "one\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("a.rs", "one\nCHANGED\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = workon::Changeset {
+            name: "cs".to_string(),
+            span: workon::ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = crate::app::ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = git2::Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_idx = content
+            .iter()
+            .position(|r| r.contains("a.rs"))
             .expect("a.rs's file row present");
-        assert!(
-            content[row].contains('M'),
-            "expected the Modified change letter 'M' in a.rs's row, got: {:?}",
-            content[row]
+        let row: Vec<char> = content[row_idx].chars().collect();
+        let y = row_idx as u16 + 1;
+
+        let x = row
+            .iter()
+            .position(|&c| c == 'M')
+            .expect("expected the Modified letter") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            ' ',
+            "expected the pad column after a committed file's single letter to be a blank space, \
+             got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().modified_fg),
+            "expected the committed Modified letter to carry theme.modified_fg (amber), got a \
+             different color"
+        );
+        assert_ne!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().warn_fg),
+            "modified_fg must stay a distinct field from warn_fg even though both default to amber"
+        );
+    }
+
+    #[test]
+    fn outline_committed_added_and_deleted_files_render_add_strong_and_del_strong() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("deleted.txt", "keep\n")
+            .create("base")
+            .unwrap();
+        let stage = fixture
+            .commit("main")
+            .file("deleted.txt", "keep\n")
+            .file("added.txt", "new\n")
+            .create("stage")
+            .unwrap();
+        let _ = stage; // only needed to move the branch tip forward before the manual deletion below
+        let repo = fixture.repo().unwrap();
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        std::fs::remove_file(workdir.join("deleted.txt")).unwrap();
+        let mut index = repo.index().unwrap();
+        // `CommitBuilder::create` wrote the index/commit through its OWN `Repository::open`
+        // handle, so `repo`'s cached index is stale until forced to re-read from disk.
+        index.read(true).unwrap();
+        index
+            .remove_path(std::path::Path::new("deleted.txt"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test User", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let head = repo
+            .commit(Some("HEAD"), &sig, &sig, "head", &tree, &[&parent])
+            .unwrap();
+
+        let cs = workon::Changeset {
+            name: "cs".to_string(),
+            span: workon::ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = crate::app::ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = git2::Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        let added_row_idx = content
+            .iter()
+            .position(|r| r.contains("added.txt"))
+            .expect("added.txt's file row present");
+        let added_row: Vec<char> = content[added_row_idx].chars().collect();
+        let added_x = added_row
+            .iter()
+            .position(|&c| c == 'A')
+            .expect("expected the Added letter") as u16;
+        assert_eq!(
+            buf.cell((added_x, added_row_idx as u16 + 1))
+                .unwrap()
+                .style()
+                .fg,
+            Some(Palette::dark().add_strong),
+            "expected a committed Added file's letter to carry theme.add_strong"
         );
 
-        let letter_x = content[row].find('M').unwrap() as u16;
+        let deleted_row_idx = content
+            .iter()
+            .position(|r| r.contains("deleted.txt"))
+            .expect("deleted.txt's file row present");
+        let deleted_row: Vec<char> = content[deleted_row_idx].chars().collect();
+        let deleted_x = deleted_row
+            .iter()
+            .position(|&c| c == 'D')
+            .expect("expected the Deleted letter") as u16;
         assert_eq!(
-            buf.cell((letter_x, row as u16)).unwrap().style().fg,
-            Some(Palette::dark().foreground),
-            "Modified is a change-to-existing-content status, so its letter must carry the \
-             theme's neutral foreground, not an add/del tint"
+            buf.cell((deleted_x, deleted_row_idx as u16 + 1))
+                .unwrap()
+                .style()
+                .fg,
+            Some(Palette::dark().del_strong),
+            "expected a committed Deleted file's letter to carry theme.del_strong"
         );
     }
 
@@ -4132,7 +4466,12 @@ mod tests {
     }
 
     #[test]
-    fn outline_file_status_nerd_glyph_replaces_the_plain_glyph() {
+    fn outline_file_status_xy_column_is_unaffected_by_icon_mode() {
+        // CS3 retires StagedStatus's nerd/plain glyph split entirely — the X/Y status matrix is
+        // now plain letters + `STATUS_PLACEHOLDER`, icon-mode-independent (only the devicons
+        // per-file icon toggles on `IconMode::Nerd`). A fully staged file (`staged_file` writes a
+        // brand-new path, so it's Added, not Modified) still renders `A·` whether or not nerd
+        // icons are on.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .staged_file("a.txt", "one\nCHANGED\n")
@@ -4145,16 +4484,14 @@ mod tests {
         }
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
-        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
-        let joined = content.join("\n");
-
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .find(|r| r.contains("a.txt"))
+            .expect("a.txt's file row present");
         assert!(
-            joined.contains(crate::outline::StagedStatus::Staged.nerd_glyph()),
-            "expected the nerd staged glyph (fa-check), got:\n{joined}"
-        );
-        assert!(
-            !joined.contains(crate::outline::StagedStatus::Staged.glyph()),
-            "nerd mode must not leave the plain ✓ glyph behind, got:\n{joined}"
+            row.contains(&format!("A{}", '\u{b7}')),
+            "expected the fully-staged 'A·' status pair to survive nerd icon mode, got: {row:?}"
         );
     }
 

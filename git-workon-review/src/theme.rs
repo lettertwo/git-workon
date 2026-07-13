@@ -31,6 +31,13 @@
 //! semantic-chrome field, same reasoning and same three-scheme mapping as the CS2 trio above —
 //! it's the outline's changeset-header-row accent, used only there (see
 //! `render::changeset_title_spans`'s doc comment for the outline-only gating).
+//!
+//! **CS3 addition (`outline-status-xy`):** [`Palette::modified_fg`] (base09, orange/amber) is a
+//! fifth semantic-chrome field, same three-scheme mapping again — the outline's committed-file
+//! "modified" tint (M/R/C letters). Deliberately a NEW field rather than reusing
+//! [`Palette::warn_fg`]: "this changeset needs restacking" and "this file was modified" are
+//! unrelated facts that happen to both want an amber tone, and collapsing them onto one field
+//! would make them un-independently themeable.
 
 use ratatui::style::Color;
 
@@ -235,6 +242,12 @@ pub struct Palette {
     /// rows (`render::changeset_title_spans`'s `counter` param gates it) — the summary panel's
     /// changeset title keeps the plain [`Palette::foreground`] look.
     pub heading_fg: Color,
+    /// Tone for a committed changeset's Modified/Renamed/Copied outline file-status letter (CS3,
+    /// `outline-status-xy`) — an amber (base09), distinct from [`Palette::warn_fg`]'s amber
+    /// (base0A) so "needs restack" and "modified" stay independently themeable even though both
+    /// default to the same amber family. Used ONLY by the outline's committed-file status column
+    /// (`render::committed_letter_color`).
+    pub modified_fg: Color,
     /// Whether [`crate::render::render`] should paint the whole frame with [`Palette::background`]
     /// before drawing panes. `true` for the curated [`Palette::dark`]/[`Palette::light`] schemes
     /// (and the probe's curated fallback); `false` for [`Palette::from_terminal`], so `auto`
@@ -278,6 +291,9 @@ impl Palette {
             // CS1: brand new (no historical `render.rs` const to reproduce), so this takes the
             // scheme's base0C directly rather than an authored literal.
             heading_fg: base.slot(12),
+            // CS3: brand new, same reasoning as `heading_fg` above — takes the scheme's base09
+            // directly rather than an authored literal.
+            modified_fg: base.slot(9),
             paint_canvas: true,
         }
     }
@@ -331,6 +347,7 @@ impl Palette {
             warn_fg: base.slot(10), // base0A
             current_fg: green,
             heading_fg: cyan,
+            modified_fg: base.slot(9), // base09
             paint_canvas: true,
         }
     }
@@ -375,6 +392,7 @@ impl Palette {
             warn_fg: base.slot(10),
             current_fg: base.slot(11),
             heading_fg: base.slot(12),
+            modified_fg: base.slot(9),
             // Unlike the curated schemes, `auto` must NOT paint over the terminal's own
             // background — base00 here IS the probed terminal bg, so painting a solid canvas
             // would defeat terminal transparency/background images for no benefit (the probed
@@ -464,6 +482,19 @@ mod tests {
         // straight from the scheme.
         let t = Palette::dark();
         assert_eq!(t.heading_fg, Color::Rgb(0x66, 0xcc, 0xcc)); // base0C
+    }
+
+    #[test]
+    fn dark_modified_fg_takes_the_eighties_dark_orange_accent() {
+        // CS3: no historical constant to reproduce (this field is new, same reasoning as
+        // `dark_heading_fg_takes_the_eighties_dark_cyan_accent` above) — takes base09 straight
+        // from the scheme.
+        let t = Palette::dark();
+        assert_eq!(t.modified_fg, Color::Rgb(0xf9, 0x91, 0x57)); // base09
+        assert_ne!(
+            t.modified_fg, t.warn_fg,
+            "modified_fg must stay independently themeable from warn_fg"
+        );
     }
 
     #[test]
@@ -585,6 +616,16 @@ mod tests {
         assert_eq!(t.heading_fg, Color::Rgb(0x01, 0x84, 0xbc)); // base0C
     }
 
+    #[test]
+    fn light_modified_fg_takes_one_lights_orange_accent() {
+        let t = Palette::light();
+        assert_eq!(t.modified_fg, Color::Rgb(0xd7, 0x5f, 0x00)); // base09
+        assert_ne!(
+            t.modified_fg, t.warn_fg,
+            "modified_fg must stay independently themeable from warn_fg"
+        );
+    }
+
     /// A synthetic probed scheme with a distinct value in every slot and the given `base00`, so a
     /// test can assert `from_terminal`'s syntax slots came from the probed scheme (not a curated
     /// one) and read the base00 luminance branch.
@@ -668,6 +709,7 @@ mod tests {
         assert_eq!(palette.warn_fg, probed.slot(10));
         assert_eq!(palette.current_fg, probed.slot(11));
         assert_eq!(palette.heading_fg, probed.slot(12));
+        assert_eq!(palette.modified_fg, probed.slot(9));
         assert_ne!(palette.error_fg, Palette::dark().error_fg);
     }
 
