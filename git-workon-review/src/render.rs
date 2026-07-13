@@ -1203,7 +1203,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
             } else {
                 View::Diff
             };
-            let text = footer_hint(keymap, focused);
+            let text = footer_hint(keymap, focused, app.outline_mode());
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(theme.dim)),
                 area,
@@ -2733,8 +2733,48 @@ mod tests {
             .map(|x| cell_text(&buf, x, footer_y))
             .collect();
         assert!(
-            footer.contains("open") && footer.contains("mode") && footer.contains("? help"),
-            "expected the curated outline hint string in the footer, got: {footer:?}"
+            footer.contains("open")
+                && footer.contains(&format!(
+                    "i \u{2192}{}",
+                    crate::outline::OutlineMode::StackTree.label()
+                ))
+                && footer.contains("? help"),
+            "expected the curated outline hint string, with CS4's dynamic next-mode label \
+             (Stack's default -> StackTree), in the footer, got: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_outline_hint_next_mode_label_updates_as_the_mode_cycles() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.toggle_outline();
+        assert!(app.outline_focused());
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Stack);
+
+        let footer_text = |app: &mut App| {
+            let buf = render_once(app, 80, 10);
+            let footer_y = buf.area.height - 1;
+            (0..buf.area.width)
+                .map(|x| cell_text(&buf, x, footer_y))
+                .collect::<String>()
+        };
+
+        let footer = footer_text(&mut app);
+        assert!(
+            footer.contains("i \u{2192}stack-tree"),
+            "Stack's next mode is StackTree; got: {footer:?}"
+        );
+
+        app.outline_cycle_mode();
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::StackTree);
+        let footer = footer_text(&mut app);
+        assert!(
+            footer.contains("i \u{2192}flat"),
+            "StackTree's next mode is Flat; got: {footer:?}"
         );
     }
 
@@ -3638,8 +3678,7 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
-        app.outline_cycle_mode(); // Stack -> Tree
-        app.outline_cycle_mode(); // Tree -> StackTree
+        app.outline_cycle_mode(); // Stack -> StackTree
         app.outline_cycle_mode(); // StackTree -> Flat
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Flat);
 
@@ -3716,7 +3755,9 @@ mod tests {
         if !app.outline_open() {
             app.toggle_outline();
         }
-        app.outline_cycle_mode(); // Stack -> Tree
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
@@ -3782,7 +3823,9 @@ mod tests {
         if !app.outline_open() {
             app.toggle_outline();
         }
-        app.outline_cycle_mode(); // Stack -> Tree
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
@@ -4366,7 +4409,9 @@ mod tests {
         if !app.outline_open() {
             app.toggle_outline();
         }
-        app.outline_cycle_mode(); // Stack -> Tree, so `src/` renders as its own Dir row
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree, so `src/` renders as its own Dir row
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
         app.set_icon_mode(crate::icons::IconMode::Nerd);
 
@@ -4405,7 +4450,9 @@ mod tests {
         if !app.outline_open() {
             app.toggle_outline();
         }
-        app.outline_cycle_mode(); // Stack -> Tree
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
         assert_eq!(
             app.icon_mode(),
@@ -4504,7 +4551,9 @@ mod tests {
         let mut app = changeset_with_nested_paths(&fixture);
         app.set_icon_mode(crate::icons::IconMode::Nerd);
         app.focus_outline(); // opens (a lone changeset defaults closed) and focuses
-        app.outline_cycle_mode(); // Stack -> Tree, so a Dir row exists to focus
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree, so a Dir row exists to focus
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
         let dir_idx = app
             .outline_items()

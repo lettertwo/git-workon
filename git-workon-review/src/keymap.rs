@@ -25,6 +25,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{RawBinding, View};
+use crate::outline::OutlineMode;
 
 /// One rebindable action. The action *identity* — distinct from `tui.rs`'s `Action`, which is the
 /// concrete effect applied to the `App` (and carries runtime data like a half-page scroll delta
@@ -334,7 +335,8 @@ pub static REGISTRY: &[Registered] = &[
         view: View::Outline,
         name: "cycle-mode",
         default_keys: "i",
-        description: "Cycle the outline mode",
+        description:
+            "Cycle the outline mode (stack \u{25b8} stack-tree \u{25b8} flat \u{25b8} tree)",
     },
     Registered {
         command: Command::FocusDiff,
@@ -806,9 +808,17 @@ enum HintItem {
     Pair(Command, Command, &'static str),
 }
 
-fn render_hint_item(keymap: &Keymap, item: &HintItem) -> Option<String> {
+/// CS4 (`outline-mode-cycle`): most hint labels are the static string baked into the `HintItem`,
+/// but `OutlineCycleMode`'s label shows the mode `i` would switch TO instead — computed from
+/// `outline_mode` (the outline's CURRENT mode, so this is `outline_mode.cycle()`'s label).
+fn render_hint_item(keymap: &Keymap, item: &HintItem, outline_mode: OutlineMode) -> Option<String> {
     match item {
         HintItem::One(command, label) => {
+            let label = if *command == Command::OutlineCycleMode {
+                format!("\u{2192}{}", outline_mode.cycle().label())
+            } else {
+                (*label).to_string()
+            };
             primary_key(keymap, *command).map(|k| format!("{k} {label}"))
         }
         HintItem::Pair(down, up, label) => {
@@ -848,7 +858,7 @@ const OUTLINE_HINTS: &[HintItem] = &[
 /// string, so a rebind shows here too. A notice temporarily replaces this in the footer (the
 /// caller's job, see `render::render_footer`); an unbound curated action is simply dropped from
 /// the string rather than leaving a stale/wrong key visible.
-pub fn footer_hint(keymap: &Keymap, focused: View) -> String {
+pub fn footer_hint(keymap: &Keymap, focused: View, outline_mode: OutlineMode) -> String {
     let items: &[HintItem] = match focused {
         View::Diff => DIFF_HINTS,
         View::Outline => OUTLINE_HINTS,
@@ -856,7 +866,7 @@ pub fn footer_hint(keymap: &Keymap, focused: View) -> String {
     };
     items
         .iter()
-        .filter_map(|item| render_hint_item(keymap, item))
+        .filter_map(|item| render_hint_item(keymap, item, outline_mode))
         .collect::<Vec<_>>()
         .join("  \u{b7}  ")
 }
@@ -1229,6 +1239,29 @@ mod tests {
     }
 
     #[test]
+    fn help_sections_cycle_mode_entry_spells_out_the_full_order() {
+        // CS4: descriptions are static `&'static str`s baked into `REGISTRY`, so the help
+        // overlay can't mark the CURRENT mode dynamically without a broader refactor — the
+        // locked fallback is a static full-order description, with the dynamic `→next` shown
+        // only in the footer hint (see `footer_hint_outline_cycle_label_tracks_the_current_mode`).
+        let km = Keymap::defaults();
+        let sections = help_sections(&km, View::Outline);
+        let outline = &sections[1];
+        let entry = outline
+            .entries
+            .iter()
+            .find(|e| e.description.contains("Cycle the outline mode"))
+            .expect("cycle-mode row present");
+        assert!(
+            entry
+                .description
+                .contains("stack \u{25b8} stack-tree \u{25b8} flat \u{25b8} tree"),
+            "got: {:?}",
+            entry.description
+        );
+    }
+
+    #[test]
     fn help_sections_skip_an_unbound_action() {
         let km = Keymap::from_bindings(&[RawBinding {
             view: View::Diff,
@@ -1266,7 +1299,7 @@ mod tests {
     #[test]
     fn footer_hint_renders_the_curated_diff_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Diff);
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("s stage"), "got: {hint:?}");
         assert!(hint.contains("d discard"), "got: {hint:?}");
@@ -1278,10 +1311,31 @@ mod tests {
     #[test]
     fn footer_hint_renders_the_curated_outline_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Outline);
+        let hint = footer_hint(&km, View::Outline, OutlineMode::Stack);
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("enter open"), "got: {hint:?}");
-        assert!(hint.contains("i mode"), "got: {hint:?}");
+        assert!(
+            hint.contains("i \u{2192}stack-tree"),
+            "cycling from Stack must show the next mode, StackTree; got: {hint:?}"
+        );
+    }
+
+    #[test]
+    fn footer_hint_outline_cycle_label_tracks_the_current_mode() {
+        let km = Keymap::defaults();
+        for (mode, next) in [
+            (OutlineMode::Stack, "stack-tree"),
+            (OutlineMode::StackTree, "flat"),
+            (OutlineMode::Flat, "tree"),
+            (OutlineMode::Tree, "stack"),
+        ] {
+            let hint = footer_hint(&km, View::Outline, mode);
+            let want = format!("i \u{2192}{next}");
+            assert!(
+                hint.contains(&want),
+                "mode {mode:?} should hint the NEXT mode {next:?}; got: {hint:?}"
+            );
+        }
     }
 
     #[test]
@@ -1291,7 +1345,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: "x".to_string(),
         }]);
-        let hint = footer_hint(&km, View::Diff);
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
         assert!(hint.contains("x stage"), "got: {hint:?}");
         assert!(!hint.contains("s stage"), "got: {hint:?}");
     }
@@ -1303,7 +1357,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: String::new(),
         }]);
-        let hint = footer_hint(&km, View::Diff);
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
         assert!(!hint.contains("stage"), "got: {hint:?}");
         // The rest of the curated set is unaffected.
         assert!(hint.contains("d discard"), "got: {hint:?}");

@@ -37,16 +37,27 @@ pub enum OutlineMode {
 }
 
 impl OutlineMode {
-    /// `i`'s cycle order: `Flat -> Stack -> Tree -> StackTree -> Flat`. Flat/Stack (the
-    /// non-trie modes) come first since they're the CS3 default pair; the trie modes follow in
-    /// the same flat/grouped pairing (Tree mirrors Flat's cross-stack dedup, StackTree mirrors
-    /// Stack's per-changeset grouping).
+    /// `i`'s cycle order: `Stack -> StackTree -> Flat -> Tree -> Stack` (CS4) — the default
+    /// [`Self::Stack`] leads, its trie sibling [`Self::StackTree`] follows immediately, then the
+    /// non-grouped pair [`Self::Flat`]/[`Self::Tree`] closes the loop.
     pub fn cycle(self) -> Self {
         match self {
-            OutlineMode::Flat => OutlineMode::Stack,
-            OutlineMode::Stack => OutlineMode::Tree,
-            OutlineMode::Tree => OutlineMode::StackTree,
+            OutlineMode::Stack => OutlineMode::StackTree,
             OutlineMode::StackTree => OutlineMode::Flat,
+            OutlineMode::Flat => OutlineMode::Tree,
+            OutlineMode::Tree => OutlineMode::Stack,
+        }
+    }
+
+    /// The kebab-cased display name (CS4, `outline-mode-cycle`) — used by the footer's `i
+    /// →<next>` hint and mirrors `App::parse_outline_mode`'s config strings (`app.rs`), so the
+    /// two never drift apart.
+    pub fn label(self) -> &'static str {
+        match self {
+            OutlineMode::Stack => "stack",
+            OutlineMode::StackTree => "stack-tree",
+            OutlineMode::Flat => "flat",
+            OutlineMode::Tree => "tree",
         }
     }
 }
@@ -787,10 +798,10 @@ mod tests {
 
     #[test]
     fn mode_cycle_round_trips_all_four_modes() {
-        assert_eq!(OutlineMode::Flat.cycle(), OutlineMode::Stack);
-        assert_eq!(OutlineMode::Stack.cycle(), OutlineMode::Tree);
-        assert_eq!(OutlineMode::Tree.cycle(), OutlineMode::StackTree);
+        assert_eq!(OutlineMode::Stack.cycle(), OutlineMode::StackTree);
         assert_eq!(OutlineMode::StackTree.cycle(), OutlineMode::Flat);
+        assert_eq!(OutlineMode::Flat.cycle(), OutlineMode::Tree);
+        assert_eq!(OutlineMode::Tree.cycle(), OutlineMode::Stack);
     }
 
     /// Deep-path fixture used by the tree-mode tests: a top-level file, a top-level directory
