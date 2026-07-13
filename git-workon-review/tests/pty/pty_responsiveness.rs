@@ -30,17 +30,14 @@
 //! explicitly:
 //!
 //! ```text
-//! cargo test -p git-workon-review --test pty_responsiveness -- --ignored
+//! cargo test -p git-workon-review --test pty -- --ignored
 //! ```
 //!
 //! Frame-content assertions are deliberately absent — capturing ratatui frame TEXT through a
 //! PTY is unreliable (only escape sequences survive dependably); rendering is covered by the
 //! `TestBackend` tests in `render.rs`/`tui.rs`.
 
-#![cfg(unix)]
-
-mod pty_support;
-use pty_support::spawn_review;
+use crate::pty_support::spawn_review;
 
 use std::time::{Duration, Instant};
 
@@ -124,7 +121,7 @@ fn rust_source(seed: usize, lines: usize) -> String {
 }
 
 #[test]
-#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_responsiveness -- --ignored"]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
 fn launch_reaches_the_tui_and_quits_promptly() {
     // Theme pinned to dark so the `theme = auto` probe (and its deadline) stays out of this
     // bound — the probe's own responsiveness is pty_smoke.rs's job. One unstaged change so the
@@ -160,7 +157,7 @@ fn launch_reaches_the_tui_and_quits_promptly() {
 }
 
 #[test]
-#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_responsiveness -- --ignored"]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
 fn rapid_outline_nav_burst_stays_responsive() {
     // Dozens of untracked multi-thousand-line Rust files: every outline row the burst crosses
     // is a file whose (regressed) synchronous load would cost real tree-sitter work.
@@ -241,7 +238,7 @@ fn commit_onto(
 /// that sized the bound and confirm this assertion fails on the regressed shape, the same
 /// validation discipline `BURST_RESPONSIVE`'s doc comment describes.
 #[test]
-#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_responsiveness -- --ignored"]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
 fn streamed_startup_lands_before_a_full_wave_could_have_finished() {
     use workon::{assemble_changesets, StackModel, UncommittedLayer};
 
