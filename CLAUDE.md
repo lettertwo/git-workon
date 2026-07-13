@@ -63,6 +63,8 @@ cargo watch --ignore contrib --ignore man -- cargo check --tests  # watch mode
 
 **Pre-commit:** `cargo test` (formatting and linting are handled by Claude hooks)
 
+Inline test/clippy runs go through `cargo-gate test`/`clippy` (a raw `cargo test`/`clippy` in a Bash call is denied) — it serializes cargo, filters output, and records green proofs the Stop hook honors, skipping crates it can already prove clean. The close runs `cargo-gate test --workspace` once per changeset before commit/submit.
+
 ## Git Commit Style
 
 **CRITICAL**: Conventional Commits format, enforced by `git-hooks/commit-msg`.
