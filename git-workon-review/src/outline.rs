@@ -193,6 +193,10 @@ pub enum OutlineItem {
     /// A changeset header — emitted in [`OutlineMode::Stack`]/[`OutlineMode::StackTree`].
     Header {
         cs_idx: usize,
+        /// Changeset count (CS1, `outline-header-polish`) — paired with `cs_idx` at render time
+        /// to draw the `[i/n]` counter (`i` = `cs_idx + 1`, base=1). Always `changesets.len()` at
+        /// build time, so it's the same for every `Header` row a given `build_items` call emits.
+        n: usize,
         label: String,
         current: bool,
         needs_restack: bool,
@@ -274,10 +278,12 @@ pub fn build_items(
 /// `file_idx` are computed from the ORIGINAL (base -> head) enumeration before any reversal, so
 /// they stay true indices into `App::changesets` either way.
 fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+    let n = changesets.len();
     let mut items = Vec::new();
     for (cs_idx, cs) in scan_order(changesets, order) {
         items.push(OutlineItem::Header {
             cs_idx,
+            n,
             label: cs.label.clone(),
             current: cs.current,
             needs_restack: cs.needs_restack,
@@ -487,10 +493,12 @@ fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
 /// changeset's own copy gets its own row" rule). `order` picks which end of the stack paints
 /// first, same as [`build_stack`]; `cs_idx`/`file_idx` stay true indices regardless.
 fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+    let n = changesets.len();
     let mut items = Vec::new();
     for (cs_idx, cs) in scan_order(changesets, order) {
         items.push(OutlineItem::Header {
             cs_idx,
+            n,
             label: cs.label.clone(),
             current: cs.current,
             needs_restack: cs.needs_restack,
@@ -591,6 +599,7 @@ mod tests {
             vec![
                 OutlineItem::Header {
                     cs_idx: 0,
+                    n: 2,
                     label: "cs-a".to_string(),
                     current: false,
                     needs_restack: false,
@@ -607,6 +616,7 @@ mod tests {
                 },
                 OutlineItem::Header {
                     cs_idx: 1,
+                    n: 2,
                     label: "cs-b".to_string(),
                     current: true,
                     needs_restack: true,
@@ -639,6 +649,7 @@ mod tests {
             vec![
                 OutlineItem::Header {
                     cs_idx: 0,
+                    n: 2,
                     label: "cs-pending".to_string(),
                     current: false,
                     needs_restack: false,
@@ -647,6 +658,7 @@ mod tests {
                 },
                 OutlineItem::Header {
                     cs_idx: 1,
+                    n: 2,
                     label: "cs-failed".to_string(),
                     current: false,
                     needs_restack: false,
@@ -914,6 +926,7 @@ mod tests {
             vec![
                 OutlineItem::Header {
                     cs_idx: 0,
+                    n: 2,
                     label: "cs-a".to_string(),
                     current: false,
                     needs_restack: false,
@@ -936,6 +949,7 @@ mod tests {
                 },
                 OutlineItem::Header {
                     cs_idx: 1,
+                    n: 2,
                     label: "cs-b".to_string(),
                     current: true,
                     needs_restack: true,
@@ -971,6 +985,7 @@ mod tests {
             items[0],
             OutlineItem::Header {
                 cs_idx: 2,
+                n: 3,
                 label: "cs-c".to_string(),
                 current: true,
                 needs_restack: false,
@@ -1025,6 +1040,7 @@ mod tests {
             items[0],
             OutlineItem::Header {
                 cs_idx: 1,
+                n: 2,
                 label: "cs-b".to_string(),
                 current: true,
                 needs_restack: false,
