@@ -9206,10 +9206,13 @@ mod tests {
         app.outline.mode = OutlineMode::Stack;
 
         app.outline_cycle_mode();
-        assert_eq!(app.outline_mode(), OutlineMode::Tree);
+        assert_eq!(app.outline_mode(), OutlineMode::StackTree);
 
         app.outline_cycle_mode();
-        assert_eq!(app.outline_mode(), OutlineMode::StackTree);
+        assert_eq!(app.outline_mode(), OutlineMode::Flat);
+
+        app.outline_cycle_mode();
+        assert_eq!(app.outline_mode(), OutlineMode::Tree);
     }
 
     /// A single committed changeset touching two files under `src/`, for the Dir-row no-op
@@ -9480,7 +9483,7 @@ mod tests {
             "precondition: scrolled away from the top"
         );
 
-        app.outline_cycle_mode(); // -> Tree
+        app.outline_cycle_mode(); // -> StackTree
         let cursor = app.outline_cursor();
         let scroll = app.outline_scroll();
         assert!(
