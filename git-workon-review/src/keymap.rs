@@ -328,7 +328,7 @@ pub static REGISTRY: &[Registered] = &[
         view: View::Outline,
         name: "open",
         default_keys: "enter",
-        description: "Jump to the selected outline entry",
+        description: "Jump to a file, or fold/unfold a header or directory",
     },
     Registered {
         command: Command::OutlineCycleMode,

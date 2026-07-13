@@ -9,7 +9,7 @@
 //! handle so it can lazily read blob/worktree content per file as the user navigates to it,
 //! independent of whatever handle acquired the [`DiffModel`] it was built from.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use git2::Repository;
@@ -27,7 +27,9 @@ use crate::highlight::{lang_key_for_ext, FgSpan, TsHighlighter};
 use crate::icons::IconMode;
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
-use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder};
+use crate::outline::{
+    self, FoldKey, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder,
+};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::scope::enclosing_scope_lines;
@@ -813,6 +815,17 @@ pub struct OutlineState {
     /// here. Reset to `0` by [`App::outline_cycle_mode`] — the row list (and therefore the set of
     /// paths on screen) changes shape there, the same reason that resyncs the cursor.
     pub hscroll: usize,
+    /// CS5 (`outline-fold`): per-[`OutlineMode`] sets of collapsed [`FoldKey`]s — a Header row's
+    /// changeset label PLUS its `cs_idx`, or a Dir row's full path (+ owning changeset `cs_idx` in
+    /// `StackTree`) — see [`FoldKey`]'s own doc comment for why `cs_idx` is load-bearing there,
+    /// not decorative (a changeset's `label` alone can collide with its own uncommitted layer's).
+    /// Each mode keeps its own independent set (folding a dir in `Tree` doesn't affect
+    /// `StackTree`'s copy of the same path), survives mode cycling and auto-refresh (this lives on
+    /// `App`, not in the rebuilt-every-call row list), and starts empty — everything expanded by
+    /// default. Mutated only by [`App::outline_toggle_fold`]; never explicitly cleared, so a fold
+    /// outlives its own toggling row's disappearance and reappearance (e.g. a discard-then-recreate
+    /// of the same path) for as long as the session runs.
+    pub folds: HashMap<OutlineMode, HashSet<FoldKey>>,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1378,6 +1391,7 @@ impl App {
             scroll: 0,
             order: OutlineOrder::default(),
             hscroll: 0,
+            folds: HashMap::new(),
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -2478,14 +2492,58 @@ impl App {
             .collect()
     }
 
-    /// Build the current [`OutlineMode`]'s row list — the outline cursor's index space, and the
-    /// source of truth `render.rs` draws from. Rebuilt fresh on every call (cheap: a small stack
-    /// times a handful of files each, no caching, same posture as [`Self::effective_zoom_for`])
-    /// rather than cached on `App`, so it's never stale across a mode toggle, a nav, or a
-    /// refresh.
+    /// Build (via [`outline::fold_outline`]) the current [`OutlineMode`]'s FOLD-FILTERED row list
+    /// — the outline cursor's SINGLE index space, and the source of truth every other outline
+    /// consumer reads: `render.rs`, [`Self::outline_move_by`]/[`Self::outline_move_to`],
+    /// [`Self::outline_confirm`], [`Self::summary_target`], and the staging-verb resolution in
+    /// [`Self::outline_row_targets`] all funnel through this SAME method (CS5, `outline-fold`) —
+    /// so folding a Header/Dir can never silently retarget a cursor move or a stage/discard verb
+    /// onto the wrong row: there is no OTHER row list any of them could accidentally read
+    /// instead. Rebuilt fresh on every call (cheap: a small stack times a handful of files each,
+    /// no caching, same posture as [`Self::effective_zoom_for`]) rather than cached on `App`, so
+    /// it's never stale across a mode toggle, a nav, a fold, or a refresh. `render.rs`'s marker
+    /// needs the per-row hidden-file counts this discards — see
+    /// [`Self::outline_items_with_hidden_counts`].
     pub fn outline_items(&self) -> Vec<OutlineItem> {
+        self.outline_folded().items
+    }
+
+    /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count —
+    /// `render_outline`'s data source. Every OTHER outline consumer uses [`Self::outline_items`]
+    /// instead, which just discards the counts it doesn't need; both funnel through the same
+    /// [`Self::outline_folded`] build, so they can never disagree about which rows are visible.
+    pub fn outline_items_with_hidden_counts(&self) -> (Vec<OutlineItem>, Vec<usize>) {
+        let folded = self.outline_folded();
+        (folded.items, folded.hidden_counts)
+    }
+
+    /// The shared build [`Self::outline_items`]/[`Self::outline_items_with_hidden_counts`]/
+    /// [`Self::outline_target_index`] all read from — [`outline::fold_outline`] applied to the
+    /// current mode/order/fold-set, so there's exactly one place that pairs "which changesets by
+    /// which state" with "the fold set for the CURRENT mode" (`self.outline.folds` is keyed by
+    /// [`OutlineMode`]; a mode with no folds recorded yet reads as "everything expanded", the
+    /// default).
+    fn outline_folded(&self) -> outline::FoldedOutline {
         let snapshot = self.outline_snapshot();
-        outline::build_items(&snapshot, self.outline.mode, self.outline.order)
+        let folds = self.outline.folds.get(&self.outline.mode);
+        outline::fold_outline(&snapshot, self.outline.mode, self.outline.order, |key| {
+            folds.is_some_and(|set| set.contains(key))
+        })
+    }
+
+    /// Resolve a target row matched against the FULL (unfiltered) row list to its position in
+    /// [`Self::outline_items`]'s FILTERED list — its own index if it's visible, or its nearest
+    /// visible (collapsed) ancestor's if a fold hides it (CS5's "`sync_outline_to_current`
+    /// targeting a file hidden under a collapsed node lands on the collapsed ancestor WITHOUT
+    /// auto-expanding" rule — see [`outline::FoldedOutline::visible_index`]'s doc comment). `find`
+    /// matches against the full build (via `outline::build_items` directly, not
+    /// [`Self::outline_items`]) since a fold-hidden target has no index in the filtered list at
+    /// all to match against.
+    fn outline_target_index(&self, find: impl Fn(&OutlineItem) -> bool) -> Option<usize> {
+        let snapshot = self.outline_snapshot();
+        let full = outline::build_items(&snapshot, self.outline.mode, self.outline.order);
+        let full_idx = full.iter().position(find)?;
+        self.outline_folded().visible_index.get(full_idx).copied()
     }
 
     /// CS4: the outline row a Header/Dir cursor selection resolves to — `None` when the outline
@@ -2706,10 +2764,14 @@ impl App {
     /// click landed in, matching the keyboard-driven equivalent for that region. Outline: focuses
     /// the outline and jumps the cursor to the clicked row via [`Self::outline_move_to`] — a File
     /// row jumps the diff there (same single-jump semantics `g`/`G` use), a Header/Dir row just
-    /// selects (the summary panel follows via [`Self::summary_target`]). Diff pane (single or
-    /// split): focuses that pane (flipping `split_focus` first if the click landed in the
-    /// unfocused half) and moves its cursor to the clicked row. Outside every recorded region
-    /// (header/footer/divider/captions): no-op.
+    /// selects (the summary panel follows via [`Self::summary_target`]) WITHOUT toggling its fold
+    /// (CS5, `outline-fold`) — a click has always been "move the cursor here", a strictly weaker
+    /// action than `Enter`'s "act on this row" even before folding existed (pre-CS5, `Enter` on a
+    /// Header jumped to its first file; a click on the same row never did), so a click staying
+    /// select-only here keeps that existing asymmetry rather than inventing a new "click mirrors
+    /// Enter" rule this pane never had. Diff pane (single or split): focuses that pane (flipping
+    /// `split_focus` first if the click landed in the unfocused half) and moves its cursor to the
+    /// clicked row. Outside every recorded region (header/footer/divider/captions): no-op.
     pub fn handle_click(&mut self, col: u16, row: u16) {
         let Some((pane, region)) = self.hit_test(col, row) else {
             return;
@@ -2964,30 +3026,50 @@ impl App {
         self.outline_move_to(last);
     }
 
-    /// `Enter` while the outline has focus: jump the diff to the row under the outline cursor (a
-    /// file row jumps straight there; a header row jumps to that changeset's first file — the
-    /// one case [`Self::outline_move_by`] deliberately does NOT do on a bare cursor move), then
-    /// return focus to the diff.
+    /// `Enter` while the outline has focus: a FILE row jumps the diff straight there and returns
+    /// focus to the diff (unchanged since CS3). A HEADER or DIR row instead TOGGLES that row's
+    /// fold state (CS5, `outline-fold`) and deliberately does NOT return focus — you're
+    /// manipulating the outline's own structure, not confirming a jump, so there's nothing to
+    /// hand focus back to yet. This REMOVES Enter's pre-CS5 jump-to-changeset-first-file behavior
+    /// on a Header row (still reachable via Enter on any of that changeset's own file rows, or
+    /// `[c`/`]c`) and Dir's pre-CS5 no-op (CS4 shipped Dir rows before any fold state existed to
+    /// toggle).
     pub fn outline_confirm(&mut self) {
         let items = self.outline_items();
         match items.get(self.outline.cursor) {
             Some(OutlineItem::File {
                 cs_idx, file_idx, ..
-            }) => self.switch_changeset(*cs_idx, *file_idx),
-            Some(OutlineItem::Header { cs_idx, .. }) => {
-                let cs_idx = *cs_idx;
-                self.goto_changeset(cs_idx);
-                // `goto_changeset` is the shared outline/diff core and deliberately does not
-                // self-sync (see its doc comment) — this outline-initiated call syncs explicitly
-                // so the cursor follows off the header row onto the file it just jumped to.
-                self.sync_outline_to_current();
+            }) => {
+                self.switch_changeset(*cs_idx, *file_idx);
+                self.outline.focused = false;
             }
-            // A directory row (Tree/StackTree modes) is not a jump target — no expand/collapse
-            // state exists to toggle (CS4 decision), so Enter here is a no-op beyond the
-            // unconditional unfocus below, same as confirming on nothing at all.
-            Some(OutlineItem::Dir { .. }) | None => {}
+            Some(OutlineItem::Header { .. } | OutlineItem::Dir { .. }) => {
+                self.outline_toggle_fold();
+            }
+            None => self.outline.focused = false,
         }
-        self.outline.focused = false;
+    }
+
+    /// `Enter` on a Header/Dir row (CS5, `outline-fold`): flip that row's collapsed state in the
+    /// CURRENT [`OutlineMode`]'s fold set (see [`OutlineState::folds`]), then re-derive the
+    /// outline scroll — the row list's length just changed shape (more/fewer rows), the same
+    /// reason every other row-count-changing op does. The cursor's own INDEX never needs
+    /// re-finding: toggling a row's fold only changes what's visible AFTER it in the list (its
+    /// descendants), never before, so the row under the cursor — the one just toggled — stays
+    /// exactly where it was.
+    fn outline_toggle_fold(&mut self) {
+        let items = self.outline_items();
+        let Some(item) = items.get(self.outline.cursor) else {
+            return;
+        };
+        let Some(key) = FoldKey::for_item(item) else {
+            return;
+        };
+        let set = self.outline.folds.entry(self.outline.mode).or_default();
+        if !set.remove(&key) {
+            set.insert(key);
+        }
+        self.derive_outline_scroll(self.outline_items().len());
     }
 
     // ── Outline staging (CS7) ───────────────────────────────────────────────────
@@ -3227,20 +3309,21 @@ impl App {
     }
 
     /// Reposition (never rebuild/refocus) the outline cursor onto the row matching the CURRENT
-    /// diff changeset+file, or clamp it into bounds if no such row exists (e.g. Flat mode
-    /// deduped the current file's changeset out of the list). The sync-follow discipline's echo
-    /// break: called ONLY from the diff-initiated nav entry points (`next_file`/`prev_file`/
-    /// `next_changeset`/`prev_changeset`/`refresh`, plus the two outline actions that explicitly
-    /// opt in after a header jump) — never from `switch_changeset`/`goto_changeset` themselves,
-    /// since those are the shared core an OUTLINE-initiated jump also calls, and an
-    /// outline-initiated jump has already set [`OutlineState::cursor`] to the row the user
-    /// selected. If this ran unconditionally inside `switch_changeset`, an outline `j`/`k` move
-    /// past a HEADER row (which never calls `switch_changeset`, so nothing would resync) would
-    /// be fine, but any accidental future call site wired into the shared core would instantly
-    /// stomp a manually-positioned outline cursor back onto the diff's last position — the exact
-    /// oscillation the prototype's `_suppress_sync` flag existed to prevent. Keeping the sync
-    /// calls only at the diff-facing entry points achieves the same break without needing a
-    /// mutable suppression flag on `App`.
+    /// diff changeset+file — or, if a fold hides that row, its nearest visible (collapsed)
+    /// ancestor instead, WITHOUT auto-expanding it (CS5, `outline-fold` — preserves the user's
+    /// fold intent; see [`Self::outline_target_index`]) — or clamps into bounds if no such row
+    /// exists in the FULL build at all (e.g. Flat mode deduped the current file's changeset out
+    /// of the list entirely). The sync-follow discipline's echo break: called ONLY from the
+    /// diff-initiated nav entry points (`next_file`/`prev_file`/`next_changeset`/`prev_changeset`/
+    /// `refresh`) — never from `switch_changeset`/`goto_changeset` themselves, since those are the
+    /// shared core an OUTLINE-initiated jump also calls, and an outline-initiated jump has already
+    /// set [`OutlineState::cursor`] to the row the user selected. If this ran unconditionally
+    /// inside `switch_changeset`, an outline `j`/`k` move past a HEADER row (which never calls
+    /// `switch_changeset`, so nothing would resync) would be fine, but any accidental future call
+    /// site wired into the shared core would instantly stomp a manually-positioned outline cursor
+    /// back onto the diff's last position — the exact oscillation the prototype's
+    /// `_suppress_sync` flag existed to prevent. Keeping the sync calls only at the diff-facing
+    /// entry points achieves the same break without needing a mutable suppression flag on `App`.
     fn sync_outline_to_current(&mut self) {
         let items = self.outline_items();
         if items.is_empty() {
@@ -3248,11 +3331,13 @@ impl App {
             self.derive_outline_scroll(0);
             return;
         }
-        if let Some(idx) = items.iter().position(|it| {
+        let current_cs = self.current_cs;
+        let current = self.current;
+        if let Some(idx) = self.outline_target_index(|it| {
             matches!(
                 it,
                 OutlineItem::File { cs_idx, file_idx, .. }
-                    if *cs_idx == self.current_cs && *file_idx == self.current
+                    if *cs_idx == current_cs && *file_idx == current
             )
         }) {
             self.outline.cursor = idx;
@@ -9123,28 +9208,48 @@ mod tests {
     }
 
     #[test]
-    fn outline_confirm_on_a_header_row_jumps_to_its_first_file_and_returns_focus() {
+    fn outline_confirm_on_a_header_row_toggles_fold_instead_of_jumping_and_keeps_focus() {
+        // CS5 (`outline-fold`) removes Enter's pre-CS5 jump-to-changeset-first-file behavior on a
+        // Header row — it now toggles that row's fold instead, and deliberately does NOT return
+        // focus (you're manipulating the outline, not confirming a jump).
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
         // CS3: pin BaseFirst explicitly — cursor 3 is hardcoded to cs-b's header under base ->
-        // head row order; the confirm mechanic under test is order-agnostic.
+        // head row order; the toggle mechanic under test is order-agnostic.
         app.outline.order = OutlineOrder::BaseFirst;
         app.outline.open = true;
         app.outline.focused = true;
         app.outline.cursor = 3; // cs-b's header row
+        let before_cs = app.current_cs();
+        let before_file = app.current;
+        let rows_before = app.outline_items().len();
 
         app.outline_confirm();
 
         assert_eq!(
             app.current_cs(),
-            1,
-            "Enter on a header must jump to that changeset"
+            before_cs,
+            "Enter on a header must NOT jump the diff (CS5)"
         );
-        assert_eq!(app.current, 0, "...landing on its FIRST file");
+        assert_eq!(app.current, before_file);
         assert!(
-            !app.outline_focused(),
-            "confirming returns focus to the diff"
+            app.outline_focused(),
+            "toggling a fold must NOT return focus to the diff"
         );
+        assert_eq!(
+            app.outline_items().len(),
+            rows_before - 1,
+            "cs-b's single file row is now hidden under its collapsed header"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            3,
+            "the cursor stays on the header row it just toggled"
+        );
+
+        // Toggling again expands it back.
+        app.outline_confirm();
+        assert_eq!(app.outline_items().len(), rows_before);
     }
 
     #[test]
@@ -9279,6 +9384,7 @@ mod tests {
 
         app.outline.cursor = dir_idx;
         app.outline.focused = true;
+        let rows_before = app.outline_items().len();
         app.outline_confirm();
         assert_eq!(app.current_cs(), before_cs);
         assert_eq!(
@@ -9286,8 +9392,12 @@ mod tests {
             "confirming a Dir row must not jump the diff"
         );
         assert!(
-            !app.outline_focused(),
-            "confirm still returns focus to the diff, even as a no-op"
+            app.outline_focused(),
+            "confirming a Dir row toggles its fold (CS5) rather than returning focus"
+        );
+        assert!(
+            app.outline_items().len() < rows_before,
+            "src/'s files must now be hidden under its collapsed row"
         );
     }
 
@@ -10211,6 +10321,203 @@ mod tests {
             }
             other => panic!("expected the cursor on b.txt's File row, got {other:?}"),
         }
+    }
+
+    // ── CS5 (`outline-fold`): collapse/expand ───────────────────────────────────
+
+    #[test]
+    fn outline_toggle_fold_hides_the_headers_files_and_move_by_skips_them() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        // Row order (BaseFirst): [Header cs-a, File a1, File a2, Header cs-b, File b1].
+        let rows_before = app.outline_items().len();
+        assert_eq!(rows_before, 5);
+
+        app.outline.cursor = 3; // cs-b's header
+        app.outline_confirm(); // toggle fold
+        let items = app.outline_items();
+        assert_eq!(items.len(), 4, "cs-b's single file row is now hidden");
+        assert!(
+            items
+                .iter()
+                .all(|it| !matches!(it, OutlineItem::File { cs_idx: 1, .. })),
+            "no cs-b file row should be reachable while its header is collapsed"
+        );
+
+        // `j` from the last visible row (now the folded header, index 3) must clamp there — there
+        // is nothing further to move onto.
+        app.outline.cursor = 3;
+        app.outline_move_by(5);
+        assert_eq!(
+            app.outline.cursor, 3,
+            "the cursor clamps at the collapsed header — b1.txt's row isn't in the index space \
+             to land on at all"
+        );
+    }
+
+    #[test]
+    fn outline_toggle_fold_expanding_again_restores_every_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        let rows_before = app.outline_items().len();
+
+        app.outline.cursor = 3;
+        app.outline_confirm(); // collapse
+        assert!(app.outline_items().len() < rows_before);
+        app.outline_confirm(); // expand again
+        assert_eq!(
+            app.outline_items(),
+            {
+                app.outline.folds.clear();
+                app.outline_items()
+            },
+            "re-expanding must reproduce exactly the same rows an empty fold set would"
+        );
+    }
+
+    #[test]
+    fn outline_fold_state_is_independent_per_mode() {
+        // Folding cs-b's header in Stack mode must not affect StackTree's own (separate) fold
+        // set, even though both modes emit a Header row keyed by the SAME label.
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 3; // cs-b's header in Stack mode
+        app.outline_confirm();
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::Stack)
+                .is_some_and(|s| !s.is_empty()),
+            "Stack mode's own fold set recorded the toggle"
+        );
+
+        app.outline.mode = OutlineMode::StackTree;
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::StackTree)
+                .is_none_or(|s| s.is_empty()),
+            "StackTree mode must start with its OWN empty fold set, untouched by Stack mode's"
+        );
+        let stack_tree_items = app.outline_items();
+        assert!(
+            stack_tree_items
+                .iter()
+                .any(|it| matches!(it, OutlineItem::File { cs_idx: 1, .. })),
+            "cs-b's file row must still be visible in StackTree mode — Stack mode's fold doesn't \
+             leak across modes"
+        );
+    }
+
+    #[test]
+    fn sync_outline_to_current_lands_on_the_collapsed_ancestor_without_auto_expanding() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        let header_b = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header present");
+        app.outline.cursor = header_b;
+        app.outline_confirm(); // collapse cs-b's header
+        assert!(
+            app.outline_focused(),
+            "toggling a fold keeps focus (CS5) — sanity for the nav below"
+        );
+
+        // A diff-initiated nav lands the diff on cs-b's (now-hidden) first file.
+        app.next_changeset();
+        assert_eq!(app.current_cs(), 1, "the diff itself did jump to cs-b");
+
+        let folded_header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's collapsed header row still present");
+        assert_eq!(
+            app.outline_cursor(),
+            folded_header_idx,
+            "the outline cursor must land on cs-b's collapsed header row, not an arbitrary clamp"
+        );
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::Stack)
+                .is_some_and(|s| !s.is_empty()),
+            "landing on the collapsed ancestor must NOT auto-expand it"
+        );
+    }
+
+    #[test]
+    fn outline_stage_targets_the_correct_row_when_an_unrelated_header_is_folded() {
+        // The highest-risk CS5 interaction: folding one changeset's header shifts every LATER
+        // row's index in `outline_items()` — a stage/discard verb resolved against a stale
+        // (unfiltered) index space would silently act on the wrong file. `outline_stage` reads
+        // `outline_row_targets`, which reads `outline_items()` at the CURSOR's own index — the
+        // same fold-filtered list the cursor itself was placed against — so it must stay correct.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .unstaged_file("dirty.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        repo.set_head("refs/heads/a").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let changesets = crate::acquire::resolve_changesets(repo, "a").unwrap();
+        assert_eq!(
+            changesets.len(),
+            2,
+            "expected the 'a' Graphite node plus the dirty tree's uncommitted layer"
+        );
+        let diffs = crate::acquire::diff_changesets(repo, &changesets).unwrap();
+        let views: Vec<ChangesetView> = changesets
+            .into_iter()
+            .zip(diffs)
+            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+            .collect();
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+
+        // Fold the committed "a" node's header — hides its own file row, shifting dirty.txt's
+        // row index one earlier in the filtered list.
+        let header_a = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 0, .. }))
+            .expect("'a's header present");
+        app.outline.cursor = header_a;
+        app.outline_confirm();
+
+        let dirty_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path, .. } if path == "dirty.txt"))
+            .expect("dirty.txt's row is still visible — its own header isn't folded");
+        app.outline.cursor = dirty_idx;
+
+        app.outline_stage();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        repo.assert(predicate::repo::has_staged_file("dirty.txt"));
     }
 
     // ── CS8: progressive gap expansion ──────────────────────────────────────
