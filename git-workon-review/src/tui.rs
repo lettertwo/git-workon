@@ -2418,15 +2418,26 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
-        // CS3: pin BaseFirst explicitly — this test exercises Enter's header-jump + focus
-        // return, which is orthogonal to display order, but the `-3` row offset below assumes
-        // the base->head row layout.
+        // CS3: pin BaseFirst explicitly — this test exercises Enter's File-row jump + focus
+        // return, which is orthogonal to display order, but the row offset below assumes the
+        // base->head row layout.
         app.set_outline_order(workon_review::outline::OutlineOrder::BaseFirst);
         app.toggle_outline(); // close
         app.toggle_outline(); // open + focus, cursor synced onto cs-b's file row
         assert!(app.outline_focused());
-        // Move the outline cursor up onto cs-a's header row.
-        app.outline_move_by(-3);
+        // Move the outline cursor onto cs-a's FILE row (rows, BaseFirst: [Header a, File a.txt,
+        // Header b, File b.txt] — cursor starts at 3; -2 lands on File a.txt at row 1). CS5
+        // (`outline-fold`) removed Enter's old header-jump behavior — see
+        // `enter_on_a_header_row_toggles_fold_and_keeps_focus` below for that case — so this
+        // keybinding-dispatch test needs a File row to still exercise a real jump+unfocus.
+        app.outline_move_by(-2);
+        assert_eq!(
+            app.current_cs(),
+            0,
+            "sanity: the move itself already landed on cs-a's file (moving onto a File row \
+             always jumps, per `outline_move_by`'s own contract) — Enter below re-confirms the \
+             same jump through the real keybinding-dispatch path"
+        );
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
 
@@ -2440,12 +2451,63 @@ mod tests {
         assert_eq!(
             app.current_cs(),
             0,
-            "Enter on cs-a's header must jump there"
+            "Enter on a File row must (still) land on cs-a"
         );
-        assert_eq!(app.current, 0, "...landing on its first file");
+        assert_eq!(app.current, 0, "...landing on its file");
         assert!(
             !app.outline_focused(),
-            "Enter returns focus to the diff after jumping"
+            "Enter on a File row returns focus to the diff"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_header_row_toggles_fold_and_keeps_focus() {
+        // CS5 (`outline-fold`): Enter on a Header/Dir row no longer jumps+unfocuses — it toggles
+        // that row's fold and deliberately keeps focus. This is the header-row counterpart to
+        // `enter_confirms_an_outline_jump_and_returns_focus_to_the_diff` above, verified through
+        // the same real keybinding-dispatch path (`update`/`map_key`), not a direct
+        // `App::outline_confirm()` call.
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.set_outline_order(workon_review::outline::OutlineOrder::BaseFirst);
+        app.toggle_outline(); // close
+        app.toggle_outline(); // open + focus, cursor synced onto cs-b's file row
+                              // Move the outline cursor onto cs-a's header row (rows, BaseFirst: [Header a, File a.txt,
+                              // Header b, File b.txt] — cursor starts at 3; -3 lands on Header a at row 0, which never
+                              // jumps).
+        app.outline_move_by(-3);
+        let before_cs = app.current_cs();
+        let before_file = app.current;
+        let rows_before = app.outline_items().len();
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Enter)),
+        );
+
+        assert_eq!(
+            app.current_cs(),
+            before_cs,
+            "Enter on a header must NOT jump the diff (CS5)"
+        );
+        assert_eq!(app.current, before_file);
+        assert!(
+            app.outline_focused(),
+            "Enter on a header toggles its fold and keeps focus (CS5), rather than confirming a \
+             jump"
+        );
+        assert!(
+            app.outline_items().len() < rows_before,
+            "cs-a's file row must now be hidden under its collapsed header"
         );
     }
 

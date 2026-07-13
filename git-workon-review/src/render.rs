@@ -739,7 +739,10 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// [`outline_status_spans`]'s doc comment for the X/Y-vs-single-letter split), and
 /// the path — Flat/Stack rows (CS2) split it into `basename  dim/dirname` (no suffix for a
 /// root-level file); Tree/StackTree rows already carry the directory via ancestor Dir rows, so
-/// `path` there is just the bare basename. The cursor row (the outline's OWN cursor — a separate coordinate space from the
+/// `path` there is just the bare basename. A COLLAPSED [`OutlineItem::Header`]/[`OutlineItem::Dir`]
+/// row (CS5, `outline-fold`) additionally carries a trailing dim ` ▸ N` (`N` = hidden FILE rows
+/// only), from [`App::outline_items_with_hidden_counts`]'s per-row marker count — an expanded row
+/// gets no chevron at all. The cursor row (the outline's OWN cursor — a separate coordinate space from the
 /// diff's [`App::cursor`]) gets the theme's cursor tint while the outline has focus, or the dimmer
 /// [`Palette::outline_cursor_unfocused_bg`] while it's merely open (so the remembered position stays
 /// legible even after focus returns to the diff). `&mut App` (CS2, precedent: [`render_body`]
@@ -750,7 +753,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     app.outline_height = area.height as usize;
     app.hit_regions.outline = Some(region_from(area));
-    let items = app.outline_items();
+    let (items, hidden_counts) = app.outline_items_with_hidden_counts();
     // Bounds-clamp only — NOT a cursor-following derive: under the wheel's peek model a
     // scrolled-away viewport must survive the frame; cursor ops re-derive on their own.
     app.clamp_outline_scroll(items.len());
@@ -765,7 +768,8 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     // small (file trees, not file contents), so re-measuring the whole thing here is cheap.
     let max_line_width = items
         .iter()
-        .map(|item| build_outline_line(item, theme, icons).width())
+        .zip(&hidden_counts)
+        .map(|(item, &hidden)| build_outline_line(item, theme, icons, hidden).width())
         .max()
         .unwrap_or(0);
     app.clamp_outline_hscroll(max_line_width);
@@ -778,8 +782,9 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
         let Some(item) = items.get(item_idx) else {
             continue;
         };
+        let hidden = hidden_counts.get(item_idx).copied().unwrap_or(0);
         let is_cursor = item_idx == cursor;
-        let line = build_outline_line(item, theme, icons);
+        let line = build_outline_line(item, theme, icons, hidden);
         let line = Line::from(pan_spans(line.spans, hscroll, theme));
         let line = if is_cursor && focused {
             apply_cursor_row(line, area.width, theme)
@@ -897,11 +902,32 @@ fn outline_status_spans(
     }
 }
 
+/// CS5 (`outline-fold`): a collapsed Header/Dir row's trailing marker — dim ` ▸ N`, `N` being the
+/// count of hidden FILE rows (not dirs) [`App::outline_items_with_hidden_counts`] attached to that
+/// row. `None` for `hidden == 0` (an EXPANDED Header/Dir — or a File row, which never carries a
+/// hidden count at all) — the locked "no chevron when expanded" rule reads a zero count as "don't
+/// draw a marker" rather than "draw ` ▸ 0`".
+fn fold_marker(hidden: usize, theme: &Palette) -> Option<TSpan<'static>> {
+    (hidden > 0).then(|| {
+        TSpan::styled(
+            format!(" \u{25b8} {hidden}"),
+            Style::default().fg(theme.dim),
+        )
+    })
+}
+
 /// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
 /// marker rules. `icons` (CS5, `workon.review.icons`) is [`IconMode::None`] by
 /// default, which reproduces the pre-CS5 row text exactly (no icon glyph, no extra space); only
-/// [`IconMode::Nerd`] inserts an icon before the name/path.
-fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> Line<'static> {
+/// [`IconMode::Nerd`] inserts an icon before the name/path. `hidden` (CS5, `outline-fold`) is the
+/// row's collapsed hidden-file count from [`App::outline_items_with_hidden_counts`] — `0` for
+/// every row that isn't a collapsed Header/Dir; see [`fold_marker`].
+fn build_outline_line(
+    item: &OutlineItem,
+    theme: &Palette,
+    icons: IconMode,
+    hidden: usize,
+) -> Line<'static> {
     match item {
         OutlineItem::Header {
             cs_idx,
@@ -933,6 +959,7 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> L
                     Style::default().fg(theme.dim),
                 ));
             }
+            spans.extend(fold_marker(hidden, theme));
             Line::from(spans)
         }
         OutlineItem::Dir { name, guides, .. } => {
@@ -941,12 +968,14 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> L
                 IconMode::None => String::new(),
             };
             let text = format!("{}{icon}{name}/", tree_prefix(guides));
-            Line::from(TSpan::styled(
+            let mut spans = vec![TSpan::styled(
                 text,
                 Style::default()
                     .fg(theme.dim)
                     .add_modifier(Modifier::ITALIC),
-            ))
+            )];
+            spans.extend(fold_marker(hidden, theme));
+            Line::from(spans)
         }
         OutlineItem::File {
             path,
@@ -3843,6 +3872,115 @@ mod tests {
             buf.cell((guide_x, 3)).unwrap().style().fg,
             Some(Palette::dark().dim),
             "expected the File row's tree-guide connector to carry theme.dim, got: {row:?}"
+        );
+    }
+
+    // ── CS5 (`outline-fold`): collapse/expand marker ────────────────────────────────
+
+    #[test]
+    fn outline_collapsed_header_renders_a_trailing_dim_hidden_file_marker() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.set_outline_order(crate::outline::OutlineOrder::BaseFirst);
+        app.focus_outline();
+        app.outline_top(); // cs-a's header row (BaseFirst: cs-a's header renders first)
+        app.outline_confirm(); // toggle fold — collapses cs-a, hiding its single file (a.txt)
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0 (the winbar) — it names the current file too (e.g. `[i/n] path`), which can
+        // false-positive a bare `contains` search, same gotcha `render_outline_file_row` already
+        // documents.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let (row_idx, header_row) = content
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("Add a"))
+            .map(|(i, r)| (i, r.clone()))
+            .expect("cs-a's header row present");
+        let y = row_idx as u16 + 1; // +1 to undo the y=0 skip above.
+        assert!(
+            header_row.contains("\u{25b8} 1"),
+            "collapsed header must show its 1 hidden file, got: {header_row:?}"
+        );
+        assert!(
+            !content.iter().any(|r| r.contains("a.txt")),
+            "a.txt's row must be hidden while its header is collapsed, got:\n{}",
+            content.join("\n")
+        );
+
+        let row_chars: Vec<char> = header_row.chars().collect();
+        let marker_x = row_chars
+            .iter()
+            .position(|&c| c == '\u{25b8}')
+            .expect("marker glyph present") as u16;
+        assert_eq!(
+            buf.cell((marker_x, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the collapsed marker to carry theme.dim, got: {header_row:?}"
+        );
+    }
+
+    #[test]
+    fn outline_expanded_header_renders_no_chevron_marker() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0 (the winbar) — see the gotcha noted above.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            !content.iter().any(|r| r.contains('\u{25b8}')),
+            "no row should carry the collapsed marker while every Header/Dir is expanded, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_collapsed_dir_renders_a_trailing_dim_hidden_file_marker() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+
+        app.focus_outline();
+        app.outline_top(); // src/ (dirs-before-files root ordering — see the tree-guide test above)
+        app.outline_confirm(); // toggle fold — collapses src/, hiding its one file (a.txt)
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0 (the winbar) — its OWN current-file label can itself contain `src/` (e.g.
+        // `[1/1] src/a.txt`) and false-positive the `contains("src/")` search below if included.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let dir_row = content
+            .iter()
+            .find(|r| r.contains("src/"))
+            .expect("src/ row present");
+        assert!(
+            dir_row.contains("\u{25b8} 1"),
+            "collapsed src/ must show its 1 hidden file, got: {dir_row:?}"
+        );
+        assert!(
+            !content.iter().any(|r| r.contains("a.txt")),
+            "a.txt must be hidden under collapsed src/, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content.iter().any(|r| r.contains("top.txt")),
+            "top.txt (a sibling, not nested under src/) must remain visible, got:\n{}",
+            content.join("\n")
         );
     }
 

@@ -12,6 +12,15 @@
 //! `crate::model::FileStatus` keeps this module's pure-data posture intact: `model.rs` is itself
 //! a pure data module (no `App`/`ChangesetView` dependency), so importing its plain enum doesn't
 //! reintroduce the `App` coupling this module was factored out to avoid.
+//!
+//! CS5 (`outline-fold`) also adds a second stage layered on top of [`build_items`]: collapse/
+//! expand. [`build_items`] itself stays wholly unaware of fold state (its extensive mode/dedup/
+//! guide tests below are untouched by CS5) — [`apply_fold`] takes its output and a per-row
+//! collapsed predicate and returns the filtered row list plus the two extra pieces of data render/
+//! cursor logic needs (a collapsed row's hidden-file count, and a full-list -> filtered-list index
+//! map for re-finding a fold-hidden target). [`fold_outline`] is the two steps composed —
+//! `App::outline_items`'s single entry point (see that method's doc comment for why every
+//! cursor/staging/render consumer funnels through the SAME filtered list).
 
 use std::collections::HashMap;
 
@@ -19,7 +28,7 @@ use crate::model::FileStatus;
 
 /// Which of the outline's row-building strategies is active — cycled by `i` (only while the
 /// outline pane has focus; see `App::outline_cycle_mode`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum OutlineMode {
     /// Every changed path across the whole stack, once each, no changeset headers.
     Flat,
@@ -196,9 +205,10 @@ pub enum OutlineItem {
     },
     /// A directory row — only emitted in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`]. Not a
     /// jump target: it carries no `file_idx`, so `App::outline_move_by` no-ops on it (same as
-    /// [`Self::Header`]) and `App::outline_confirm` also no-ops on it (CS4 decision — there's no
-    /// expand/collapse state to toggle, so Enter on a directory row does nothing but still
-    /// returns focus to the diff, matching every other confirm outcome).
+    /// [`Self::Header`]); `App::outline_confirm` toggles this row's fold state instead of jumping
+    /// (CS5, `outline-fold`) and deliberately does NOT return focus to the diff — see that
+    /// method's doc comment. Fold state itself lives on `App` (per-[`OutlineMode`] sets keyed by
+    /// [`FoldKey`]), not here — this row stays a plain data snapshot either way.
     Dir {
         name: String,
         /// The FULL path from the trie root (e.g. `"src/cmd"`), unlike `name` which is just the
@@ -248,7 +258,11 @@ impl OutlineItem {
 /// (that array's own base -> head storage order never changes) regardless of `order` — only the
 /// ROW SEQUENCE the outline paints flips. [`build_tree`]'s de-dupe is order-independent (see its
 /// own doc comment), so `order` is accepted but unused there.
-pub fn build_items(
+///
+/// `pub(crate)` (CS5): this is the "unfiltered build" [`fold_outline`]'s doc comment refers to —
+/// every outside-the-module consumer (i.e. `App`) goes through `fold_outline`/`apply_fold`
+/// instead, so a fold is never accidentally bypassed by calling this directly.
+pub(crate) fn build_items(
     changesets: &[OutlineChangeset],
     mode: OutlineMode,
     order: OutlineOrder,
@@ -259,6 +273,186 @@ pub fn build_items(
         OutlineMode::Tree => build_tree(changesets),
         OutlineMode::StackTree => build_stack_tree(changesets, order),
     }
+}
+
+// ── Fold (collapse/expand), CS5 `outline-fold` ──────────────────────────────────
+
+/// A foldable outline row's identity — the key `App`'s per-[`OutlineMode`] fold sets store.
+/// [`OutlineItem::Header`] is keyed by its changeset's label PLUS its `cs_idx`; [`OutlineItem::Dir`]
+/// by its full path plus, in [`OutlineMode::StackTree`], its owning changeset's `cs_idx` (`None`
+/// in [`OutlineMode::Tree`], mirroring [`OutlineItem::Dir::cs_idx`]'s own `Option` — that mode's
+/// single trie has no one owning changeset to key by).
+///
+/// `cs_idx` is load-bearing here, not just belt-and-suspenders: a changeset's own `label` is NOT
+/// unique across a single snapshot — [`crate::acquire::uncommitted_changeset`] and Graphite's
+/// `insert_uncommitted_layer` both name the synthetic uncommitted-layer changeset after the SAME
+/// branch its committed node is named after (no title on either), so a branch's committed node
+/// and its own uncommitted worktree layer are two DIFFERENT rows that render the identical label.
+/// Keying by label alone would fold both together the moment either was toggled. `cs_idx` is
+/// still the true index into `App::changesets` (stable across an ordinary refresh — only a
+/// structural stack change, e.g. a changeset added/removed, shifts it), matching the same
+/// "identity survives refresh via `cs_idx`" precedent [`crate::app::OutlineRowIdentity`] already
+/// relies on for staging-verb restore.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum FoldKey {
+    Header { label: String, cs_idx: usize },
+    Dir { path: String, owner: Option<usize> },
+}
+
+impl FoldKey {
+    /// `item`'s [`FoldKey`], or `None` for a [`OutlineItem::File`] row (never foldable — it
+    /// carries no fold state of its own). Reads only fields the item already carries on itself
+    /// (`cs_idx`, `label`/`path`) — no external lookup needed. `pub(crate)`: also
+    /// `App::outline_toggle_fold`'s way of turning "the row under the cursor" into the key its
+    /// fold set is keyed by, without duplicating this match.
+    pub(crate) fn for_item(item: &OutlineItem) -> Option<Self> {
+        match item {
+            OutlineItem::Header { cs_idx, label, .. } => Some(FoldKey::Header {
+                label: label.clone(),
+                cs_idx: *cs_idx,
+            }),
+            OutlineItem::Dir { path, cs_idx, .. } => Some(FoldKey::Dir {
+                path: path.clone(),
+                owner: *cs_idx,
+            }),
+            OutlineItem::File { .. } => None,
+        }
+    }
+}
+
+/// The outline's row list after CS5's fold filtering is layered on top of [`build_items`]'s raw
+/// build — see [`apply_fold`]/[`fold_outline`]'s doc comments for how it's derived, and
+/// `App::outline_items`'s doc comment for why this is the SINGLE choke point every cursor/
+/// staging/render consumer reads through.
+#[derive(Debug, Clone)]
+pub(crate) struct FoldedOutline {
+    /// The visible rows, in order — a subsequence of [`build_items`]'s full (unfiltered) output.
+    pub items: Vec<OutlineItem>,
+    /// Parallel to `items`: the count of hidden FILE rows (not dirs — CS5's locked "N = hidden
+    /// FILE rows only" rule) under a collapsed Header/Dir row. `0` for every other row, including
+    /// an EXPANDED Header/Dir — render reads `0` as "no marker", so an expanded row never draws
+    /// the trailing ` ▸ N` chevron.
+    pub hidden_counts: Vec<usize>,
+    /// Parallel to the FULL (unfiltered) [`build_items`] output, NOT to `items`: for original row
+    /// `i`, the index into `items`/`hidden_counts` a cursor targeting that row should land on —
+    /// its own filtered position if it survived filtering, or its nearest VISIBLE ancestor's if a
+    /// fold hides it (CS5's "lands on the collapsed ancestor without auto-expanding" rule). Used
+    /// by `App::sync_outline_to_current` to re-target a diff-initiated jump onto a folded row's
+    /// row instead of leaving the outline cursor on an arbitrary clamp.
+    pub visible_index: Vec<usize>,
+}
+
+/// Filter `items` (a fresh [`build_items`] call's output) down to the rows `is_folded`'s per-mode
+/// fold set leaves visible, computing each collapsed row's hidden-file marker and the full-list ->
+/// filtered-list index map described on [`FoldedOutline::visible_index`]. Needs no `changesets`
+/// snapshot of its own — [`FoldKey::for_item`] reads only what each item already carries on
+/// itself (see that fn's doc comment on why `cs_idx`, not a label lookup, is what disambiguates).
+///
+/// One linear pass with an explicit stack of "open ancestor" frames, mirroring [`emit`]'s own
+/// depth-first row order: a [`OutlineItem::Header`] frame's scope is "everything up to the next
+/// Header" (depth `-1`, a sentinel shallower than every real tree depth); a [`OutlineItem::Dir`]
+/// frame's scope is "everything with a deeper tree `guides` prefix than its own" (its
+/// [`OutlineItem::depth`]). Both close the same way: popping frames whose recorded depth is `>=`
+/// the current row's depth, since a shallower-or-equal row can't be that frame's descendant. A row
+/// hidden by ANY currently-open ancestor being folded is dropped from the output entirely, but a
+/// hidden File row still bumps every open ancestor's running hidden-file count (even an unfolded
+/// one — that count is simply never read unless the frame turns out to be folded when it's
+/// popped), so a doubly-nested fold's OUTER marker still counts files hidden two levels down.
+pub(crate) fn apply_fold(
+    items: &[OutlineItem],
+    is_folded: impl Fn(&FoldKey) -> bool,
+) -> FoldedOutline {
+    struct Frame {
+        depth: isize,
+        folded: bool,
+        hidden: usize,
+        /// Index into the output `items`/`hidden_counts` this frame's OWN row landed at — `None`
+        /// if the frame's own row was itself hidden by a still-further-out fold (a doubly-nested
+        /// collapse), in which case it never got a marker to write into.
+        out_idx: Option<usize>,
+    }
+
+    /// Write a popped frame's final hidden-file count into its own row's marker slot — only if
+    /// the frame is folded (an expanded frame's count is dead data, never read) and was itself
+    /// visible (`out_idx: Some`; a hidden frame has no marker slot to write into at all).
+    fn finalize(frame: Frame, hidden_counts: &mut [usize]) {
+        if frame.folded {
+            if let Some(idx) = frame.out_idx {
+                hidden_counts[idx] = frame.hidden;
+            }
+        }
+    }
+
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut out_items: Vec<OutlineItem> = Vec::new();
+    let mut hidden_counts: Vec<usize> = Vec::new();
+    let mut visible_index: Vec<usize> = Vec::with_capacity(items.len());
+
+    for item in items {
+        let depth: isize = match item {
+            OutlineItem::Header { .. } => -1,
+            OutlineItem::Dir { .. } | OutlineItem::File { .. } => item.depth() as isize,
+        };
+        while stack.last().is_some_and(|f| f.depth >= depth) {
+            finalize(
+                stack.pop().expect("just checked the stack is non-empty"),
+                &mut hidden_counts,
+            );
+        }
+
+        let hidden = stack.iter().any(|f| f.folded);
+        if hidden && matches!(item, OutlineItem::File { .. }) {
+            for f in &mut stack {
+                f.hidden += 1;
+            }
+        }
+
+        let out_idx =
+            if hidden {
+                stack.iter().rev().find_map(|f| f.out_idx).expect(
+                    "row 0 of any build is always visible, so some open ancestor must be too",
+                )
+            } else {
+                let idx = out_items.len();
+                out_items.push(item.clone());
+                hidden_counts.push(0);
+                idx
+            };
+        visible_index.push(out_idx);
+
+        if let OutlineItem::Header { .. } | OutlineItem::Dir { .. } = item {
+            let key = FoldKey::for_item(item)
+                .expect("just matched Header/Dir, both of which always resolve a FoldKey");
+            stack.push(Frame {
+                depth,
+                folded: is_folded(&key),
+                hidden: 0,
+                out_idx: if hidden { None } else { Some(out_idx) },
+            });
+        }
+    }
+    while let Some(frame) = stack.pop() {
+        finalize(frame, &mut hidden_counts);
+    }
+
+    FoldedOutline {
+        items: out_items,
+        hidden_counts,
+        visible_index,
+    }
+}
+
+/// [`build_items`] + [`apply_fold`] composed — `App::outline_items`'s (and its private
+/// `App::outline_folded` helper's) single entry point, so `app.rs` never has to import both
+/// functions and remember to always pair them.
+pub(crate) fn fold_outline(
+    changesets: &[OutlineChangeset],
+    mode: OutlineMode,
+    order: OutlineOrder,
+    is_folded: impl Fn(&FoldKey) -> bool,
+) -> FoldedOutline {
+    let items = build_items(changesets, mode, order);
+    apply_fold(&items, is_folded)
 }
 
 /// [`OutlineMode::Stack`]: a header per changeset, then its files in order — no de-duplication,
@@ -1050,5 +1244,247 @@ mod tests {
             },
             "cs-b's own file follows immediately under its head-first header"
         );
+    }
+
+    // ── Fold (collapse/expand), CS5 `outline-fold` ──────────────────────────────
+
+    #[test]
+    fn apply_fold_with_nothing_folded_leaves_every_row_visible_with_zero_markers() {
+        let changesets = vec![
+            cs("cs-a", false, false, &[("a1.txt", StagedStatus::None)]),
+            cs("cs-b", true, true, &[("b1.txt", StagedStatus::None)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
+        let folded = apply_fold(&items, |_| false);
+        assert_eq!(
+            folded.items, items,
+            "nothing folded, so nothing is filtered"
+        );
+        assert!(
+            folded.hidden_counts.iter().all(|&n| n == 0),
+            "no collapsed row, so no marker anywhere"
+        );
+        assert_eq!(
+            folded.visible_index,
+            (0..items.len()).collect::<Vec<_>>(),
+            "every row maps onto its own (only) position"
+        );
+    }
+
+    #[test]
+    fn apply_fold_hides_a_collapsed_headers_files_and_marks_the_hidden_count() {
+        let changesets = vec![
+            cs(
+                "cs-a",
+                false,
+                false,
+                &[
+                    ("a1.txt", StagedStatus::None),
+                    ("a2.txt", StagedStatus::None),
+                ],
+            ),
+            cs("cs-b", true, false, &[("b1.txt", StagedStatus::None)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
+        let folded = apply_fold(&items, |key| {
+            *key == FoldKey::Header {
+                label: "cs-a".to_string(),
+                cs_idx: 0,
+            }
+        });
+        assert_eq!(
+            folded.items.len(),
+            3,
+            "cs-a's header survives (its 2 files hidden); cs-b's header AND its own file both \
+             survive (cs-b isn't folded)"
+        );
+        assert!(matches!(
+            folded.items[0],
+            OutlineItem::Header { ref label, .. } if label == "cs-a"
+        ));
+        assert_eq!(
+            folded.hidden_counts[0], 2,
+            "cs-a's collapsed header marks its 2 hidden files"
+        );
+        assert!(matches!(
+            folded.items[1],
+            OutlineItem::Header { ref label, .. } if label == "cs-b"
+        ));
+        assert_eq!(folded.hidden_counts[1], 0, "cs-b is not collapsed");
+        assert!(matches!(
+            folded.items[2],
+            OutlineItem::File { ref path, .. } if path == "b1.txt"
+        ));
+    }
+
+    #[test]
+    fn apply_fold_leaves_a_sibling_headers_files_untouched() {
+        let changesets = vec![
+            cs("cs-a", false, false, &[("a1.txt", StagedStatus::None)]),
+            cs("cs-b", true, false, &[("b1.txt", StagedStatus::None)]),
+        ];
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
+        let folded = apply_fold(&items, |key| {
+            *key == FoldKey::Header {
+                label: "cs-a".to_string(),
+                cs_idx: 0,
+            }
+        });
+        let paths: Vec<&str> = folded
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                OutlineItem::File { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["b1.txt"],
+            "cs-b's own file stays visible; only cs-a's collapsed section is hidden"
+        );
+    }
+
+    #[test]
+    fn apply_fold_collapsing_a_dir_hides_its_nested_files_and_subdirs_but_counts_only_files() {
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let items = build_items(&changesets, OutlineMode::Tree, OutlineOrder::HeadFirst);
+        // `src` (depth 0) contains `src/a` (a nested dir, depth 1) and `src/d.rs`, and `src/a`
+        // itself contains `src/a/b.rs` + `src/a/c.rs` — collapsing `src` should hide all 3 files
+        // (b.rs, c.rs, d.rs) it contains at any depth, but the marker counts files only, not the
+        // nested `src/a` dir row itself.
+        let folded = apply_fold(&items, |key| {
+            *key == FoldKey::Dir {
+                path: "src".to_string(),
+                owner: None,
+            }
+        });
+        assert_eq!(
+            folded.items.len(),
+            2,
+            "src/ (collapsed) and top.rs (an unrelated sibling) survive"
+        );
+        let src_idx = folded
+            .items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ row survives collapsed");
+        assert_eq!(
+            folded.hidden_counts[src_idx], 3,
+            "b.rs, c.rs, and d.rs are all hidden under collapsed src/ — src/a/ itself doesn't count"
+        );
+    }
+
+    #[test]
+    fn apply_fold_doubly_nested_collapse_still_counts_toward_the_outer_markers_hidden_files() {
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let items = build_items(&changesets, OutlineMode::Tree, OutlineOrder::HeadFirst);
+        // Collapse BOTH `src` and its nested `src/a` — `src/a`'s own row is hidden (nested inside
+        // the already-collapsed `src`), but its 2 files must still count toward `src`'s own
+        // marker, even though `src/a`'s marker is never written (it has no visible row to write
+        // into).
+        let folded = apply_fold(&items, |key| {
+            matches!(
+                key,
+                FoldKey::Dir { path, owner: None } if path == "src" || path == "src/a"
+            )
+        });
+        assert_eq!(
+            folded.items.len(),
+            2,
+            "only src/ (collapsed) and top.rs survive; src/a/ is hidden under src/'s own fold"
+        );
+        let src_idx = folded
+            .items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ row survives collapsed");
+        assert_eq!(
+            folded.hidden_counts[src_idx], 3,
+            "src/'s marker still counts all 3 descendant files, even the 2 nested two levels down \
+             under the also-collapsed (and therefore invisible) src/a/"
+        );
+    }
+
+    #[test]
+    fn apply_fold_visible_index_maps_a_hidden_files_full_list_position_to_its_visible_ancestor() {
+        // `deep_path_changeset`'s full (unfolded) Tree-mode row order is exactly:
+        // [src/ (0), src/a/ (1), src/a/b.rs (2), src/a/c.rs (3), src/d.rs (4), top.rs (5)] — see
+        // `tree_mode_builds_dirs_before_files_alpha_within_group_with_correct_depth_and_guides`
+        // above, which pins this same order. Collapsing `src/` hides everything at indices 1..=4
+        // (all nested under it, regardless of their own depth); index 5 (`top.rs`) is a sibling,
+        // untouched.
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let items = build_items(&changesets, OutlineMode::Tree, OutlineOrder::HeadFirst);
+        let folded = apply_fold(&items, |key| {
+            *key == FoldKey::Dir {
+                path: "src".to_string(),
+                owner: None,
+            }
+        });
+        let src_visible_idx = folded
+            .items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ survives collapsed");
+
+        assert_eq!(
+            folded.visible_index[0], src_visible_idx,
+            "src/'s own row maps onto itself"
+        );
+        for (full_idx, item) in items.iter().enumerate().take(5).skip(1) {
+            assert_eq!(
+                folded.visible_index[full_idx], src_visible_idx,
+                "row {full_idx} ({item:?}) is hidden under collapsed src/, so it must map onto \
+                 src/'s own visible row"
+            );
+        }
+        let top_rs_visible_idx = folded
+            .items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path, .. } if path == "top.rs"))
+            .expect("top.rs survives, unaffected by src/'s fold");
+        assert_eq!(
+            folded.visible_index[5], top_rs_visible_idx,
+            "top.rs (a sibling of src/, not nested under it) maps onto its own visible row"
+        );
+    }
+
+    #[test]
+    fn fold_outline_composes_build_items_and_apply_fold() {
+        let changesets = vec![cs(
+            "cs-a",
+            true,
+            false,
+            &[
+                ("a1.txt", StagedStatus::None),
+                ("a2.txt", StagedStatus::None),
+            ],
+        )];
+        let folded = fold_outline(
+            &changesets,
+            OutlineMode::Stack,
+            OutlineOrder::HeadFirst,
+            |key| {
+                *key == FoldKey::Header {
+                    label: "cs-a".to_string(),
+                    cs_idx: 0,
+                }
+            },
+        );
+        assert_eq!(
+            folded.items,
+            vec![OutlineItem::Header {
+                cs_idx: 0,
+                n: 1,
+                label: "cs-a".to_string(),
+                current: true,
+                needs_restack: false,
+                loading: false,
+                failed: false,
+            }],
+            "the header survives collapsed; both files are hidden"
+        );
+        assert_eq!(folded.hidden_counts, vec![2]);
     }
 }
