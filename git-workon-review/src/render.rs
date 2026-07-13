@@ -737,7 +737,9 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
 /// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
 /// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
-/// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
+/// the path — Flat/Stack rows (CS2) split it into `basename  dim/dirname` (no suffix for a
+/// root-level file); Tree/StackTree rows already carry the directory via ancestor Dir rows, so
+/// `path` there is just the bare basename. The cursor row (the outline's OWN cursor — a separate coordinate space from the
 /// diff's [`App::cursor`]) gets the theme's cursor tint while the outline has focus, or the dimmer
 /// [`Palette::outline_cursor_unfocused_bg`] while it's merely open (so the remembered position stays
 /// legible even after focus returns to the diff). `&mut App` (CS2, precedent: [`render_body`]
@@ -796,19 +798,21 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
 /// its parent's last child) or blank space (if it was), and the last element draws the row's own
 /// `╰─`/`├─` connector — CS4 rounds the last-child corner (`╰`, U+2570) from the square `└`
 /// (U+2514); there's no widely-supported rounded "tee" glyph, so the non-last `├─` connector is
-/// unchanged.
+/// unchanged. CS2 tightens indent to 2 cols/level: continuation is `│ ` (bar + space, no third
+/// column), and connectors (`├─`/`╰─`) carry no trailing space — the glyph that follows hugs the
+/// connector directly.
 fn tree_prefix(guides: &[bool]) -> String {
     let mut s = String::new();
     let Some((&is_last, ancestors)) = guides.split_last() else {
         return s;
     };
     for &last in ancestors {
-        s.push_str(if last { "   " } else { "\u{2502}  " });
+        s.push_str(if last { "  " } else { "\u{2502} " });
     }
     s.push_str(if is_last {
-        "\u{2570}\u{2500} "
+        "\u{2570}\u{2500}"
     } else {
-        "\u{251C}\u{2500} "
+        "\u{251C}\u{2500}"
     });
     s
 }
@@ -932,10 +936,34 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: IconMode) -> L
                     Style::default().fg(color.unwrap_or(theme.foreground)),
                 ));
             }
-            spans.push(TSpan::styled(
-                path.clone(),
-                Style::default().fg(theme.foreground),
-            ));
+            // Flat/Stack rows (empty `guides`) split `path` at render time into `basename  dim/
+            // dirname` — basename first (bright, matching the tree modes' bare-name leaves) so
+            // truncation eats the dim dirname before the name a user is scanning for (CS2
+            // gotcha). Tree/StackTree rows (non-empty `guides`) already carry the path via
+            // ancestor Dir rows, so `path` there is already just the basename — render it as-is.
+            if guides.is_empty() {
+                match path.rsplit_once('/') {
+                    Some((dir, base)) => {
+                        spans.push(TSpan::styled(
+                            base.to_string(),
+                            Style::default().fg(theme.foreground),
+                        ));
+                        spans.push(TSpan::styled(
+                            format!("  {dir}"),
+                            Style::default().fg(theme.dim),
+                        ));
+                    }
+                    None => spans.push(TSpan::styled(
+                        path.clone(),
+                        Style::default().fg(theme.foreground),
+                    )),
+                }
+            } else {
+                spans.push(TSpan::styled(
+                    path.clone(),
+                    Style::default().fg(theme.foreground),
+                ));
+            }
             Line::from(spans)
         }
     }
@@ -3644,20 +3672,46 @@ mod tests {
         // buffer row starting at y=1 (y=0 is the winbar): `src/` (dir, root, NOT the root's last
         // child — `top.txt` follows), `a.txt` nested one level under `src/` (the only — hence
         // last — child of `src/`), then `top.txt` (file, root, IS the root's last child).
-        assert!(
-            content[1].contains('\u{251C}') && content[1].contains("src/"),
-            "expected row 1 to be the src/ directory row with a non-last '├─' guide, got:\n{}",
+        //
+        // CS2 tightens `tree_prefix` to 2 cols/level with no trailing space on the connector, so
+        // these are exact-column checks (not just `contains`) — every rendered cell here is one
+        // column wide, so `chars()` (not byte) indexing IS the display column (the guide glyphs
+        // themselves are multi-byte, which is exactly why byte indexing would be wrong).
+        let row1: Vec<char> = content[1].chars().collect();
+        assert_eq!(
+            row1[0..6],
+            ['\u{251C}', '\u{2500}', 's', 'r', 'c', '/'],
+            "expected row 1 to be a tight '├─src/' (2-col connector, no trailing space), got:\n{}",
             content.join("\n")
         );
-        assert!(
-            content[2].contains('\u{2570}') && content[2].contains("a.txt"),
-            "expected row 2 to be src/a.txt, indented under src/ with its own last-child \
-             rounded '╰─' guide, got:\n{}",
+        let row2: Vec<char> = content[2].chars().collect();
+        assert_eq!(
+            row2[0..4],
+            ['\u{2502}', ' ', '\u{2570}', '\u{2500}'],
+            "expected row 2's guide to be a tight '│ ╰─' (continuation + last-child connector, \
+             both 2 cols), got:\n{}",
             content.join("\n")
         );
-        assert!(
-            content[3].contains('\u{2570}') && content[3].contains("top.txt"),
-            "expected row 3 to be top.txt with a last-child rounded '╰─' guide, got:\n{}",
+        assert_eq!(
+            row2[7..12],
+            ['a', '.', 't', 'x', 't'],
+            "expected src/a.txt's basename to start immediately after the 4-col guide + 1-col \
+             glyph + 1-col letter + 1-col space, got:\n{}",
+            content.join("\n")
+        );
+        let row3: Vec<char> = content[3].chars().collect();
+        assert_eq!(
+            row3[0..2],
+            ['\u{2570}', '\u{2500}'],
+            "expected row 3's guide to be a tight '╰─' (root-level last-child, 2 cols, no \
+             trailing space), got:\n{}",
+            content.join("\n")
+        );
+        assert_eq!(
+            row3[5..12],
+            ['t', 'o', 'p', '.', 't', 'x', 't'],
+            "expected top.txt to start immediately after the 2-col guide + 1-col glyph + 1-col \
+             letter + 1-col space, got:\n{}",
             content.join("\n")
         );
     }
@@ -3680,11 +3734,154 @@ mod tests {
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
         // Row 3 is top.txt (see the test above) — a File row with a non-empty guide vector.
         let row = outline_row(&buf, 3);
-        let guide_x = row.find('\u{2570}').expect("rounded guide present") as u16;
+        // `String::find` returns a BYTE offset, not a display column — the rounded guide glyph is
+        // multi-byte, so a `chars()` (not byte) position is what actually lines up with the
+        // column-indexed `buf.cell` lookup below (every rendered cell here is one column wide).
+        let row_chars: Vec<char> = row.chars().collect();
+        let guide_x = row_chars
+            .iter()
+            .position(|&c| c == '\u{2570}')
+            .expect("rounded guide present") as u16;
         assert_eq!(
             buf.cell((guide_x, 3)).unwrap().style().fg,
             Some(Palette::dark().dim),
             "expected the File row's tree-guide connector to carry theme.dim, got: {row:?}"
+        );
+    }
+
+    // ── CS2 (outline-row-shape): smart path render ─────────────────────────────────
+
+    #[test]
+    fn outline_stack_mode_file_row_splits_basename_and_dim_dirname() {
+        // Stack mode keeps `guides` empty, so a nested path (`src/a.txt`) must split at render
+        // time into basename-first, then the dirname in `theme.dim` — ancestors don't carry the
+        // path here (unlike Tree mode), so the row has to spell it out itself.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        assert_eq!(
+            app.outline_mode(),
+            crate::outline::OutlineMode::Stack,
+            "sanity: default mode is Stack, so guides stay empty and this exercises CS2's split"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: the full-width winbar also names the current file (possibly `src/a.txt`
+        // itself), so an unskipped search could false-positive onto it instead of the outline's
+        // own row below it. `content`'s index `i` is buffer row `i + 1` (the skip), so every
+        // `buf` query below adds 1 back.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_idx = content
+            .iter()
+            .position(|r| r.contains("a.txt") && r.contains("src"))
+            .expect("src/a.txt's split row present");
+        let row_chars: Vec<char> = content[row_idx].chars().collect();
+        let buf_y = row_idx as u16 + 1;
+
+        let basename_x = row_chars
+            .windows(5)
+            .position(|w| w == ['a', '.', 't', 'x', 't'])
+            .expect("basename 'a.txt' present in its own row") as u16;
+        assert_eq!(
+            buf.cell((basename_x, buf_y)).unwrap().style().fg,
+            Some(Palette::dark().foreground),
+            "expected the basename to carry the plain (bright) foreground, got:\n{}",
+            content[row_idx]
+        );
+
+        // Two blank columns separate the basename from the dirname (CS2: "basename  dim/
+        // dirname"), so the dirname starts right after them.
+        let dirname_x = basename_x + 5 + 2;
+        assert_eq!(
+            row_chars[dirname_x as usize], 's',
+            "expected the dirname 'src' to start two columns after the basename, got:\n{}",
+            content[row_idx]
+        );
+        assert_eq!(
+            buf.cell((dirname_x, buf_y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the dirname to carry theme.dim, got:\n{}",
+            content[row_idx]
+        );
+        assert!(
+            basename_x < dirname_x,
+            "basename must render BEFORE the dim dirname (basename-first ordering is what makes \
+             truncation eat the dirname first), got:\n{}",
+            content[row_idx]
+        );
+    }
+
+    #[test]
+    fn outline_root_level_file_gets_no_dirname_suffix() {
+        // A root-level file (no `/` in its path) gets no suffix at all — no "(root)"
+        // placeholder, just the bare basename.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture); // top.txt is root-level
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: see the split test above — the winbar also names the current file.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .find(|r| r.contains("top.txt"))
+            .expect("top.txt's row present");
+        assert!(
+            row.trim_end().ends_with("top.txt"),
+            "a root-level file must render with no trailing suffix after its basename, got: \
+             {row:?}"
+        );
+    }
+
+    #[test]
+    fn outline_flat_row_truncation_eats_the_dim_dirname_first() {
+        // A pane-width-exceeding Flat-mode row must truncate the (later, dim) dirname before it
+        // ever touches the (earlier, bright) basename — that ordering is the whole point of
+        // basename-first rendering (CS2 gotcha).
+        let long_dir = "reallyquiteverbosedirectoryname";
+        let path = format!("{long_dir}/x.txt");
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file(&path, "content\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: see the split test above — the winbar also names the current file (the long
+        // path itself here), so an unskipped search would false-positive onto it.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_idx = content
+            .iter()
+            .position(|r| r.contains("x.txt"))
+            .expect("x.txt's row present");
+        assert!(
+            !content[row_idx].contains(long_dir),
+            "the full dirname must NOT fit/appear — truncation should have eaten part of it, \
+             got: {:?}",
+            content[row_idx]
+        );
+        // Column 34 is the outline's last column before the divider at 35 (see
+        // `OUTLINE_TEST_WIDTH`'s doc comment). `content`'s index is buffer row `+ 1` (the y=0
+        // skip above).
+        assert_eq!(
+            cell_text(&buf, 34, row_idx as u16 + 1),
+            "\u{2026}",
+            "the truncated row must show the right-edge marker at the pane's last column"
         );
     }
 
