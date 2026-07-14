@@ -6180,9 +6180,7 @@ mod tests {
             .collect();
         let worktree: String = (1..=14)
             .map(|n| {
-                if n == 2 || n == 10 {
-                    format!("L{n}X\n")
-                } else if n == 14 {
+                if n == 2 || n == 10 || n == 14 {
                     format!("L{n}X\n")
                 } else {
                     format!("L{n}\n")
