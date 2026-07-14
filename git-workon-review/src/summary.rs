@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn dir_summary_filters_by_segment_boundary_not_raw_prefix() {
-        let files = vec![
+        let files = [
             file("src/a.rs", 1, 0, 0),
             file("src/b.rs", 0, 1, 0),
             file("src2/b.rs", 5, 5, 0),
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn dir_summary_matches_nested_paths_under_the_dir() {
-        let files = vec![file("src/a/b.rs", 2, 0, 0), file("src/c.rs", 0, 2, 0)];
+        let files = [file("src/a/b.rs", 2, 0, 0), file("src/c.rs", 0, 2, 0)];
         let summary = dir_summary("src".to_string(), &files.iter().collect::<Vec<_>>());
         assert_eq!(summary.files.len(), 2);
         assert_eq!(summary.total_adds, 2);
