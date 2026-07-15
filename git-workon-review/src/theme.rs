@@ -46,6 +46,12 @@
 //! [`Palette::apply_overrides`] on top of whichever base (`dark`/`light`/`auto`'s probe) was
 //! already resolved. Named bundled schemes (`theme = solarized`) were explicitly deferred —
 //! only the override-key tier landed; see ADR-029's CS1 revision note for the full table.
+//!
+//! **CS2 addition (`no-color-mono`):** the same tier's other deferred extra, `NO_COLOR` support,
+//! lands as [`Palette::mono`] — an achromatic scheme `main.rs` substitutes, after theme
+//! resolution AND override application, when `NO_COLOR` is set (env kill-switch: it wins over
+//! any override). See [`Palette::mono`]'s doc comment for the fg-vs-wash split and ADR-029's
+//! CS2 revision note.
 
 use ratatui::style::Color;
 
@@ -185,8 +191,9 @@ pub(crate) fn tint_toward(color: Color, base: Color, ratio: f32) -> Color {
 /// Used to pick which curated scheme's diff/cursor tints a probed or fallback theme borrows
 /// (CS6): a probed dark background reuses [`Palette::dark`]'s hand-tuned tints, a light one reuses
 /// [`Palette::light`]'s derived washes. A non-RGB color (never produced by the OSC probe) reads as
-/// dark.
-pub(crate) fn is_light_background(color: Color) -> bool {
+/// dark. `pub` (not `pub(crate)`) since CS2 (`no-color-mono`) also calls this from `main.rs`,
+/// which depends on this lib crate externally, to pick [`Palette::mono`]'s ladder.
+pub fn is_light_background(color: Color) -> bool {
     match color {
         Color::Rgb(r, g, b) => r as u32 + g as u32 + b as u32 > 382,
         _ => false,
@@ -456,6 +463,80 @@ impl Palette {
             // background — base00 here IS the probed terminal bg, so painting a solid canvas
             // would defeat terminal transparency/background images for no benefit (the probed
             // fg/dim/gutter already match the inherited bg, since they came from the same probe).
+            paint_canvas: false,
+        }
+    }
+
+    /// The achromatic scheme used when `NO_COLOR` is set (CS2, NO_COLOR support, `no-color.org`).
+    /// Every fg field (`foreground`/`dim`/`gutter`/`error_fg`/`warn_fg`/`current_fg`/
+    /// `heading_fg`/`modified_fg`), every [`Palette::syntax`] entry, and [`Palette::background`]
+    /// collapse to `Color::Reset` — the terminal's own default fg/bg, nothing painted
+    /// (`paint_canvas: false`, since Reset already means "don't touch"). `render.rs` has no
+    /// non-color channel (reverse/dim modifiers) to fall back on for the 11 diff/cursor washes —
+    /// adding one is a render.rs change, out of CS2's scope (`render.rs` must not change) — so
+    /// those instead become achromatic (`r == g == b`) `Rgb` grayscale ladders: near-black for a
+    /// dark terminal, near-white for a light one (picked by `light`, matching `main.rs`'s
+    /// `is_light_background(theme.background)` call on the pre-mono base so `auto`'s probe still
+    /// picks the right ladder). Hand-tuned to preserve the same three invariants the curated
+    /// schemes maintain: subtle vs strong read as distinct steps, staged reads dimmer (closer to
+    /// the implied background) than unstaged, and cursor vs selection are distinct. Add and Del
+    /// share one ladder — colorless mode can't carry add-vs-del by hue, so that distinction
+    /// falls to gutter glyph/structure instead, an accepted, documented degradation (see
+    /// ADR-029's NO_COLOR note).
+    pub fn mono(light: bool) -> Self {
+        // (subtle, strong, staged_subtle, staged_strong, cursor, selection, outline_cursor_unfocused)
+        let (
+            subtle,
+            strong,
+            staged_subtle,
+            staged_strong,
+            cursor,
+            selection,
+            outline_cursor_unfocused,
+        ) = if light {
+            (
+                Color::Rgb(215, 215, 215),
+                Color::Rgb(165, 165, 165),
+                Color::Rgb(230, 230, 230),
+                Color::Rgb(205, 205, 205),
+                Color::Rgb(190, 190, 190),
+                Color::Rgb(200, 200, 200),
+                Color::Rgb(210, 210, 210),
+            )
+        } else {
+            (
+                Color::Rgb(40, 40, 40),
+                Color::Rgb(90, 90, 90),
+                Color::Rgb(25, 25, 25),
+                Color::Rgb(50, 50, 50),
+                Color::Rgb(65, 65, 65),
+                Color::Rgb(55, 55, 55),
+                Color::Rgb(45, 45, 45),
+            )
+        };
+
+        Palette {
+            syntax: vec![Color::Reset; SYNTAX_SLOTS.len()],
+            del_subtle: subtle,
+            del_strong: strong,
+            add_subtle: subtle,
+            add_strong: strong,
+            del_staged_subtle: staged_subtle,
+            del_staged_strong: staged_strong,
+            add_staged_subtle: staged_subtle,
+            add_staged_strong: staged_strong,
+            cursor_bg: cursor,
+            selection_bg: selection,
+            outline_cursor_unfocused_bg: outline_cursor_unfocused,
+            background: Color::Reset,
+            foreground: Color::Reset,
+            dim: Color::Reset,
+            gutter: Color::Reset,
+            error_fg: Color::Reset,
+            warn_fg: Color::Reset,
+            current_fg: Color::Reset,
+            heading_fg: Color::Reset,
+            modified_fg: Color::Reset,
             paint_canvas: false,
         }
     }
@@ -991,5 +1072,101 @@ mod tests {
         // The del/add tints are untouched by the base08 slot override — tint overrides are the
         // only thing that moves them.
         assert_eq!(t.del_subtle, Palette::dark().del_subtle);
+    }
+
+    #[test]
+    fn mono_fg_and_syntax_fields_are_all_reset() {
+        let t = Palette::mono(false);
+        assert_eq!(t.background, Color::Reset);
+        assert_eq!(t.foreground, Color::Reset);
+        assert_eq!(t.dim, Color::Reset);
+        assert_eq!(t.gutter, Color::Reset);
+        assert_eq!(t.error_fg, Color::Reset);
+        assert_eq!(t.warn_fg, Color::Reset);
+        assert_eq!(t.current_fg, Color::Reset);
+        assert_eq!(t.heading_fg, Color::Reset);
+        assert_eq!(t.modified_fg, Color::Reset);
+        assert!(!t.paint_canvas);
+        for capture in 0..syntax_slot_count() {
+            assert_eq!(
+                t.syntax(capture),
+                Color::Reset,
+                "capture {capture} not Reset"
+            );
+        }
+    }
+
+    /// A wash must be an achromatic (`r == g == b`) `Rgb` — never `Reset`, since the 11 washes
+    /// still need to carry cursor/selection/staged attribution (unlike the fg fields above).
+    fn assert_achromatic(color: Color) {
+        let (r, g, b) = rgb(color);
+        assert_eq!(r, g, "not achromatic: {color:?}");
+        assert_eq!(g, b, "not achromatic: {color:?}");
+    }
+
+    #[test]
+    fn mono_washes_are_achromatic_and_preserve_the_curated_invariants() {
+        for light in [false, true] {
+            let t = Palette::mono(light);
+            for wash in [
+                t.del_subtle,
+                t.del_strong,
+                t.add_subtle,
+                t.add_strong,
+                t.del_staged_subtle,
+                t.del_staged_strong,
+                t.add_staged_subtle,
+                t.add_staged_strong,
+                t.cursor_bg,
+                t.selection_bg,
+                t.outline_cursor_unfocused_bg,
+            ] {
+                assert_achromatic(wash);
+            }
+
+            // Add and Del share one gray ladder (accepted degradation — hue can't carry
+            // add-vs-del in colorless mode, so gutter structure does instead).
+            assert_eq!(t.del_subtle, t.add_subtle);
+            assert_eq!(t.del_strong, t.add_strong);
+            assert_eq!(t.del_staged_subtle, t.add_staged_subtle);
+            assert_eq!(t.del_staged_strong, t.add_staged_strong);
+
+            // Subtle vs strong remain visibly distinct steps.
+            assert_ne!(t.del_subtle, t.del_strong);
+            assert_ne!(t.del_staged_subtle, t.del_staged_strong);
+
+            // Staged reads dimmer (closer to the implied background — brighter grays near a
+            // light bg, darker grays near a dark bg) than unstaged.
+            let (staged_subtle, _, _) = rgb(t.del_staged_subtle);
+            let (subtle, _, _) = rgb(t.del_subtle);
+            let (staged_strong, _, _) = rgb(t.del_staged_strong);
+            let (strong, _, _) = rgb(t.del_strong);
+            if light {
+                assert!(staged_subtle > subtle, "staged should sit closer to white");
+                assert!(staged_strong > strong, "staged should sit closer to white");
+            } else {
+                assert!(staged_subtle < subtle, "staged should sit closer to black");
+                assert!(staged_strong < strong, "staged should sit closer to black");
+            }
+
+            // Cursor vs selection are distinct, and the unfocused outline cursor reads dimmer
+            // (closer to the implied background) than the focused cursor wash.
+            assert_ne!(t.cursor_bg, t.selection_bg);
+            let (cursor, _, _) = rgb(t.cursor_bg);
+            let (outline_unfocused, _, _) = rgb(t.outline_cursor_unfocused_bg);
+            if light {
+                assert!(outline_unfocused > cursor);
+            } else {
+                assert!(outline_unfocused < cursor);
+            }
+        }
+    }
+
+    #[test]
+    fn mono_dark_ladder_sits_near_black_and_light_ladder_near_white() {
+        let (r, _, _) = rgb(Palette::mono(false).del_strong);
+        assert!(r < 128, "dark ladder should be a dark gray");
+        let (r, _, _) = rgb(Palette::mono(true).del_strong);
+        assert!(r > 128, "light ladder should be a pale gray");
     }
 }

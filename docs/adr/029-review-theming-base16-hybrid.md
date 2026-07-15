@@ -185,6 +185,24 @@ to vendor) was considered and set aside — the override-key tier covers the imm
 named schemes slot in additively later (a `Theme::Named` variant + a `schemes.rs` of vendored
 constants) without touching this work if demand appears.
 
+**NO_COLOR (CS2).** The other extra this tier's Context section named — `NO_COLOR`, no CLI flag,
+no color-depth downgrade — lands as `Palette::mono(light: bool)`: every fg field, every syntax
+entry, and the canvas background collapse to `Color::Reset` (`paint_canvas: false`), while the
+11 diff/cursor washes become achromatic grayscale `Rgb` ladders (dark-terminal vs light-terminal
+picked by `light`) rather than also going `Reset`, since `render.rs` has no non-color channel
+(reverse/dim) to substitute for them and changing `render.rs` was out of scope. Add and Del share
+one ladder — colorless mode can't carry that distinction by hue, so it falls to gutter
+glyph/structure instead, an accepted degradation. `main.rs` applies this last, after theme
+resolution AND override application (`NO_COLOR` is an env kill-switch that wins over any
+`workon.review.theme.*` override), when `NO_COLOR` is set to any non-empty value (`no-color.org`);
+`FORCE_COLOR` is deliberately not consulted — it answers a different question (this repo's own
+test/output-capture posture), not "does this user want THIS tool's colors." One wrinkle,
+found by driving the real binary under a PTY: crossterm ALSO honors `NO_COLOR`, by stripping
+every color SGR at the output layer — which would erase the grayscale washes too and leave
+cursor/selection/staged attribution invisible. The app owns `NO_COLOR` semantics at the palette
+level instead, so the mono branch calls `crossterm::style::force_color_output(true)` to disable
+that blanket suppression and let the achromatic ladders through.
+
 ## References
 
 - [ADR-028](028-review-git-native-config-schema.md) — `workon.review.theme` config key
