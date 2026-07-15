@@ -42,8 +42,8 @@ use crate::wordiff::Span as WordSpan;
 // auto-detection ever picks Nerd for the user). Picked from the classic BMP nerd-font sets
 // (`fa`/`oct`) rather than devicons' broader (partly supplementary-plane) table, for wider
 // font compatibility — see `icons.rs`'s v3 doc note.
-/// Nerd-mode "this is the current changeset" marker, replacing the plain `●` (U+25CF).
-const NERD_CURRENT_MARKER: char = '\u{f111}'; // nf-fa-circle
+/// Nerd-mode "this is the current changeset" marker, replacing the plain `•` (U+2022).
+const NERD_CURRENT_MARKER: char = '\u{f444}'; // nf-oct-dot-fill
 /// Nerd-mode needs-restack marker, replacing the plain `⚠` (U+26A0).
 const NERD_WARN_MARKER: char = '\u{f071}'; // nf-fa-warning
 /// Nerd-mode failed-changeset marker, replacing the plain `✗` (U+2717).
@@ -66,7 +66,7 @@ const NERD_DIFF_REMOVED: char = '\u{f458}'; // nf-oct-diff-removed
 fn current_marker(icons: IconMode) -> char {
     match icons {
         IconMode::Nerd => NERD_CURRENT_MARKER,
-        IconMode::None => '\u{25CF}',
+        IconMode::None => '\u{2022}',
     }
 }
 
@@ -123,12 +123,13 @@ fn changeset_title_spans(
     icons: IconMode,
     counter: Option<(usize, usize)>,
 ) -> Vec<TSpan<'static>> {
-    let marker = if current {
-        format!("{} ", current_marker(icons))
-    } else {
-        "  ".to_string()
-    };
-    let mut spans = vec![TSpan::styled(marker, Style::default().fg(theme.current_fg))];
+    let mut spans = Vec::new();
+    if current {
+        spans.push(TSpan::styled(
+            format!("{} ", current_marker(icons)),
+            Style::default().fg(theme.current_fg),
+        ));
+    }
     if icons == IconMode::Nerd {
         spans.push(TSpan::styled(
             format!("{NERD_BRANCH_ICON} "),
@@ -731,7 +732,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 }
 
 /// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
-/// carry the changeset's position marker (green ● for `cs.current`), a `[i/n]` TRUE-stack-position
+/// carry the changeset's position marker (green • for `cs.current`), a `[i/n]` TRUE-stack-position
 /// counter, an accented ([`Palette::heading_fg`]) bold label (CS1, `outline-header-polish` — see
 /// [`changeset_title_spans`]'s doc comment), and needs-restack glyph (amber ⚠,
 /// [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
@@ -1122,7 +1123,7 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
-    let title = cs.title.as_deref().unwrap_or(cs.name.as_str());
+    let title = crate::app::display_label(cs);
     let icons = app.icon_mode();
 
     let mut spans = vec![TSpan::styled(
@@ -3478,9 +3479,9 @@ mod tests {
         let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
         let row = content
             .iter()
-            .position(|r| r.contains('\u{25CF}'))
+            .position(|r| r.contains('\u{2022}'))
             .expect("current marker present in the outline");
-        let marker_x = content[row].find('\u{25CF}').unwrap() as u16;
+        let marker_x = content[row].find('\u{2022}').unwrap() as u16;
         assert_eq!(
             buf.cell((marker_x, row as u16)).unwrap().style().fg,
             Some(Palette::dark().current_fg),
@@ -3562,7 +3563,7 @@ mod tests {
             .position(|r| r.contains("cs-b"))
             .expect("cs-b's header row present (it has no title, so falls back to its name)");
         // `String::find` returns a BYTE offset, not a display column — the row has multi-byte
-        // glyphs (`●`/`⚠`) ahead of/around the label, so a byte offset would target the wrong
+        // glyphs (`•`/`⚠`) ahead of/around the label, so a byte offset would target the wrong
         // cell. Every rendered cell here is exactly one column wide, so a `chars()` (not byte)
         // position IS the display column.
         let label_chars: Vec<char> = "cs-b".chars().collect();
@@ -3620,7 +3621,7 @@ mod tests {
             .position(|r| r.contains("cs-b"))
             .expect("summary panel's title (cs-b's label) present");
         // `String::find` is a BYTE offset, not a display column (the title carries a multi-byte
-        // `●` marker ahead of the label, since cs-b is `current`) — a `chars()` position over the
+        // `•` marker ahead of the label, since cs-b is `current`) — a `chars()` position over the
         // 36.. slice IS the column offset within that slice (every cell here is one column wide),
         // so add the slice's own start column (36) back to get the absolute buffer column.
         let label_chars: Vec<char> = "cs-b".chars().collect();
@@ -4641,7 +4642,7 @@ mod tests {
             "expected the nerd needs-restack marker, got:\n{joined}"
         );
         assert!(
-            !joined.contains('\u{25CF}') && !joined.contains('\u{26A0}'),
+            !joined.contains('\u{2022}') && !joined.contains('\u{26A0}'),
             "nerd mode must not leave the plain unicode markers behind in the outline pane, got:\n{joined}"
         );
         assert!(
