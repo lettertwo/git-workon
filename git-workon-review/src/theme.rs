@@ -319,6 +319,13 @@ pub struct Palette {
     /// (and the probe's curated fallback); `false` for [`Palette::from_terminal`], so `auto`
     /// preserves the terminal's own background (transparency, images) rather than flattening it.
     pub paint_canvas: bool,
+    /// Whether this palette carries no hue (CS2's `NO_COLOR` follow-up, `no-color-mono`
+    /// finding). `true` only for [`Palette::mono`]; `false` for every other constructor. Sources
+    /// of color OUTSIDE the palette itself — namely [`crate::icons::icon_for_path`]'s hardcoded
+    /// per-filetype `Rgb` — can't consult a palette field to know they should go achromatic, so
+    /// `render.rs`'s icon paint sites check this flag directly and collapse to
+    /// [`Palette::foreground`] when it's set, rather than trusting the icon's own color.
+    pub colorless: bool,
 }
 
 impl Palette {
@@ -361,6 +368,7 @@ impl Palette {
             // directly rather than an authored literal.
             modified_fg: base.slot(9),
             paint_canvas: true,
+            colorless: false,
         }
     }
 
@@ -415,6 +423,7 @@ impl Palette {
             heading_fg: cyan,
             modified_fg: base.slot(9), // base09
             paint_canvas: true,
+            colorless: false,
         }
     }
 
@@ -464,6 +473,7 @@ impl Palette {
             // would defeat terminal transparency/background images for no benefit (the probed
             // fg/dim/gutter already match the inherited bg, since they came from the same probe).
             paint_canvas: false,
+            colorless: false,
         }
     }
 
@@ -538,6 +548,7 @@ impl Palette {
             heading_fg: Color::Reset,
             modified_fg: Color::Reset,
             paint_canvas: false,
+            colorless: true,
         }
     }
 
@@ -1160,6 +1171,18 @@ mod tests {
                 assert!(outline_unfocused < cursor);
             }
         }
+    }
+
+    #[test]
+    fn only_mono_sets_colorless() {
+        // `colorless` is the flag `render.rs`'s icon paint sites consult to collapse
+        // palette-external colors (nerd-font icons) to `foreground` under NO_COLOR — it must be
+        // true ONLY for `mono`, false for every curated/probed constructor.
+        assert!(!Palette::dark().colorless);
+        assert!(!Palette::light().colorless);
+        assert!(!Palette::from_terminal(probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a))).colorless);
+        assert!(Palette::mono(false).colorless);
+        assert!(Palette::mono(true).colorless);
     }
 
     #[test]

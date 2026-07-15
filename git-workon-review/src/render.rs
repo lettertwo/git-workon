@@ -1015,9 +1015,18 @@ fn build_outline_line(
                     path,
                     crate::theme::is_light_background(theme.background),
                 );
+                // Nerd-font icon colors are palette-external (hardcoded per-filetype `Rgb` from
+                // `icons::icon_for_path`, not a `Palette` field), so a colorless (NO_COLOR) theme
+                // must collapse them to `foreground` itself — see `Palette::colorless`'s doc
+                // comment.
+                let icon_fg = if theme.colorless {
+                    theme.foreground
+                } else {
+                    color.unwrap_or(theme.foreground)
+                };
                 spans.push(TSpan::styled(
                     format!("{icon} "),
-                    Style::default().fg(color.unwrap_or(theme.foreground)),
+                    Style::default().fg(icon_fg),
                 ));
             }
             // Flat/Stack rows (empty `guides`) split `path` at render time into `basename  dim/
@@ -1180,11 +1189,16 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
                 &f.path,
                 crate::theme::is_light_background(theme.background),
             );
+            // Same palette-external collapse as the outline's icon paint site above — see
+            // `Palette::colorless`'s doc comment.
+            let icon_fg = if theme.colorless {
+                theme.foreground
+            } else {
+                color.unwrap_or(theme.foreground)
+            };
             spans.push(TSpan::styled(
                 format!("{icon} "),
-                Style::default()
-                    .fg(color.unwrap_or(theme.foreground))
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(icon_fg).add_modifier(Modifier::BOLD),
             ));
         }
     }
@@ -4576,6 +4590,74 @@ mod tests {
         assert!(
             file_row.contains(crate::icons::icon_for_path("main.rs", false).0),
             "expected the rust file icon before main.rs, got: {file_row:?}"
+        );
+    }
+
+    #[test]
+    fn icon_mode_nerd_collapses_the_file_icon_color_to_foreground_under_a_colorless_theme() {
+        // The `no-color-mono` finding this guards: `icons::icon_for_path`'s hardcoded per-filetype
+        // `Rgb` is palette-EXTERNAL, so it must be collapsed to `foreground` by the render.rs paint
+        // site itself when `Palette::colorless` is set — `mono()`'s own fields (already `Reset`)
+        // can't do this for it. Companion to the theme.rs-level `only_mono_sets_colorless` test.
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        use crate::app::ChangesetView;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("main.rs", "fn main() {}\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "cs".to_string(),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
+
+        let mono = Palette::mono(false);
+        let buf = render_once_themed(&mut app, OUTLINE_TEST_WIDTH, 20, &mono);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        let (row_idx, row) = content
+            .iter()
+            .enumerate()
+            .skip(1) // y=0 is the winbar
+            .find(|(_, r)| r.contains("main.rs"))
+            .expect("main.rs file row present");
+        let icon = crate::icons::icon_for_path("main.rs", false).0;
+        let icon_x = row
+            .chars()
+            .position(|c| c == icon)
+            .expect("icon glyph present in the file row") as u16;
+
+        assert_eq!(
+            buf.cell((icon_x, row_idx as u16)).unwrap().style().fg,
+            Some(mono.foreground),
+            "icon fg must collapse to `foreground` under a colorless theme, got row: {row:?}"
         );
     }
 
