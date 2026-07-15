@@ -32,6 +32,8 @@ is stored **action-as-key** in **per-view subsections**:
 
 ```
 workon.review.theme                    = dark            ; global, non-view
+workon.review.theme.<slot>             = #rrggbb          ; base00-base0f override (CS1)
+workon.review.theme.<tint>             = #rrggbb          ; diff/cursor tint override (CS1)
 workon.review.<view>.bind.<action>     = "<key tokens>"  ; a keymap entry
 workon.review.<view>.<setting>         = <value>         ; view config
 ```
@@ -58,6 +60,12 @@ workon.review.<view>.<setting>         = <value>         ; view config
 - **View config** (non-binding) shares the view namespace: `workon.review.outline.width`,
   `workon.review.outline.mode`, `workon.review.diff.layout`, `workon.review.diff.zoom`.
   The `.bind.` marker is what distinguishes a keymap entry from a view setting.
+- **Theme overrides** (CS1, user-configurable colors tier — see
+  [ADR-035](035-review-theming-base16-hybrid.md)'s CS1 revision) live in the `review.theme`
+  subsection, distinct from the top-level `workon.review.theme` selection itself: `workon.review
+  .theme.base00`–`workon.review.theme.base0f` (base16 slot overrides) and eleven kebab-case tint
+  keys (`workon.review.theme.cursor-bg`, …). Same validation posture as an unknown bind
+  action — an unrecognized key or malformed `#rrggbb` value is a startup warning, not an error.
 - **Load-time inversion:** on startup, walk every `workon.review.*.bind.*` variable, split
   values into key tokens, and build the per-view key→action dispatch maps. This pass
   validates (unknown `bind.<action>` → warning; the action set is enumerable) and detects

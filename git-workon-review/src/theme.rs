@@ -38,6 +38,14 @@
 //! [`Palette::warn_fg`]: "this changeset needs restacking" and "this file was modified" are
 //! unrelated facts that happen to both want an amber tone, and collapsing them onto one field
 //! would make them un-independently themeable.
+//!
+//! **CS1 addition (`user-configurable colors tier`):** the deferred "user-configurable colors"
+//! tier from this module's original doc comment lands as [`ThemeOverrides`] — per-slot
+//! (`base00`–`base0f`) and per-tint (`del-subtle`, `cursor-bg`, …) git-config keys under
+//! `workon.review.theme.*`, read by `config::ReviewConfig::theme_overrides` and applied via
+//! [`Palette::apply_overrides`] on top of whichever base (`dark`/`light`/`auto`'s probe) was
+//! already resolved. Named bundled schemes (`theme = solarized`) were explicitly deferred —
+//! only the override-key tier landed; see ADR-035's CS1 revision note for the full table.
 
 use ratatui::style::Color;
 
@@ -102,6 +110,57 @@ impl Base16 {
 
     fn slot(&self, i: usize) -> Color {
         self.slots[i]
+    }
+}
+
+/// Parse a `workon.review.theme.*` color value: `#rrggbb` or bare `rrggbb`, six hex digits,
+/// case-insensitive. Deliberately no 3-digit shorthand (`#fff`) — the config schema names only
+/// the 6-digit form, so a shorthand is treated the same as any other malformed value: `None`,
+/// which `config::ReviewConfig::theme_overrides` turns into an ignore-and-warn.
+pub(crate) fn parse_hex_color(s: &str) -> Option<Color> {
+    let hex = s.strip_prefix('#').unwrap_or(s);
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
+/// Per-slot base16 and per-tint color overrides, read from `workon.review.theme.*` git config
+/// (CS1, user-configurable colors tier) and applied on top of an already-resolved [`Palette`] via
+/// [`Palette::apply_overrides`]. `slots` is private — built only through [`ThemeOverrides::set_slot`]
+/// so the 0–15 index invariant lives in one place; the 11 tint fields mirror
+/// [`Palette`]'s diff/cursor tint fields verbatim (same names, kebab-case in config).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThemeOverrides {
+    slots: [Option<Color>; 16],
+    pub del_subtle: Option<Color>,
+    pub del_strong: Option<Color>,
+    pub add_subtle: Option<Color>,
+    pub add_strong: Option<Color>,
+    pub del_staged_subtle: Option<Color>,
+    pub del_staged_strong: Option<Color>,
+    pub add_staged_subtle: Option<Color>,
+    pub add_staged_strong: Option<Color>,
+    pub cursor_bg: Option<Color>,
+    pub selection_bg: Option<Color>,
+    pub outline_cursor_unfocused_bg: Option<Color>,
+}
+
+impl ThemeOverrides {
+    /// Set the override for base16 slot `index` (0–15, i.e. `base00`–`base0f`). Panics on an
+    /// out-of-range index — callers (`config::ReviewConfig::theme_overrides`) only reach this
+    /// after validating the slot name parsed to `0..16`.
+    pub fn set_slot(&mut self, index: usize, color: Color) {
+        self.slots[index] = Some(color);
+    }
+
+    /// Whether no slot or tint override is set — used to skip [`Palette::apply_overrides`]
+    /// entirely when `workon.review.theme.*` is unset (the common case). Compared against
+    /// `default()` rather than enumerating fields so a future tint field can't be forgotten
+    /// here silently.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -423,6 +482,98 @@ impl Palette {
             crate::config::Theme::Auto => Self::dark(), // probe lives in main.rs/terminal_query
         }
     }
+
+    /// Apply `workon.review.theme.*` overrides on top of an already-resolved palette (CS1,
+    /// user-configurable colors tier) — works the same on ANY base (`dark`/`light`/`auto`'s
+    /// probe result), applied last in `main.rs`'s resolution chain.
+    ///
+    /// **Uniform slot rule:** a slot override rewrites every palette field role-mapped to that
+    /// slot, regardless of which base authored the field's current value — base00 →
+    /// [`Palette::background`] (and sets [`Palette::paint_canvas`], so an explicitly chosen
+    /// background always paints, even under `auto`, which otherwise leaves the canvas
+    /// unpainted), base03 → [`Palette::dim`], base04 → [`Palette::gutter`], base05 →
+    /// [`Palette::foreground`], base08 → [`Palette::error_fg`], base09 → [`Palette::modified_fg`],
+    /// base0A → [`Palette::warn_fg`], base0B → [`Palette::current_fg`], base0C →
+    /// [`Palette::heading_fg`], plus every [`Palette::syntax`] entry whose [`SYNTAX_SLOTS`]
+    /// template maps to that slot. This is deliberately uniform rather than "only override
+    /// fields the base didn't hand-author": the alternative (silently ignoring a slot override
+    /// for `dark()`'s hand-tuned `error_fg`) is the UX trap — a user who sets `base08` expects
+    /// red to change, full stop.
+    ///
+    /// Slot overrides do NOT re-derive the diff/cursor tints — that stays the 11 tint override
+    /// keys' job, applied last and verbatim below, so a slot override can't silently reshape a
+    /// hand-tuned wash it wasn't asked to touch.
+    pub fn apply_overrides(&mut self, overrides: &ThemeOverrides) {
+        for (capture, &slot) in SYNTAX_SLOTS.iter().enumerate() {
+            if let Some(color) = overrides.slots[slot] {
+                self.syntax[capture] = color;
+            }
+        }
+
+        if let Some(color) = overrides.slots[0] {
+            self.background = color;
+            self.paint_canvas = true;
+        }
+        if let Some(color) = overrides.slots[3] {
+            self.dim = color;
+        }
+        if let Some(color) = overrides.slots[4] {
+            self.gutter = color;
+        }
+        if let Some(color) = overrides.slots[5] {
+            self.foreground = color;
+        }
+        if let Some(color) = overrides.slots[8] {
+            self.error_fg = color;
+        }
+        if let Some(color) = overrides.slots[9] {
+            self.modified_fg = color;
+        }
+        if let Some(color) = overrides.slots[10] {
+            self.warn_fg = color;
+        }
+        if let Some(color) = overrides.slots[11] {
+            self.current_fg = color;
+        }
+        if let Some(color) = overrides.slots[12] {
+            self.heading_fg = color;
+        }
+
+        // Tint overrides assign last and verbatim — unaffected by any slot override above.
+        if let Some(color) = overrides.del_subtle {
+            self.del_subtle = color;
+        }
+        if let Some(color) = overrides.del_strong {
+            self.del_strong = color;
+        }
+        if let Some(color) = overrides.add_subtle {
+            self.add_subtle = color;
+        }
+        if let Some(color) = overrides.add_strong {
+            self.add_strong = color;
+        }
+        if let Some(color) = overrides.del_staged_subtle {
+            self.del_staged_subtle = color;
+        }
+        if let Some(color) = overrides.del_staged_strong {
+            self.del_staged_strong = color;
+        }
+        if let Some(color) = overrides.add_staged_subtle {
+            self.add_staged_subtle = color;
+        }
+        if let Some(color) = overrides.add_staged_strong {
+            self.add_staged_strong = color;
+        }
+        if let Some(color) = overrides.cursor_bg {
+            self.cursor_bg = color;
+        }
+        if let Some(color) = overrides.selection_bg {
+            self.selection_bg = color;
+        }
+        if let Some(color) = overrides.outline_cursor_unfocused_bg {
+            self.outline_cursor_unfocused_bg = color;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -742,5 +893,103 @@ mod tests {
             Palette::for_theme(Theme::Auto).del_subtle,
             Palette::dark().del_subtle
         );
+    }
+
+    #[test]
+    fn parse_hex_color_accepts_hash_and_bare_six_digit_hex() {
+        assert_eq!(
+            parse_hex_color("#2d2d2d"),
+            Some(Color::Rgb(0x2d, 0x2d, 0x2d))
+        );
+        assert_eq!(
+            parse_hex_color("2d2d2d"),
+            Some(Color::Rgb(0x2d, 0x2d, 0x2d))
+        );
+    }
+
+    #[test]
+    fn parse_hex_color_rejects_shorthand_invalid_and_empty() {
+        assert_eq!(parse_hex_color("#fff"), None, "3-digit shorthand rejected");
+        assert_eq!(parse_hex_color("2d2d2g"), None, "non-hex digit rejected");
+        assert_eq!(parse_hex_color(""), None, "empty rejected");
+    }
+
+    #[test]
+    fn empty_overrides_is_an_identity_on_dark() {
+        // Pixel-identity precedent (same as `dark_diff_tints_match_the_historical_constants`):
+        // an empty `ThemeOverrides` must leave every field untouched.
+        let overrides = ThemeOverrides::default();
+        assert!(overrides.is_empty());
+        let mut t = Palette::dark();
+        let before = Palette::dark();
+        t.apply_overrides(&overrides);
+        assert_eq!(t.background, before.background);
+        assert_eq!(t.foreground, before.foreground);
+        assert_eq!(t.error_fg, before.error_fg);
+        assert_eq!(t.heading_fg, before.heading_fg);
+        assert_eq!(t.del_subtle, before.del_subtle);
+        assert_eq!(t.cursor_bg, before.cursor_bg);
+        assert_eq!(t.paint_canvas, before.paint_canvas);
+        assert_eq!(
+            t.syntax(capture_index("keyword").unwrap()),
+            before.syntax(capture_index("keyword").unwrap())
+        );
+    }
+
+    #[test]
+    fn apply_overrides_base0e_recolors_the_keyword_syntax_capture() {
+        let mut overrides = ThemeOverrides::default();
+        overrides.set_slot(14, Color::Rgb(0x11, 0x22, 0x33)); // base0E → keyword
+        let mut t = Palette::dark();
+        t.apply_overrides(&overrides);
+        assert_eq!(
+            t.syntax(capture_index("keyword").unwrap()),
+            Color::Rgb(0x11, 0x22, 0x33)
+        );
+        // Unrelated captures are untouched.
+        assert_eq!(
+            t.syntax(capture_index("string").unwrap()),
+            Palette::dark().syntax(capture_index("string").unwrap())
+        );
+    }
+
+    #[test]
+    fn apply_overrides_base08_rewrites_error_fg_even_on_darks_hand_authored_value() {
+        // The uniform rule (see `Palette::apply_overrides`'s doc comment): a slot override
+        // rewrites its role-mapped field even when the base authored that field explicitly
+        // (`dark()`'s `error_fg` is a hand-tuned literal, not derived from base08).
+        let mut overrides = ThemeOverrides::default();
+        overrides.set_slot(8, Color::Rgb(0xaa, 0xbb, 0xcc)); // base08 → error_fg
+        let mut t = Palette::dark();
+        t.apply_overrides(&overrides);
+        assert_eq!(t.error_fg, Color::Rgb(0xaa, 0xbb, 0xcc));
+        assert_ne!(t.error_fg, Palette::dark().error_fg);
+    }
+
+    #[test]
+    fn apply_overrides_base00_on_a_from_terminal_palette_sets_paint_canvas() {
+        // `auto`'s probe result leaves `paint_canvas: false`; an explicit base00 override means
+        // the user chose a background, so it must paint even under `auto`.
+        let probed = probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a));
+        let mut t = Palette::from_terminal(probed);
+        assert!(!t.paint_canvas);
+        let mut overrides = ThemeOverrides::default();
+        overrides.set_slot(0, Color::Rgb(0x10, 0x10, 0x10));
+        t.apply_overrides(&overrides);
+        assert_eq!(t.background, Color::Rgb(0x10, 0x10, 0x10));
+        assert!(t.paint_canvas);
+    }
+
+    #[test]
+    fn apply_overrides_tint_lands_verbatim_unaffected_by_slot_overrides() {
+        let mut overrides = ThemeOverrides::default();
+        overrides.set_slot(8, Color::Rgb(0xaa, 0xbb, 0xcc)); // base08 → error_fg, NOT del_subtle
+        overrides.cursor_bg = Some(Color::Rgb(0x01, 0x02, 0x03));
+        let mut t = Palette::dark();
+        t.apply_overrides(&overrides);
+        assert_eq!(t.cursor_bg, Color::Rgb(0x01, 0x02, 0x03));
+        // The del/add tints are untouched by the base08 slot override — tint overrides are the
+        // only thing that moves them.
+        assert_eq!(t.del_subtle, Palette::dark().del_subtle);
     }
 }
