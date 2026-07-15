@@ -2593,7 +2593,7 @@ mod tests {
     fn single_pane_zoom_is_identical_to_combined_for_an_unstaged_only_file() {
         // The common case: a dirty-but-unstaged file. The default split gate downgrades it to a
         // single unstaged pane, whose view is byte-for-byte the combined view (index == HEAD when
-        // nothing is staged) — so a user who never presses `z` sees exactly the pre-zoom app.
+        // nothing is staged) — so a user who never presses `Z` sees exactly the pre-zoom app.
         let old = "l1\nl2\nl3\nl4\nl5\nold word here\nl7\nl8\nl9\nl10\n";
         let new = "l1\nl2\nl3\nl4\nl5\nnew word here\nl7\nl8\nl9\nl10\n";
         let fixture = FixtureBuilder::new()
