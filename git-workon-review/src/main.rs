@@ -1,5 +1,7 @@
 mod tui;
 
+use std::ffi::OsStr;
+
 use clap::{CommandFactory, Parser};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
@@ -11,7 +13,17 @@ use workon_review::config::{self, ReviewConfig};
 use workon_review::keymap::{self, Command, Keymap};
 use workon_review::source::{complete_source, resolve_source, Source};
 use workon_review::terminal_query;
-use workon_review::theme::Palette;
+use workon_review::theme::{self, Palette};
+
+/// Whether `NO_COLOR` (per `no-color.org`) requests colorless output — any non-empty value
+/// means yes, unset or empty means no. `FORCE_COLOR` is deliberately not consulted: `NO_COLOR`
+/// is the user's explicit request for THIS tool's colors, whereas `FORCE_COLOR` (already read
+/// elsewhere for test/output-capture posture) answers a different question. Takes `Option<&OsStr>`
+/// rather than reading `std::env::var_os` itself so tests can drive it without touching process
+/// env (the `FORCE_COLOR=3` dev-env trap this repo's tests already work around).
+fn no_color(var: Option<&OsStr>) -> bool {
+    var.is_some_and(|v| !v.is_empty())
+}
 
 /// A TUI for reviewing changesets
 #[derive(Debug, Parser)]
@@ -119,6 +131,21 @@ fn main() -> Result<()> {
         }
         Err(_) => Vec::new(),
     };
+
+    // CS2 (`no-color-mono`): `NO_COLOR` is an env kill-switch — it wins over any override
+    // applied just above, so it must be checked last, after resolution AND overrides. The
+    // ladder choice (`is_light_background`) reads the pre-mono `theme.background` so `auto`'s
+    // probe still picks the right dark/pale ladder. `FORCE_COLOR` is deliberately not consulted
+    // (see `no_color`'s doc comment).
+    if no_color(std::env::var_os("NO_COLOR").as_deref()) {
+        theme = Palette::mono(theme::is_light_background(theme.background));
+        // Crossterm ALSO honors NO_COLOR, by stripping every color SGR at the output layer —
+        // which would erase `mono()`'s achromatic washes and leave cursor/selection/staged
+        // attribution invisible (the exact unusability the grayscale ladders exist to prevent).
+        // This app owns NO_COLOR semantics at the palette level instead, so disable crossterm's
+        // blanket suppression and let the grayscale washes through.
+        crossterm::style::force_color_output(true);
+    }
 
     // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,
     // before `repo` moves — CS7. `view_config` reads into an owned `RawViewConfig`, so no
@@ -281,4 +308,24 @@ fn seat_app(
     }
 
     app
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_truth_table() {
+        assert!(!no_color(None), "unset must not trigger mono");
+        assert!(
+            !no_color(Some(OsStr::new(""))),
+            "empty must not trigger mono"
+        );
+        assert!(no_color(Some(OsStr::new("1"))));
+        assert!(
+            no_color(Some(OsStr::new("0"))),
+            "any non-empty value counts, per no-color.org"
+        );
+        assert!(no_color(Some(OsStr::new("true"))));
+    }
 }
