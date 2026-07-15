@@ -65,6 +65,8 @@ pub enum Command {
     PrevChangeset,
     ExpandGap,
     ExpandGapAll,
+    ResetGaps,
+    ExpandAllGaps,
     HscrollLeft,
     HscrollRight,
     // Diff view.
@@ -183,7 +185,11 @@ pub static REGISTRY: &[Registered] = &[
         command: Command::CycleZoom,
         view: View::Diff,
         name: "cycle-zoom",
-        default_keys: "z",
+        // Rebound from `z` (diff-fold-keys): `z` now anchors the `zM`/`zR` gap fold-all chords in
+        // this view, and a bare-key binding can't coexist with a longer chord sharing its prefix
+        // (see `shift_z_dispatches_cycle_zoom_with_no_collisions`'s doc comment for the
+        // mechanics). `Z` was free in `View::Diff`.
+        default_keys: "Z",
         description: "Cycle the staged/unstaged zoom",
     },
     Registered {
@@ -253,14 +259,14 @@ pub static REGISTRY: &[Registered] = &[
         command: Command::NextHunk,
         view: View::Diff,
         name: "next-hunk",
-        default_keys: "]h",
+        default_keys: "]h n",
         description: "Go to the next hunk",
     },
     Registered {
         command: Command::PrevHunk,
         view: View::Diff,
         name: "prev-hunk",
-        default_keys: "[h",
+        default_keys: "[h p",
         description: "Go to the previous hunk",
     },
     Registered {
@@ -311,6 +317,20 @@ pub static REGISTRY: &[Registered] = &[
         name: "expand-gap-all",
         default_keys: "E",
         description: "Reveal the whole collapsed gap under the cursor",
+    },
+    Registered {
+        command: Command::ResetGaps,
+        view: View::Diff,
+        name: "reset-gaps",
+        default_keys: "zM",
+        description: "Collapse all gaps back to the initial view",
+    },
+    Registered {
+        command: Command::ExpandAllGaps,
+        view: View::Diff,
+        name: "expand-all-gaps",
+        default_keys: "zR",
+        description: "Reveal every collapsed gap in the file",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {
@@ -1167,6 +1187,84 @@ mod tests {
                 &[key(KeyCode::Char('z')), key(KeyCode::Char('R'))]
             ),
             Dispatch::Command(Command::OutlineExpandAll)
+        );
+    }
+
+    /// CS3 (diff-fold-keys): `n`/`p` are extra default bindings on the existing hunk-nav
+    /// commands (`]h`/`[h`), added purely for symmetry with the outline's `n`/`p` changeset nav.
+    /// `primary_key` still picks the first token, so the footer/help keep showing `]h`/`[h` —
+    /// `next-hunk`/`prev-hunk` aren't in `DIFF_HINTS` today, but `primary_key`/`keys_for` (which
+    /// the help overlay uses) are exercised by `footer_hint_renders_the_curated_diff_entries` and
+    /// `help_sections_groups_global_and_the_focused_view_only`.
+    #[test]
+    fn n_and_p_dispatch_diff_hunk_nav_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "n/p hunk-nav defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('n'))]),
+            Dispatch::Command(Command::NextHunk)
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('p'))]),
+            Dispatch::Command(Command::PrevHunk)
+        );
+    }
+
+    /// CS3 (diff-fold-keys): `cycle-zoom` was rebound from bare `z` to `Z` to make room for the
+    /// `zM`/`zR` gap fold-all chords in `View::Diff`. This wasn't optional bookkeeping —
+    /// `match_keys` gives a strict-prefix match precedence over an exact one in the SAME scan
+    /// (see its doc comment): had `cycle-zoom` stayed on bare `z` alongside `zM`/`zR`, a lone `z`
+    /// press would always report `Pending` instead of firing `CycleZoom` immediately, and any
+    /// follow-up key that wasn't `M`/`R` would be swallowed as `Unmatched { mid_sequence: true }`
+    /// rather than re-processed — silently breaking `cycle-zoom` with no warning (`build_context`'s
+    /// collision check only flags identical sequences, not prefix overlaps, so it wouldn't catch
+    /// this). This test pins the resolved state: `Z` fires `CycleZoom` immediately, and `z` only
+    /// ever anchors the `zM`/`zR` chords below — never a bare-key command of its own again.
+    #[test]
+    fn shift_z_dispatches_cycle_zoom_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "cycle-zoom's rebind to Z must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('Z'))]),
+            Dispatch::Command(Command::CycleZoom)
+        );
+    }
+
+    /// `zM`/`zR` — reset/expand-all gaps in the diff view (companion to the outline's own
+    /// `zM`/`zR` fold-all, `z_m_and_z_r_dispatch_outline_fold_all_with_no_collisions` above).
+    /// Coexists cleanly with `Z` (`cycle-zoom`, see the test above) now that `cycle-zoom` no
+    /// longer claims the bare `z` prefix.
+    #[test]
+    fn z_m_and_z_r_dispatch_diff_gap_fold_all_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "zM/zR defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(
+                &km,
+                false,
+                &[key(KeyCode::Char('z')), key(KeyCode::Char('M'))]
+            ),
+            Dispatch::Command(Command::ResetGaps)
+        );
+        assert_eq!(
+            feed(
+                &km,
+                false,
+                &[key(KeyCode::Char('z')), key(KeyCode::Char('R'))]
+            ),
+            Dispatch::Command(Command::ExpandAllGaps)
         );
     }
 

@@ -447,6 +447,8 @@ enum Action {
     StartSelection,
     ExpandGap,
     ExpandGapAll,
+    ResetGaps,
+    ExpandAllGaps,
     HscrollLeft,
     HscrollRight,
     ToggleOutline,
@@ -495,6 +497,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::StartSelection => Action::StartSelection,
         Command::ExpandGap => Action::ExpandGap,
         Command::ExpandGapAll => Action::ExpandGapAll,
+        Command::ResetGaps => Action::ResetGaps,
+        Command::ExpandAllGaps => Action::ExpandAllGaps,
         Command::HscrollLeft => Action::HscrollLeft,
         Command::HscrollRight => Action::HscrollRight,
         Command::NextFile => Action::NextFile,
@@ -593,6 +597,8 @@ fn action_needs_loaded_view(action: Action) -> bool {
             | Action::ToggleSplitFocus
             | Action::ExpandGap
             | Action::ExpandGapAll
+            | Action::ResetGaps
+            | Action::ExpandAllGaps
     )
 }
 
@@ -630,6 +636,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::StartSelection => app.start_selection(),
         Action::ExpandGap => app.expand_gap_at_cursor(false),
         Action::ExpandGapAll => app.expand_gap_at_cursor(true),
+        Action::ResetGaps => app.reset_gaps(),
+        Action::ExpandAllGaps => app.expand_all_gaps(),
         Action::HscrollLeft => app.hscroll_left(),
         Action::HscrollRight => app.hscroll_right(),
         Action::ToggleOutline => app.toggle_outline(),
@@ -1553,16 +1561,43 @@ mod tests {
     }
 
     #[test]
-    fn z_and_w_map_to_zoom_and_split_focus() {
+    fn shift_z_and_w_map_to_zoom_and_split_focus() {
+        // diff-fold-keys: `cycle-zoom` moved off bare `z` to `Z` — `z` now anchors the `zM`/`zR`
+        // gap fold-all chords in this view (see `z_m_and_z_r_map_to_reset_and_expand_all_gaps`
+        // below), and a bare-key binding can't coexist with a longer chord sharing its prefix.
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('Z')), 20, false, false),
             Action::CycleZoom
         );
         assert_eq!(
             map_key(&km, &mut pending, key(KeyCode::Char('w')), 20, false, false),
             Action::ToggleSplitFocus
+        );
+    }
+
+    #[test]
+    fn z_m_and_z_r_map_to_reset_and_expand_all_gaps() {
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false, false),
+            Action::None,
+            "the first key of a chord reports no action yet (Pending)"
+        );
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('M')), 20, false, false),
+            Action::ResetGaps
+        );
+
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false, false),
+            Action::None
+        );
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('R')), 20, false, false),
+            Action::ExpandAllGaps
         );
     }
 

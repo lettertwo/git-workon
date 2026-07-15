@@ -18,8 +18,8 @@ use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{
-    align_file, collapse_gaps_with_expansions, gap_hidden_range, inline_rows, AlignedRow, CellKind,
-    DisplayRow, GapExpansion, InlineRow, Row,
+    align_file, collapse_gaps, collapse_gaps_with_expansions, gap_hidden_range, inline_rows,
+    AlignedRow, CellKind, DisplayRow, GapExpansion, InlineRow, Row,
 };
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
@@ -250,6 +250,48 @@ impl FileView {
         entry.after += more_after;
         entry.full |= full;
         self.rebuild_rows();
+    }
+
+    /// Collapse every gap back to the original, freshly-loaded window, discarding every
+    /// [`Self::expand_gap`]/[`Self::scope_expand_gap`] accumulated since. An empty
+    /// [`Self::expansions`] map already IS that original state (what [`Self::load`] starts with),
+    /// so nothing-to-discard returns `false` without rebuilding — the caller uses that to leave
+    /// selection/scroll state alone when the row space did not reshape (the same rule
+    /// [`App::expand_gap_at_cursor`] documents). Driven by `zM` — see [`App::reset_gaps`].
+    pub fn reset_expansions(&mut self) -> bool {
+        if self.expansions.is_empty() {
+            return false;
+        }
+        self.expansions.clear();
+        self.rebuild_rows();
+        true
+    }
+
+    /// Reveal every collapsed gap in the file at once. Collects the gap keys from the BASE
+    /// collapse ([`collapse_gaps`], not [`Self::display`]) so a gap that's already partially
+    /// expanded is still caught — the base collapse always has every gap the file can have, while
+    /// the current display only shows the ones still collapsed under the CURRENT expansions.
+    /// Returns whether anything actually changed (some gap was not already fully revealed);
+    /// a gapless or already-fully-expanded file skips the rebuild and returns `false`, same
+    /// contract as [`Self::reset_expansions`].
+    pub fn expand_all_gaps(&mut self) -> bool {
+        let mut changed = false;
+        for row in collapse_gaps(&self.aligned) {
+            if let DisplayRow::Gap { key, .. } = row {
+                changed |= !self.expansions.get(&key).is_some_and(|e| e.full);
+                self.expansions.insert(
+                    key,
+                    GapExpansion {
+                        full: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        if changed {
+            self.rebuild_rows();
+        }
+        changed
     }
 
     /// CS9's scope-reveal: widen the gap keyed `key` to uncover a tree-sitter scope range
@@ -582,7 +624,7 @@ pub enum Role {
     Staged,
 }
 
-/// The zoom the user *requested* via `z` — persists across file navigation (like [`Layout`]). The
+/// The zoom the user *requested* via `Z` — persists across file navigation (like [`Layout`]). The
 /// actual state rendered per file is [`EffectiveZoom`], resolved by [`effective_zoom`] from this
 /// plus the file's available sub-diffs; a file lacking the requested role collapses to
 /// [`Role::Combined`] rather than showing an empty pane.
@@ -1204,7 +1246,7 @@ pub struct App {
     highlighter: TsHighlighter,
     /// Current render layout; see [`Layout`]'s doc comment for the persistence contract.
     pub layout: Layout,
-    /// The requested zoom (cycled by `z`); the effective per-file zoom is resolved each frame via
+    /// The requested zoom (cycled by `Z`); the effective per-file zoom is resolved each frame via
     /// [`effective_zoom`]. Persists across file navigation, like [`Self::layout`].
     pub zoom: Zoom,
     /// Which split pane has focus. Only meaningful under [`EffectiveZoom::Split`]; reset to
@@ -2225,7 +2267,7 @@ impl App {
     /// [`Self::complete_pending_open`]'s tail — with one refinement over a plain "always clear"
     /// rule: an `Ok` result only clears the pending open when its SHAPE satisfies the current
     /// effective zoom (see [`loaded_views_satisfy`]). Without this, a zoom cycled mid-load
-    /// (`z` is exempt from force-completion — [`Self::open_current`] re-defers with
+    /// (`Z` is exempt from force-completion — [`Self::open_current`] re-defers with
     /// `open_pending_dispatched = false`) lets the stale-shaped in-flight result seat only the
     /// old view, clear the pending flags, and strand the new zoom's view forever un-dispatched.
     /// When unsatisfied, `open_pending` stays set and `open_pending_dispatched` resets to
@@ -2357,7 +2399,7 @@ impl App {
         }
     }
 
-    /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`z`). The new zoom
+    /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`Z`). The new zoom
     /// persists across file navigation; both panes reset to their first hunks so `cursor`/`scroll`
     /// are always valid for the now-active view(s).
     pub fn cycle_zoom(&mut self) {
@@ -3790,6 +3832,41 @@ impl App {
         self.clamp_cursor();
     }
 
+    /// Collapse every gap in the focused file's view back to the original, freshly-loaded state,
+    /// discarding any accumulated [`Self::expand_gap_at_cursor`] reveals (`zM`, mirroring the
+    /// outline's `OutlineCollapseAll`). Scope: the focused view only ([`FileView::expansions`] is
+    /// per-file, same as a refresh already clears it). A no-op when there's no loaded view
+    /// (mirrors [`Self::expand_gap_at_cursor`]'s guard).
+    ///
+    /// `zM`/`zR` share the `z` prefix in `View::Diff`, which is why `cycle-zoom` moved off bare
+    /// `z` to `Z` (see `keymap::tests::shift_z_dispatches_cycle_zoom_with_no_collisions`'s doc
+    /// comment for the mechanics that forced the rebind).
+    pub fn reset_gaps(&mut self) {
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        // Tail only when the row space actually reshaped — a no-op zM must leave an in-progress
+        // selection alone, the same rule expand_gap_at_cursor documents above.
+        if view.reset_expansions() {
+            self.cancel_selection();
+            self.derive_scroll();
+            self.clamp_cursor();
+        }
+    }
+
+    /// Reveal every collapsed gap in the focused file's view at once (`zR`, mirroring the
+    /// outline's `OutlineExpandAll`). Scope and tail mirror [`Self::reset_gaps`].
+    pub fn expand_all_gaps(&mut self) {
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        if view.expand_all_gaps() {
+            self.cancel_selection();
+            self.derive_scroll();
+            self.clamp_cursor();
+        }
+    }
+
     /// Toggle between side-by-side and inline layouts (`L`). Deliberately does not try to
     /// re-derive an exactly equivalent `cursor` position for the new layout — the two layouts'
     /// row vectors track the same underlying content in a different shape, and translating
@@ -3985,7 +4062,7 @@ impl App {
             );
         } else {
             self.notify(
-                format!("{verb} in the unstaged/staged pane — cycle zoom (z)"),
+                format!("{verb} in the unstaged/staged pane — cycle zoom (Z)"),
                 Severity::Error,
             );
         }
@@ -4675,7 +4752,7 @@ pub enum LoadedViews {
 /// Whether a loaded result's SHAPE — what zoom it was built against, per [`FileLoadSpec::zoom`]
 /// — still matches `current_zoom`, the current file's effective zoom at result-apply time. Used
 /// by [`App::apply_file_ready`] to tell a still-useful deferred-open result apart from one a
-/// mid-load `z` cycle outran: `Single` satisfies only the SAME role's `Single`, `Split`
+/// mid-load `Z` cycle outran: `Single` satisfies only the SAME role's `Single`, `Split`
 /// satisfies only `Split` (never the reverse — a `Split` result doesn't seat a `Single` open,
 /// and vice versa, even though `set_if_absent` already caches whichever roles it carries).
 fn loaded_views_satisfy(views: &LoadedViews, current_zoom: EffectiveZoom) -> bool {
@@ -5329,7 +5406,7 @@ mod tests {
             .expect("first take dispatches against the Split zoom");
         assert_eq!(spec.zoom, EffectiveZoom::Split);
 
-        // Mid-load `z`: CycleZoom is exempt from force-completion, so this re-defers the open
+        // Mid-load `Z`: CycleZoom is exempt from force-completion, so this re-defers the open
         // against the NEW zoom instead of blocking for it.
         app.cycle_zoom();
         assert!(
@@ -11215,6 +11292,151 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, DisplayRow::Gap { .. })),
             "the gap must be back in its base (still-collapsed) form"
+        );
+    }
+
+    // ── diff-fold-keys CS3: reset (`zM`) / expand-all (`zR`) gaps ───────────
+
+    #[test]
+    fn reset_gaps_collapses_an_expanded_gap_back_to_the_freshly_loaded_shape() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let freshly_loaded_len = app.current_view_ref().unwrap().display.len();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+        assert!(
+            app.current_view_ref().unwrap().display.len() > freshly_loaded_len,
+            "precondition: the gap must actually have expanded"
+        );
+
+        app.reset_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert_eq!(
+            view.display.len(),
+            freshly_loaded_len,
+            "reset must return the display to its freshly-loaded (fully collapsed) shape"
+        );
+        assert!(
+            view.display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "a `Gap` row must be back after resetting"
+        );
+    }
+
+    #[test]
+    fn reset_gaps_with_nothing_expanded_is_a_no_op() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let before_len = app.current_view_ref().unwrap().display.len();
+        let before_cursor = app.cursor;
+        // An in-progress selection must survive a no-op zM — the row space didn't reshape, so
+        // there's no reason to destroy it (same rule as expand_gap_at_cursor's non-gap no-op).
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+
+        app.reset_gaps();
+
+        assert_eq!(
+            app.current_view_ref().unwrap().display.len(),
+            before_len,
+            "no-op must not change the row count"
+        );
+        assert_eq!(app.cursor, before_cursor, "no-op must not move the cursor");
+        assert!(
+            app.selection_anchor.is_some(),
+            "a no-op reset must leave an in-progress selection alone"
+        );
+    }
+
+    #[test]
+    fn expand_all_gaps_on_a_fully_expanded_file_is_a_no_op_that_keeps_the_selection() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.expand_all_gaps();
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+
+        app.expand_all_gaps();
+
+        assert!(
+            app.selection_anchor.is_some(),
+            "re-running zR with every gap already revealed must leave the selection alone"
+        );
+    }
+
+    #[test]
+    fn reset_gaps_keeps_the_cursor_in_bounds_after_collapsing_an_expanded_region() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+        // Put the cursor deep inside the just-revealed region, past where the reset shape ends.
+        app.cursor = app.current_view_ref().unwrap().display.len() - 1;
+
+        app.reset_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            app.cursor < view.display.len(),
+            "cursor must be clamped back into the reset (shorter) display: {} vs len {}",
+            app.cursor,
+            view.display.len()
+        );
+    }
+
+    #[test]
+    fn expand_all_gaps_leaves_no_gap_row_behind() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.expand_all_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "expand-all must reveal every gap: {:?}",
+            view.display
+        );
+        assert!(
+            app.cursor < view.display.len(),
+            "cursor must stay in bounds"
+        );
+    }
+
+    #[test]
+    fn expand_all_gaps_then_reset_gaps_round_trips_to_the_freshly_loaded_shape() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let freshly_loaded_len = app.current_view_ref().unwrap().display.len();
+
+        app.expand_all_gaps();
+        assert!(
+            app.current_view_ref().unwrap().display.len() > freshly_loaded_len,
+            "precondition: expand-all must have revealed more rows"
+        );
+
+        app.reset_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert_eq!(
+            view.display.len(),
+            freshly_loaded_len,
+            "reset must undo an expand-all just as it undoes a partial expansion"
         );
     }
 
