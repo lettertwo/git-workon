@@ -201,7 +201,11 @@ found by driving the real binary under a PTY: crossterm ALSO honors `NO_COLOR`, 
 every color SGR at the output layer — which would erase the grayscale washes too and leave
 cursor/selection/staged attribution invisible. The app owns `NO_COLOR` semantics at the palette
 level instead, so the mono branch calls `crossterm::style::force_color_output(true)` to disable
-that blanket suppression and let the achromatic ladders through.
+that blanket suppression and let the achromatic ladders through. That same re-enable, however,
+also re-opens the icon color channel for `icons::icon_for_path`'s hardcoded per-filetype `Rgb` —
+a palette-EXTERNAL color source `mono()`'s own `Color::Reset` fields can't reach — so `Palette`
+carries a `colorless` flag (`false` on every curated/probed constructor, `true` only on `mono`)
+and `render.rs`'s icon paint sites collapse to `foreground` themselves whenever it's set.
 
 ## References
 
