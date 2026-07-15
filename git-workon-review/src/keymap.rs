@@ -81,6 +81,10 @@ pub enum Command {
     OutlineDiscard,
     OutlineHscrollLeft,
     OutlineHscrollRight,
+    OutlineNextChangeset,
+    OutlinePrevChangeset,
+    OutlineCollapseAll,
+    OutlineExpandAll,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -386,6 +390,34 @@ pub static REGISTRY: &[Registered] = &[
         name: "outline-hscroll-right",
         default_keys: ">",
         description: "Pan the outline right",
+    },
+    Registered {
+        command: Command::OutlineNextChangeset,
+        view: View::Outline,
+        name: "outline-next-changeset",
+        default_keys: "n",
+        description: "Jump to the next changeset",
+    },
+    Registered {
+        command: Command::OutlinePrevChangeset,
+        view: View::Outline,
+        name: "outline-prev-changeset",
+        default_keys: "p",
+        description: "Jump to the previous changeset",
+    },
+    Registered {
+        command: Command::OutlineCollapseAll,
+        view: View::Outline,
+        name: "outline-collapse-all",
+        default_keys: "zM",
+        description: "Collapse every changeset/directory in the outline",
+    },
+    Registered {
+        command: Command::OutlineExpandAll,
+        view: View::Outline,
+        name: "outline-expand-all",
+        default_keys: "zR",
+        description: "Expand every changeset/directory in the outline",
     },
 ];
 
@@ -847,10 +879,15 @@ const DIFF_HINTS: &[HintItem] = &[
 const OUTLINE_HINTS: &[HintItem] = &[
     HintItem::Pair(Command::OutlineDown, Command::OutlineUp, "move"),
     HintItem::One(Command::OutlineConfirm, "open"),
+    HintItem::Pair(
+        Command::OutlineNextChangeset,
+        Command::OutlinePrevChangeset,
+        "changeset",
+    ),
     HintItem::One(Command::OutlineCycleMode, "mode"),
-    HintItem::One(Command::ToggleOutline, "outline"),
+    // No `o outline` / `q quit` here: with the changeset pair the full set no longer fits 80
+    // cols, and both stay discoverable in the diff footer and the help overlay.
     HintItem::One(Command::ToggleHelp, "help"),
-    HintItem::One(Command::Quit, "quit"),
 ];
 
 /// Build the persistent, always-visible footer hint string for `focused` ([`View::Diff`] or
@@ -1090,6 +1127,50 @@ mod tests {
     }
 
     #[test]
+    fn n_and_p_dispatch_outline_changeset_nav_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "n/p defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(&km, true, &[key(KeyCode::Char('n'))]),
+            Dispatch::Command(Command::OutlineNextChangeset)
+        );
+        assert_eq!(
+            feed(&km, true, &[key(KeyCode::Char('p'))]),
+            Dispatch::Command(Command::OutlinePrevChangeset)
+        );
+    }
+
+    #[test]
+    fn z_m_and_z_r_dispatch_outline_fold_all_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "zM/zR defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(
+                &km,
+                true,
+                &[key(KeyCode::Char('z')), key(KeyCode::Char('M'))]
+            ),
+            Dispatch::Command(Command::OutlineCollapseAll)
+        );
+        assert_eq!(
+            feed(
+                &km,
+                true,
+                &[key(KeyCode::Char('z')), key(KeyCode::Char('R'))]
+            ),
+            Dispatch::Command(Command::OutlineExpandAll)
+        );
+    }
+
+    #[test]
     fn a_config_rebind_overrides_the_default() {
         let km = Keymap::from_bindings(&[RawBinding {
             view: View::Diff,
@@ -1314,9 +1395,17 @@ mod tests {
         let hint = footer_hint(&km, View::Outline, OutlineMode::Stack);
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("enter open"), "got: {hint:?}");
+        assert!(hint.contains("n/p changeset"), "got: {hint:?}");
         assert!(
             hint.contains("i \u{2192}stack-tree"),
             "cycling from Stack must show the next mode, StackTree; got: {hint:?}"
+        );
+        assert!(hint.contains("? help"), "got: {hint:?}");
+        assert!(
+            hint.chars().count() <= 80,
+            "the curated outline hint must fit an 80-col footer even with the longest \
+             next-mode label (stack-tree); got {} chars: {hint:?}",
+            hint.chars().count()
         );
     }
 

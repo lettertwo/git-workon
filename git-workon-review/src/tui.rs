@@ -461,6 +461,10 @@ enum Action {
     OutlineDiscard,
     OutlineHscrollLeft,
     OutlineHscrollRight,
+    OutlineNextChangeset,
+    OutlinePrevChangeset,
+    OutlineCollapseAll,
+    OutlineExpandAll,
     None,
 }
 
@@ -511,6 +515,10 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::OutlineDiscard => Action::OutlineDiscard,
         Command::OutlineHscrollLeft => Action::OutlineHscrollLeft,
         Command::OutlineHscrollRight => Action::OutlineHscrollRight,
+        Command::OutlineNextChangeset => Action::OutlineNextChangeset,
+        Command::OutlinePrevChangeset => Action::OutlinePrevChangeset,
+        Command::OutlineCollapseAll => Action::OutlineCollapseAll,
+        Command::OutlineExpandAll => Action::OutlineExpandAll,
     }
 }
 
@@ -648,6 +656,10 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::OutlineDiscard => app.outline_discard(),
         Action::OutlineHscrollLeft => app.outline_hscroll_left(),
         Action::OutlineHscrollRight => app.outline_hscroll_right(),
+        Action::OutlineNextChangeset => app.outline_next_changeset(),
+        Action::OutlinePrevChangeset => app.outline_prev_changeset(),
+        Action::OutlineCollapseAll => app.outline_collapse_all(),
+        Action::OutlineExpandAll => app.outline_expand_all(),
         Action::None => {}
     }
     false
