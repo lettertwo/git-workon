@@ -157,8 +157,9 @@ pub struct OutlineFile {
 /// to know about [`crate::app::ChangesetView`] or `workon::Changeset` at all.
 #[derive(Debug, Clone)]
 pub struct OutlineChangeset {
-    /// The changeset's title, falling back to its name — same rule the winbar (render.rs)
-    /// already uses.
+    /// The changeset's display label (`crate::app::display_label` — title falling back to name,
+    /// with the uncommitted layer rendered as "Uncommitted changes"), the same rule the winbar
+    /// and summary panel use.
     pub label: String,
     /// Mirrors `workon::Changeset::current` — drives the outline's green current marker.
     pub current: bool,
@@ -284,15 +285,12 @@ pub(crate) fn build_items(
 /// single trie has no one owning changeset to key by).
 ///
 /// `cs_idx` is load-bearing here, not just belt-and-suspenders: a changeset's own `label` is NOT
-/// unique across a single snapshot — [`crate::acquire::uncommitted_changeset`] and Graphite's
-/// `insert_uncommitted_layer` both name the synthetic uncommitted-layer changeset after the SAME
-/// branch its committed node is named after (no title on either), so a branch's committed node
-/// and its own uncommitted worktree layer are two DIFFERENT rows that render the identical label.
-/// Keying by label alone would fold both together the moment either was toggled. `cs_idx` is
-/// still the true index into `App::changesets` (stable across an ordinary refresh — only a
-/// structural stack change, e.g. a changeset added/removed, shifts it), matching the same
-/// "identity survives refresh via `cs_idx`" precedent [`crate::app::OutlineRowIdentity`] already
-/// relies on for staging-verb restore.
+/// guaranteed unique across a single snapshot in general (e.g. two changesets could otherwise
+/// share a title), so keying by label alone would risk folding unrelated rows together the
+/// moment either was toggled. `cs_idx` is still the true index into `App::changesets` (stable
+/// across an ordinary refresh — only a structural stack change, e.g. a changeset added/removed,
+/// shifts it), matching the same "identity survives refresh via `cs_idx`" precedent
+/// [`crate::app::OutlineRowIdentity`] already relies on for staging-verb restore.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FoldKey {
     Header { label: String, cs_idx: usize },

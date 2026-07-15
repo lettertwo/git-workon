@@ -9,8 +9,9 @@
 //!
 //! `workon::Changeset` (see `git-workon-lib/src/changeset.rs`) exposes only `name`/`title` for a
 //! changeset today — no commit body/message. [`changeset_summary`] therefore renders the
-//! label (title, falling back to name — the same rule the winbar/outline header already use)
-//! plus the diffstat; there is no commit-message row. Surfacing the commit body would need a
+//! label (`crate::app::display_label` — title falling back to name, with the uncommitted layer
+//! rendered as "Uncommitted changes"; the same rule the winbar/outline header use) plus the
+//! diffstat; there is no commit-message row. Surfacing the commit body would need a
 //! `repo.find_commit` lookup keyed off the changeset's head OID — left as a follow-up, not part
 //! of this changeset's scope.
 

@@ -1339,6 +1339,20 @@ pub struct Notice {
     pub severity: Severity,
 }
 
+/// The one display-label rule for a changeset, shared by the outline header
+/// ([`App::outline_snapshot`]), the summary panel ([`App::summary_for`]), and the winbar
+/// (`render::render_winbar`): title, falling back to name — except the synthetic uncommitted
+/// worktree layer, which is named after the SAME branch as its committed node (see
+/// `workon::Changeset`'s `insert_uncommitted_layer` / [`crate::acquire::uncommitted_changeset`])
+/// and so renders as "Uncommitted changes" instead of duplicating that label.
+pub(crate) fn display_label(cs: &Changeset) -> String {
+    if cs.span == ChangesetSpan::Uncommitted {
+        "Uncommitted changes".to_string()
+    } else {
+        cs.title.clone().unwrap_or_else(|| cs.name.clone())
+    }
+}
+
 impl App {
     /// Build an [`App`] reviewing a single uncommitted changeset — the M2–M4 shape, and still
     /// what a non-Graphite (or clean-Graphite-tip) repo degrades to under M5's auto-detect
@@ -2473,7 +2487,7 @@ impl App {
         self.changesets
             .iter()
             .map(|v| OutlineChangeset {
-                label: v.cs.title.clone().unwrap_or_else(|| v.cs.name.clone()),
+                label: display_label(&v.cs),
                 current: v.cs.current,
                 needs_restack: v.cs.needs_restack,
                 loading: v.is_pending(),
@@ -2571,11 +2585,7 @@ impl App {
         match target {
             SummaryTarget::Changeset(cs_idx) => {
                 let view = &self.changesets[cs_idx];
-                let label = view
-                    .cs
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| view.cs.name.clone());
+                let label = display_label(&view.cs);
                 let failure_message = view.failure_message().map(|s| s.to_string());
                 Summary::Changeset(summary::changeset_summary(
                     label,
@@ -8788,11 +8798,15 @@ mod tests {
 
     /// A minimal [`Changeset`] descriptor for the slot tests below — the slot model only cares
     /// about the metadata `ChangesetView::pending`/`failed` carry alongside a diff-free
-    /// [`DiffState`], not any real git content.
+    /// [`DiffState`], not any real git content. The span must be a committed variant (zero OID
+    /// is fine, nothing diffs it) so the outline labels these by name rather than as the
+    /// "Uncommitted changes" layer.
     fn bare_changeset(name: &str, current: bool) -> Changeset {
         Changeset {
             name: name.to_string(),
-            span: ChangesetSpan::Uncommitted,
+            span: ChangesetSpan::CommittedRoot {
+                head: git2::Oid::ZERO_SHA1,
+            },
             title: None,
             current,
             needs_restack: false,
@@ -9121,6 +9135,86 @@ mod tests {
         };
         assert_eq!(change_for("c1.txt"), FileStatus::Added);
         assert_eq!(change_for("u1.txt"), FileStatus::Untracked);
+    }
+
+    /// `outline_snapshot`'s label fallback (`title` else `name`) used to render the SAME label
+    /// for a branch's committed node and its own uncommitted worktree layer — both are named
+    /// after the same branch, no title on either (see `FoldKey`'s doc comment, outline.rs). The
+    /// uncommitted layer must instead say "Uncommitted changes", so the branch name appears
+    /// exactly once (on the committed node).
+    #[test]
+    fn outline_snapshot_labels_the_uncommitted_layer_uncommitted_changes_not_the_branch_name() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("base.txt", "b\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("c1.txt", "c1\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        std::fs::write(repo.workdir().unwrap().join("u1.txt"), "u1\n").unwrap();
+
+        let committed = Changeset {
+            name: "feature".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let uncommitted = Changeset {
+            name: "feature".to_string(),
+            span: ChangesetSpan::Uncommitted,
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_c = ChangesetView::from_changeset_diff(
+            committed.clone(),
+            crate::acquire::diff_changeset(repo, &committed).unwrap(),
+        );
+        let view_u = ChangesetView::from_changeset_diff(
+            uncommitted.clone(),
+            crate::acquire::diff_changeset(repo, &uncommitted).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_c, view_u]);
+        app.open_current();
+        app.outline.mode = OutlineMode::Stack;
+        // Pin BaseFirst: this asserts an exact label vec, and display order is incidental here.
+        app.outline.order = OutlineOrder::BaseFirst;
+
+        let labels: Vec<String> = app
+            .outline_items()
+            .into_iter()
+            .filter_map(|it| match it {
+                OutlineItem::Header { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["feature", "Uncommitted changes"],
+            "the committed node keeps the branch name; the uncommitted layer must say \
+             \"Uncommitted changes\" instead of duplicating it"
+        );
+
+        // Label parity: the summary panel (and the winbar, which reads the same
+        // `display_label` helper) must agree with the outline header — the uncommitted layer
+        // is `current: true` in this fixture, so both non-outline surfaces target it.
+        let Summary::Changeset(summary) = app.summary_for(SummaryTarget::Changeset(1)) else {
+            panic!("expected a changeset summary for the uncommitted layer");
+        };
+        assert_eq!(
+            summary.label, "Uncommitted changes",
+            "the summary panel must use the same display-label rule as the outline header"
+        );
     }
 
     #[test]
