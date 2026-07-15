@@ -3036,6 +3036,37 @@ impl App {
         self.outline_move_to(last);
     }
 
+    /// `n` while the outline has focus: jump the cursor to the next [`OutlineItem::Header`] row
+    /// AFTER the current cursor position, or no-op (no wraparound) when there isn't one. Goes
+    /// through [`Self::outline_move_to`], so — like `g`/`G` — landing on a Header row never jumps
+    /// the diff (only a Header's own `Enter`/fold toggle or a File-row nav does that).
+    pub fn outline_next_changeset(&mut self) {
+        let items = self.outline_items();
+        let cursor = self.outline.cursor;
+        if let Some(off) = items
+            .iter()
+            .skip(cursor + 1)
+            .position(|item| matches!(item, OutlineItem::Header { .. }))
+        {
+            self.outline_move_to(cursor + 1 + off);
+        }
+    }
+
+    /// `p` while the outline has focus: jump the cursor to the next [`OutlineItem::Header`] row
+    /// BEFORE the current cursor position, or no-op (no wraparound) when there isn't one. The
+    /// counterpart to [`Self::outline_next_changeset`] — see its doc comment for the shared
+    /// no-diff-jump invariant.
+    pub fn outline_prev_changeset(&mut self) {
+        let items = self.outline_items();
+        let cursor = self.outline.cursor;
+        if let Some(idx) = items[..cursor]
+            .iter()
+            .rposition(|item| matches!(item, OutlineItem::Header { .. }))
+        {
+            self.outline_move_to(idx);
+        }
+    }
+
     /// `Enter` while the outline has focus: a FILE row jumps the diff straight there and returns
     /// focus to the diff (unchanged since CS3). A HEADER or DIR row instead TOGGLES that row's
     /// fold state (CS5, `outline-fold`) and deliberately does NOT return focus — you're
@@ -3080,6 +3111,41 @@ impl App {
             set.insert(key);
         }
         self.derive_outline_scroll(self.outline_items().len());
+    }
+
+    /// `zM` while the outline has focus: collapse every foldable (Header/Dir) row of the CURRENT
+    /// [`OutlineMode`], unlike [`Self::outline_toggle_fold`]'s single-row flip. Scans the
+    /// UNFOLDED build ([`outline::build_items`] over the current snapshot — the same source
+    /// [`Self::outline_folded`] itself folds) rather than [`Self::outline_items`], so a row
+    /// already hidden under an existing fold still gets its own key recorded (collapsing
+    /// everything must be idempotent regardless of what's already collapsed). Unlike
+    /// [`Self::outline_toggle_fold`], this can hide the row the cursor itself sits on, so it
+    /// re-derives the cursor via [`Self::sync_outline_to_current`] (the same reseat
+    /// [`Self::outline_cycle_mode`] uses for its own row-list reshape) rather than trusting the
+    /// toggle's "only descendants move" invariant, which doesn't hold here.
+    pub fn outline_collapse_all(&mut self) {
+        let snapshot = self.outline_snapshot();
+        let full = outline::build_items(&snapshot, self.outline.mode, self.outline.order);
+        let set = self.outline.folds.entry(self.outline.mode).or_default();
+        for item in &full {
+            if let Some(key) = FoldKey::for_item(item) {
+                set.insert(key);
+            }
+        }
+        self.sync_outline_to_current();
+    }
+
+    /// `zR` while the outline has focus: expand every folded row of the CURRENT [`OutlineMode`] —
+    /// clears that mode's fold set entirely. See [`Self::outline_collapse_all`] for the cursor
+    /// reseat rationale (shared here too, even though expanding can only ever ADD rows, never
+    /// hide the cursor's own).
+    pub fn outline_expand_all(&mut self) {
+        self.outline
+            .folds
+            .entry(self.outline.mode)
+            .or_default()
+            .clear();
+        self.sync_outline_to_current();
     }
 
     // ── Outline staging (CS7) ───────────────────────────────────────────────────
@@ -10551,6 +10617,201 @@ mod tests {
                 .get(&OutlineMode::Stack)
                 .is_some_and(|s| !s.is_empty()),
             "landing on the collapsed ancestor must NOT auto-expand it"
+        );
+    }
+
+    // ── n/p (outline changeset nav) + zM/zR (collapse/expand all) ──────────────
+
+    #[test]
+    fn outline_next_changeset_jumps_to_the_next_header_without_jumping_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        // Row order (BaseFirst): [Header cs-a, File a1, File a2, Header cs-b, File b1].
+        app.outline.cursor = 1; // a1's row
+        let cursor_before = (app.current_cs(), app.current);
+
+        app.outline_next_changeset();
+        assert_eq!(app.outline.cursor, 3, "must land on cs-b's header row");
+        assert_eq!(
+            (app.current_cs(), app.current),
+            cursor_before,
+            "a header landing must not jump the diff"
+        );
+    }
+
+    #[test]
+    fn outline_next_changeset_does_not_wrap_past_the_last_header() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 3; // cs-b's header, the LAST header row
+
+        app.outline_next_changeset();
+        assert_eq!(
+            app.outline.cursor, 3,
+            "no next header to jump to — the cursor must not move"
+        );
+    }
+
+    #[test]
+    fn outline_prev_changeset_jumps_to_the_previous_header_without_jumping_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 4; // b1's row
+        let cursor_before = (app.current_cs(), app.current);
+
+        app.outline_prev_changeset();
+        assert_eq!(app.outline.cursor, 3, "must land on cs-b's own header row");
+        assert_eq!(
+            (app.current_cs(), app.current),
+            cursor_before,
+            "a header landing must not jump the diff"
+        );
+
+        app.outline_prev_changeset();
+        assert_eq!(app.outline.cursor, 0, "must land on cs-a's header row");
+    }
+
+    #[test]
+    fn outline_prev_changeset_does_not_wrap_past_the_first_header() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 0; // cs-a's header, the FIRST header row
+
+        app.outline_prev_changeset();
+        assert_eq!(
+            app.outline.cursor, 0,
+            "no previous header to jump to — the cursor must not move"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_folds_every_header_leaving_only_header_rows() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        assert_eq!(app.outline_items().len(), 5, "sanity: both stacks expanded");
+
+        app.outline_collapse_all();
+        let items = app.outline_items();
+        assert_eq!(
+            items.len(),
+            2,
+            "only the two Header rows remain once every changeset is collapsed"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|it| matches!(it, OutlineItem::Header { .. })),
+            "every remaining row must be a Header row: {items:?}"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_is_idempotent_when_a_header_is_already_folded() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 3; // cs-b's header
+        app.outline_confirm(); // pre-collapse cs-b only
+
+        app.outline_collapse_all();
+        assert_eq!(
+            app.outline_items().len(),
+            2,
+            "collapse-all must still fold cs-a even though cs-b was already folded"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_reseats_a_cursor_on_a_row_that_just_got_hidden() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 1; // a1's row — about to be hidden under cs-a's header
+
+        app.outline_collapse_all();
+        let items = app.outline_items();
+        assert!(
+            app.outline.cursor < items.len(),
+            "the cursor must land inside the shrunk row list, not stay at a now-invalid index"
+        );
+        assert!(
+            matches!(
+                items[app.outline.cursor],
+                OutlineItem::Header { cs_idx: 0, .. }
+            ),
+            "the cursor must reseat onto cs-a's collapsed header, the ancestor of the hidden row \
+             it was on"
+        );
+    }
+
+    #[test]
+    fn outline_expand_all_restores_every_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        let rows_before = app.outline_items().len();
+
+        app.outline_collapse_all();
+        assert!(app.outline_items().len() < rows_before);
+
+        app.outline_expand_all();
+        assert_eq!(
+            app.outline_items().len(),
+            rows_before,
+            "expand-all must restore every row collapse-all hid"
+        );
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::Stack)
+                .is_none_or(|s| s.is_empty()),
+            "expand-all must clear the CURRENT mode's fold set"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_and_expand_all_are_scoped_to_the_current_mode() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+
+        app.outline_collapse_all();
+        assert!(app
+            .outline
+            .folds
+            .get(&OutlineMode::Stack)
+            .is_some_and(|s| !s.is_empty()));
+
+        app.outline.mode = OutlineMode::StackTree;
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::StackTree)
+                .is_none_or(|s| s.is_empty()),
+            "Stack's collapse-all must not leak into StackTree's own fold set"
         );
     }
 
