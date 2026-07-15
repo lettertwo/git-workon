@@ -144,6 +144,47 @@ precedent the diff/cursor tints follow); `light()` takes `ONE_LIGHT`'s base08/ba
 the syntax slots (matching the terminal, not curated-tint-borrowing). No other part of the
 hybrid boundary changes: this only moves three named colors from `const` to palette fields.
 
+## Revised (CS1, user-configurable colors tier)
+
+The "user-supplied base16 scheme … the deferred 'user-configurable colors' tier" noted in
+Consequences above lands, narrower than originally sketched: **per-slot and per-tint git-config
+override keys**, not named bundled schemes. `workon.review.theme.*` (a subsection distinct from
+`workon.review.theme` itself — both coexist, since git parses `[workon "review"] theme = …` and
+`[workon "review.theme"] base00 = …` as different subsections) accepts:
+
+| Key | Meaning | Palette field(s) rewritten |
+| --- | --- | --- |
+| `base00`–`base0f` (lowercase) | base16 slot override | role-mapped field(s) below, plus every `syntax` entry whose capture→slot template maps to that slot |
+| `base00` | canvas background | `background` (and sets `paint_canvas: true`) |
+| `base03` | dim/comment ramp step | `dim` |
+| `base04` | gutter/divider ramp step | `gutter` |
+| `base05` | default text | `foreground` |
+| `base08` | red accent | `error_fg` |
+| `base09` | orange accent | `modified_fg` |
+| `base0a` | yellow accent | `warn_fg` |
+| `base0b` | green accent | `current_fg` |
+| `base0c` | cyan accent | `heading_fg` |
+| `del-subtle`, `del-strong`, `add-subtle`, `add-strong`, `del-staged-subtle`, `del-staged-strong`, `add-staged-subtle`, `add-staged-strong`, `cursor-bg`, `selection-bg`, `outline-cursor-unfocused-bg` | diff/cursor tint override (kebab-case, mirroring the `Palette` field names) | the matching field, verbatim |
+
+Values are `#rrggbb` or bare `rrggbb` (six hex digits only — no 3-digit shorthand). Applied via
+`Palette::apply_overrides`, on top of whichever base (`dark`/`light`/`auto`'s probe) was already
+resolved — the mechanism is base-agnostic, so an override key works identically regardless of
+`workon.review.theme`'s selection. **Uniform slot rule:** a slot override rewrites its
+role-mapped field(s) even when the current base hand-authored that field explicitly (e.g.
+`base08` under `theme = dark` replaces `dark()`'s hand-tuned `error_fg`) — the alternative
+(silently ignoring slot overrides for authored fields) is a UX trap: a user who sets `base08`
+expects red to change. Slot overrides do NOT re-derive the diff/cursor tints; that stays the 11
+tint keys' job, applied last and verbatim, so a slot override can't reshape a hand-tuned wash it
+wasn't asked to touch. An invalid value or an unrecognized key under `workon.review.theme.*` is
+ignored with a startup warning (the same posture as ADR-028's keybinding validation) — not a
+hard error.
+
+**Named bundled schemes explicitly deferred.** `theme = <scheme-name>` selecting a whole
+vendored base16 scheme (e.g. from tinted-theming/schemes, MIT-licensed and so licensing-clean
+to vendor) was considered and set aside — the override-key tier covers the immediate need, and
+named schemes slot in additively later (a `Theme::Named` variant + a `schemes.rs` of vendored
+constants) without touching this work if demand appears.
+
 ## References
 
 - [ADR-028](028-review-git-native-config-schema.md) — `workon.review.theme` config key

@@ -100,10 +100,24 @@ fn main() -> Result<()> {
     // flush; every other path (an answered probe, a timed-out-uncached probe, a non-auto theme)
     // is `false`/`true` exactly as before.
     let selection = ReviewConfig::new(&repo).theme();
-    let (theme, probed) = match selection {
+    let (mut theme, probed) = match selection {
         Ok(config::Theme::Auto) => terminal_query::detect_auto_palette(),
         Ok(selection) => (Palette::for_theme(selection), false),
         Err(_) => (Palette::dark(), false),
+    };
+
+    // CS1 (user-configurable colors tier): apply any `workon.review.theme.*` slot/tint
+    // overrides on top of whichever base was just resolved above — works uniformly on
+    // `dark`/`light`/`auto`'s probe result (see `Palette::apply_overrides`'s doc comment). A
+    // config-read error degrades to no overrides, same posture as every other getter here; a
+    // malformed value or unknown key is collected as a warning and joined into the startup
+    // notice in `seat_app` below, alongside the keymap/view-config warnings.
+    let theme_override_warnings = match ReviewConfig::new(&repo).theme_overrides() {
+        Ok((overrides, warnings)) => {
+            theme.apply_overrides(&overrides);
+            warnings
+        }
+        Err(_) => Vec::new(),
     };
 
     // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,
@@ -177,7 +191,14 @@ fn main() -> Result<()> {
         // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here
         // after acquisition is done borrowing it. `App::from_changesets` opens on whichever
         // changeset the lib marked `current` (locked decision #6).
-        let mut app = seat_app(repo, views, source, &view_config, &keymap);
+        let mut app = seat_app(
+            repo,
+            views,
+            source,
+            &view_config,
+            &keymap,
+            &theme_override_warnings,
+        );
 
         // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
         // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
@@ -195,7 +216,14 @@ fn main() -> Result<()> {
             .map(ChangesetView::pending)
             .collect();
 
-        let mut app = seat_app(repo, views, source, &view_config, &keymap);
+        let mut app = seat_app(
+            repo,
+            views,
+            source,
+            &view_config,
+            &keymap,
+            &theme_override_warnings,
+        );
 
         tui.into_diagnostic()?
             .run_streamed(&mut app, &keymap, &theme, repo_path, changesets)
@@ -207,16 +235,17 @@ fn main() -> Result<()> {
 
 /// The app-seating tail both `changesets.len()` arms of `main` share byte-identically (F5):
 /// build `App` from `views`, wire the review source, defer file loads (CS4), apply CS7's
-/// view-config settings, open the current file, and surface any keymap/view-config warnings as
-/// a startup notice. `open_current` is a no-op on an empty file list — safe for the streamed
-/// arm's `Pending` slots (no files yet), which `Tui::run_streamed`'s `ChangesetReady` handling
-/// re-runs it for once the active changeset's diff actually lands.
+/// view-config settings, open the current file, and surface any keymap/view-config/theme-override
+/// warnings as a startup notice. `open_current` is a no-op on an empty file list — safe for the
+/// streamed arm's `Pending` slots (no files yet), which `Tui::run_streamed`'s `ChangesetReady`
+/// handling re-runs it for once the active changeset's diff actually lands.
 fn seat_app(
     repo: Repository,
     views: Vec<ChangesetView>,
     source: Option<Source>,
     view_config: &config::RawViewConfig,
     keymap: &Keymap,
+    theme_override_warnings: &[String],
 ) -> App {
     let mut app = App::from_changesets(repo, views);
     if let Some(source) = source {
@@ -241,11 +270,12 @@ fn seat_app(
     let view_config_warnings = app.apply_view_config(view_config);
     app.open_current();
 
-    // A misconfigured keybinding or view-config setting is non-fatal: show the collected
-    // warnings as a startup notice (cleared on the first keypress, like any notice) and run with
-    // the defaults for those keys/settings.
+    // A misconfigured keybinding, view-config setting, or theme override is non-fatal: show the
+    // collected warnings as a startup notice (cleared on the first keypress, like any notice) and
+    // run with the defaults for those keys/settings/colors.
     let mut warnings = keymap.warnings().to_vec();
     warnings.extend(view_config_warnings);
+    warnings.extend(theme_override_warnings.iter().cloned());
     if !warnings.is_empty() {
         app.notify(warnings.join("; "), Severity::Error);
     }
