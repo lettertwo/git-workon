@@ -740,7 +740,7 @@ impl Keymap {
         let mut exact: Option<Command> = None;
         let mut has_prefix = false;
         for (seq, command) in list {
-            if seq.len() > buffer.len() && seq[..buffer.len()] == *buffer {
+            if is_strict_prefix(buffer, seq) {
                 has_prefix = true;
             } else if seq.as_slice() == buffer {
                 exact.get_or_insert(*command);
@@ -813,6 +813,9 @@ fn build_context(
 }
 
 /// True when `shorter` is strictly shorter than `longer` AND is its leading sub-sequence.
+/// The ONE definition of chord-prefix precedence: `match_keys`' pending test and
+/// `build_context`'s clash warning both call this, so the "the shorter binding can never
+/// fire" claim in [`prefix_clash_warning`] can't drift from what dispatch actually does.
 fn is_strict_prefix(shorter: &[KeyPress], longer: &[KeyPress]) -> bool {
     shorter.len() < longer.len() && longer[..shorter.len()] == *shorter
 }
