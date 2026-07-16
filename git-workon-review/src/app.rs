@@ -1346,6 +1346,13 @@ pub struct App {
     /// touches a thread or a `Repository`-carrying `Sender` itself, so it stays constructible (and
     /// `refresh` stays synchronously testable) with nothing wired up to actually dispatch this.
     pending_wave: Option<(u64, Vec<(usize, Changeset)>)>,
+    /// Display label for the resolved [`crate::keymap::Command::CycleZoom`] binding, shown in
+    /// [`Self::notify_combined_refusal`]'s "cycle zoom" hint. `App` deliberately has no keymap
+    /// field (the keymap is threaded through `tui.rs`/`main.rs` separately), so `main.rs::seat_app`
+    /// sets this once at seat time from the resolved binding; defaults to `"Z"` — the command's
+    /// default binding — for every `App::new`/`from_changesets` path that never seats a keymap
+    /// (keeps existing unit tests passing without churn).
+    zoom_key_label: String,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1526,6 +1533,7 @@ impl App {
             generation: 1,
             wave_failure_notified: false,
             pending_wave: None,
+            zoom_key_label: "Z".to_string(),
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1542,6 +1550,13 @@ impl App {
     /// never calls it, leaving [`Self::review_source`] at its `None` default.
     pub fn set_review_source(&mut self, source: Source) {
         self.review_source = Some(source);
+    }
+
+    /// Set the display label shown in [`Self::notify_combined_refusal`]'s "cycle zoom" hint —
+    /// see the `zoom_key_label` field's doc comment. `main.rs::seat_app` calls this with the
+    /// resolved [`crate::keymap::Command::CycleZoom`] binding right after construction.
+    pub fn set_zoom_key_label(&mut self, label: String) {
+        self.zoom_key_label = label;
     }
 
     /// The current `.git/index`'s cheap fingerprint (mtime + size), or `None` if the read fails —
@@ -4061,8 +4076,9 @@ impl App {
                 Severity::Error,
             );
         } else {
+            let key = &self.zoom_key_label;
             self.notify(
-                format!("{verb} in the unstaged/staged pane — cycle zoom (Z)"),
+                format!("{verb} in the unstaged/staged pane — cycle zoom ({key})"),
                 Severity::Error,
             );
         }
@@ -7639,6 +7655,42 @@ mod tests {
             "f.txt",
             "alpha\nBETAEDIT\ngamma\n",
         ));
+    }
+
+    #[test]
+    fn combined_refusal_defaults_to_the_shift_z_label() {
+        use super::{Severity, Zoom};
+
+        // `App::from_changesets`/`App::new` paths that never seat a keymap (this test included)
+        // must keep showing the command's default binding, byte-identical to before this field
+        // existed.
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = Zoom::Combined;
+        app.open_current();
+        app.stage_hunk();
+
+        let notice = app.notice.as_ref().expect("combined stage must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("(Z)"), "got: {:?}", notice.text);
+    }
+
+    #[test]
+    fn combined_refusal_shows_the_seated_zoom_key_label() {
+        use super::{Severity, Zoom};
+
+        // `main.rs::seat_app` calls `set_zoom_key_label` with the resolved CycleZoom binding —
+        // simulate a rebind by setting a non-default label directly.
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.set_zoom_key_label("F5".to_string());
+        app.zoom = Zoom::Combined;
+        app.open_current();
+        app.stage_hunk();
+
+        let notice = app.notice.as_ref().expect("combined stage must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("(F5)"), "got: {:?}", notice.text);
     }
 
     #[test]
