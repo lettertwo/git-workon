@@ -1,4 +1,4 @@
-//! Frame rendering: header, side-by-side diff body, footer.
+//! Frame rendering: per-pane headers, side-by-side diff body, footer.
 //!
 //! Ported from the `review-tui-spike` prototype's `ui.rs`, adapted to render [`App`]'s
 //! gap-collapsed [`crate::align::DisplayRow`]s instead of a flat aligned-row list, and extended
@@ -60,9 +60,9 @@ const NERD_DIFF_ADDED: char = '\u{f457}'; // nf-oct-diff-added
 const NERD_DIFF_REMOVED: char = '\u{f458}'; // nf-oct-diff-removed
 
 /// The current-changeset marker for the active icon strategy. These four one-switch helpers are
-/// the single source of each semantic marker's glyph pair — the outline's Header arm and the
-/// summary panel (and, upstack, the winbar) deliberately draw the SAME markers, so the selection
-/// lives in one place instead of a hand-synced `match` per call site.
+/// the single source of each semantic marker's glyph pair — the outline's Header arm, the summary
+/// panel, and the diff/outline pane headers (CS1, `pane-headers`) deliberately draw the SAME
+/// markers, so the selection lives in one place instead of a hand-synced `match` per call site.
 fn current_marker(icons: IconMode) -> char {
     match icons {
         IconMode::Nerd => NERD_CURRENT_MARKER,
@@ -590,9 +590,10 @@ fn build_pane_line(
     }
 }
 
-/// Render one frame: header, SBS body, footer, and (when [`App::help_visible`]) the `?` overlay
-/// on top of everything else. `keymap` is the resolved, possibly-rebound keymap — the footer hint
-/// and help overlay render its ACTUAL bindings (see [`crate::keymap::footer_hint`]/
+/// Render one frame: SBS body (each pane painting its own 1-row header — CS1, `pane-headers`;
+/// there's no more global header/winbar row), footer, and (when [`App::help_visible`]) the `?`
+/// overlay on top of everything else. `keymap` is the resolved, possibly-rebound keymap — the
+/// footer hint and help overlay render its ACTUAL bindings (see [`crate::keymap::footer_hint`]/
 /// [`crate::keymap::help_sections`]), never a hardcoded key string. `theme` is the resolved
 /// on-tint palette — see [`crate::theme`]; the diff body, syntax foreground, and cursor/selection
 /// washes all resolve their colors against it at paint time, as do the canvas background and the
@@ -617,20 +618,19 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
         );
     }
 
+    // CS1 (`pane-headers`): no more standalone header row — the outline pane and the diff pane
+    // each paint their own 1-row header at the top of their own rect (`render_outline`/
+    // `render_body`), so `body_area` now claims the row the old global header/winbar used to
+    // occupy. Every content row below keeps its exact prior y-coordinate: the row that moved out
+    // of the top-level layout reappears as the per-pane header carve-out inside `body_area`.
     let vlayout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
-    let header_area = vlayout[0];
-    let body_area = vlayout[1];
-    let footer_area = vlayout[2];
+    let body_area = vlayout[0];
+    let footer_area = vlayout[1];
 
-    render_header(frame, app, header_area, theme);
     render_footer(frame, app, footer_area, keymap, theme);
 
     if app.outline_open() {
@@ -646,6 +646,9 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
         let div_area = hlayout[1];
         let diff_area = hlayout[2];
         render_outline(frame, app, outline_area, theme);
+        // Spans the FULL body height, including row 0 — it now divides the two pane headers
+        // (outline header vs. diff header) as well as the content rows below them; this reads
+        // fine in practice (CS1 risk noted, revisit if it looks heavy at review).
         for y in div_area.y..div_area.y + div_area.height {
             frame
                 .buffer_mut()
@@ -731,11 +734,96 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
-/// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
-/// carry the changeset's position marker (green • for `cs.current`), a `[i/n]` TRUE-stack-position
-/// counter, an accented ([`Palette::heading_fg`]) bold label (CS1, `outline-header-polish` — see
-/// [`changeset_title_spans`]'s doc comment), and needs-restack glyph (amber ⚠,
-/// [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
+/// The outline pane's own top row (CS1, `pane-headers`): `[i/n] {display_label}` (the active
+/// changeset's TRUE stack position, `theme.heading_fg` bold label — no current-marker glyph,
+/// since this header is always describing the currently-active changeset, a redundant thing to
+/// mark), ` {warn_marker} needs restack` (`theme.warn_fg`, full text unlike the diff header's
+/// glyph-only prefix — see [`changeset_prefix_spans`]) when [`workon::Changeset::needs_restack`],
+/// and a changeset-total `+A -D` diffstat (the fold `render_winbar` used to own, pre-CS1) skipped
+/// when [`App::files`] is empty (a Pending/Failed changeset, ADR-031). Truncated to the outline's
+/// own width via [`Buffer::set_line`], exactly like every outline item row below it.
+///
+/// CS1 risk (accepted, not fixed here): in [`crate::outline::OutlineMode::Flat`], the item rows
+/// below dedupe a file across every changeset that touches it, with no changeset context of their
+/// own — this header still names only the single ACTIVE changeset, so it can read as narrower
+/// than what the (deduped, cross-stack) row list actually shows. Acceptable for now; a future
+/// changeset could soften this (e.g. suppress the header in Flat mode) if it proves confusing in
+/// practice.
+fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+    let cs = app.current_changeset();
+    let i = app.current_cs() + 1;
+    let n = app.changeset_count();
+    let title = crate::app::display_label(cs);
+    let icons = app.icon_mode();
+
+    let mut spans = vec![
+        TSpan::styled(
+            format!("[{i}/{n}] "),
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TSpan::styled(
+            title,
+            Style::default()
+                .fg(theme.heading_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if cs.needs_restack {
+        spans.push(TSpan::styled(
+            format!("  {} needs restack", warn_marker(icons)),
+            Style::default()
+                .fg(theme.warn_fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // A pending/failed changeset's `files()` is always empty (ADR-031) — skip the diffstat
+    // segment entirely rather than show a misleading "+0 -0" (same gate `render_winbar` used).
+    if !app.files().is_empty() {
+        let (adds, dels) = app
+            .files()
+            .iter()
+            .map(crate::summary::file_diffstat)
+            .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
+        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
+        spans.push(TSpan::styled(
+            "  ".to_string(),
+            Style::default().fg(theme.foreground),
+        ));
+        spans.push(TSpan::styled(
+            format!("{added_prefix}{adds}"),
+            Style::default()
+                .fg(theme.add_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(TSpan::styled(
+            " ".to_string(),
+            Style::default().fg(theme.foreground),
+        ));
+        spans.push(TSpan::styled(
+            format!("{removed_prefix}{dels}"),
+            Style::default()
+                .fg(theme.del_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let line = Line::from(spans);
+    frame
+        .buffer_mut()
+        .set_line(area.x, area.y, &line, area.width);
+}
+
+/// Render the outline pane into `area`: row 0 is the pane's own header (CS1, `pane-headers` — see
+/// [`render_outline_header`]), skipped only when `area.height < 2` (a degenerate terminal has no
+/// room to spare); every row below is an outline item exactly as before this changeset — the
+/// header carve-out is why an item's absolute screen row hasn't moved (it used to start one row
+/// below the OLD global header, now it starts one row below the pane's OWN header instead).
+/// [`OutlineItem::Header`]s (Stack mode only) carry the changeset's position marker (green • for
+/// `cs.current`), a `[i/n]` TRUE-stack-position counter, an accented ([`Palette::heading_fg`])
+/// bold label (CS1, `outline-header-polish` — see [`changeset_title_spans`]'s doc comment), and
+/// needs-restack glyph (amber ⚠, [`crate::theme::Palette::warn_fg`] — locked decision #9's outline
+/// half); [`OutlineItem::File`]s carry an
 /// indent, a two-column git-porcelain-style status matrix (CS3, `outline-status-xy` — see
 /// [`outline_status_spans`]'s doc comment for the X/Y-vs-single-letter split), and
 /// the path — Flat/Stack rows (CS2) split it into `basename  dim/dirname` (no suffix for a
@@ -752,6 +840,14 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// the same stateful scrolloff-margined viewport the diff panes already have, instead of the old
 /// transient bottom-anchor scroll computed fresh each frame.
 fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
+    // CS1 risk: this `>= 2` guard must exist in BOTH pane renderers (see `render_body`'s matching
+    // carve-out) — a 1-row (or shorter) terminal has no room to spare for a header at all.
+    let area = if area.height >= 2 {
+        render_outline_header(frame, app, area, theme);
+        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+    } else {
+        area
+    };
     app.outline_height = area.height as usize;
     app.hit_regions.outline = Some(region_from(area));
     let (items, hidden_counts) = app.outline_items_with_hidden_counts();
@@ -1062,9 +1158,9 @@ fn build_outline_line(
     }
 }
 
-/// The current file's label for the top status row: its path, or a rename's `old @ base ->
-/// path` form — shared by the lone-changeset header and the multi-changeset winbar (they differ
-/// only in what wraps this).
+/// The current file's label for the diff pane header: its path, or a rename's `old @ base ->
+/// path` form — shared by every diff-header state ([`file_segment_spans`]) and the summary
+/// panel's own current-changeset-independent uses.
 fn current_file_label(app: &App) -> String {
     match app.files().get(app.current) {
         Some(f) if f.status == FileStatus::Renamed || f.status == FileStatus::Copied => {
@@ -1080,32 +1176,8 @@ fn current_file_label(app: &App) -> String {
     }
 }
 
-/// The top status row: `[fidx/nfiles] path` for a lone changeset (the M4 look, unchanged), or the
-/// changeset-aware winbar (locked decision #8) once the stack has more than one changeset — the
-/// winbar's own `[i/n]` is the CHANGESET counter, so showing both here would render two different
-/// counters under the same bracket notation. Never both at once.
-fn render_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
-    if app.changeset_count() > 1 {
-        render_winbar(frame, app, area, theme);
-        return;
-    }
-    let idx = app.current + 1;
-    let n = app.files().len();
-    let text = format!("[{idx}/{n}] {}", current_file_label(app));
-    let mut spans = vec![TSpan::styled(
-        text,
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if let Some(span) = hscroll_indicator_span(app, theme) {
-        spans.push(span);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// While [`App::hscroll`] is panned, a small dim `»42` (the column offset) appended to the header/
-/// winbar (locked decision #8) — `None` at column `0`, matching the diffstat span's own
+/// While [`App::hscroll`] is panned, a small dim `»42` (the column offset) appended to the diff
+/// pane header (locked decision #8) — `None` at column `0`, matching the diffstat span's own
 /// present-or-absent pattern above/below.
 fn hscroll_indicator_span(app: &App, theme: &Palette) -> Option<TSpan<'static>> {
     if app.hscroll == 0 {
@@ -1117,23 +1189,19 @@ fn hscroll_indicator_span(app: &App, theme: &Palette) -> Option<TSpan<'static>> 
     ))
 }
 
-/// The multi-changeset winbar (locked decisions #8 + #9): `[i/n] <title-or-name>
-/// <restack-marker>  <diffstat>  —  <path> (fidx/nfiles)`, where `i/n` is the changeset's position
-/// in the stack and `fidx/nfiles` the active file's position within it. Only reached when
-/// [`App::changeset_count`] > 1 (see [`render_header`]) — a lone uncommitted changeset never
-/// shows this, keeping the M4 full-width look.
-///
-/// CS4 polish: a tight `+A -D` diffstat for the ACTIVE changeset (there wasn't one before),
-/// tinted with the same [`Palette::add_strong`]/[`Palette::del_strong`] the summary panel's own
-/// totals line uses; in [`IconMode::Nerd`] mode the restack marker and diffstat prefixes swap
-/// to their nerd glyphs (same consts `build_outline_line`/`push_summary_body` use), and the
-/// active file's path gets its devicons file icon.
-fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+/// CS1 (`pane-headers`)'s changeset-position prefix, prepended to the diff pane header only when
+/// the outline is CLOSED and the stack has more than one changeset (see [`diff_header_line`]) —
+/// with the outline open, the outline pane's own header ([`render_outline_header`]) already
+/// carries this information, so showing it twice would be redundant. `[i/n] {display_label}`
+/// bold, plus a glyph-ONLY (no "needs restack" text — that's the outline header's fuller
+/// treatment) `⚠` in `theme.warn_fg` when [`workon::Changeset::needs_restack`]. Ported verbatim
+/// from the old `render_winbar`'s equivalent prefix (locked decisions #8 + #9), minus the
+/// diffstat/path/icon tail that moved into [`file_segment_spans`].
+fn changeset_prefix_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TSpan<'static>> {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
     let title = crate::app::display_label(cs);
-    let icons = app.icon_mode();
 
     let mut spans = vec![TSpan::styled(
         format!("[{i}/{n}] {title}"),
@@ -1145,44 +1213,31 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     // from the plain title so a stale-parent changeset reads as a heads-up at a glance.
     if cs.needs_restack {
         spans.push(TSpan::styled(
-            format!("  {} needs restack", warn_marker(icons)),
+            format!(" {}", warn_marker(icons)),
             Style::default()
                 .fg(theme.warn_fg)
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // A pending/failed changeset's `files()` is always empty (ADR-031) — skip the diffstat
-    // segment entirely rather than show a misleading "+0 -0".
-    if !app.files().is_empty() {
-        let (adds, dels) = app
-            .files()
-            .iter()
-            .map(crate::summary::file_diffstat)
-            .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
-        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
-        spans.push(TSpan::raw("  "));
-        spans.push(TSpan::styled(
-            format!("{added_prefix}{adds}"),
-            Style::default()
-                .fg(theme.add_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(TSpan::raw(" "));
-        spans.push(TSpan::styled(
-            format!("{removed_prefix}{dels}"),
-            Style::default()
-                .fg(theme.del_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    let fidx = app.current + 1;
-    let nfiles = app.files().len();
-    spans.push(TSpan::styled(
-        "  —  ".to_string(),
+    spans
+}
+
+/// The diff pane header's shared "current file" segment (CS1, `pane-headers`): `[fidx/nfiles] `
+/// bold, an optional nerd devicons file icon, [`current_file_label`] bold, a tight `+N -M`
+/// per-file diffstat (new: the old winbar only ever showed a CHANGESET-total diffstat, never a
+/// per-file one — [`crate::summary::file_diffstat`] gives the same recorded counts for a binary
+/// file as a text one, so this segment needs no binary special-case), and the pan-offset
+/// indicator. Used verbatim whether the outline is open, closed+lone, or closed+multi (with the
+/// changeset prefix ahead of it) — see [`diff_header_line`]'s state table.
+fn file_segment_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TSpan<'static>> {
+    let idx = app.current + 1;
+    let n = app.files().len();
+    let mut spans = vec![TSpan::styled(
+        format!("[{idx}/{n}] "),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
-    ));
+    )];
     if icons == IconMode::Nerd {
         if let Some(f) = app.files().get(app.current) {
             let (icon, color) = crate::icons::icon_for_path(
@@ -1203,16 +1258,86 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
         }
     }
     spans.push(TSpan::styled(
-        format!("{} ({fidx}/{nfiles})", current_file_label(app)),
+        current_file_label(app),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
     ));
+    if let Some(f) = app.files().get(app.current) {
+        let (adds, dels) = crate::summary::file_diffstat(f);
+        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
+        spans.push(TSpan::styled(
+            "  ".to_string(),
+            Style::default().fg(theme.foreground),
+        ));
+        spans.push(TSpan::styled(
+            format!("{added_prefix}{adds}"),
+            Style::default()
+                .fg(theme.add_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(TSpan::styled(
+            " ".to_string(),
+            Style::default().fg(theme.foreground),
+        ));
+        spans.push(TSpan::styled(
+            format!("{removed_prefix}{dels}"),
+            Style::default()
+                .fg(theme.del_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(span) = hscroll_indicator_span(app, theme) {
         spans.push(span);
     }
+    spans
+}
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+/// The diff pane's own top-row header (CS1, `pane-headers` — replacing the old global
+/// header/winbar row; see `render_body`'s header carve-out). Only covers the NON-summary states —
+/// [`render_body`] handles the summary-panel title separately, since that title comes from
+/// [`App::summary_for`] (called once per frame, not re-derived here). State table:
+///
+/// - Outline open: [`file_segment_spans`] alone (the outline pane's own header already carries
+///   the changeset-position context, so this stays file-focused).
+/// - Outline closed + `changeset_count() > 1`: [`changeset_prefix_spans`], then a bold `  —  `
+///   separator, then [`file_segment_spans`] — the closed outline hides `]c`/`[c`'s (Diff-view
+///   bindings, `keymap.rs`) changeset-nav feedback, so this prefix keeps it visible.
+/// - Outline closed + lone changeset: [`file_segment_spans`] alone (the pre-CS1 M4 look, now with
+///   a per-file diffstat it never had before).
+/// - Pending/failed/empty `files()` (ADR-031): the changeset prefix alone if
+///   `changeset_count() > 1 && !outline_open()`, else a blank row — never a misleading `[1/0]`.
+///   "Blank" still carries an explicit `theme.foreground`-styled space (not a zero-span [`Line`])
+///   — an empty span list leaves the row's cells at whatever style predates this frame's paint
+///   (`Style::default()`'s `Reset` fg, even under a painted canvas, since [`Buffer::set_line`]
+///   writes nothing for zero-width content) rather than the theme's own baseline (regression:
+///   `header_text_carries_the_theme_foreground_not_the_terminal_default`).
+fn diff_header_line(app: &App, theme: &Palette, icons: IconMode) -> Line<'static> {
+    let show_prefix = app.changeset_count() > 1 && !app.outline_open();
+
+    if app.current_failure().is_some() || app.is_current_pending() || app.files().is_empty() {
+        return if show_prefix {
+            Line::from(changeset_prefix_spans(app, theme, icons))
+        } else {
+            Line::from(TSpan::styled(
+                " ".to_string(),
+                Style::default().fg(theme.foreground),
+            ))
+        };
+    }
+
+    let mut spans = Vec::new();
+    if show_prefix {
+        spans.extend(changeset_prefix_spans(app, theme, icons));
+        spans.push(TSpan::styled(
+            "  —  ".to_string(),
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.extend(file_segment_spans(app, theme, icons));
+    Line::from(spans)
 }
 
 /// Footer priority: a pending discard confirm's prompt (warn-toned) wins over a transient notice,
@@ -1403,28 +1528,29 @@ fn push_summary_body(
     ]));
 }
 
-/// Build a [`ChangesetSummary`]'s lines: title line (the same current/needs-restack markers
+/// Build a [`ChangesetSummary`]'s title spans (the same current/needs-restack markers
 /// `build_outline_line`'s Header arm draws, structurally shared via [`changeset_title_spans`] —
 /// but passing `None` for that fn's `counter` param, so this title keeps its pre-CS1 plain-
-/// foreground look with no `[i/n]` counter; see [`changeset_title_spans`]'s doc comment), a
-/// loading/failed line OR the per-file list + totals line.
+/// foreground look with no `[i/n]` counter; see [`changeset_title_spans`]'s doc comment) and its
+/// body lines: a loading/failed line OR the per-file list + totals line. CS1 (`pane-headers`)
+/// split the return into `(title, body)` — the title now paints the diff pane's header row
+/// ([`render_body`]), and the body no longer duplicates it as its own first line.
 fn changeset_summary_lines(
     summary: &ChangesetSummary,
     height: usize,
     theme: &Palette,
     icons: IconMode,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
-    lines.push(Line::from(changeset_title_spans(
+) -> (Vec<TSpan<'static>>, Vec<Line<'static>>) {
+    let title = changeset_title_spans(
         &summary.label,
         summary.current,
         summary.needs_restack,
         theme,
         icons,
         None,
-    )));
+    );
 
+    let mut lines = Vec::new();
     if summary.failed {
         let msg = summary
             .failure_message
@@ -1434,14 +1560,14 @@ fn changeset_summary_lines(
             format!("{} {msg}", error_marker(icons)),
             Style::default().fg(theme.error_fg),
         )));
-        return lines;
+        return (title, lines);
     }
     if summary.loading {
         lines.push(Line::from(TSpan::styled(
             format!("Loading{}", loading_marker(icons)),
             Style::default().fg(theme.dim),
         )));
-        return lines;
+        return (title, lines);
     }
 
     push_summary_body(
@@ -1453,29 +1579,32 @@ fn changeset_summary_lines(
         theme,
         icons,
     );
-    lines
+    (title, lines)
 }
 
-/// Build a [`DirSummary`]'s lines: a bold path title, a blank line, the per-file list, and the
-/// totals line — no current/restack/loading/failed markers (a directory carries none of those).
-/// The title gets [`crate::icons::DIR_ICON`] in [`IconMode::Nerd`] mode, matching the
-/// outline's own [`OutlineItem::Dir`] row (`build_outline_line`).
+/// Build a [`DirSummary`]'s title spans (a bold path line — no current/restack/loading/failed
+/// markers, a directory carries none of those; the title gets [`crate::icons::DIR_ICON`] in
+/// [`IconMode::Nerd`] mode, matching the outline's own [`OutlineItem::Dir`] row
+/// (`build_outline_line`)) and its body lines (the per-file list + totals line). CS1
+/// (`pane-headers`): see [`changeset_summary_lines`]'s doc comment for why this returns a
+/// `(title, body)` tuple now instead of one combined line list.
 fn dir_summary_lines(
     summary: &DirSummary,
     height: usize,
     theme: &Palette,
     icons: IconMode,
-) -> Vec<Line<'static>> {
+) -> (Vec<TSpan<'static>>, Vec<Line<'static>>) {
     let dir_icon = match icons {
         IconMode::Nerd => format!("{} ", crate::icons::DIR_ICON),
         IconMode::None => String::new(),
     };
-    let mut lines = vec![Line::from(TSpan::styled(
+    let title = vec![TSpan::styled(
         format!("{dir_icon}{}/", summary.path),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
-    ))];
+    )];
+    let mut lines = Vec::new();
     push_summary_body(
         &mut lines,
         &summary.files,
@@ -1485,38 +1614,73 @@ fn dir_summary_lines(
         theme,
         icons,
     );
-    lines
+    (title, lines)
 }
 
 /// CS4's summary panel: renders in place of the diff body while the outline is open and focused
-/// with its cursor on a Header/Dir row (see [`App::summary_target`]) — a title line, a blank
-/// line, per-file `"path  +N -M"` rows (truncated to the pane height), and a totals line. A
-/// loading/failed Header shows its own inline state instead of a file list (see
-/// [`changeset_summary_lines`]).
+/// with its cursor on a Header/Dir row (see [`App::summary_target`]) — per-file `"path  +N -M"`
+/// rows (truncated to the pane height) and a totals line, painted into `area` (the diff pane's
+/// header row is carved out by the caller, [`render_body`], before this ever runs — CS1,
+/// `pane-headers`). Returns the title [`Line`] so the caller can paint it into that header row;
+/// this fn itself paints only the body. A loading/failed Header shows its own inline state
+/// instead of a file list (see [`changeset_summary_lines`]).
 fn render_summary(
     frame: &mut Frame,
     summary: &Summary,
     area: Rect,
     theme: &Palette,
     icons: IconMode,
-) {
+) -> Line<'static> {
     let height = area.height as usize;
-    let lines = match summary {
+    let (title, lines) = match summary {
         Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme, icons),
         Summary::Dir(dir) => dir_summary_lines(dir, height, theme, icons),
     };
     frame.render_widget(Paragraph::new(lines), area);
+    Line::from(title)
 }
 
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
+    let icons = app.icon_mode();
+
+    // CS1 (`pane-headers`): row 0 of the diff pane's own rect is its header — every branch below
+    // (summary panel, pending/failed/empty, binary, normal file) shares this same carve-out, so
+    // it happens once, up front. CS1 risk: this `>= 2` guard must exist in BOTH pane renderers
+    // (see `render_outline`'s matching carve-out) — a 1-row (or shorter) terminal has no room to
+    // spare for a header at all, so `header_area` is `None` and `area` (shadowed below) stays the
+    // full rect. Every content row keeps its exact prior y-coordinate: the row that moved out of
+    // `render`'s top-level layout reappears as this per-pane carve-out.
+    let (header_area, area) = if area.height >= 2 {
+        (
+            Some(Rect::new(area.x, area.y, area.width, 1)),
+            Rect::new(area.x, area.y + 1, area.width, area.height - 1),
+        )
+    } else {
+        (None, area)
+    };
+
     // CS4: the outline is open AND focused, and its cursor rests on a Header/Dir row — show that
     // row's summary instead of a file's diff. Checked before every other body gate below (an
     // unfocused open outline, or the cursor on a File row, falls straight through to the usual
     // diff-body rendering; `summary_target` returns `None` in both cases).
     if let Some(target) = app.summary_target() {
+        // Built exactly once per frame (CS1 risk: never call `summary_for` twice) — its title
+        // spans paint the header row below, its body-only lines paint `render_summary`'s content.
         let summary = app.summary_for(target);
-        render_summary(frame, &summary, area, theme, app.icon_mode());
+        let title = render_summary(frame, &summary, area, theme, icons);
+        if let Some(header_area) = header_area {
+            frame
+                .buffer_mut()
+                .set_line(header_area.x, header_area.y, &title, header_area.width);
+        }
         return;
+    }
+
+    if let Some(header_area) = header_area {
+        let line = diff_header_line(app, theme, icons);
+        frame
+            .buffer_mut()
+            .set_line(header_area.x, header_area.y, &line, header_area.width);
     }
     // ADR-031: the active changeset's diff hasn't been acquired (or failed to acquire) yet —
     // both cases have an empty `files()` list, so they must be checked BEFORE the "(no changes)"
@@ -2917,9 +3081,9 @@ mod tests {
         );
     }
 
-    // ── M5 CS2: winbar (locked decisions #8 + #9) ─────────────────────────────
+    // ── CS1 (`pane-headers`): outline header + diff header, replacing the old global winbar ────
 
-    /// Build a two-committed-changeset stack for the winbar tests, hand-built the same way as
+    /// Build a two-committed-changeset stack for the pane-header tests, hand-built the same way as
     /// `app.rs`'s M5 CS1 tests (`Changeset` literal + `diff_changeset` +
     /// `ChangesetView::from_changeset_diff`): `cs-a` (`root..mid`, one file) then `cs-b`
     /// (`mid..head`, one file, `current` + `needs_restack`).
@@ -2980,15 +3144,19 @@ mod tests {
     }
 
     #[test]
-    fn winbar_shows_changeset_position_title_path_and_restack_marker() {
+    fn outline_header_shows_changeset_position_title_and_restack_marker() {
+        // CS1: with the outline open (a two-changeset stack's default), the changeset-position
+        // context lives in the OUTLINE pane's own header, not the diff pane's — the outline
+        // columns are x 0..35 at this width (see `OUTLINE_TEST_WIDTH`'s doc comment below).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open(), "a two-changeset stack default-opens");
 
         let buf = render_once(&mut app, 80, 20);
-        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        let header: String = (0..35).map(|x| cell_text(&buf, x, 0)).collect();
 
         assert!(
             header.contains("[2/2]"),
@@ -3002,19 +3170,88 @@ mod tests {
             header.contains("needs restack"),
             "expected the needs-restack marker, got: {header:?}"
         );
-        assert!(
-            header.contains("b.txt") && header.contains("(1/1)"),
-            "expected the active file's path and position, got: {header:?}"
-        );
     }
 
     #[test]
-    fn winbar_restack_marker_carries_the_warning_color() {
+    fn diff_header_shows_the_active_files_position_diffstat_and_path_when_outline_open() {
+        // CS1: with the outline open, the diff header shows ONLY the file segment (no changeset
+        // prefix — the outline's own header already carries that) — diff columns are x 36.. at
+        // this width.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open());
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
+
+        assert!(
+            header.contains("[1/1]") && header.contains("b.txt"),
+            "expected the active file's position and path, got: {header:?}"
+        );
+        // CS4: a tight '+A -D' diffstat for the ACTIVE FILE (b.txt, one-line file, committed
+        // with no prior content, adds one line and deletes nothing) — CS1 is what made this
+        // PER-FILE (the old winbar only ever showed a changeset-total diffstat).
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected a tight '+N -M' per-file diffstat fragment, got: {header:?}"
+        );
+        assert!(
+            !header.contains("[2/2]"),
+            "outline open: the diff header must not repeat the changeset-position prefix, \
+             got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn diff_header_carries_the_changeset_prefix_when_outline_closed() {
+        // CS1: closing the outline removes the pane that carried changeset-position context, so
+        // the diff header grows a `[i/n] <title-or-name> <restack-glyph>  —  ` prefix ahead of
+        // the file segment — this is what the old winbar used to show unconditionally.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline();
+        assert!(!app.outline_open());
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+
+        assert!(
+            header.contains("[2/2]") && header.contains("cs-b"),
+            "expected the changeset position counter and active changeset's name, \
+             got: {header:?}"
+        );
+        // The diff header's changeset prefix is glyph-ONLY (no "needs restack" text — that
+        // fuller treatment is the outline header's, see `changeset_prefix_spans`'s doc comment).
+        assert!(
+            header.contains('⚠'),
+            "expected the needs-restack glyph, got: {header:?}"
+        );
+        assert!(
+            header.contains("[1/1]") && header.contains("b.txt"),
+            "expected the active file's position and path, got: {header:?}"
+        );
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected the per-file diffstat fragment, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn diff_header_restack_marker_carries_the_warning_color_when_outline_closed() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline();
 
         let buf = render_once(&mut app, 80, 20);
         let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
@@ -3027,30 +3264,13 @@ mod tests {
     }
 
     #[test]
-    fn winbar_shows_a_tight_diffstat_for_the_active_changeset() {
-        // CS4: the winbar previously showed no diffstat at all — cs-b adds a single line
-        // (`b.txt`, one-line file, committed with no prior content) with nothing deleted.
-        let fixture = FixtureBuilder::new()
-            .config("core.autocrlf", "false")
-            .build()
-            .unwrap();
-        let mut app = two_committed_changesets_app(&fixture);
-
-        let buf = render_once(&mut app, 80, 20);
-        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
-        assert!(
-            header.contains("+1") && header.contains("-0"),
-            "expected a tight '+N -M' diffstat fragment for cs-b's single added file, got: {header:?}"
-        );
-    }
-
-    #[test]
-    fn winbar_nerd_mode_swaps_the_restack_marker_and_diffstat_glyphs_and_shows_a_file_icon() {
+    fn diff_header_nerd_mode_swaps_the_restack_marker_and_diffstat_glyphs_and_shows_a_file_icon() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        app.toggle_outline();
         app.set_icon_mode(crate::icons::IconMode::Nerd);
 
         let buf = render_once(&mut app, 80, 20);
@@ -3061,22 +3281,23 @@ mod tests {
         );
         assert!(
             header.contains(super::NERD_DIFF_ADDED) && header.contains(super::NERD_DIFF_REMOVED),
-            "expected nerd diffstat glyphs in the winbar, got: {header:?}"
+            "expected nerd diffstat glyphs in the diff header, got: {header:?}"
         );
         assert!(
             header.contains(crate::icons::icon_for_path("b.txt", false).0),
-            "expected the active file's (b.txt) devicons icon in the winbar, got: {header:?}"
+            "expected the active file's (b.txt) devicons icon in the diff header, got: {header:?}"
         );
     }
 
     #[test]
-    fn winbar_uses_title_when_present() {
+    fn diff_header_uses_title_when_present() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
         app.prev_changeset();
+        app.toggle_outline();
 
         let buf = render_once(&mut app, 80, 20);
         let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
@@ -3091,7 +3312,7 @@ mod tests {
     }
 
     #[test]
-    fn winbar_absent_for_a_lone_changeset() {
+    fn diff_header_lone_changeset_shows_file_counter_and_no_changeset_chrome() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
@@ -3107,7 +3328,110 @@ mod tests {
         );
         assert!(
             !header.contains('⚠'),
-            "a lone changeset must not render the winbar chrome, got: {header:?}"
+            "a lone changeset must not render the changeset-prefix chrome, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn diff_header_shows_a_per_file_diffstat_for_a_lone_changeset() {
+        // CS1: new behavior — pre-CS1, the lone-changeset header never showed a diffstat at all
+        // (only the multi-changeset winbar did, and only a CHANGESET total). The file segment now
+        // carries a per-file diffstat in every state, including this one.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        // The fixture only ADDS a line ("CHANGED", appended after the unchanged "one") — nothing
+        // is deleted, so the per-file diffstat is `+1 -0`.
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected a per-file '+N -M' diffstat fragment on the lone-changeset header, \
+             got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn pending_changeset_diff_header_shows_no_file_counter() {
+        // ADR-031 + CS1: a Pending changeset's `files()` is always empty — the diff header must
+        // never show a misleading `[1/0]` file counter, whether the outline is open (a blank
+        // row) or closed (the changeset prefix alone, still no file counter).
+        use crate::app::ChangesetView;
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mid = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("mid")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "cs-b".to_string(),
+            span: ChangesetSpan::Committed {
+                base: mid,
+                head: mid,
+            },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::pending(cs_b);
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        assert!(app.is_current_pending());
+
+        // Outline open (this stack's default): a blank diff-header row, never "[1/0]".
+        assert!(app.outline_open());
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
+        assert!(
+            !header.contains("[1/0]"),
+            "must never show a misleading file counter, got: {header:?}"
+        );
+
+        // Outline closed: the changeset prefix alone, still no file counter.
+        app.toggle_outline();
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("cs-b"),
+            "expected the changeset prefix naming the pending changeset, got: {header:?}"
+        );
+        assert!(
+            !header.contains("[1/0]"),
+            "must never show a misleading file counter, got: {header:?}"
         );
     }
 
@@ -3366,7 +3690,10 @@ mod tests {
     }
 
     #[test]
-    fn winbar_shows_the_pan_offset_indicator_once_panned() {
+    fn diff_header_shows_the_pan_offset_indicator_once_panned() {
+        // CS1: the pan indicator lives in the file segment, which the diff header always shows
+        // (outline open or closed) — with the outline open (this stack's default), that's the
+        // diff columns (x 36..) at this width.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -3375,22 +3702,24 @@ mod tests {
         assert_eq!(app.hscroll, 0);
 
         let buf_unpanned = render_once(&mut app, 80, 20);
-        let header_unpanned: String = (0..buf_unpanned.area.width)
+        let header_unpanned: String = (36..buf_unpanned.area.width)
             .map(|x| cell_text(&buf_unpanned, x, 0))
             .collect();
         assert!(
             !header_unpanned.contains('»'),
-            "no indicator at column 0, got: {header_unpanned:?}"
+            "no indicator at hscroll 0, got: {header_unpanned:?}"
         );
 
-        // The winbar test's fixture files are tiny (`a\n`/`b\n`) — nowhere near wide enough for
+        // The fixture files are tiny (`a\n`/`b\n`) — nowhere near wide enough for
         // `hscroll_right` to actually move `hscroll` off `0`. This checks the indicator's own
         // render logic, not the pan mechanics (covered separately in `app.rs`), so setting the
         // field directly is the more honest test: the indicator must key off `App::hscroll`
         // exactly, with no dependency on how it got there.
         app.hscroll = 42;
         let buf = render_once(&mut app, 80, 20);
-        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
         assert!(
             header.contains("»42"),
             "expected the pan offset indicator, got: {header:?}"
@@ -3594,6 +3923,110 @@ mod tests {
     }
 
     #[test]
+    fn outline_header_truncates_to_the_pane_width() {
+        // CS1: `render_outline_header` writes via `Buffer::set_line(.., area.width)`, exactly
+        // like every outline item row below it — a long changeset label must not bleed past the
+        // outline's own width into the divider column (x=35 at `OUTLINE_TEST_WIDTH`).
+        use crate::app::ChangesetView;
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mid = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("mid")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("b.txt", "b\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "x".repeat(100),
+            span: ChangesetSpan::Committed { base: mid, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::from_changeset_diff(
+            cs_b.clone(),
+            crate::acquire::diff_changeset(repo, &cs_b).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.open_current();
+        assert!(app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        assert_ne!(
+            cell_text(&buf, 34, 0),
+            " ",
+            "expected the truncated label to reach all the way to the outline's last column"
+        );
+        assert_eq!(
+            cell_text(&buf, 35, 0),
+            "│",
+            "the outline header must truncate to the pane's own width, not bleed into the \
+             divider column"
+        );
+    }
+
+    #[test]
+    fn outline_items_still_start_at_y_1_below_the_outline_headers_own_row() {
+        // CS1 invariant: carving out row 0 for the outline's own header must not shift outline
+        // ITEM rows at all — they already started at y=1 pre-CS1 (below the OLD global header),
+        // and they still do now (below the outline's OWN header instead). The pane header itself
+        // never shows the current-changeset marker (only an outline ITEM row does — see
+        // `render_outline_header`'s doc comment), which makes the marker a clean signal for where
+        // items actually start.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let row0 = outline_row(&buf, 0);
+        assert!(
+            !row0.contains('\u{2022}'),
+            "the outline's OWN header never shows the current-changeset marker, got: {row0:?}"
+        );
+        let row1 = outline_row(&buf, 1);
+        assert!(
+            row1.contains('\u{2022}'),
+            "the first outline ITEM row (cs-b's Header row, which IS current) must start at \
+             y=1, got: {row1:?}"
+        );
+    }
+
+    #[test]
     fn summary_panel_title_has_no_counter_and_keeps_the_plain_foreground_look() {
         // CS1's Gotcha: the counter + accent are outline-only — the summary panel's title (shared
         // via `changeset_title_spans`, `counter: None`) must render exactly as it did pre-CS1.
@@ -3614,11 +4047,12 @@ mod tests {
         app.focus_outline();
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
-        // Skip y=0: the full-width winbar spans every column (including the body's 36.. slice),
-        // and it too names the current changeset (cs-b) — same false-positive risk as the outline
-        // tests above. `body_rows`' index `i` is buffer row `i + 1` (the skip), so every `buf`
-        // query below adds 1 back.
-        let body_rows: Vec<String> = (1..buf.area.height)
+        // CS1: the summary panel's title now paints the diff pane's OWN header row (y=0, x
+        // 36..) instead of the body's first line — include y=0 in the scan (no skip needed).
+        // The OUTLINE pane's header (x <35) also shows a `[i/n]` counter for the same active
+        // changeset, so this scan stays scoped to the diff-header/body slice (x 36..) to avoid
+        // that false-positive, same as the outline tests above.
+        let body_rows: Vec<String> = (0..buf.area.height)
             .map(|y| {
                 (36..buf.area.width)
                     .map(|x| cell_text(&buf, x, y))
@@ -3634,6 +4068,11 @@ mod tests {
             .iter()
             .position(|r| r.contains("cs-b"))
             .expect("summary panel's title (cs-b's label) present");
+        assert_eq!(
+            row, 0,
+            "the summary panel's title now paints the diff pane's header row (y=0), got row \
+             {row} instead:\n{joined}"
+        );
         // `String::find` is a BYTE offset, not a display column (the title carries a multi-byte
         // `•` marker ahead of the label, since cs-b is `current`) — a `chars()` position over the
         // 36.. slice IS the column offset within that slice (every cell here is one column wide),
@@ -3647,7 +4086,7 @@ mod tests {
             as u16
             + 36;
         assert_eq!(
-            buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
+            buf.cell((label_x, row as u16)).unwrap().style().fg,
             Some(Palette::dark().foreground),
             "the summary panel's title must keep its plain foreground look, not the outline's \
              heading accent"
@@ -4813,6 +5252,58 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn summary_header_shows_dir_title_and_body_drops_duplicate() {
+        // CS1: `dir_summary_lines` now returns `(title, body)` — the title paints the diff
+        // pane's header row (y=0), and the body (per-file rows + totals) no longer repeats it as
+        // its own first line.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        app.focus_outline(); // opens (a lone changeset defaults closed) and focuses
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree, so a Dir row exists to focus
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { .. }))
+            .expect("a Dir row present in Tree mode") as i64;
+        let delta = dir_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        assert!(matches!(
+            app.outline_items()[app.outline_cursor()],
+            OutlineItem::Dir { .. }
+        ));
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
+        assert!(
+            header.trim_end().ends_with("src/"),
+            "expected the diff pane's header row to carry the dir summary's title, got: {header:?}"
+        );
+
+        // The exact title text ("src/", nothing else) must not reappear as a whole body line —
+        // a per-file row like "src/a.txt  +1 -0" legitimately CONTAINS "src/" as a substring, so
+        // this checks for an exact-line match, not a substring.
+        for y in 1..buf.area.height {
+            let row: String = (36..buf.area.width)
+                .map(|x| cell_text(&buf, x, y))
+                .collect();
+            assert_ne!(
+                row.trim_end(),
+                "src/",
+                "the summary panel's body must not duplicate the title as its own line, \
+                 got row {y}: {row:?}"
+            );
+        }
     }
 
     #[test]
