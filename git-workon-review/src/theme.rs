@@ -150,7 +150,7 @@ pub struct ThemeOverrides {
     pub add_staged_strong: Option<Color>,
     pub cursor_bg: Option<Color>,
     pub selection_bg: Option<Color>,
-    pub outline_cursor_unfocused_bg: Option<Color>,
+    pub cursor_unfocused_bg: Option<Color>,
     pub pane_header_focused_fg: Option<Color>,
 }
 
@@ -275,8 +275,11 @@ pub struct Palette {
     /// Tint blended into a selected (line-selection) row — a muted teal, distinct from
     /// [`Palette::cursor_bg`].
     pub selection_bg: Color,
-    /// Cursor wash for the outline pane while OPEN but NOT focused — dimmer than [`Palette::cursor_bg`].
-    pub outline_cursor_unfocused_bg: Color,
+    /// Cursor wash for ANY pane's remembered cursor row while that pane does NOT hold focus —
+    /// dimmer than [`Palette::cursor_bg`]. Originally the outline-only field
+    /// `outline_cursor_unfocused_bg`; renamed (`unfocused-cursor-wash`) when the diff body and
+    /// split halves adopted the same dim-when-unfocused model the outline already had.
+    pub cursor_unfocused_bg: Color,
 
     /// Foreground for the ONE pane header/caption label that currently holds focus (CS1,
     /// `focused-pane-header` — locked decision #2). Defaults to [`Palette::foreground`] (base05);
@@ -360,7 +363,7 @@ impl Palette {
             add_staged_strong: Color::Rgb(34, 50, 38),
             cursor_bg: Color::Rgb(45, 50, 90),
             selection_bg: Color::Rgb(30, 66, 66),
-            outline_cursor_unfocused_bg: Color::Rgb(35, 38, 55),
+            cursor_unfocused_bg: Color::Rgb(35, 38, 55),
             pane_header_focused_fg: base.slot(5),
             background: base.slot(0),
             foreground: base.slot(5),
@@ -408,7 +411,7 @@ impl Palette {
         const STAGED_SUBTLE: f32 = 0.94;
         const STAGED_STRONG: f32 = 0.80;
         const CURSOR: f32 = 0.82;
-        const OUTLINE_CURSOR_UNFOCUSED: f32 = 0.90;
+        const CURSOR_UNFOCUSED: f32 = 0.90;
 
         Palette {
             syntax: SYNTAX_SLOTS.iter().map(|&s| base.slot(s)).collect(),
@@ -422,7 +425,7 @@ impl Palette {
             add_staged_strong: tint_toward(green, base00, STAGED_STRONG),
             cursor_bg: tint_toward(blue, base00, CURSOR),
             selection_bg: tint_toward(cyan, base00, CURSOR),
-            outline_cursor_unfocused_bg: tint_toward(blue, base00, OUTLINE_CURSOR_UNFOCUSED),
+            cursor_unfocused_bg: tint_toward(blue, base00, CURSOR_UNFOCUSED),
             pane_header_focused_fg: base.slot(5),
             background: base.slot(0),
             foreground: base.slot(5),
@@ -465,7 +468,7 @@ impl Palette {
             add_staged_strong: curated.add_staged_strong,
             cursor_bg: curated.cursor_bg,
             selection_bg: curated.selection_bg,
-            outline_cursor_unfocused_bg: curated.outline_cursor_unfocused_bg,
+            cursor_unfocused_bg: curated.cursor_unfocused_bg,
             // Derived straight from the probed terminal scheme (NOT the curated fallback) — this
             // is the whole point of `auto`: chrome that matches the terminal's own colors.
             background: base.slot(0),
@@ -506,36 +509,29 @@ impl Palette {
     /// falls to gutter glyph/structure instead, an accepted, documented degradation (see
     /// ADR-029's NO_COLOR note).
     pub fn mono(light: bool) -> Self {
-        // (subtle, strong, staged_subtle, staged_strong, cursor, selection, outline_cursor_unfocused)
-        let (
-            subtle,
-            strong,
-            staged_subtle,
-            staged_strong,
-            cursor,
-            selection,
-            outline_cursor_unfocused,
-        ) = if light {
-            (
-                Color::Rgb(215, 215, 215),
-                Color::Rgb(165, 165, 165),
-                Color::Rgb(230, 230, 230),
-                Color::Rgb(205, 205, 205),
-                Color::Rgb(190, 190, 190),
-                Color::Rgb(200, 200, 200),
-                Color::Rgb(210, 210, 210),
-            )
-        } else {
-            (
-                Color::Rgb(40, 40, 40),
-                Color::Rgb(90, 90, 90),
-                Color::Rgb(25, 25, 25),
-                Color::Rgb(50, 50, 50),
-                Color::Rgb(65, 65, 65),
-                Color::Rgb(55, 55, 55),
-                Color::Rgb(45, 45, 45),
-            )
-        };
+        // (subtle, strong, staged_subtle, staged_strong, cursor, selection, cursor_unfocused)
+        let (subtle, strong, staged_subtle, staged_strong, cursor, selection, cursor_unfocused) =
+            if light {
+                (
+                    Color::Rgb(215, 215, 215),
+                    Color::Rgb(165, 165, 165),
+                    Color::Rgb(230, 230, 230),
+                    Color::Rgb(205, 205, 205),
+                    Color::Rgb(190, 190, 190),
+                    Color::Rgb(200, 200, 200),
+                    Color::Rgb(210, 210, 210),
+                )
+            } else {
+                (
+                    Color::Rgb(40, 40, 40),
+                    Color::Rgb(90, 90, 90),
+                    Color::Rgb(25, 25, 25),
+                    Color::Rgb(50, 50, 50),
+                    Color::Rgb(65, 65, 65),
+                    Color::Rgb(55, 55, 55),
+                    Color::Rgb(45, 45, 45),
+                )
+            };
 
         Palette {
             syntax: vec![Color::Reset; SYNTAX_SLOTS.len()],
@@ -549,7 +545,7 @@ impl Palette {
             add_staged_strong: staged_strong,
             cursor_bg: cursor,
             selection_bg: selection,
-            outline_cursor_unfocused_bg: outline_cursor_unfocused,
+            cursor_unfocused_bg: cursor_unfocused,
             pane_header_focused_fg: Color::Reset,
             background: Color::Reset,
             foreground: Color::Reset,
@@ -675,8 +671,8 @@ impl Palette {
         if let Some(color) = overrides.selection_bg {
             self.selection_bg = color;
         }
-        if let Some(color) = overrides.outline_cursor_unfocused_bg {
-            self.outline_cursor_unfocused_bg = color;
+        if let Some(color) = overrides.cursor_unfocused_bg {
+            self.cursor_unfocused_bg = color;
         }
         if let Some(color) = overrides.pane_header_focused_fg {
             self.pane_header_focused_fg = color;
@@ -722,7 +718,7 @@ mod tests {
         assert_eq!(t.add_staged_strong, Color::Rgb(34, 50, 38));
         assert_eq!(t.cursor_bg, Color::Rgb(45, 50, 90));
         assert_eq!(t.selection_bg, Color::Rgb(30, 66, 66));
-        assert_eq!(t.outline_cursor_unfocused_bg, Color::Rgb(35, 38, 55));
+        assert_eq!(t.cursor_unfocused_bg, Color::Rgb(35, 38, 55));
     }
 
     #[test]
@@ -852,13 +848,11 @@ mod tests {
     }
 
     #[test]
-    fn light_cursor_and_selection_washes_are_distinct_and_outline_cursor_is_dimmer() {
+    fn light_cursor_and_selection_washes_are_distinct_and_unfocused_cursor_is_dimmer() {
         let t = Palette::light();
         assert_ne!(t.cursor_bg, t.selection_bg);
-        // The unfocused outline cursor wash should read dimmer than the focused cursor wash.
-        assert!(
-            distance_from_base00(t.outline_cursor_unfocused_bg) < distance_from_base00(t.cursor_bg)
-        );
+        // The unfocused cursor wash should read dimmer than the focused cursor wash.
+        assert!(distance_from_base00(t.cursor_unfocused_bg) < distance_from_base00(t.cursor_bg));
     }
 
     #[test]
@@ -937,10 +931,7 @@ mod tests {
         assert_eq!(palette.add_strong, dark.add_strong);
         assert_eq!(palette.cursor_bg, dark.cursor_bg);
         assert_eq!(palette.selection_bg, dark.selection_bg);
-        assert_eq!(
-            palette.outline_cursor_unfocused_bg,
-            dark.outline_cursor_unfocused_bg
-        );
+        assert_eq!(palette.cursor_unfocused_bg, dark.cursor_unfocused_bg);
     }
 
     #[test]
@@ -1158,7 +1149,7 @@ mod tests {
                 t.add_staged_strong,
                 t.cursor_bg,
                 t.selection_bg,
-                t.outline_cursor_unfocused_bg,
+                t.cursor_unfocused_bg,
             ] {
                 assert_achromatic(wash);
             }
@@ -1188,15 +1179,15 @@ mod tests {
                 assert!(staged_strong < strong, "staged should sit closer to black");
             }
 
-            // Cursor vs selection are distinct, and the unfocused outline cursor reads dimmer
+            // Cursor vs selection are distinct, and the unfocused cursor wash reads dimmer
             // (closer to the implied background) than the focused cursor wash.
             assert_ne!(t.cursor_bg, t.selection_bg);
             let (cursor, _, _) = rgb(t.cursor_bg);
-            let (outline_unfocused, _, _) = rgb(t.outline_cursor_unfocused_bg);
+            let (cursor_unfocused, _, _) = rgb(t.cursor_unfocused_bg);
             if light {
-                assert!(outline_unfocused > cursor);
+                assert!(cursor_unfocused > cursor);
             } else {
-                assert!(outline_unfocused < cursor);
+                assert!(cursor_unfocused < cursor);
             }
         }
     }

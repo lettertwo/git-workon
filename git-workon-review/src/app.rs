@@ -3693,8 +3693,13 @@ impl App {
     }
 
     /// The `(scroll, cursor)` a split pane renders with: the focused pane contributes its own
-    /// `scroll` and `Some(cursor)` (so the cursor highlight draws there); the unfocused pane
-    /// contributes its stashed scroll and `None` (no highlight). Combined resolves to the focused
+    /// `scroll`/`cursor`; the unfocused pane contributes its stashed `alt` scroll/cursor (CS1,
+    /// `unfocused-cursor-wash` — previously `None`, since only the focused pane ever drew a
+    /// cursor; now the unfocused half's remembered position is always returned too, so the
+    /// renderer can paint it with the dim [`crate::theme::Palette::cursor_unfocused_bg`] wash
+    /// when it's within the visible `scroll..end` range). The cursor alone no longer says
+    /// whether a pane holds focus — callers resolve that separately (`split_focus_role`,
+    /// `outline_focused`) and pick the wash accordingly. Combined resolves to the focused
     /// (single) state.
     pub(crate) fn pane_render_state(&self, role: Role) -> (usize, Option<usize>) {
         let pane = match role {
@@ -3705,7 +3710,7 @@ impl App {
         if self.split_focus == pane {
             (self.scroll, Some(self.cursor))
         } else {
-            (self.alt.scroll, None)
+            (self.alt.scroll, Some(self.alt.cursor))
         }
     }
 

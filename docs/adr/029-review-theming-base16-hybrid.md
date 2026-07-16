@@ -164,7 +164,7 @@ override keys**, not named bundled schemes. `workon.review.theme.*` (a subsectio
 | `base0a` | yellow accent | `warn_fg` |
 | `base0b` | green accent | `current_fg` |
 | `base0c` | cyan accent | `heading_fg` |
-| `del-subtle`, `del-strong`, `add-subtle`, `add-strong`, `del-staged-subtle`, `del-staged-strong`, `add-staged-subtle`, `add-staged-strong`, `cursor-bg`, `selection-bg`, `outline-cursor-unfocused-bg`, `pane-header-focused-fg` | diff/cursor tint override (kebab-case, mirroring the `Palette` field names) | the matching field, verbatim |
+| `del-subtle`, `del-strong`, `add-subtle`, `add-strong`, `del-staged-subtle`, `del-staged-strong`, `add-staged-subtle`, `add-staged-strong`, `cursor-bg`, `selection-bg`, `cursor-unfocused-bg`, `pane-header-focused-fg` | diff/cursor tint override (kebab-case, mirroring the `Palette` field names) | the matching field, verbatim |
 
 Values are `#rrggbb` or bare `rrggbb` (six hex digits only — no 3-digit shorthand). Applied via
 `Palette::apply_overrides`, on top of whichever base (`dark`/`light`/`auto`'s probe) was already

@@ -231,9 +231,29 @@ fn apply_row_tint(mut line: Line<'static>, width: u16, tint: Color) -> Line<'sta
     line
 }
 
-/// Wash the cursor row with the theme's cursor tint.
-fn apply_cursor_row(line: Line<'static>, width: u16, theme: &Palette) -> Line<'static> {
-    apply_row_tint(line, width, theme.cursor_bg)
+/// The cursor row's tint — full [`Palette::cursor_bg`] when `focused` is true (this pane holds
+/// focus), or the dimmer [`Palette::cursor_unfocused_bg`] otherwise. Shared by [`apply_cursor_row`]
+/// and `render_pane_sbs`'s divider-cell re-tint so the row wash and the divider it crosses never
+/// drift apart.
+fn cursor_tint(theme: &Palette, focused: bool) -> Color {
+    if focused {
+        theme.cursor_bg
+    } else {
+        theme.cursor_unfocused_bg
+    }
+}
+
+/// Wash the cursor row with the theme's cursor tint — full [`Palette::cursor_bg`] when `focused`
+/// is true (this pane holds focus), or the dimmer [`Palette::cursor_unfocused_bg`] otherwise (CS1,
+/// `unfocused-cursor-wash`: the uniform model every pane's remembered cursor row now follows,
+/// matching the outline's pre-existing focused/unfocused split).
+fn apply_cursor_row(
+    line: Line<'static>,
+    width: u16,
+    theme: &Palette,
+    focused: bool,
+) -> Line<'static> {
+    apply_row_tint(line, width, cursor_tint(theme, focused))
 }
 
 /// Wash a selected (line-selection) row with the theme's selection tint.
@@ -860,7 +880,7 @@ fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palet
 /// only), from [`App::outline_items_with_hidden_counts`]'s per-row marker count — an expanded row
 /// gets no chevron at all. The cursor row (the outline's OWN cursor — a separate coordinate space from the
 /// diff's [`App::cursor`]) gets the theme's cursor tint while the outline has focus, or the dimmer
-/// [`Palette::outline_cursor_unfocused_bg`] while it's merely open (so the remembered position stays
+/// [`Palette::cursor_unfocused_bg`] while it's merely open (so the remembered position stays
 /// legible even after focus returns to the diff). `&mut App` (CS2, precedent: [`render_body`]
 /// writing [`App::pane_height`]) — writes [`App::outline_height`] and re-derives
 /// [`App::derive_outline_scroll`] before painting from `app.outline.scroll`, giving the outline
@@ -910,10 +930,8 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
         let is_cursor = item_idx == cursor;
         let line = build_outline_line(item, theme, icons, hidden);
         let line = Line::from(pan_spans(line.spans, hscroll, theme));
-        let line = if is_cursor && focused {
-            apply_cursor_row(line, area.width, theme)
-        } else if is_cursor {
-            apply_row_tint(line, area.width, theme.outline_cursor_unfocused_bg)
+        let line = if is_cursor {
+            apply_cursor_row(line, area.width, theme, focused)
         } else {
             line
         };
@@ -1405,6 +1423,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
 /// Write a gap row's `··· N unchanged lines (Enter to expand) ···` marker across the FULL body
 /// width (both panes and the divider column) — unlike a per-pane content row, a gap hides the
 /// same span on both sides, so it isn't "about" one side or the other.
+#[allow(clippy::too_many_arguments)]
 fn render_gap_row(
     buf: &mut Buffer,
     area: Rect,
@@ -1413,12 +1432,13 @@ fn render_gap_row(
     is_cursor: bool,
     is_selected: bool,
     theme: &Palette,
+    focused: bool,
 ) {
     let msg = format!("··· {skipped} unchanged lines (Enter to expand) ···");
     let line = Line::from(TSpan::styled(msg, Style::default().fg(theme.dim)));
     // Cursor wins over selection on the same row.
     let line = if is_cursor {
-        apply_cursor_row(line, area.width, theme)
+        apply_cursor_row(line, area.width, theme, focused)
     } else if is_selected {
         apply_selection_row(line, area.width, theme)
     } else {
@@ -1777,12 +1797,16 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
             let cursor = Some(app.cursor);
             // The single pane is the focused one, so it shows any active selection.
             let selection = app.selection_range();
+            // CS1 (`unfocused-cursor-wash`, locked decision #1): the single/combined diff body's
+            // cursor dims to the unfocused wash while the outline holds focus instead — it never
+            // holds real focus itself in that state.
+            let focused = !app.outline_focused();
             match app.layout {
                 AppLayout::Sbs => render_pane_sbs(
-                    frame, app, area, idx, role, scroll, cursor, selection, theme,
+                    frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
                 ),
                 AppLayout::Inline => render_pane_inline(
-                    frame, app, area, idx, role, scroll, cursor, selection, theme,
+                    frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
                 ),
             }
         }
@@ -1809,12 +1833,15 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
         app.pane_height = area.height as usize;
         let (scroll, cursor) = app.pane_render_state(role);
         let selection = app.selection_range();
+        // `split_focus_role()`'s pane is only the frame's REAL focus while the outline doesn't
+        // hold it (same rule as the split's two-caption branch below).
+        let focused = !outline_focused;
         match app.layout {
             AppLayout::Sbs => render_pane_sbs(
-                frame, app, area, idx, role, scroll, cursor, selection, theme,
+                frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
             ),
             AppLayout::Inline => render_pane_inline(
-                frame, app, area, idx, role, scroll, cursor, selection, theme,
+                frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
             ),
         }
         return;
@@ -1845,28 +1872,35 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     app.clamp_scroll();
     app.clamp_alt_scroll();
 
+    // Each half's REAL focus (CS1, `unfocused-cursor-wash` — locked decisions #1/#5): the outline
+    // holding focus means neither half does. Computed once here and reused by both
+    // `render_caption` calls below and the pane render calls further down; a selection lives in
+    // the focused pane only, so it gates on `focused` too (not on `cursor`, which the unfocused
+    // half now always carries — its remembered position, per `App::pane_render_state`'s updated
+    // doc comment).
+    let u_focused = !outline_focused && app.split_focus_role() == Role::Unstaged;
+    let s_focused = !outline_focused && app.split_focus_role() == Role::Staged;
+
     render_caption(
         frame.buffer_mut(),
         unstaged_caption,
         "UNSTAGED",
         theme,
-        !outline_focused && app.split_focus_role() == Role::Unstaged,
+        u_focused,
     );
     render_caption(
         frame.buffer_mut(),
         staged_caption,
         "STAGED",
         theme,
-        !outline_focused && app.split_focus_role() == Role::Staged,
+        s_focused,
     );
 
     let (u_scroll, u_cursor) = app.pane_render_state(Role::Unstaged);
     let (s_scroll, s_cursor) = app.pane_render_state(Role::Staged);
-    // A selection lives in the focused pane only — the one whose `pane_render_state` yields a
-    // cursor. Show it there, `None` in the unfocused pane.
     let range = app.selection_range();
-    let u_selection = u_cursor.and(range);
-    let s_selection = s_cursor.and(range);
+    let u_selection = if u_focused { range } else { None };
+    let s_selection = if s_focused { range } else { None };
     match app.layout {
         AppLayout::Sbs => {
             render_pane_sbs(
@@ -1879,6 +1913,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 u_cursor,
                 u_selection,
                 theme,
+                u_focused,
             );
             render_pane_sbs(
                 frame,
@@ -1890,6 +1925,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 s_cursor,
                 s_selection,
                 theme,
+                s_focused,
             );
         }
         AppLayout::Inline => {
@@ -1903,6 +1939,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 u_cursor,
                 u_selection,
                 theme,
+                u_focused,
             );
             render_pane_inline(
                 frame,
@@ -1914,6 +1951,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 s_cursor,
                 s_selection,
                 theme,
+                s_focused,
             );
         }
     }
@@ -1933,8 +1971,12 @@ fn render_caption(buf: &mut Buffer, area: Rect, label: &str, theme: &Palette, fo
 }
 
 /// Render one SBS pane of `role`'s view for file `idx` into `area`, scrolled to `scroll`. The
-/// cursor-row highlight draws only when `cursor` is `Some` (the focused pane) and matches a visible
-/// row — a split's unfocused pane passes `None`.
+/// cursor-row highlight draws whenever `cursor` is `Some` and matches a visible row — this now
+/// includes an unfocused split half's REMEMBERED cursor (CS1, `unfocused-cursor-wash`; previously
+/// unfocused passed `None` and drew no cursor at all). `focused` says which wash that row gets:
+/// full [`Palette::cursor_bg`] when this pane holds real focus, the dim
+/// [`Palette::cursor_unfocused_bg`] otherwise — resolved by the caller from app state
+/// (`outline_focused`, `split_focus_role`), never guessed here from `cursor`/`selection` alone.
 #[allow(clippy::too_many_arguments)]
 fn render_pane_sbs(
     frame: &mut Frame,
@@ -1946,6 +1988,7 @@ fn render_pane_sbs(
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
     theme: &Palette,
+    focused: bool,
 ) {
     let left_w = area.width.saturating_sub(1) / 2;
     let right_w = area.width.saturating_sub(1).saturating_sub(left_w);
@@ -2017,6 +2060,7 @@ fn render_pane_sbs(
                     is_cursor,
                     is_selected,
                     theme,
+                    focused,
                 );
             }
             DisplayRow::Row(row) => {
@@ -2056,8 +2100,8 @@ fn render_pane_sbs(
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
                     (
-                        apply_cursor_row(old_line, old_area.width, theme),
-                        apply_cursor_row(new_line, new_area.width, theme),
+                        apply_cursor_row(old_line, old_area.width, theme, focused),
+                        apply_cursor_row(new_line, new_area.width, theme, focused),
                     )
                 } else if is_selected {
                     (
@@ -2082,12 +2126,15 @@ fn render_pane_sbs(
                 // The divider column was painted once for the whole pane height above, with the
                 // default background; re-tint just this row's divider cell so the cursor wash
                 // covers the full width (panes AND the `│` between them), like `render_gap_row`.
+                // Must carry whichever wash the row actually got — full when `focused`, dim
+                // otherwise — or the divider cell stays bright on a dimmed row.
                 if is_cursor {
+                    let tint = cursor_tint(theme, focused);
                     frame.buffer_mut().set_string(
                         div_area.x,
                         y,
                         "│",
-                        Style::default().fg(theme.dim).bg(theme.cursor_bg),
+                        Style::default().fg(theme.dim).bg(tint),
                     );
                 }
             }
@@ -2190,6 +2237,7 @@ fn render_pane_inline(
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
     theme: &Palette,
+    focused: bool,
 ) {
     // One offset shared by every content pane (locked decision #1) — read once, before any of
     // the `app` borrows below.
@@ -2235,6 +2283,7 @@ fn render_pane_inline(
                     is_cursor,
                     is_selected,
                     theme,
+                    focused,
                 );
             }
             row => {
@@ -2260,7 +2309,7 @@ fn render_pane_inline(
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let line = if is_cursor {
-                    apply_cursor_row(line, area.width, theme)
+                    apply_cursor_row(line, area.width, theme, focused)
                 } else if is_selected {
                     apply_selection_row(line, area.width, theme)
                 } else {
@@ -2326,6 +2375,34 @@ mod tests {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| cell_text(buf, x, y)).collect())
             .collect()
+    }
+
+    /// Find the row (by line index) whose caption reads `label` — e.g. "UNSTAGED" or "STAGED".
+    /// The `label != "STAGED" || !line.contains("UNSTAGED")` guard disambiguates the two: the
+    /// UNSTAGED caption row's tail can itself contain the substring "STAGED".
+    fn caption_row(content: &[String], label: &str) -> usize {
+        content
+            .iter()
+            .position(|line| {
+                line.contains(label) && (label != "STAGED" || !line.contains("UNSTAGED"))
+            })
+            .unwrap_or_else(|| panic!("{label} caption present"))
+    }
+
+    /// Find the first row in `start..end` whose text (columns `x0..buf.area.width`, so callers can
+    /// exclude an outline/gutter to the left) contains `text`. Used by the split-half cursor-wash
+    /// tests to locate each pane's cursor row bounded to that pane's own row range, disambiguating
+    /// text that appears once per pane.
+    fn find_row(buf: &Buffer, x0: u16, start: usize, end: usize, text: &str) -> u16 {
+        (start..end)
+            .find(|&y| {
+                (x0..buf.area.width)
+                    .map(|x| cell_text(buf, x, y as u16))
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .unwrap_or_else(|| panic!("row containing {text:?} not found in {start}..{end}"))
+            as u16
     }
 
     /// Find `label`'s starting display COLUMN within `row` — a `chars()` window search (not
@@ -5865,6 +5942,212 @@ mod tests {
         assert!(
             diff_bold,
             "the lit (focused) diff header must stay bold under NO_COLOR"
+        );
+    }
+
+    // ── unfocused-cursor-wash (CS1): the uniform dim-when-unfocused cursor model ───
+
+    #[test]
+    fn diff_cursor_dims_when_outline_holds_focus_single_zoom() {
+        // Locked decision #1: the diff body (single/combined zoom) paints its cursor row with the
+        // dim unfocused wash, not full `cursor_bg`, whenever the outline (not the diff) holds
+        // focus.
+        let old = "l1\nl2\nl3\n";
+        let new = "l1\nCHANGED\nl3\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("only.txt", old, new)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Unstaged)
+        );
+        app.focus_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        // Row 0 of the diff pane's own rect is its header; content starts at row 1. The cursor
+        // row lands at `1 + (cursor - scroll)`, neither of which `render_body`'s Single-zoom arm
+        // mutates (it only reads them), so the values read back after rendering are exactly what
+        // painted the frame.
+        let cursor_y = (1 + app.cursor - app.scroll) as u16;
+        let cell = buf.cell((37, cursor_y)).unwrap();
+        assert_eq!(
+            cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the diff cursor must dim to the unfocused wash while the outline holds focus"
+        );
+        assert_ne!(
+            cell.style().bg,
+            Some(theme.cursor_bg),
+            "the diff cursor must NOT show the full focused wash while the outline holds focus"
+        );
+    }
+
+    #[test]
+    fn both_split_halves_dim_and_the_divider_carries_the_dim_wash_when_outline_holds_focus() {
+        // Locked decision #1's "outline-focused + split zoom" case: neither half holds focus, so
+        // BOTH show the dim wash on their own remembered cursor row — and the gotcha this
+        // changeset must fix, the divider cell re-tint on that row must follow the same wash
+        // (previously hardcoded to full `cursor_bg`).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "default split focus"
+        );
+
+        // Move the (currently focused) unstaged pane's cursor onto its changed row, before the
+        // outline takes focus — the staged pane's `alt` cursor is untouched, so it stays at
+        // `reset_panes`'s first-hunk reseat: the staged pane renders the base->staged diff, whose
+        // only change is "beta" -> "BETAEDIT" (row 1), not row 0 ("alpha"). ("GAMMAEDIT" is the
+        // UNSTAGED pane's own hunk — the index->workdir diff — and never appears in the staged
+        // pane at all.)
+        app.cursor = 1;
+        app.derive_scroll();
+        app.focus_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 24);
+        let content = buf_lines(&buf);
+
+        let unstaged_caption_row = caption_row(&content, "UNSTAGED");
+        let staged_caption_row = caption_row(&content, "STAGED");
+
+        // "BETAEDIT" appears once in EACH pane at row index 1 — the unstaged pane's unchanged
+        // CONTEXT line (its own hunk is gamma -> GAMMAEDIT, at row 2, which `app.cursor` is never
+        // set to here) and the staged pane's actual hunk (its `alt.cursor`, from `reset_panes`'s
+        // first-hunk reseat) — so each search is bounded to its own pane's row range to
+        // disambiguate which "BETAEDIT" it's finding. Bounded starting at column 36 to skip the
+        // outline to the left of the diff panes.
+        let unstaged_cursor_y = find_row(
+            &buf,
+            36,
+            unstaged_caption_row + 1,
+            staged_caption_row,
+            "BETAEDIT",
+        );
+        let staged_cursor_y = find_row(&buf, 36, staged_caption_row + 1, content.len(), "BETAEDIT");
+
+        // Same left/divider geometry `render_pane_sbs` computes for a `diff_w`-wide pane at
+        // `OUTLINE_TEST_WIDTH` (outline `0..35` + 1-col divider, diff pane `36..`).
+        let diff_x0 = 36u16;
+        let diff_w = OUTLINE_TEST_WIDTH - diff_x0;
+        let left_w = diff_w.saturating_sub(1) / 2;
+        let div_x = diff_x0 + left_w;
+
+        let unstaged_cell = buf.cell((diff_x0 + 1, unstaged_cursor_y)).unwrap();
+        assert_eq!(
+            unstaged_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the unstaged half's cursor must dim while the outline holds focus"
+        );
+        let staged_cell = buf.cell((diff_x0 + 1, staged_cursor_y)).unwrap();
+        assert_eq!(
+            staged_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the staged half's cursor must dim while the outline holds focus"
+        );
+
+        let divider_cell = buf.cell((div_x, unstaged_cursor_y)).unwrap();
+        assert_eq!(
+            divider_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the divider cell on a dimmed cursor row must carry the same dim wash, not stay bright"
+        );
+    }
+
+    #[test]
+    fn unfocused_split_half_shows_the_remembered_dim_cursor_while_the_focused_half_is_full() {
+        // Locked decision #1's diff-focused split case: the half that just LOST focus (`w`
+        // toggled away from it) now shows its remembered cursor position in the dim wash, rather
+        // than no cursor at all (the pre-changeset behavior — `pane_render_state` returned `None`
+        // for the unfocused half).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert!(!app.outline_focused());
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "default split focus"
+        );
+        if app.outline_open() {
+            app.toggle_outline(); // force closed — a clean full-width diff pane, no outline offset
+        }
+
+        // Land the (currently focused) unstaged pane's cursor on row 1 (a context line in the
+        // unstaged/index->workdir diff — its own hunk, gamma -> GAMMAEDIT, is row 2), then flip
+        // focus to the staged half — `toggle_split_focus` swaps `cursor`/`scroll` with `alt`, so
+        // that position becomes the unstaged half's REMEMBERED `alt` cursor. The staged half's OWN
+        // `alt` (untouched since `reset_panes`'s first-hunk reseat) becomes the newly-focused
+        // `cursor`: the staged pane renders the base->staged diff, whose only hunk is
+        // "beta" -> "BETAEDIT", also row 1 — coincidentally the same row index, different text.
+        app.cursor = 1;
+        app.derive_scroll();
+        app.toggle_split_focus();
+        assert_eq!(app.split_focus_role(), Role::Staged);
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+
+        let unstaged_caption_row = caption_row(&content, "UNSTAGED");
+        let staged_caption_row = caption_row(&content, "STAGED");
+
+        // "BETAEDIT" appears once in EACH pane at row index 1 (see the comment above) — bounded
+        // per pane to disambiguate which one a given search lands on. No outline offset here (the
+        // outline was force-closed above), so the search starts at column 0.
+        let unstaged_cursor_y = find_row(
+            &buf,
+            0,
+            unstaged_caption_row + 1,
+            staged_caption_row,
+            "BETAEDIT",
+        );
+        let staged_cursor_y = find_row(&buf, 0, staged_caption_row + 1, content.len(), "BETAEDIT");
+
+        let unstaged_cell = buf.cell((1, unstaged_cursor_y)).unwrap();
+        assert_eq!(
+            unstaged_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the just-unfocused half's remembered cursor must show the dim wash"
+        );
+        assert_ne!(unstaged_cell.style().bg, Some(theme.cursor_bg));
+
+        let staged_cell = buf.cell((1, staged_cursor_y)).unwrap();
+        assert_eq!(
+            staged_cell.style().bg,
+            Some(theme.cursor_bg),
+            "the newly-focused half must show the full cursor wash"
         );
     }
 }

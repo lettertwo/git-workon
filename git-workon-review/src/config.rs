@@ -174,7 +174,7 @@ fn tint_slot<'a>(overrides: &'a mut ThemeOverrides, key: &str) -> Option<&'a mut
         "add-staged-strong" => &mut overrides.add_staged_strong,
         "cursor-bg" => &mut overrides.cursor_bg,
         "selection-bg" => &mut overrides.selection_bg,
-        "outline-cursor-unfocused-bg" => &mut overrides.outline_cursor_unfocused_bg,
+        "cursor-unfocused-bg" => &mut overrides.cursor_unfocused_bg,
         "pane-header-focused-fg" => &mut overrides.pane_header_focused_fg,
         _ => return None,
     })
@@ -626,6 +626,49 @@ mod tests {
         palette.apply_overrides(&overrides);
         assert_eq!(palette.background, Color::Rgb(0x10, 0x10, 0x10));
         assert_eq!(overrides.cursor_bg, Some(Color::Rgb(0x1a, 0x2b, 0x3c)));
+    }
+
+    #[test]
+    fn theme_overrides_reads_the_cursor_unfocused_bg_tint_key() {
+        use crate::theme::Palette;
+
+        // CS1 (`unfocused-cursor-wash`): `cursor-unfocused-bg` replaced the outline-only
+        // `outline-cursor-unfocused-bg` key with no backward compatibility — see the sibling
+        // rejection test below for the dropped old key.
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme.cursor-unfocused-bg", "#1a2b3c")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let (overrides, warnings) = ReviewConfig::new(repo)
+            .theme_overrides()
+            .expect("theme_overrides");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            overrides.cursor_unfocused_bg,
+            Some(Color::Rgb(0x1a, 0x2b, 0x3c))
+        );
+
+        let mut palette = Palette::dark();
+        palette.apply_overrides(&overrides);
+        assert_eq!(palette.cursor_unfocused_bg, Color::Rgb(0x1a, 0x2b, 0x3c));
+    }
+
+    #[test]
+    fn theme_overrides_rejects_the_dropped_outline_cursor_unfocused_bg_key() {
+        // The pre-rename key must NOT resolve as a compat alias — it's just an unknown key now,
+        // warned and ignored exactly like any other unrecognized `workon.review.theme.*` name.
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme.outline-cursor-unfocused-bg", "#1a2b3c")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let (overrides, warnings) = ReviewConfig::new(repo)
+            .theme_overrides()
+            .expect("theme_overrides");
+        assert!(overrides.is_empty(), "dropped key must not set any field");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("outline-cursor-unfocused-bg"));
     }
 
     #[test]
