@@ -14,7 +14,9 @@
 //! - [`Keymap`] — resolves the registry defaults against a repo's [`RawBinding`]s (a git entry
 //!   overrides that action's default; an empty value unbinds), builds per-view
 //!   sequence→command lookup lists, and drives dispatch through [`Keymap::advance`]. Unknown
-//!   action names and same-view key collisions are collected as [`Keymap::warnings`].
+//!   action names, same-view key collisions, and prefix clashes (a complete binding that's a
+//!   strict prefix of another, leaving the shorter one unreachable) are collected as
+//!   [`Keymap::warnings`].
 //!
 //! **Not handled here** (stays hardcoded in `tui.rs`): the confirm modal (`y`/`n`/`Esc`) and the
 //! whole `Esc`-precedence cascade (confirm > help > selection-cancel > outline-focused-quit >
@@ -188,7 +190,8 @@ pub static REGISTRY: &[Registered] = &[
         // Rebound from `z` (diff-fold-keys): `z` now anchors the `zM`/`zR` gap fold-all chords in
         // this view, and a bare-key binding can't coexist with a longer chord sharing its prefix
         // (see `shift_z_dispatches_cycle_zoom_with_no_collisions`'s doc comment for the
-        // mechanics). `Z` was free in `View::Diff`.
+        // mechanics; `build_context`'s prefix-clash check would now warn on this, not just
+        // silently break dispatch). `Z` was free in `View::Diff`.
         default_keys: "Z",
         description: "Cycle the staged/unstaged zoom",
     },
@@ -755,7 +758,13 @@ impl Keymap {
 
 /// Build one context's active binding list: every global row plus every row of `view`, in
 /// registry order (global first). On a key sequence already claimed in this context, the
-/// first-seen (registry-order) command wins and a collision warning is recorded.
+/// first-seen (registry-order) command wins and a collision warning is recorded. Also flags
+/// **prefix clashes**: a complete binding that is a strict prefix of another complete binding in
+/// the same context. `match_keys` gives a pending (longer) chord precedence over an exact
+/// (shorter) match in the same scan, so the shorter binding's command can never fire — the
+/// warning names both actions and the view. Two chords merely sharing a prefix with each other
+/// (`zM` vs `zR`) are NOT a clash: neither is a strict prefix of the other since a chord anchor
+/// key (`z`) is never itself a complete binding here.
 fn build_context(
     resolved: &[Vec<KeySeq>],
     view: View,
@@ -777,11 +786,55 @@ fn build_context(
                     command_label(*winner),
                 ));
             } else {
+                for (existing, other) in &out {
+                    if is_strict_prefix(existing, seq) {
+                        warnings.push(prefix_clash_warning(
+                            view,
+                            existing,
+                            *other,
+                            seq,
+                            entry.command,
+                        ));
+                    } else if is_strict_prefix(seq, existing) {
+                        warnings.push(prefix_clash_warning(
+                            view,
+                            seq,
+                            entry.command,
+                            existing,
+                            *other,
+                        ));
+                    }
+                }
                 out.push((seq.clone(), entry.command));
             }
         }
     }
     out
+}
+
+/// True when `shorter` is strictly shorter than `longer` AND is its leading sub-sequence.
+fn is_strict_prefix(shorter: &[KeyPress], longer: &[KeyPress]) -> bool {
+    shorter.len() < longer.len() && longer[..shorter.len()] == *shorter
+}
+
+/// A prefix-clash warning: `shorter_seq`/`shorter_cmd` is the bare(r) binding rendered
+/// unreachable by the longer, chord-taking-precedence `longer_seq`/`longer_cmd`.
+fn prefix_clash_warning(
+    view: View,
+    shorter_seq: &[KeyPress],
+    shorter_cmd: Command,
+    longer_seq: &[KeyPress],
+    longer_cmd: Command,
+) -> String {
+    format!(
+        "key '{}' for {} is unreachable in the {} view: the longer chord '{}' is bound to {}, \
+         and a pending chord always takes precedence over a shorter binding sharing its prefix",
+        render_seq(shorter_seq),
+        command_label(shorter_cmd),
+        view_label(view),
+        render_seq(longer_seq),
+        command_label(longer_cmd),
+    )
 }
 
 /// One row of the `?` help overlay: an action's resolved key label (space-joined alternatives,
@@ -1220,10 +1273,13 @@ mod tests {
     /// (see its doc comment): had `cycle-zoom` stayed on bare `z` alongside `zM`/`zR`, a lone `z`
     /// press would always report `Pending` instead of firing `CycleZoom` immediately, and any
     /// follow-up key that wasn't `M`/`R` would be swallowed as `Unmatched { mid_sequence: true }`
-    /// rather than re-processed — silently breaking `cycle-zoom` with no warning (`build_context`'s
-    /// collision check only flags identical sequences, not prefix overlaps, so it wouldn't catch
-    /// this). This test pins the resolved state: `Z` fires `CycleZoom` immediately, and `z` only
+    /// rather than re-processed — silently breaking `cycle-zoom` with no *runtime* warning; the
+    /// matcher's chord-wins precedence never changed. This test pins the resolved state: `Z`
+    /// fires `CycleZoom` immediately, and `z` only
     /// ever anchors the `zM`/`zR` chords below — never a bare-key command of its own again.
+    /// (`build_context` now also flags this shape as a prefix clash and warns — see
+    /// `a_bare_prefix_binding_warns_about_the_chord_that_shadows_it` below — but the resolved
+    /// defaults must still be clash-free, hence the empty-warnings assertion here.)
     #[test]
     fn shift_z_dispatches_cycle_zoom_with_no_collisions() {
         let km = Keymap::defaults();
@@ -1347,6 +1403,34 @@ mod tests {
         assert_eq!(
             feed(&km, false, &[key(KeyCode::Char('o'))]),
             Dispatch::Command(Command::ToggleOutline)
+        );
+    }
+
+    #[test]
+    fn a_bare_prefix_binding_warns_about_the_chord_that_shadows_it() {
+        // Rebind cycle-zoom back onto bare `z`, which now collides with the `zM`/`zR` gap
+        // fold-all chords still on their defaults in `View::Diff`. Each chord sharing the `z`
+        // prefix is its own clashing pair — one warning per pair, both naming cycle-zoom.
+        let km = Keymap::from_bindings(&[RawBinding {
+            view: View::Diff,
+            action: "cycle-zoom".to_string(),
+            keys: "z".to_string(),
+        }]);
+        assert_eq!(km.warnings().len(), 2, "warnings: {:?}", km.warnings());
+        assert!(km.warnings().iter().all(|w| w.contains("cycle-zoom")));
+        assert!(km.warnings().iter().all(|w| w.contains("diff")));
+        assert!(km.warnings().iter().any(|w| w.contains("reset-gaps")));
+        assert!(km.warnings().iter().any(|w| w.contains("expand-all-gaps")));
+    }
+
+    #[test]
+    fn z_m_and_z_r_alone_do_not_clash_with_each_other() {
+        // zM/zR both anchor on `z` but neither is a strict prefix of the other — no warning.
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "zM/zR must not warn about each other: {:?}",
+            km.warnings()
         );
     }
 
