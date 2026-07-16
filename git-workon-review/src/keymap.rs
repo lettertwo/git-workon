@@ -904,8 +904,10 @@ fn view_label_title(view: View) -> &'static str {
 }
 
 /// The resolved key label for the FIRST alternative bound to `command` (for the curated footer
-/// hint, which only has room for one key per action), or `None` when unbound.
-fn primary_key(keymap: &Keymap, command: Command) -> Option<String> {
+/// hint, which only has room for one key per action), or `None` when unbound. `pub` (not
+/// `pub(crate)`): `main.rs::seat_app` — the bin target, consuming the lib externally — uses the
+/// same first-alternative policy for the refusal hint's zoom key label, so the two can't diverge.
+pub fn primary_key(keymap: &Keymap, command: Command) -> Option<String> {
     keymap.keys_for(command).first().map(|seq| render_seq(seq))
 }
 

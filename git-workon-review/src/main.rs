@@ -225,11 +225,7 @@ fn seat_app(
     // Plumb the resolved CycleZoom binding into the "cycle zoom" refusal hint (App has no keymap
     // field of its own — see `App::zoom_key_label`'s doc comment); leaves the "Z" default in
     // place if the command has no bound key.
-    if let Some(label) = keymap
-        .keys_for(Command::CycleZoom)
-        .first()
-        .map(|seq| keymap::render_seq(seq))
-    {
+    if let Some(label) = keymap::primary_key(keymap, Command::CycleZoom) {
         app.set_zoom_key_label(label);
     }
     // CS4: defer file loads to the event loop's input-idle window rather than blocking here (or
