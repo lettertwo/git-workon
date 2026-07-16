@@ -8,7 +8,7 @@ use miette::{IntoDiagnostic, Result};
 use workon_review::acquire::{diff_changesets, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::{self, ReviewConfig};
-use workon_review::keymap::Keymap;
+use workon_review::keymap::{self, Command, Keymap};
 use workon_review::source::{complete_source, resolve_source, Source};
 use workon_review::terminal_query;
 use workon_review::theme::Palette;
@@ -221,6 +221,16 @@ fn seat_app(
     let mut app = App::from_changesets(repo, views);
     if let Some(source) = source {
         app.set_review_source(source);
+    }
+    // Plumb the resolved CycleZoom binding into the "cycle zoom" refusal hint (App has no keymap
+    // field of its own — see `App::zoom_key_label`'s doc comment); leaves the "Z" default in
+    // place if the command has no bound key.
+    if let Some(label) = keymap
+        .keys_for(Command::CycleZoom)
+        .first()
+        .map(|seq| keymap::render_seq(seq))
+    {
+        app.set_zoom_key_label(label);
     }
     // CS4: defer file loads to the event loop's input-idle window rather than blocking here (or
     // on any later selection change) — `app.open_current()` below marks the initial open pending
