@@ -764,14 +764,36 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
+/// The style for a pane header/caption LABEL word (CS1, `focused-pane-header`) — never the
+/// surrounding chrome (counters, diffstats, rule characters, markers), which keep their own
+/// existing colors regardless of focus (locked decision #4). `focused` selects between
+/// [`Palette::pane_header_focused_fg`] with a structural, unconditional BOLD (locked decision #3
+/// — under [`Palette::mono`], where that color and `theme.dim` both collapse to `Color::Reset`,
+/// this BOLD is the only thing that still marks the focused label) and the plain
+/// [`Palette::dim`] every unfocused label already used before this changeset. Exactly one call
+/// site across a frame's outline header / diff header / split captions should ever pass `true`
+/// (the exactly-one-lit-label invariant — see the module's `focused-pane-header` handoff).
+fn pane_header_label_style(theme: &Palette, focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(theme.pane_header_focused_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dim)
+    }
+}
+
 /// The outline pane's own top row (CS1, `pane-headers`): `[i/n] {display_label}` (the active
-/// changeset's TRUE stack position, `theme.heading_fg` bold label — no current-marker glyph,
-/// since this header is always describing the currently-active changeset, a redundant thing to
-/// mark), ` {warn_marker} needs restack` (`theme.warn_fg`, full text unlike the diff header's
-/// glyph-only prefix — see [`changeset_prefix_spans`]) when [`workon::Changeset::needs_restack`],
-/// and a changeset-total `+A -D` diffstat (the fold `render_winbar` used to own, pre-CS1) skipped
-/// when [`App::files`] is empty (a Pending/Failed changeset, ADR-037). Truncated to the outline's
-/// own width via [`Buffer::set_line`], exactly like every outline item row below it.
+/// changeset's TRUE stack position, the display label styled via [`pane_header_label_style`] —
+/// lit ([`Palette::pane_header_focused_fg`] + bold) while the outline has focus, dim otherwise
+/// (CS1, `focused-pane-header` — locked decision #5's "outline focused" case); no current-marker
+/// glyph, since this header is always describing the currently-active changeset, a redundant
+/// thing to mark), ` {warn_marker} needs restack` (`theme.warn_fg`, full text unlike the diff
+/// header's glyph-only prefix — see [`changeset_prefix_spans`]) when
+/// [`workon::Changeset::needs_restack`], and a changeset-total `+A -D` diffstat (the fold
+/// `render_winbar` used to own, pre-CS1) skipped when [`App::files`] is empty (a Pending/Failed
+/// changeset, ADR-037). Truncated to the outline's own width via [`Buffer::set_line`], exactly
+/// like every outline item row below it.
 ///
 /// CS1 risk (accepted, not fixed here): in [`crate::outline::OutlineMode::Flat`], the item rows
 /// below dedupe a file across every changeset that touches it, with no changeset context of their
@@ -779,7 +801,7 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// than what the (deduped, cross-stack) row list actually shows. Acceptable for now; a future
 /// changeset could soften this (e.g. suppress the header in Flat mode) if it proves confusing in
 /// practice.
-fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette, focused: bool) {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
@@ -793,12 +815,7 @@ fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palet
                 .fg(theme.foreground)
                 .add_modifier(Modifier::BOLD),
         ),
-        TSpan::styled(
-            title,
-            Style::default()
-                .fg(theme.heading_fg)
-                .add_modifier(Modifier::BOLD),
-        ),
+        TSpan::styled(title, pane_header_label_style(theme, focused)),
     ];
     if cs.needs_restack {
         spans.push(TSpan::styled(
@@ -853,7 +870,7 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     // CS1 risk: this `>= 2` guard must exist in BOTH pane renderers (see `render_body`'s matching
     // carve-out) — a 1-row (or shorter) terminal has no room to spare for a header at all.
     let area = if area.height >= 2 {
-        render_outline_header(frame, app, area, theme);
+        render_outline_header(frame, app, area, theme, app.outline_focused());
         Rect::new(area.x, area.y + 1, area.width, area.height - 1)
     } else {
         area
@@ -1233,13 +1250,24 @@ fn changeset_prefix_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TS
 }
 
 /// The diff pane header's shared "current file" segment (CS1, `pane-headers`): `[fidx/nfiles] `
-/// bold, an optional nerd devicons file icon, [`current_file_label`] bold, a tight `+N -M`
-/// per-file diffstat (new: the old winbar only ever showed a CHANGESET-total diffstat, never a
-/// per-file one — [`crate::summary::file_diffstat`] gives the same recorded counts for a binary
-/// file as a text one, so this segment needs no binary special-case), and the pan-offset
-/// indicator. Used verbatim whether the outline is open, closed+lone, or closed+multi (with the
-/// changeset prefix ahead of it) — see [`diff_header_line`]'s state table.
-fn file_segment_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TSpan<'static>> {
+/// bold, an optional nerd devicons file icon, [`current_file_label`] styled via
+/// [`pane_header_label_style`] (lit while `focused`, dim otherwise — CS1, `focused-pane-header`),
+/// a tight `+N -M` per-file diffstat (new: the old winbar only ever showed a CHANGESET-total
+/// diffstat, never a per-file one — [`crate::summary::file_diffstat`] gives the same recorded
+/// counts for a binary file as a text one, so this segment needs no binary special-case), and the
+/// pan-offset indicator. Used verbatim whether the outline is open, closed+lone, or closed+multi
+/// (with the changeset prefix ahead of it) — see [`diff_header_line`]'s state table. `focused` is
+/// resolved by the caller from [`EffectiveZoom`] + focus state, not computed here (locked
+/// decision #5: this segment is the diff pane header's own label, lit only when the diff has
+/// focus AND the effective zoom is [`EffectiveZoom::Single`] — under [`EffectiveZoom::Split`] a
+/// caption is the lit label instead, so this stays dim, EXCEPT when `render_body_split`'s own
+/// short-area fallback drops both captions, in which case this label lights up instead).
+fn file_segment_spans(
+    app: &App,
+    theme: &Palette,
+    icons: IconMode,
+    focused: bool,
+) -> Vec<TSpan<'static>> {
     let idx = app.current + 1;
     let n = app.files().len();
     let mut spans = vec![TSpan::styled(
@@ -1269,9 +1297,7 @@ fn file_segment_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TSpan<
     }
     spans.push(TSpan::styled(
         current_file_label(app),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
+        pane_header_label_style(theme, focused),
     ));
     if let Some(f) = app.files().get(app.current) {
         let (adds, dels) = crate::summary::file_diffstat(f);
@@ -1302,7 +1328,12 @@ fn file_segment_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TSpan<
 ///   (`Style::default()`'s `Reset` fg, even under a painted canvas, since [`Buffer::set_line`]
 ///   writes nothing for zero-width content) rather than the theme's own baseline (regression:
 ///   `header_text_carries_the_theme_foreground_not_the_terminal_default`).
-fn diff_header_line(app: &App, theme: &Palette, icons: IconMode) -> Line<'static> {
+///
+/// `focused` is `true` only when the diff pane's OWN header label should be lit — the caller
+/// ([`render_body`]) resolves this from the diff's focus state AND [`EffectiveZoom`] (locked
+/// decision #5): a Split zoom lights a caption instead (see [`render_body_split`]), so this stays
+/// dim even while the diff has focus in that case.
+fn diff_header_line(app: &App, theme: &Palette, icons: IconMode, focused: bool) -> Line<'static> {
     let show_prefix = app.changeset_count() > 1 && !app.outline_open();
 
     if app.current_failure().is_some() || app.is_current_pending() || app.files().is_empty() {
@@ -1326,7 +1357,7 @@ fn diff_header_line(app: &App, theme: &Palette, icons: IconMode) -> Line<'static
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    spans.extend(file_segment_spans(app, theme, icons));
+    spans.extend(file_segment_spans(app, theme, icons, focused));
     Line::from(spans)
 }
 
@@ -1667,7 +1698,25 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     }
 
     if let Some(header_area) = header_area {
-        let line = diff_header_line(app, theme, icons);
+        // CS1 (`focused-pane-header`, locked decision #5): the diff header label lights up only
+        // when the diff has focus AND its effective (not requested) zoom is `Single` — a `Split`
+        // zoom lights the focused half's caption instead (see `render_body_split`), and the
+        // outline holding focus dims every diff-side label. `effective_zoom_for` is cheap and
+        // already re-derived every frame elsewhere in this fn (locked decision #3), so no caching
+        // concern here either.
+        //
+        // Exception: `render_body_split`'s own short-area fallback (`area.height < 4`) renders
+        // only the focused pane and returns before either caption is drawn — no split caption
+        // survives to be the frame's lit label. `area` here is the exact same rect that fallback
+        // gates on (both derive from the header carve-out above), so this branch mirrors that
+        // check and lights the diff header instead, preserving the exactly-one-lit-label
+        // invariant.
+        let diff_header_focused = !app.outline_focused()
+            && match app.effective_zoom_for(app.current) {
+                EffectiveZoom::Single(_) => true,
+                EffectiveZoom::Split => area.height < 4,
+            };
+        let line = diff_header_line(app, theme, icons, diff_header_focused);
         frame
             .buffer_mut()
             .set_line(header_area.x, header_area.y, &line, header_area.width);
@@ -1747,6 +1796,12 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
 /// unstaged-content + caption(1) + staged-content, with the remainder halved between the two
 /// content panes (even split).
 fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, theme: &Palette) {
+    // CS1 (`focused-pane-header`, locked decision #5's split case): the outline holding focus
+    // dims BOTH captions (the outline header is the frame's one lit label); otherwise exactly the
+    // focused half's caption lights up, matching `split_focus_role()` — never derived from the
+    // requested `Zoom`, since this fn only ever runs once `effective_zoom_for` has already
+    // resolved to `Split` (see `render_body`'s caller).
+    let outline_focused = app.outline_focused();
     // Too short to fit two captions plus a content line each: fall back to the focused pane alone,
     // rendered over the whole area, so the user still sees SOMETHING navigable.
     if area.height < 4 {
@@ -1790,8 +1845,20 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     app.clamp_scroll();
     app.clamp_alt_scroll();
 
-    render_caption(frame.buffer_mut(), unstaged_caption, "UNSTAGED", theme);
-    render_caption(frame.buffer_mut(), staged_caption, "STAGED", theme);
+    render_caption(
+        frame.buffer_mut(),
+        unstaged_caption,
+        "UNSTAGED",
+        theme,
+        !outline_focused && app.split_focus_role() == Role::Unstaged,
+    );
+    render_caption(
+        frame.buffer_mut(),
+        staged_caption,
+        "STAGED",
+        theme,
+        !outline_focused && app.split_focus_role() == Role::Staged,
+    );
 
     let (u_scroll, u_cursor) = app.pane_render_state(Role::Unstaged);
     let (s_scroll, s_cursor) = app.pane_render_state(Role::Staged);
@@ -1852,11 +1919,16 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     }
 }
 
-/// Write a split pane's role caption (`── LABEL ──`) across the pane width, styled like the dim
-/// gap-row markers.
-fn render_caption(buf: &mut Buffer, area: Rect, label: &str, theme: &Palette) {
-    let text = format!("── {label} ──");
-    let line = Line::from(TSpan::styled(text, Style::default().fg(theme.dim)));
+/// Write a split pane's role caption (`── LABEL ──`) across the pane width. The `──` rule
+/// characters always stay `theme.dim` (locked decision #4, `focused-pane-header` — label text
+/// only); only the label word itself takes [`pane_header_label_style`], lit while `focused`.
+fn render_caption(buf: &mut Buffer, area: Rect, label: &str, theme: &Palette, focused: bool) {
+    let rule_style = Style::default().fg(theme.dim);
+    let line = Line::from(vec![
+        TSpan::styled("── ", rule_style),
+        TSpan::styled(label.to_string(), pane_header_label_style(theme, focused)),
+        TSpan::styled(" ──", rule_style),
+    ]);
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
@@ -2207,7 +2279,7 @@ fn render_pane_inline(
 mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::style::Style;
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::Span as TSpan;
     use ratatui::Terminal;
 
@@ -2217,7 +2289,7 @@ mod tests {
     use super::{hscroll_cut, pan_spans, render, STATUS_PLACEHOLDER};
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
-    use crate::app::App;
+    use crate::app::{App, EffectiveZoom, Role};
     use crate::keymap::Keymap;
     use crate::outline::OutlineItem;
     use crate::theme::Palette;
@@ -2254,6 +2326,20 @@ mod tests {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| cell_text(buf, x, y)).collect())
             .collect()
+    }
+
+    /// Find `label`'s starting display COLUMN within `row` — a `chars()` window search (not
+    /// `String::find`'s byte offset), matching the convention several outline/summary-header tests
+    /// already use for a row that may carry multi-byte glyphs (`•`/`⚠`) ahead of the label; every
+    /// rendered cell here is exactly one column wide, so a `chars()` position IS the display
+    /// column, as long as `row` starts at buffer column 0 (true for every `buf_lines` row).
+    fn find_label_x(row: &str, label: &str) -> u16 {
+        let label_chars: Vec<char> = label.chars().collect();
+        let row_chars: Vec<char> = row.chars().collect();
+        row_chars
+            .windows(label_chars.len())
+            .position(|w| w == label_chars.as_slice())
+            .unwrap_or_else(|| panic!("label {label:?} not found in row {row:?}")) as u16
     }
 
     #[test]
@@ -3895,16 +3981,7 @@ mod tests {
             .iter()
             .position(|r| r.contains("cs-b"))
             .expect("cs-b's header row present (it has no title, so falls back to its name)");
-        // `String::find` returns a BYTE offset, not a display column — the row has multi-byte
-        // glyphs (`•`/`⚠`) ahead of/around the label, so a byte offset would target the wrong
-        // cell. Every rendered cell here is exactly one column wide, so a `chars()` (not byte)
-        // position IS the display column.
-        let label_chars: Vec<char> = "cs-b".chars().collect();
-        let row_chars: Vec<char> = content[row].chars().collect();
-        let label_x = row_chars
-            .windows(label_chars.len())
-            .position(|w| w == label_chars.as_slice())
-            .expect("cs-b's label text present in its own header row") as u16;
+        let label_x = find_label_x(&content[row], "cs-b");
         assert_eq!(
             buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
             Some(Palette::dark().heading_fg),
@@ -4063,18 +4140,10 @@ mod tests {
             "the summary panel's title now paints the diff pane's header row (y=0), got row \
              {row} instead:\n{joined}"
         );
-        // `String::find` is a BYTE offset, not a display column (the title carries a multi-byte
-        // `•` marker ahead of the label, since cs-b is `current`) — a `chars()` position over the
-        // 36.. slice IS the column offset within that slice (every cell here is one column wide),
-        // so add the slice's own start column (36) back to get the absolute buffer column.
-        let label_chars: Vec<char> = "cs-b".chars().collect();
-        let row_chars: Vec<char> = body_rows[row].chars().collect();
-        let label_x = row_chars
-            .windows(label_chars.len())
-            .position(|w| w == label_chars.as_slice())
-            .expect("cs-b's label text present in the summary panel's title")
-            as u16
-            + 36;
+        // `find_label_x` returns a column offset within the 36.. slice it's given (every cell here
+        // is one column wide, so a `chars()` position IS the display column) — add the slice's own
+        // start column (36) back to get the absolute buffer column.
+        let label_x = find_label_x(&body_rows[row], "cs-b") + 36;
         assert_eq!(
             buf.cell((label_x, row as u16)).unwrap().style().fg,
             Some(Palette::dark().foreground),
@@ -5488,6 +5557,314 @@ mod tests {
             cursor_bg,
             Some(theme.background),
             "the cursor tint must be visually distinct from the flat painted canvas"
+        );
+    }
+
+    // ── focused-pane-header (CS1): exactly-one-lit-label invariant ────────────────
+
+    /// A cell's `(fg, bold?)` pair — the two axes [`pane_header_label_style`] toggles, checked
+    /// together everywhere below since neither alone proves the invariant (a themed fg match with
+    /// no bold, or vice versa, would both be bugs).
+    fn label_style_at(buf: &Buffer, x: u16, y: u16) -> (Option<Color>, bool) {
+        let style = buf.cell((x, y)).unwrap().style();
+        (style.fg, style.add_modifier.contains(Modifier::BOLD))
+    }
+
+    #[test]
+    fn startup_state_lights_the_diff_header_not_the_outline_header() {
+        // Gotcha: `App::from_changesets` defaults the outline open but UNFOCUSED, so at launch the
+        // one lit label must be on the diff side, not the outline's — this is also the general
+        // "diff focused, effective zoom Single" case, since a Committed changeset's file has no
+        // unstaged/staged split (always `EffectiveZoom::Single(Role::Combined)`).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(
+            app.outline_open() && !app.outline_focused(),
+            "locked startup default"
+        );
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Combined)
+        );
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content = buf_lines(&buf);
+
+        // Outline header's own title (row 0) names the current changeset ("cs-b") — dim, no bold.
+        let outline_x = find_label_x(&content[0], "cs-b");
+        assert_eq!(
+            label_style_at(&buf, outline_x, 0),
+            (Some(theme.dim), false),
+            "outline header must stay dim while the outline is unfocused"
+        );
+
+        // Diff header's own label (row 0, right of the divider) names the file ("b.txt") — lit.
+        let diff_x = find_label_x(&content[0], "b.txt");
+        assert_eq!(
+            label_style_at(&buf, diff_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "diff header must be lit at startup, since focus starts on the diff side"
+        );
+    }
+
+    #[test]
+    fn outline_focused_lights_the_outline_header_and_dims_every_diff_side_label() {
+        // Locked decision #5's "outline focused" case: even a Split-zoom file's diff header AND
+        // both of its captions must stay dim — the outline header is the frame's one lit label.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Split,
+            "a partially-staged file defaults to a Split render"
+        );
+        app.focus_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 24);
+        let content = buf_lines(&buf);
+
+        // `app_from_fixture`'s lone changeset is the synthetic uncommitted layer, whose
+        // `display_label` is always "Uncommitted changes" (see `crate::app::display_label`), not
+        // the file's own name.
+        let outline_x = find_label_x(&content[0], "Uncommitted changes");
+        assert_eq!(
+            label_style_at(&buf, outline_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "outline header must be lit while the outline has focus"
+        );
+
+        let unstaged_row = content
+            .iter()
+            .position(|line| line.contains("UNSTAGED"))
+            .expect("unstaged caption present");
+        let staged_row = content
+            .iter()
+            .position(|line| line.contains("STAGED") && !line.contains("UNSTAGED"))
+            .expect("staged caption present");
+        let unstaged_x = find_label_x(&content[unstaged_row], "UNSTAGED");
+        let staged_x = find_label_x(&content[staged_row], "STAGED");
+        assert_eq!(
+            label_style_at(&buf, unstaged_x, unstaged_row as u16),
+            (Some(theme.dim), false),
+            "the unstaged caption must stay dim while the outline holds focus"
+        );
+        assert_eq!(
+            label_style_at(&buf, staged_x, staged_row as u16),
+            (Some(theme.dim), false),
+            "the staged caption must stay dim while the outline holds focus"
+        );
+    }
+
+    #[test]
+    fn split_zoom_lights_only_the_focused_halfs_caption_and_dims_the_diff_header() {
+        // Locked decision #5's "diff focused, effective zoom Split" case: the diff pane's OWN
+        // header stays dim (there's no single file-wide label to light while two panes show), and
+        // exactly the focused half's caption lights up — flipping `split_focus` flips which one.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert!(!app.outline_focused());
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "default split focus"
+        );
+
+        let theme = Palette::dark();
+
+        // "STAGED" is a substring of "UNSTAGED", so a naive `contains` search for the STAGED
+        // caption's row can false-positive onto the UNSTAGED caption's row (which also contains
+        // the literal text "STAGED") — same asymmetry
+        // `split_renders_both_role_captions_stacked_with_content_in_each_pane` guards against.
+        // Searching for "UNSTAGED" needs no such exclusion, since "UNSTAGED" never appears inside
+        // the STAGED-only row.
+        let caption_row = |content: &[String], label: &str| -> usize {
+            content
+                .iter()
+                .position(|line| {
+                    line.contains(label) && (label != "STAGED" || !line.contains("UNSTAGED"))
+                })
+                .unwrap_or_else(|| panic!("{label} caption present"))
+        };
+
+        let check = |app: &mut App, lit_label: &str, dim_label: &str| {
+            let buf = render_once(app, OUTLINE_TEST_WIDTH, 24);
+            let content = buf_lines(&buf);
+            let lit_row = caption_row(&content, lit_label);
+            let dim_row = caption_row(&content, dim_label);
+            let lit_x = find_label_x(&content[lit_row], lit_label);
+            let dim_x = find_label_x(&content[dim_row], dim_label);
+            assert_eq!(
+                label_style_at(&buf, lit_x, lit_row as u16),
+                (Some(theme.pane_header_focused_fg), true),
+                "{lit_label} should be the lit label"
+            );
+            assert_eq!(
+                label_style_at(&buf, dim_x, dim_row as u16),
+                (Some(theme.dim), false),
+                "{dim_label} should stay dim"
+            );
+            // The diff pane's own header (row 0) stays dim under Split, regardless of which half
+            // has focus — there is no single-file label to light while two panes are showing.
+            let file_x = find_label_x(&content[0], "f.txt");
+            assert_eq!(
+                label_style_at(&buf, file_x, 0),
+                (Some(theme.dim), false),
+                "the diff header must stay dim under a Split zoom"
+            );
+        };
+
+        check(&mut app, "UNSTAGED", "STAGED");
+        app.toggle_split_focus();
+        assert_eq!(app.split_focus_role(), Role::Staged);
+        check(&mut app, "STAGED", "UNSTAGED");
+    }
+
+    #[test]
+    fn zoom_collapse_to_single_lights_the_diff_header_not_a_caption() {
+        // Gotcha: a requested `Split` collapses to `EffectiveZoom::Single` for a file lacking one
+        // of the two sub-diffs (here, unstaged-only) — no captions render at all, so the diff
+        // header itself must be the lit label, exactly as the plain-Single case above.
+        let old = "l1\nl2\nl3\n";
+        let new = "l1\nCHANGED\nl3\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("only.txt", old, new)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.zoom,
+            crate::app::Zoom::Split,
+            "default requested zoom is Split"
+        );
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Unstaged),
+            "collapsed down to a single pane — no staged sub-diff to pair it with"
+        );
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+        for line in &content {
+            assert!(
+                !line.contains("UNSTAGED") && !line.contains("STAGED"),
+                "a collapsed Single zoom must not render split captions, got: {line:?}"
+            );
+        }
+        let file_x = find_label_x(&content[0], "only.txt");
+        assert_eq!(
+            label_style_at(&buf, file_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the diff header must be the lit label once Split has collapsed to Single"
+        );
+    }
+
+    #[test]
+    fn split_zoom_short_area_fallback_lights_the_diff_header_not_a_caption() {
+        // Gotcha: `render_body_split`'s own short-area fallback (`area.height < 4`) renders only
+        // the focused pane and returns before either caption is drawn — no split caption survives
+        // to be the frame's lit label, so `render_body` must light the diff header instead. A
+        // 5-row frame leaves a diff pane body area of height 3 after the header carve-out (frame
+        // height 5 - footer 1 = body/diff area height 4, minus the diff header's own 1 row = 3),
+        // which is under the `render_body_split` fallback's `< 4` threshold.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert!(!app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 5);
+        let content = buf_lines(&buf);
+
+        for line in &content {
+            assert!(
+                !line.contains("UNSTAGED") && !line.contains("STAGED"),
+                "the short-area fallback must not render split captions, got: {line:?}"
+            );
+        }
+        let file_x = find_label_x(&content[0], "f.txt");
+        assert_eq!(
+            label_style_at(&buf, file_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the diff header must be the lit label once the split fallback drops both captions"
+        );
+    }
+
+    #[test]
+    fn no_color_bold_is_the_only_focus_differentiator() {
+        // Locked decision #3: under `Palette::mono`, `pane_header_focused_fg` and `dim` both
+        // collapse to `Color::Reset` (see theme.rs's own
+        // `mono_pane_header_focused_fg_collapses_with_dim_leaving_bold_the_only_differentiator`)
+        // — this test proves `render.rs` itself still differentiates the focused label via BOLD
+        // alone when actually painting a frame under that palette.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(!app.outline_focused());
+
+        let theme = Palette::mono(false);
+        let buf = render_once_themed(&mut app, OUTLINE_TEST_WIDTH, 20, &theme);
+        let content = buf_lines(&buf);
+
+        let outline_x = find_label_x(&content[0], "cs-b");
+        let (outline_fg, outline_bold) = label_style_at(&buf, outline_x, 0);
+        let diff_x = find_label_x(&content[0], "b.txt");
+        let (diff_fg, diff_bold) = label_style_at(&buf, diff_x, 0);
+
+        assert_eq!(outline_fg, Some(Color::Reset));
+        assert_eq!(diff_fg, Some(Color::Reset));
+        assert_eq!(
+            outline_fg, diff_fg,
+            "color alone carries no distinction under NO_COLOR"
+        );
+        assert!(
+            !outline_bold,
+            "the dim (unfocused) outline header must not be bold"
+        );
+        assert!(
+            diff_bold,
+            "the lit (focused) diff header must stay bold under NO_COLOR"
         );
     }
 }
