@@ -151,6 +151,7 @@ pub struct ThemeOverrides {
     pub cursor_bg: Option<Color>,
     pub selection_bg: Option<Color>,
     pub outline_cursor_unfocused_bg: Option<Color>,
+    pub pane_header_focused_fg: Option<Color>,
 }
 
 impl ThemeOverrides {
@@ -277,6 +278,14 @@ pub struct Palette {
     /// Cursor wash for the outline pane while OPEN but NOT focused — dimmer than [`Palette::cursor_bg`].
     pub outline_cursor_unfocused_bg: Color,
 
+    /// Foreground for the ONE pane header/caption label that currently holds focus (CS1,
+    /// `focused-pane-header` — locked decision #2). Defaults to [`Palette::foreground`] (base05);
+    /// an unfocused label keeps [`Palette::dim`] instead — there is no separate "unfocused" field.
+    /// [`crate::render`] always pairs this color with a structural, unconditional BOLD (locked
+    /// decision #3), so under [`Palette::mono`] (where this and [`Palette::dim`] both collapse to
+    /// `Color::Reset`) BOLD alone still marks the focused label.
+    pub pane_header_focused_fg: Color,
+
     /// The screen/canvas background (base00) — painted by [`crate::render::render`] when
     /// [`Palette::paint_canvas`] is set, so a curated theme's background actually shows instead of
     /// the terminal's own.
@@ -352,6 +361,7 @@ impl Palette {
             cursor_bg: Color::Rgb(45, 50, 90),
             selection_bg: Color::Rgb(30, 66, 66),
             outline_cursor_unfocused_bg: Color::Rgb(35, 38, 55),
+            pane_header_focused_fg: base.slot(5),
             background: base.slot(0),
             foreground: base.slot(5),
             dim: base.slot(3),
@@ -413,6 +423,7 @@ impl Palette {
             cursor_bg: tint_toward(blue, base00, CURSOR),
             selection_bg: tint_toward(cyan, base00, CURSOR),
             outline_cursor_unfocused_bg: tint_toward(blue, base00, OUTLINE_CURSOR_UNFOCUSED),
+            pane_header_focused_fg: base.slot(5),
             background: base.slot(0),
             foreground: base.slot(5),
             dim: base.slot(3),
@@ -459,6 +470,7 @@ impl Palette {
             // is the whole point of `auto`: chrome that matches the terminal's own colors.
             background: base.slot(0),
             foreground: base.slot(5),
+            pane_header_focused_fg: base.slot(5),
             dim: base.slot(3),
             gutter: base.slot(4),
             // Semantic chrome also matches the terminal — probed base08/base0A/base0B, not the
@@ -538,6 +550,7 @@ impl Palette {
             cursor_bg: cursor,
             selection_bg: selection,
             outline_cursor_unfocused_bg: outline_cursor_unfocused,
+            pane_header_focused_fg: Color::Reset,
             background: Color::Reset,
             foreground: Color::Reset,
             dim: Color::Reset,
@@ -665,6 +678,9 @@ impl Palette {
         if let Some(color) = overrides.outline_cursor_unfocused_bg {
             self.outline_cursor_unfocused_bg = color;
         }
+        if let Some(color) = overrides.pane_header_focused_fg {
+            self.pane_header_focused_fg = color;
+        }
     }
 }
 
@@ -751,6 +767,18 @@ mod tests {
         assert_eq!(t.dim, Color::Rgb(0x74, 0x73, 0x69)); // base03
         assert_eq!(t.gutter, Color::Rgb(0xa0, 0x9f, 0x93)); // base04
         assert!(t.paint_canvas);
+    }
+
+    #[test]
+    fn pane_header_focused_fg_defaults_to_foreground_and_is_distinct_from_dim() {
+        // CS1 (`focused-pane-header`, locked decision #2): the new tint field defaults to the
+        // normal foreground, not an independently authored color — and it must read distinct from
+        // `dim` (the unfocused label's color) in every curated/probed scheme, mirroring the
+        // contrast checks around `mono_washes_are_achromatic_and_preserve_the_curated_invariants`.
+        for t in [Palette::dark(), Palette::light()] {
+            assert_eq!(t.pane_header_focused_fg, t.foreground);
+            assert_ne!(t.pane_header_focused_fg, t.dim);
+        }
     }
 
     #[test]
@@ -1170,6 +1198,19 @@ mod tests {
             } else {
                 assert!(outline_unfocused < cursor);
             }
+        }
+    }
+
+    #[test]
+    fn mono_pane_header_focused_fg_collapses_with_dim_leaving_bold_the_only_differentiator() {
+        // CS1 (`focused-pane-header`, locked decision #3): under `NO_COLOR`, `pane_header_focused_fg`
+        // and `dim` both collapse to `Color::Reset` — color alone can no longer tell a focused
+        // header label from an unfocused one, so `crate::render`'s structural BOLD is load-bearing
+        // here (asserted against real render output in `render.rs`'s own NO_COLOR test).
+        for light in [false, true] {
+            let t = Palette::mono(light);
+            assert_eq!(t.pane_header_focused_fg, Color::Reset);
+            assert_eq!(t.pane_header_focused_fg, t.dim);
         }
     }
 
