@@ -106,6 +106,36 @@ fn diffstat_prefixes(icons: IconMode) -> (String, String) {
     }
 }
 
+/// The pane headers' bold `  +A -D` diffstat span run (leading two-space spacer included) —
+/// single-sourced for [`render_outline_header`] (changeset total) and [`file_segment_spans`]
+/// (per-file), so the styling (spacing, boldness, glyph prefixes) can't drift between the two.
+/// The summary panel's totals line deliberately keeps its own non-bold variant
+/// ([`push_summary_body`]).
+fn diffstat_spans(
+    adds: usize,
+    dels: usize,
+    theme: &Palette,
+    icons: IconMode,
+) -> Vec<TSpan<'static>> {
+    let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
+    vec![
+        TSpan::styled("  ".to_string(), Style::default().fg(theme.foreground)),
+        TSpan::styled(
+            format!("{added_prefix}{adds}"),
+            Style::default()
+                .fg(theme.add_strong)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TSpan::styled(" ".to_string(), Style::default().fg(theme.foreground)),
+        TSpan::styled(
+            format!("{removed_prefix}{dels}"),
+            Style::default()
+                .fg(theme.del_strong)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]
+}
+
 /// The shared changeset-title span run — `[current-marker] [branch-icon] ([i/n] )label
 /// [warn-marker]` — drawn by both `build_outline_line`'s Header arm and
 /// [`changeset_summary_lines`]. **The two call sites no longer render identically** (CS1,
@@ -786,27 +816,7 @@ fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palet
             .iter()
             .map(crate::summary::file_diffstat)
             .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
-        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
-        spans.push(TSpan::styled(
-            "  ".to_string(),
-            Style::default().fg(theme.foreground),
-        ));
-        spans.push(TSpan::styled(
-            format!("{added_prefix}{adds}"),
-            Style::default()
-                .fg(theme.add_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(TSpan::styled(
-            " ".to_string(),
-            Style::default().fg(theme.foreground),
-        ));
-        spans.push(TSpan::styled(
-            format!("{removed_prefix}{dels}"),
-            Style::default()
-                .fg(theme.del_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.extend(diffstat_spans(adds, dels, theme, icons));
     }
     let line = Line::from(spans);
     frame
@@ -1265,27 +1275,7 @@ fn file_segment_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TSpan<
     ));
     if let Some(f) = app.files().get(app.current) {
         let (adds, dels) = crate::summary::file_diffstat(f);
-        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
-        spans.push(TSpan::styled(
-            "  ".to_string(),
-            Style::default().fg(theme.foreground),
-        ));
-        spans.push(TSpan::styled(
-            format!("{added_prefix}{adds}"),
-            Style::default()
-                .fg(theme.add_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(TSpan::styled(
-            " ".to_string(),
-            Style::default().fg(theme.foreground),
-        ));
-        spans.push(TSpan::styled(
-            format!("{removed_prefix}{dels}"),
-            Style::default()
-                .fg(theme.del_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
+        spans.extend(diffstat_spans(adds, dels, theme, icons));
     }
     if let Some(span) = hscroll_indicator_span(app, theme) {
         spans.push(span);
