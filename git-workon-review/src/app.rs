@@ -4531,11 +4531,11 @@ impl App {
     }
 
     /// Stage (unstaged pane) / unstage (staged pane) the active line selection (`s` with a
-    /// selection up). Refuses on the combined view (cycle-zoom notice), on a file no hunk patch
-    /// can express (the modified-file notice — line ops need a two-sided hunk, per
-    /// [`ops::is_hunk_patchable`]), and on a selection that covers no changed lines. Otherwise
-    /// applies every overlapped hunk's kept lines as ONE merged patch via [`LineSelectionOp`]
-    /// (never one op per hunk — see that type's docs), drains once, and clears the selection.
+    /// selection up). Refuses on the combined view (cycle-zoom notice), on a file no line op can
+    /// express ([`ops::supports_line_ops`] — Deleted/Unmerged/binary, per-status notice), and on
+    /// a selection that covers no changed lines. Otherwise applies every overlapped hunk's kept
+    /// lines as ONE merged patch via [`LineSelectionOp`] (never one op per hunk — see that
+    /// type's docs), drains once, and clears the selection.
     fn stage_selection(&mut self) {
         if self.cur().diff.files.is_empty() {
             self.cancel_selection();
@@ -4548,9 +4548,9 @@ impl App {
         let Some(verb) = Self::verb_for_role(role) else {
             return;
         };
-        if !ops::is_hunk_patchable(&self.cur().diff.files[self.current]) {
+        if !ops::supports_line_ops(&self.cur().diff.files[self.current]) {
             self.notify(
-                "line staging needs a modified file — use s/S for the whole file",
+                line_ops_refusal_message(&self.cur().diff.files[self.current]),
                 Severity::Error,
             );
             return;
@@ -4568,9 +4568,13 @@ impl App {
     }
 
     /// Request confirmation to discard the active line selection from the worktree (`d` with a
-    /// selection up). Discard acts only in the unstaged pane; refuses otherwise, on a
-    /// non-hunk-patchable file, or on a selection with no changed lines. The confirm prompt states
-    /// the TRUE scope (total lines across N hunks); the discard runs on `y`.
+    /// selection up). Discard acts only in the unstaged pane; refuses otherwise, on a file no
+    /// line op can express ([`ops::supports_line_ops`], per-status notice), or on a selection
+    /// with no changed lines. A selection covering ALL of an `Untracked` file's lines is routed
+    /// to the whole-file discard confirm instead (fork 2 of the line-ops-on-one-sided-files
+    /// handoff): the file gets removed, not left behind empty, and the prompt says so. Otherwise
+    /// the confirm prompt states the TRUE scope (total lines across N hunks); the discard runs
+    /// on `y`.
     fn discard_selection(&mut self) {
         if self.cur().diff.files.is_empty() {
             self.cancel_selection();
@@ -4584,16 +4588,24 @@ impl App {
             self.notify("discard acts in the unstaged pane", Severity::Error);
             return;
         }
-        if !ops::is_hunk_patchable(&self.cur().diff.files[self.current]) {
-            self.notify(
-                "line staging needs a modified file — use s/S for the whole file",
-                Severity::Error,
-            );
+        let file = &self.cur().diff.files[self.current];
+        if !ops::supports_line_ops(file) {
+            self.notify(line_ops_refusal_message(file), Severity::Error);
             return;
         }
         let selections = self.selection_line_ops();
         if selections.is_empty() {
             self.notify("no changed lines in selection", Severity::Error);
+            return;
+        }
+        if file.status == FileStatus::Untracked && selection_covers_every_line(file, &selections) {
+            let path = file.path.clone();
+            self.request_confirm(
+                format!("Discard `{path}`? This removes the untracked file. (y/n)"),
+                PendingOp::DiscardFile {
+                    file_idx: self.current,
+                },
+            );
             return;
         }
         let total: usize = selections
@@ -4614,6 +4626,51 @@ impl App {
             },
         );
     }
+}
+
+/// Per-status footer refusal for a line-op gate failure (fork 4 of the line-ops-on-one-sided-files
+/// handoff): name the blocked status specifically rather than the old one-size-fits-all
+/// "needs a modified file" wording, which stopped being accurate once
+/// [`ops::supports_line_ops`] started admitting `Untracked`/`Added` too. The statuses that still
+/// reach this message are exactly [`ops::supports_line_ops`]'s refusals: `Deleted`, `Unmerged`,
+/// and any binary file regardless of status.
+fn line_ops_refusal_message(file: &FileChange) -> String {
+    if file.is_binary {
+        return "line staging isn't available for a binary file — use s/S for the whole file"
+            .to_string();
+    }
+    let noun = match file.status {
+        FileStatus::Deleted => "deleted file",
+        FileStatus::Unmerged => "unmerged file",
+        // Every other status passes `ops::supports_line_ops`, so this arm is unreachable in
+        // practice — kept as a safe fallback rather than a `panic!`/`unreachable!` (a routing
+        // bug elsewhere should surface as a slightly generic notice, not a crash).
+        _ => "file",
+    };
+    format!("line staging isn't available for a {noun} — use s/S for the whole file")
+}
+
+/// Fork 2's full-selection detector: whether `selections` keeps every [`LineKind::Addition`]
+/// line across ALL of `file`'s hunks — the shape [`App::discard_selection`] must route to the
+/// whole-file discard confirm instead of a partial line discard (an `Untracked` file has no
+/// deletions to speak of, so "every addition kept" is "the whole file selected"). `false` when
+/// `file` has no addition lines at all (nothing to have "covered everything").
+fn selection_covers_every_line(file: &FileChange, selections: &[(usize, LineSelection)]) -> bool {
+    let total_adds: usize = file
+        .hunks
+        .iter()
+        .map(|h| {
+            h.lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Addition)
+                .count()
+        })
+        .sum();
+    if total_adds == 0 {
+        return false;
+    }
+    let selected_adds: usize = selections.iter().map(|(_, sel)| sel.keep_adds.len()).sum();
+    selected_adds == total_adds
 }
 
 /// Resolve a selection's kept old-del / new-add LINE NUMBERS to a [`LineSelection`] — whose keys
@@ -8064,8 +8121,8 @@ mod tests {
     }
 
     #[test]
-    fn line_stage_on_untracked_file_refuses_with_modified_file_message() {
-        use super::Severity;
+    fn line_stage_on_untracked_file_stages_only_the_selected_lines() {
+        use crate::outline::StagedStatus;
 
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -8074,20 +8131,106 @@ mod tests {
             .unwrap();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        app.start_selection(); // untracked file has an unstaged change, so selection is allowed
+        app.start_selection(); // single row: just the first addition line ("x\n")
+        app.stage_hunk();
+
+        assert!(
+            app.notice.is_none(),
+            "line staging on an untracked file must succeed now; got notice: {:?}",
+            app.notice
+        );
+        assert!(
+            app.selection_anchor.is_none(),
+            "selection clears after apply"
+        );
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::index_blob_equals(
+            "new.txt",
+            b"x\n".to_vec(),
+        ));
+        repo.assert(predicate::repo::workdir_file_equals(
+            "new.txt",
+            b"x\ny\nz\n".to_vec(),
+        ));
+
+        assert_eq!(
+            app.cur().staged_status(0),
+            StagedStatus::Partial,
+            "a partially staged untracked file shows Partial in the outline"
+        );
+    }
+
+    /// Regression guard (fork 4): a `Deleted` file still refuses line staging — unlike
+    /// `Untracked`/`Added`, a deletion has no meaningful "one-sided" creation shape — but the
+    /// notice now names the status instead of the old one-size-fits-all "modified file" wording.
+    #[test]
+    fn line_stage_on_deleted_file_still_refuses_with_per_status_message() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .deleted_file("gone.txt", "bye\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection();
         app.stage_hunk();
 
         let notice = app.notice.as_ref().expect("line staging must refuse here");
         assert_eq!(notice.severity, Severity::Error);
         assert!(
-            notice.text.contains("line staging needs a modified file"),
+            notice
+                .text
+                .contains("line staging isn't available for a deleted file"),
             "got: {:?}",
             notice.text
         );
         let repo = fixture.repo().unwrap();
         assert!(
-            !predicate::repo::has_staged_file("new.txt").eval(repo),
+            !predicate::repo::has_staged_deletion("gone.txt").eval(repo),
             "a refused line stage must not touch the index"
+        );
+    }
+
+    /// Fork 2: discarding a selection that covers EVERY line of an untracked file routes to the
+    /// whole-file discard confirm (file removal), not a partial line-discard confirm — and does
+    /// NOT leave an empty file behind.
+    #[test]
+    fn discard_selection_covering_the_whole_untracked_file_confirms_file_removal() {
+        use super::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("new.txt", "only\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection(); // single-line file: this one row IS the whole file
+        app.discard_hunk(); // active selection -> discard_selection
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("full-file untracked discard requests a confirm");
+        assert!(
+            confirm.prompt.contains("removes the untracked file"),
+            "expected file-removal wording, got: {:?}",
+            confirm.prompt
+        );
+        assert_eq!(
+            confirm.op,
+            PendingOp::DiscardFile { file_idx: 0 },
+            "must route to the whole-file discard op, not a partial line discard"
+        );
+
+        app.resolve_confirm(true);
+        let repo = fixture.repo().unwrap();
+        assert!(
+            !repo.workdir().unwrap().join("new.txt").exists(),
+            "the untracked file must be removed outright, not left empty"
         );
     }
 

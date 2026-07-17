@@ -148,6 +148,7 @@ pub struct FixtureBuilder<'fixture> {
     partially_staged_files: Vec<(String, String, String, String)>, // (path, committed, staged, workdir)
     untracked_symlinks: Vec<(String, String)>, // (path, target) — target need not exist
     executable_unstaged_files: Vec<(String, String, String)>, // (path, committed, modified), mode 0o100755
+    executable_untracked_files: Vec<(String, String)>,        // (path, content), mode 0o100755
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -172,6 +173,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
             partially_staged_files: Vec::new(),
             untracked_symlinks: Vec::new(),
             executable_unstaged_files: Vec::new(),
+            executable_untracked_files: Vec::new(),
         }
     }
 
@@ -369,6 +371,20 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Like [`untracked_file`](Self::untracked_file), but `path` is written with the executable
+    /// bit set (`chmod 0o755`) — needed to pin that a line-precise stage of an untracked file's
+    /// content preserves the real file mode in the synthesized `new file mode` header, rather
+    /// than hardcoding `100644`.
+    ///
+    /// Unix-only ([`std::os::unix::fs::PermissionsExt`]); applies to the LAST worktree added, or
+    /// the main repo if none. Errors at [`build`](Self::build) if the fixture is `bare(true)`
+    /// with no worktree.
+    pub fn executable_untracked_file(mut self, path: &str, content: &str) -> Self {
+        self.executable_untracked_files
+            .push((path.to_string(), content.to_string()));
+        self
+    }
+
     /// Commit `path` with `committed_content` on the cwd repo's branch during `build()`
     /// (moving the branch tip, in the same baseline-commit block as
     /// [`unstaged_file`](Self::unstaged_file)), then remove it from the working tree — a
@@ -551,11 +567,13 @@ impl<'fixture> FixtureBuilder<'fixture> {
             || !self.deleted_files.is_empty()
             || !self.partially_staged_files.is_empty()
             || !self.untracked_symlinks.is_empty()
-            || !self.executable_unstaged_files.is_empty();
+            || !self.executable_unstaged_files.is_empty()
+            || !self.executable_untracked_files.is_empty();
         if has_index_state && self.bare && self.worktrees.is_empty() {
             return Err(
                 "staged_file/unstaged_file/untracked_file/deleted_file/partially_staged_file/\
-                 untracked_symlink/executable_unstaged_file require a working tree: fixture is \
+                 untracked_symlink/executable_unstaged_file/executable_untracked_file require a \
+                 working tree: fixture is \
                  bare(true) with no worktree"
                     .into(),
             );
@@ -816,6 +834,21 @@ impl<'fixture> FixtureBuilder<'fixture> {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::write(&abs_path, content)?;
+            }
+
+            #[cfg(unix)]
+            for (file_path, content) in &self.executable_untracked_files {
+                use std::os::unix::fs::PermissionsExt;
+                let abs_path = cwd_path.join(file_path);
+                if let Some(parent) = abs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&abs_path, content)?;
+                std::fs::set_permissions(&abs_path, std::fs::Permissions::from_mode(0o755))?;
+            }
+            #[cfg(not(unix))]
+            if !self.executable_untracked_files.is_empty() {
+                return Err("executable_untracked_file is unix-only".into());
             }
 
             for (file_path, _committed) in &self.deleted_files {

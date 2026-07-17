@@ -188,10 +188,64 @@ fn scenarios() -> Vec<Scenario> {
             verify: unstage_staged_new_verify,
         },
         Scenario {
-            name: "refusal_lines_on_untracked",
+            name: "untracked_partial_stage_contiguous",
+            build: untracked_multi_build,
+            ops: untracked_partial_stage_contiguous_ops,
+            verify: untracked_partial_stage_contiguous_verify,
+        },
+        Scenario {
+            name: "untracked_partial_stage_noncontiguous",
+            build: untracked_multi_build,
+            ops: untracked_partial_stage_noncontiguous_ops,
+            verify: untracked_partial_stage_noncontiguous_verify,
+        },
+        Scenario {
+            name: "untracked_partial_discard",
+            build: untracked_multi_build,
+            ops: untracked_partial_discard_ops,
+            verify: untracked_partial_discard_verify,
+        },
+        Scenario {
+            name: "untracked_full_selection_discard",
+            build: untracked_multi_build,
+            ops: untracked_full_selection_discard_ops,
+            verify: untracked_full_selection_discard_verify,
+        },
+        Scenario {
+            name: "untracked_eofnl_keep_final_line",
+            build: untracked_eofnl_build,
+            ops: untracked_eofnl_keep_final_line_ops,
+            verify: untracked_eofnl_keep_final_line_verify,
+        },
+        Scenario {
+            name: "untracked_eofnl_drop_final_line",
+            build: untracked_eofnl_build,
+            ops: untracked_eofnl_drop_final_line_ops,
+            verify: untracked_eofnl_drop_final_line_verify,
+        },
+        Scenario {
+            name: "executable_untracked_partial_stage",
+            build: executable_untracked_build,
+            ops: executable_untracked_partial_stage_ops,
+            verify: executable_untracked_partial_stage_verify,
+        },
+        Scenario {
+            name: "untracked_stage_rest_reaches_fully_staged",
+            build: untracked_multi_build,
+            ops: untracked_stage_rest_reaches_fully_staged_ops,
+            verify: untracked_stage_rest_reaches_fully_staged_verify,
+        },
+        Scenario {
+            name: "added_line_unstage",
+            build: added_multi_build,
+            ops: added_line_unstage_ops,
+            verify: added_line_unstage_verify,
+        },
+        Scenario {
+            name: "refusal_lines_empty_selection_on_untracked",
             build: untracked_build,
-            ops: refusal_lines_on_untracked_ops,
-            verify: refusal_lines_on_untracked_verify,
+            ops: refusal_lines_empty_selection_on_untracked_ops,
+            verify: refusal_lines_empty_selection_on_untracked_verify,
         },
         Scenario {
             name: "refusal_lines_on_deleted",
@@ -764,11 +818,301 @@ fn unstage_staged_new_verify(fixture: &Fixture) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// refusals: apply_lines on untracked/deleted files never reaches an applier, so these can never
-// diverge between backends — kept for grid completeness per the plan.
+// line ops on one-sided files (Untracked/Added) — line-ops-on-one-sided-files handoff.
+// `apply_lines` synthesizes a one-sided (creation) patch for these statuses instead of refusing;
+// `partial_hunk_patch`'s doc comment on `src/synthesis.rs` is the mechanism reference.
 // ---------------------------------------------------------------------------------------------
 
-fn refusal_lines_on_untracked_ops(
+const UNTRACKED_MULTI: &str = "one\ntwo\nthree\nfour\n";
+
+fn untracked_multi_build() -> Fixture {
+    FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .untracked_file("multi.txt", UNTRACKED_MULTI)
+        .build()
+        .expect("fixture build")
+}
+
+fn untracked_partial_stage_contiguous_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let keep_two = line_index(file, 0, LineKind::Addition, "two\n");
+    let keep_three = line_index(file, 0, LineKind::Addition, "three\n");
+    let sel = LineSelection {
+        keep_adds: [keep_two, keep_three].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Stage)
+}
+
+fn untracked_partial_stage_contiguous_verify(fixture: &Fixture) {
+    fixture.assert(predicate::repo::index_blob_equals(
+        "multi.txt",
+        b"two\nthree\n".to_vec(),
+    ));
+    // Index-only apply: the untracked worktree file is untouched (still all four lines).
+    fixture.assert(predicate::repo::workdir_file_equals(
+        "multi.txt",
+        UNTRACKED_MULTI.as_bytes().to_vec(),
+    ));
+}
+
+fn untracked_partial_stage_noncontiguous_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let keep_one = line_index(file, 0, LineKind::Addition, "one\n");
+    let keep_three = line_index(file, 0, LineKind::Addition, "three\n");
+    let sel = LineSelection {
+        keep_adds: [keep_one, keep_three].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Stage)
+}
+
+fn untracked_partial_stage_noncontiguous_verify(fixture: &Fixture) {
+    fixture.assert(predicate::repo::index_blob_equals(
+        "multi.txt",
+        b"one\nthree\n".to_vec(),
+    ));
+}
+
+fn untracked_partial_discard_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    // Keep (= select for reverse-apply) only "two\n" — the other three lines are dropped, so
+    // they convert to context (base=New) and survive in the workdir; only "two\n" is removed.
+    let keep_two = line_index(file, 0, LineKind::Addition, "two\n");
+    let sel = LineSelection {
+        keep_adds: [keep_two].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Discard)
+}
+
+fn untracked_partial_discard_verify(fixture: &Fixture) {
+    let repo = fixture.repo().expect("repo");
+    assert!(
+        repo.workdir().unwrap().join("multi.txt").exists(),
+        "a partial discard must not remove the file"
+    );
+    fixture.assert(predicate::repo::workdir_file_equals(
+        "multi.txt",
+        b"one\nthree\nfour\n".to_vec(),
+    ));
+}
+
+/// Fork 2's synthesis-level contract, exercised directly (not through `app.rs`'s UI routing,
+/// which avoids this shape per the handoff — see `App::discard_selection`'s doc comment):
+/// selecting EVERY line for discard renders (once inverted) a whole-file deletion patch applied
+/// to the workdir, which removes the file outright rather than leaving it empty.
+fn untracked_full_selection_discard_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let sel = LineSelection {
+        keep_adds: (0..file.hunks[0].lines.len()).collect(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Discard)
+}
+
+fn untracked_full_selection_discard_verify(fixture: &Fixture) {
+    let repo = fixture.repo().expect("repo");
+    assert!(
+        !repo.workdir().unwrap().join("multi.txt").exists(),
+        "a full-selection discard must remove the file, not leave it empty"
+    );
+}
+
+/// EOFNL (final line missing a trailing newline): untracked files never carry a Deletion line
+/// (nothing pre-exists to delete), so the trap-2 splice never applies to them — this scenario
+/// documents that directly rather than assuming it. Keeping the final (no-newline) line renders
+/// its bytes byte-exact, with a dropped middle line omitted entirely (base=Old).
+const UNTRACKED_EOFNL: &str = "one\ntwo\nlast"; // no trailing newline
+
+fn untracked_eofnl_build() -> Fixture {
+    FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .untracked_file("eofnl.txt", UNTRACKED_EOFNL)
+        .build()
+        .expect("fixture build")
+}
+
+fn untracked_eofnl_keep_final_line_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let keep_one = line_index(file, 0, LineKind::Addition, "one\n");
+    let keep_last = line_index(file, 0, LineKind::Addition, "last");
+    let sel = LineSelection {
+        keep_adds: [keep_one, keep_last].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Stage)
+}
+
+fn untracked_eofnl_keep_final_line_verify(fixture: &Fixture) {
+    // "two\n" dropped entirely (base=Old omits it); "one\n" and "last" (no trailing newline)
+    // kept, byte-exact.
+    fixture.assert(predicate::repo::index_blob_equals(
+        "eofnl.txt",
+        b"one\nlast".to_vec(),
+    ));
+}
+
+fn untracked_eofnl_drop_final_line_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let keep_one = line_index(file, 0, LineKind::Addition, "one\n");
+    let keep_two = line_index(file, 0, LineKind::Addition, "two\n");
+    let sel = LineSelection {
+        keep_adds: [keep_one, keep_two].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Stage)
+}
+
+fn untracked_eofnl_drop_final_line_verify(fixture: &Fixture) {
+    // The no-newline final line is dropped entirely (base=Old): the result is two normal,
+    // newline-terminated lines, not a truncated/corrupted tail.
+    fixture.assert(predicate::repo::index_blob_equals(
+        "eofnl.txt",
+        b"one\ntwo\n".to_vec(),
+    ));
+}
+
+/// Executable untracked file: the synthesized `new file mode` line must carry the real mode
+/// (`100755`), not a hardcoded `100644` — the same exec-bit-preserving contract
+/// `executable_whole_hunk_stage` pins for Modified files, extended to one-sided creation
+/// patches.
+fn executable_untracked_build() -> Fixture {
+    FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .executable_untracked_file("run.sh", "#!/bin/sh\necho one\necho two\n")
+        .build()
+        .expect("fixture build")
+}
+
+fn executable_untracked_partial_stage_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let keep_shebang = line_index(file, 0, LineKind::Addition, "#!/bin/sh\n");
+    let keep_one = line_index(file, 0, LineKind::Addition, "echo one\n");
+    let sel = LineSelection {
+        keep_adds: [keep_shebang, keep_one].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Stage)
+}
+
+fn executable_untracked_partial_stage_verify(fixture: &Fixture) {
+    fixture.assert(predicate::repo::index_blob_equals(
+        "run.sh",
+        b"#!/bin/sh\necho one\n".to_vec(),
+    ));
+    fixture.assert(predicate::repo::has_index_mode("run.sh", 0o100755));
+}
+
+/// "Stage-rest reaches fully-staged Added": staging the REMAINING lines of an already-partially-
+/// staged untracked file must reach the exact same end state `apply_file(Stage)` (the whole-file
+/// path) would have produced directly — the one-sided line path and the whole-file path must
+/// agree on the fully-staged case, not just diverge less visibly.
+fn untracked_stage_rest_reaches_fully_staged_ops(
+    repo: &Repository,
+    applier: &dyn Applier,
+) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let keep_one = line_index(file, 0, LineKind::Addition, "one\n");
+    let sel = LineSelection {
+        keep_adds: [keep_one].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Stage)?;
+
+    // Re-diff: "one\n" is now Added (staged) and the rest still shows as the untracked
+    // remainder in the unstaged pane — stage every remaining line.
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.unstaged.files[0];
+    let sel = LineSelection {
+        keep_adds: (0..file.hunks[0].lines.len()).collect(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Stage)
+}
+
+fn untracked_stage_rest_reaches_fully_staged_verify(fixture: &Fixture) {
+    fixture.assert(predicate::repo::has_staged_file("multi.txt"));
+    fixture.assert(predicate::repo::index_blob_equals(
+        "multi.txt",
+        UNTRACKED_MULTI.as_bytes().to_vec(),
+    ));
+    let repo = fixture.repo().expect("repo");
+    let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+    assert_eq!(
+        diffs.staged.files[0].status,
+        FileStatus::Added,
+        "a fully staged untracked file must show as Added, matching apply_file(Stage)'s result"
+    );
+}
+
+/// "Line-unstage of an Added file": the mirror of `unstage_staged_new` (whole-file), but for a
+/// line-precise selection — an Added file's line-UNSTAGE (fork 3) reuses the same base=New
+/// machinery discard needs.
+fn added_multi_build() -> Fixture {
+    FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .staged_file("added.txt", UNTRACKED_MULTI)
+        .build()
+        .expect("fixture build")
+}
+
+fn added_line_unstage_ops(repo: &Repository, applier: &dyn Applier) -> Result<(), ReviewError> {
+    let diffs = diff_uncommitted(repo)?;
+    let file = &diffs.staged.files[0];
+    let keep_two = line_index(file, 0, LineKind::Addition, "two\n");
+    let sel = LineSelection {
+        keep_adds: [keep_two].into(),
+        keep_dels: [].into(),
+    };
+    apply_lines(repo, applier, file, 0, &sel, StageVerb::Unstage)
+}
+
+fn added_line_unstage_verify(fixture: &Fixture) {
+    // "two\n" is unstaged (removed from the index); the other three lines stay staged.
+    fixture.assert(predicate::repo::index_blob_equals(
+        "added.txt",
+        b"one\nthree\nfour\n".to_vec(),
+    ));
+}
+
+// ---------------------------------------------------------------------------------------------
+// refusals: apply_lines on deleted files never reaches an applier, so this can never diverge
+// between backends — kept for grid completeness per the plan. Untracked's own refusal moved to
+// `refusal_lines_empty_selection_on_untracked` below: an untracked file no longer refuses line
+// ops outright (see the section above), only an EMPTY selection on one still does.
+// ---------------------------------------------------------------------------------------------
+
+fn refusal_lines_empty_selection_on_untracked_ops(
     repo: &Repository,
     applier: &dyn Applier,
 ) -> Result<(), ReviewError> {
@@ -780,15 +1124,15 @@ fn refusal_lines_on_untracked_ops(
         matches!(
             result,
             Err(ReviewError::Synthesis(
-                SynthesisError::LineSelectionUnsupported { .. }
+                SynthesisError::EmptySelection { .. }
             ))
         ),
-        "expected LineSelectionUnsupported, got {result:?}"
+        "expected EmptySelection, got {result:?}"
     );
     Ok(())
 }
 
-fn refusal_lines_on_untracked_verify(fixture: &Fixture) {
+fn refusal_lines_empty_selection_on_untracked_verify(fixture: &Fixture) {
     fixture.assert(predicate::repo::has_untracked_file("new.txt"));
 }
 
