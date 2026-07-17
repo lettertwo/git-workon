@@ -1968,15 +1968,20 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     }
 }
 
-/// Write a split pane's role caption (`── LABEL ──`) across the pane width. The `──` rule
-/// characters always stay `theme.dim` (locked decision #4, `focused-pane-header` — label text
-/// only); only the label word itself takes [`pane_header_label_style`], lit while `focused`.
+/// Write a split pane's role caption (`── LABEL ────…`) across the FULL pane width — the rule
+/// runs to the right edge so the staged pane's caption row doubles as the horizontal divider
+/// between the split's two panes, matching the outline↔diff and side-by-side `│` rules (same
+/// `theme.dim`) without spending a dedicated divider row. The `──` rule characters always stay
+/// `theme.dim` (locked decision #4, `focused-pane-header` — label text only); only the label
+/// word itself takes [`pane_header_label_style`], lit while `focused`.
 fn render_caption(buf: &mut Buffer, area: Rect, label: &str, theme: &Palette, focused: bool) {
     let rule_style = Style::default().fg(theme.dim);
+    let used = 3 + label.chars().count() + 1; // "── " + label + " "
+    let fill = (area.width as usize).saturating_sub(used);
     let line = Line::from(vec![
         TSpan::styled("── ", rule_style),
         TSpan::styled(label.to_string(), pane_header_label_style(theme, focused)),
-        TSpan::styled(" ──", rule_style),
+        TSpan::styled(format!(" {}", "─".repeat(fill)), rule_style),
     ]);
     buf.set_line(area.x, area.y, &line, area.width);
 }
@@ -2932,6 +2937,48 @@ mod tests {
             "expected file content under the staged caption, got:\n{}",
             content.join("\n")
         );
+    }
+
+    #[test]
+    fn split_captions_rule_runs_the_full_pane_width_as_the_pane_divider() {
+        // The staged caption row is the only seam between the split's two panes — its rule must
+        // reach the right edge to read as a divider (dogfood feedback: the split lacked a rule
+        // like the outline↔diff and side-by-side ones).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let buf = render_once(&mut app, 80, 24);
+        let content = buf_lines(&buf);
+
+        for label in ["UNSTAGED", "STAGED"] {
+            let cap = content
+                .iter()
+                .position(|line| {
+                    line.contains(label) && (label != "STAGED" || !line.contains("UNSTAGED"))
+                })
+                .expect("caption present");
+            let row = content[cap].trim_end();
+            assert_eq!(
+                row.chars().count(),
+                80,
+                "{label} caption must span the full pane width, got: {row:?}"
+            );
+            assert_eq!(
+                row.chars().last(),
+                Some('─'),
+                "{label} caption must end in the rule glyph, got: {row:?}"
+            );
+        }
     }
 
     #[test]
