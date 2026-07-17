@@ -229,54 +229,81 @@ fn apply_lines_on_deleted_file_refuses() {
     );
 }
 
+/// Flipped (was `apply_lines_on_untracked_file_refuses`): the old naive-header bug, not a real
+/// git limitation (see the go/no-go test above and `src/synthesis.rs`'s one-sided-patch-header
+/// rendering) — `apply_lines` now synthesizes a one-sided creation patch of just the kept lines.
 #[test]
-fn apply_lines_on_untracked_file_refuses() {
+fn apply_lines_on_untracked_file_stages_only_the_selected_lines() {
     let fixture = FixtureBuilder::new()
         .config("core.autocrlf", "false")
-        .untracked_file("new.txt", "hello\n")
+        .untracked_file("new.txt", "hello\nworld\n")
         .build()
         .expect("fixture build");
     let repo = fixture.repo().expect("repo");
 
     let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
     let file = &diffs.unstaged.files[0];
-    let sel = LineSelection::default();
+    let keep_add = file.hunks[0]
+        .lines
+        .iter()
+        .position(|l| l.kind == LineKind::Addition && l.content == b"hello\n")
+        .expect("hello line present");
+    let sel = LineSelection {
+        keep_adds: [keep_add].into(),
+        keep_dels: [].into(),
+    };
     let result = apply_lines(repo, &CliApplier, file, 0, &sel, StageVerb::Stage);
 
     assert!(
-        matches!(
-            result,
-            Err(ReviewError::Synthesis(
-                SynthesisError::LineSelectionUnsupported { .. }
-            ))
-        ),
-        "expected LineSelectionUnsupported, got {result:?}"
+        result.is_ok(),
+        "expected a line stage of an untracked file to succeed, got {result:?}"
     );
+    fixture.assert(predicate::repo::index_blob_equals(
+        "new.txt",
+        b"hello\n".to_vec(),
+    ));
+    // Index-only apply: the untracked worktree file is untouched (still both lines).
+    fixture.assert(predicate::repo::workdir_file_equals(
+        "new.txt",
+        b"hello\nworld\n".to_vec(),
+    ));
 }
 
+/// Flipped (was `apply_lines_on_added_file_refuses`) per fork 3: Added-file line-UNSTAGE is IN
+/// SCOPE — the base=New machinery built for Untracked discard is exactly what unstage needs. A
+/// partially staged untracked file immediately shows as Added in the staged pane, so this is
+/// the same mechanism, just entered from the other side.
 #[test]
-fn apply_lines_on_added_file_refuses() {
+fn apply_lines_on_added_file_unstages_only_the_selected_lines() {
     let fixture = FixtureBuilder::new()
         .config("core.autocrlf", "false")
-        .staged_file("added.txt", "hello\n")
+        .staged_file("added.txt", "hello\nworld\n")
         .build()
         .expect("fixture build");
     let repo = fixture.repo().expect("repo");
 
     let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
     let file = &diffs.staged.files[0];
-    let sel = LineSelection::default();
-    let result = apply_lines(repo, &CliApplier, file, 0, &sel, StageVerb::Stage);
+    let keep_add = file.hunks[0]
+        .lines
+        .iter()
+        .position(|l| l.kind == LineKind::Addition && l.content == b"world\n")
+        .expect("world line present");
+    let sel = LineSelection {
+        keep_adds: [keep_add].into(),
+        keep_dels: [].into(),
+    };
+    let result = apply_lines(repo, &CliApplier, file, 0, &sel, StageVerb::Unstage);
 
     assert!(
-        matches!(
-            result,
-            Err(ReviewError::Synthesis(
-                SynthesisError::LineSelectionUnsupported { .. }
-            ))
-        ),
-        "expected LineSelectionUnsupported, got {result:?}"
+        result.is_ok(),
+        "expected a line unstage of an Added file to succeed, got {result:?}"
     );
+    // "world\n" is unstaged (removed from the index); "hello\n" stays staged.
+    fixture.assert(predicate::repo::index_blob_equals(
+        "added.txt",
+        b"hello\n".to_vec(),
+    ));
 }
 
 #[test]
@@ -477,5 +504,28 @@ fn apply_hunk_on_modified_text_file_passes_through_to_whole_hunk_stage() {
     fixture.assert(predicate::repo::index_blob_equals(
         "f.txt",
         b"line1\nCHANGED\nline3\n".to_vec(),
+    ));
+}
+
+/// Regression guard: `is_hunk_patchable`/`apply_hunk`'s routing is deliberately UNCHANGED by the
+/// line-ops-on-one-sided-files handoff — a hunk-level `s`/`d` (as opposed to a line-precise
+/// selection) on an untracked file still falls back to the whole-file stage, since "the one hunk
+/// IS the file" for these statuses.
+#[test]
+fn apply_hunk_on_untracked_file_still_stages_the_whole_file() {
+    let fixture = FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .untracked_file("new.txt", "hello\nworld\n")
+        .build()
+        .expect("fixture build");
+    let repo = fixture.repo().expect("repo");
+
+    let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
+    let file = &diffs.unstaged.files[0];
+    apply_hunk(repo, &CliApplier, file, 0, StageVerb::Stage).expect("apply_hunk");
+
+    fixture.assert(predicate::repo::index_blob_equals(
+        "new.txt",
+        b"hello\nworld\n".to_vec(),
     ));
 }
