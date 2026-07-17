@@ -45,35 +45,6 @@ fn naive_deletion_hunk_patch(path: &str, committed_content: &str) -> PatchText {
     }
 }
 
-/// Hand-build the patch a naive whole-hunk stage of an UNTRACKED file would render: an
-/// all-additions hunk from `/dev/null` to `b/<path>` — what `whole_hunk_patch` would produce if
-/// it didn't refuse `FileStatus::Untracked`.
-fn naive_untracked_hunk_patch(path: &str, content: &str) -> PatchText {
-    let lines: Vec<PatchLine> = content
-        .lines()
-        .map(|line| PatchLine {
-            kind: LineKind::Addition,
-            content: format!("{line}\n").into_bytes(),
-            missing_newline: false,
-        })
-        .collect();
-    let count = lines.len() as u32;
-    PatchText {
-        old_path: None,
-        new_path: Some(path.to_string()),
-        old_mode: 0o100644,
-        new_mode: 0o100644,
-        hunks: vec![PatchHunk {
-            old_start: 0,
-            old_count: 0,
-            new_start: 1,
-            new_count: count,
-            header: format!("@@ -0,0 +1,{count} @@\n").into_bytes(),
-            lines,
-        }],
-    }
-}
-
 /// TRIPWIRE: a naive whole-hunk stage of a deletion (deleting every line, but keeping the
 /// `a/`/`b/` paths as if the file still existed) is ACCEPTED by `git apply --cached` — it
 /// stages an EMPTY BLOB for the path instead of removing the index entry. This is exactly the
@@ -105,32 +76,132 @@ fn naive_hunk_stage_of_deletion_stages_empty_blob() {
     fixture.assert(predicate::repo::index_blob_equals("gone.txt", b"".to_vec()));
 }
 
-/// TRIPWIRE: a naive whole-hunk stage of an untracked file (from `/dev/null`) is REJECTED by
-/// `git apply --cached` — the file isn't in the index yet, so there's no preimage to apply the
-/// patch's context against ("... does not exist in index"). Verified directly against
-/// `CliApplier`, bypassing `ops.rs`/`synthesis.rs` for the same reason as the deletion
-/// tripwire above.
+/// TRIPWIRE: a creation patch WITHOUT a `new file mode` header line (the shape
+/// `PatchText::to_bytes` used to render for a one-sided patch — mode-suffixed `index` line,
+/// `/dev/null` old side, but no mode line) is REJECTED by `git apply --cached`: git only sets
+/// its is-new flag from the `new file mode` line, so this parses as a MODIFICATION of `new.txt`
+/// and fails against the absent index preimage ("... does not exist in index"). This is the
+/// exact rejection that motivated the one-sided header fix — the bytes are hand-crafted here
+/// because `to_bytes` can no longer produce this broken shape (see
+/// `creation_patch_with_proper_headers_is_accepted_by_both_appliers` below for the fixed one).
 #[test]
 fn naive_hunk_stage_of_untracked_errors() {
+    use std::io::Write;
+
+    let raw: &[u8] = b"diff --git a/new.txt b/new.txt\n\
+index 0000000..0000000 100644\n\
+--- /dev/null\n\
++++ b/new.txt\n\
+@@ -0,0 +1,1 @@\n\
++hello\n";
+
     let fixture = FixtureBuilder::new()
         .config("core.autocrlf", "false")
         .untracked_file("new.txt", "hello\n")
         .build()
         .expect("fixture build");
     let repo = fixture.repo().expect("repo");
+    let workdir = repo.workdir().expect("workdir");
 
-    let patch = naive_untracked_hunk_patch("new.txt", "hello\n");
-    let result = CliApplier.apply(
-        repo,
-        &patch,
-        ApplyDestination::Index,
-        ApplyDirection::Forward,
-    );
+    let mut child = std::process::Command::new("git")
+        .args(["apply", "--cached"])
+        .current_dir(workdir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git apply");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(raw)
+        .expect("write patch to stdin");
+    let output = child.wait_with_output().expect("wait for git apply");
 
     assert!(
-        result.is_err(),
-        "expected git apply --cached to reject the naive untracked hunk, got {result:?}"
+        !output.status.success(),
+        "expected git apply --cached to reject the mode-line-less creation patch, got: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
+}
+
+/// Go/no-go (fork 1 of `docs/handoffs/2026-07-17-line-ops-one-sided-files.md`): a
+/// properly-headed creation patch — `new file mode`, bare `index 0000000..0000000` (no mode
+/// suffix), `/dev/null` old side, the canonical `git diff --no-index /dev/null file` shape — is
+/// accepted by BOTH appliers. Deliberately bypasses `PatchText`/`Applier`: this pins the
+/// MECHANISM (git accepts these headers) as a standing regression test, independent of whether
+/// `PatchText::to_bytes` renders this shape (see `creation_patch_renders_new_file_mode_and_bare_index_line`
+/// in `src/synthesis.rs` for that). Companion to (not a replacement of)
+/// `naive_hunk_stage_of_untracked_errors` above, which pins the OLD (rejected) header shape.
+#[test]
+fn creation_patch_with_proper_headers_is_accepted_by_both_appliers() {
+    let raw: &[u8] = b"diff --git a/new.txt b/new.txt\n\
+new file mode 100644\n\
+index 0000000..0000000\n\
+--- /dev/null\n\
++++ b/new.txt\n\
+@@ -0,0 +1,2 @@\n\
++hello\n\
++world\n";
+
+    // git2::Diff::from_buffer + Repository::apply(ApplyLocation::Index).
+    {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("new.txt", "hello\nworld\n")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let diff = git2::Diff::from_buffer(raw).expect("git2 parses the proper creation header");
+        repo.apply(&diff, git2::ApplyLocation::Index, None)
+            .expect("git2 applies the proper creation header to the index");
+
+        fixture.assert(predicate::repo::index_blob_equals(
+            "new.txt",
+            b"hello\nworld\n".to_vec(),
+        ));
+    }
+
+    // `git apply --cached` directly (CliApplier's mechanism, bypassing PatchText).
+    {
+        use std::io::Write;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("new.txt", "hello\nworld\n")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let workdir = repo.workdir().expect("workdir");
+
+        let mut child = std::process::Command::new("git")
+            .args(["apply", "--cached"])
+            .current_dir(workdir)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn git apply");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin was piped")
+            .write_all(raw)
+            .expect("write patch to stdin");
+        let output = child.wait_with_output().expect("wait for git apply");
+        assert!(
+            output.status.success(),
+            "git apply --cached rejected the proper creation header: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        fixture.assert(predicate::repo::index_blob_equals(
+            "new.txt",
+            b"hello\nworld\n".to_vec(),
+        ));
+    }
 }
 
 #[test]

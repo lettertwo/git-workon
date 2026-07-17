@@ -145,19 +145,30 @@ pub struct PatchText {
 }
 
 impl PatchText {
-    /// Render the full patch: a `diff --git`/`index`/`---`/`+++` file header, then each
-    /// hunk's bytes. Always ends in `\n` (each hunk's last line is either a real line with its
-    /// own trailing `\n`, or a `missing_newline` line whose marker supplies one).
+    /// Render the full patch: a `diff --git`/(`new file mode`|`deleted file mode`)?/`index`/
+    /// `---`/`+++` file header, then each hunk's bytes. Always ends in `\n` (each hunk's last
+    /// line is either a real line with its own trailing `\n`, or a `missing_newline` line whose
+    /// marker supplies one).
     ///
-    /// The `index 0000000..0000000 <mode>` line's OIDs are a placeholder — this crate never
+    /// A one-sided patch (`old_path` or `new_path` is `None` — a whole-file creation or
+    /// deletion) additionally needs a `new file mode {mode:06o}` / `deleted file mode
+    /// {mode:06o}` line: without it, git parses the patch as a MODIFICATION of an existing
+    /// path and rejects it against an untracked/absent preimage ("does not exist in index") —
+    /// this is the exact shape `git diff --no-index /dev/null <file>` emits, and the one both
+    /// `git2::Diff::from_buffer` + `Repository::apply(ApplyLocation::Index)` and `git apply
+    /// --cached` accept (see the go/no-go test in `tests/suite/file_ops.rs`). The `index` line
+    /// that follows omits its mode suffix for a one-sided patch — canonical git output has no
+    /// mode there, since the mode line above already carries it.
+    ///
+    /// The `index 0000000..0000000[ <mode>]` line's OIDs are a placeholder — this crate never
     /// reads blob OIDs off the model (untracked deltas don't have them either), and `git
     /// apply` ignores them. The line exists because `git2::Diff::from_buffer` parses stricter
-    /// than `git apply` and rejects a bare 3-line header (plan risk #4). The MODE, however, is
-    /// load-bearing: `Repository::apply(ApplyLocation::Index, ..)` takes the new index entry's
-    /// mode straight from this line, so it must be the file's real mode
-    /// ([`Self::new_mode`]) — a hardcoded `100644` here used to silently clobber the exec bit
-    /// of any staged `100755` file (the `git apply` CLI path never had this bug: it reads the
-    /// mode from the working tree instead).
+    /// than `git apply` and rejects a bare 3-line header (plan risk #4). For a two-sided
+    /// (Modified/Renamed/Copied) patch, the MODE is load-bearing: `Repository::apply
+    /// (ApplyLocation::Index, ..)` takes the new index entry's mode straight from this line, so
+    /// it must be the file's real mode ([`Self::new_mode`]) — a hardcoded `100644` here used to
+    /// silently clobber the exec bit of any staged `100755` file (the `git apply` CLI path
+    /// never had this bug: it reads the mode from the working tree instead).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let diff_git_old = self
@@ -171,7 +182,23 @@ impl PatchText {
             .or(self.old_path.as_deref())
             .unwrap_or("");
         out.extend_from_slice(format!("diff --git a/{diff_git_old} b/{diff_git_new}\n").as_bytes());
-        out.extend_from_slice(format!("index 0000000..0000000 {:06o}\n", self.new_mode).as_bytes());
+        match (&self.old_path, &self.new_path) {
+            (None, Some(_)) => {
+                out.extend_from_slice(format!("new file mode {:06o}\n", self.new_mode).as_bytes());
+                out.extend_from_slice(b"index 0000000..0000000\n");
+            }
+            (Some(_), None) => {
+                out.extend_from_slice(
+                    format!("deleted file mode {:06o}\n", self.old_mode).as_bytes(),
+                );
+                out.extend_from_slice(b"index 0000000..0000000\n");
+            }
+            _ => {
+                out.extend_from_slice(
+                    format!("index 0000000..0000000 {:06o}\n", self.new_mode).as_bytes(),
+                );
+            }
+        }
         let old_label = match &self.old_path {
             Some(p) => format!("a/{p}"),
             None => "/dev/null".to_string(),
@@ -758,6 +785,130 @@ mod tests {
         assert_eq!(inverted.hunks[0].lines[1].kind, LineKind::Addition);
         assert!(inverted.hunks[0].lines[1].missing_newline);
         assert_eq!(inverted.hunks[0].lines[1].content, b"line2");
+    }
+
+    /// A hand-built one-sided (creation) [`PatchText`] — `whole_hunk_patch`/`partial_hunk_patch`
+    /// don't synthesize these yet (that's step 3, gated on `selectable_hunk`'s status refusal);
+    /// this constructs `PatchText` directly to pin `to_bytes`'s header-rendering contract on its
+    /// own, matching the canonical `git diff --no-index /dev/null file` shape from the handoff.
+    fn creation_patch() -> PatchText {
+        PatchText {
+            old_path: None,
+            new_path: Some("new.txt".to_string()),
+            old_mode: 0,
+            new_mode: 0o100644,
+            hunks: vec![PatchHunk {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                header: b"@@ -0,0 +1,2 @@\n".to_vec(),
+                lines: vec![
+                    PatchLine {
+                        kind: LineKind::Addition,
+                        content: b"hello\n".to_vec(),
+                        missing_newline: false,
+                    },
+                    PatchLine {
+                        kind: LineKind::Addition,
+                        content: b"world\n".to_vec(),
+                        missing_newline: false,
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn creation_patch_renders_new_file_mode_and_bare_index_line() {
+        let patch = creation_patch();
+
+        let expected = [
+            "diff --git a/new.txt b/new.txt\n",
+            "new file mode 100644\n",
+            "index 0000000..0000000\n",
+            "--- /dev/null\n",
+            "+++ b/new.txt\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+hello\n",
+            "+world\n",
+        ]
+        .concat()
+        .into_bytes();
+
+        assert_eq!(patch.to_bytes(), expected);
+    }
+
+    #[test]
+    fn deletion_patch_renders_deleted_file_mode_and_bare_index_line() {
+        let patch = PatchText {
+            old_path: Some("gone.txt".to_string()),
+            new_path: None,
+            old_mode: 0o100644,
+            new_mode: 0,
+            hunks: vec![PatchHunk {
+                old_start: 1,
+                old_count: 2,
+                new_start: 0,
+                new_count: 0,
+                header: b"@@ -1,2 +0,0 @@\n".to_vec(),
+                lines: vec![
+                    PatchLine {
+                        kind: LineKind::Deletion,
+                        content: b"hello\n".to_vec(),
+                        missing_newline: false,
+                    },
+                    PatchLine {
+                        kind: LineKind::Deletion,
+                        content: b"world\n".to_vec(),
+                        missing_newline: false,
+                    },
+                ],
+            }],
+        };
+
+        let expected = [
+            "diff --git a/gone.txt b/gone.txt\n",
+            "deleted file mode 100644\n",
+            "index 0000000..0000000\n",
+            "--- a/gone.txt\n",
+            "+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n",
+            "-hello\n",
+            "-world\n",
+        ]
+        .concat()
+        .into_bytes();
+
+        assert_eq!(patch.to_bytes(), expected);
+    }
+
+    /// Fork 1's `invert` requirement: a reversed creation patch must render as a DELETION
+    /// (`deleted file mode`), not silently keep the `new file mode` line — `invert` already
+    /// swaps `old_path`/`new_path`/`old_mode`/`new_mode`, so this is a round-trip contract test
+    /// on `to_bytes`'s header rendering, not new inversion logic.
+    #[test]
+    fn invert_of_creation_renders_as_deletion_header() {
+        let patch = creation_patch();
+        let inverted = patch.invert();
+
+        assert_eq!(inverted.old_path.as_deref(), Some("new.txt"));
+        assert!(inverted.new_path.is_none());
+
+        let rendered = String::from_utf8(inverted.to_bytes()).unwrap();
+        assert!(
+            rendered.contains("deleted file mode 100644\n"),
+            "expected a deleted file mode line, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("index 0000000..0000000\n"),
+            "expected the bare (mode-suffix-free) index line, got: {rendered}"
+        );
+        assert!(!rendered.contains("new file mode"));
+
+        // invert(invert(creation)) == creation (same contract as the existing modification
+        // round-trip test above).
+        assert_eq!(inverted.invert(), patch);
     }
 
     #[test]
