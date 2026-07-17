@@ -784,15 +784,21 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
-/// The style for a pane header/caption LABEL word (CS1, `focused-pane-header`) — never the
-/// surrounding chrome (counters, diffstats, rule characters, markers), which keep their own
-/// existing colors regardless of focus (locked decision #4). `focused` selects between
-/// [`Palette::pane_header_focused_fg`] with a structural, unconditional BOLD (locked decision #3
-/// — under [`Palette::mono`], where that color and `theme.dim` both collapse to `Color::Reset`,
-/// this BOLD is the only thing that still marks the focused label) and the plain
-/// [`Palette::dim`] every unfocused label already used before this changeset. Exactly one call
-/// site across a frame's outline header / diff header / split captions should ever pass `true`
-/// (the exactly-one-lit-label invariant — see the module's `focused-pane-header` handoff).
+/// The style for a pane header/caption LABEL word (CS1, `focused-pane-header`), and — since
+/// `header-chrome-follows-focus` — the structural "identity" chrome that travels with it: the
+/// outline header's `[i/n]` counter, the diff header's `[fidx/nfiles]` counter, and the
+/// changeset-prefix segment's `[i/n] {title}` text. The SEMANTIC spans (diffstats, the
+/// needs-restack `⚠`, the current-changeset `●` marker, the pan-offset indicator) never use this
+/// style — they keep their own colors regardless of focus (locked decision #2). `focused` selects
+/// between [`Palette::pane_header_focused_fg`] with a structural, unconditional BOLD (locked
+/// decision #3 — under [`Palette::mono`], where that color and `theme.dim` both collapse to
+/// `Color::Reset`, this BOLD is the only thing that still marks the focused label) and the plain
+/// [`Palette::dim`] every unfocused label already used before this changeset. Exactly one
+/// header/caption across a frame's outline header / diff header / split captions should ever
+/// receive `focused == true` (the exactly-one-lit-label invariant — see the module's
+/// `focused-pane-header` handoff); since `header-chrome-follows-focus` that one header may style
+/// several spans (counter + label + changeset-prefix text) through this function with the same
+/// flag, so the invariant counts lit headers, not call sites.
 fn pane_header_label_style(theme: &Palette, focused: bool) -> Style {
     if focused {
         Style::default()
@@ -804,7 +810,8 @@ fn pane_header_label_style(theme: &Palette, focused: bool) -> Style {
 }
 
 /// The outline pane's own top row (CS1, `pane-headers`): `[i/n] {display_label}` (the active
-/// changeset's TRUE stack position, the display label styled via [`pane_header_label_style`] —
+/// changeset's TRUE stack position, the counter and display label both styled via
+/// [`pane_header_label_style`] (the counter joined the toggle in `header-chrome-follows-focus`) —
 /// lit ([`Palette::pane_header_focused_fg`] + bold) while the outline has focus, dim otherwise
 /// (CS1, `focused-pane-header` — locked decision #5's "outline focused" case); no current-marker
 /// glyph, since this header is always describing the currently-active changeset, a redundant
@@ -831,9 +838,7 @@ fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palet
     let mut spans = vec![
         TSpan::styled(
             format!("[{i}/{n}] "),
-            Style::default()
-                .fg(theme.foreground)
-                .add_modifier(Modifier::BOLD),
+            pane_header_label_style(theme, focused),
         ),
         TSpan::styled(title, pane_header_label_style(theme, focused)),
     ];
@@ -1237,12 +1242,20 @@ fn hscroll_indicator_span(app: &App, theme: &Palette) -> Option<TSpan<'static>> 
 /// CS1 (`pane-headers`)'s changeset-position prefix, prepended to the diff pane header only when
 /// the outline is CLOSED and the stack has more than one changeset (see [`diff_header_line`]) —
 /// with the outline open, the outline pane's own header ([`render_outline_header`]) already
-/// carries this information, so showing it twice would be redundant. `[i/n] {display_label}`
-/// bold, plus a glyph-ONLY (no "needs restack" text — that's the outline header's fuller
-/// treatment) `⚠` in `theme.warn_fg` when [`workon::Changeset::needs_restack`]. Ported verbatim
-/// from the old `render_winbar`'s equivalent prefix (locked decisions #8 + #9), minus the
-/// diffstat/path/icon tail that moved into [`file_segment_spans`].
-fn changeset_prefix_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TSpan<'static>> {
+/// carries this information, so showing it twice would be redundant. `[i/n] {display_label}`,
+/// plus a glyph-ONLY (no "needs restack" text — that's the outline header's fuller treatment) `⚠`
+/// in `theme.warn_fg` when [`workon::Changeset::needs_restack`]. Ported verbatim from the old
+/// `render_winbar`'s equivalent prefix (locked decisions #8 + #9), minus the diffstat/path/icon
+/// tail that moved into [`file_segment_spans`]. `focused` (CS1, `header-chrome-follows-focus`)
+/// is the same flag [`diff_header_line`]'s own label receives — the `[i/n] {title}` text lights
+/// and dims with it via [`pane_header_label_style`], while the warn glyph keeps its semantic
+/// `theme.warn_fg` regardless (locked decision #2).
+fn changeset_prefix_spans(
+    app: &App,
+    theme: &Palette,
+    icons: IconMode,
+    focused: bool,
+) -> Vec<TSpan<'static>> {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
@@ -1250,9 +1263,7 @@ fn changeset_prefix_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TS
 
     let mut spans = vec![TSpan::styled(
         format!("[{i}/{n}] {title}"),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
+        pane_header_label_style(theme, focused),
     )];
     // A boolean-driven glyph + color (locked decision #9), not a title-string suffix — distinct
     // from the plain title so a stale-parent changeset reads as a heads-up at a glance.
@@ -1268,9 +1279,11 @@ fn changeset_prefix_spans(app: &App, theme: &Palette, icons: IconMode) -> Vec<TS
 }
 
 /// The diff pane header's shared "current file" segment (CS1, `pane-headers`): `[fidx/nfiles] `
-/// bold, an optional nerd devicons file icon, [`current_file_label`] styled via
-/// [`pane_header_label_style`] (lit while `focused`, dim otherwise — CS1, `focused-pane-header`),
-/// a tight `+N -M` per-file diffstat (new: the old winbar only ever showed a CHANGESET-total
+/// and [`current_file_label`] both styled via [`pane_header_label_style`] (lit while `focused`,
+/// dim otherwise — CS1, `focused-pane-header`; the counter joined the label's lit/dim toggle in
+/// `header-chrome-follows-focus`, having previously stayed unconditionally bold), an optional
+/// nerd devicons file icon, a tight `+N -M` per-file diffstat (new: the old winbar only ever
+/// showed a CHANGESET-total
 /// diffstat, never a per-file one — [`crate::summary::file_diffstat`] gives the same recorded
 /// counts for a binary file as a text one, so this segment needs no binary special-case), and the
 /// pan-offset indicator. Used verbatim whether the outline is open, closed+lone, or closed+multi
@@ -1290,9 +1303,7 @@ fn file_segment_spans(
     let n = app.files().len();
     let mut spans = vec![TSpan::styled(
         format!("[{idx}/{n}] "),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
+        pane_header_label_style(theme, focused),
     )];
     if icons == IconMode::Nerd {
         if let Some(f) = app.files().get(app.current) {
@@ -1356,7 +1367,7 @@ fn diff_header_line(app: &App, theme: &Palette, icons: IconMode, focused: bool) 
 
     if app.current_failure().is_some() || app.is_current_pending() || app.files().is_empty() {
         return if show_prefix {
-            Line::from(changeset_prefix_spans(app, theme, icons))
+            Line::from(changeset_prefix_spans(app, theme, icons, focused))
         } else {
             Line::from(TSpan::styled(
                 " ".to_string(),
@@ -1367,7 +1378,7 @@ fn diff_header_line(app: &App, theme: &Palette, icons: IconMode, focused: bool) 
 
     let mut spans = Vec::new();
     if show_prefix {
-        spans.extend(changeset_prefix_spans(app, theme, icons));
+        spans.extend(changeset_prefix_spans(app, theme, icons, focused));
         spans.push(TSpan::styled(
             "  —  ".to_string(),
             Style::default()
@@ -2335,7 +2346,10 @@ mod tests {
     use git_workon_fixture::prelude::*;
     use unicode_width::UnicodeWidthChar;
 
-    use super::{hscroll_cut, pan_spans, render, STATUS_PLACEHOLDER};
+    use super::{
+        changeset_prefix_spans, hscroll_cut, pan_spans, pane_header_label_style, render,
+        STATUS_PLACEHOLDER,
+    };
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::{App, EffectiveZoom, Role};
@@ -6148,6 +6162,162 @@ mod tests {
             staged_cell.style().bg,
             Some(theme.cursor_bg),
             "the newly-focused half must show the full cursor wash"
+        );
+    }
+
+    // ── header-chrome-follows-focus (CS1): counters join the label's lit/dim toggle ───
+
+    #[test]
+    fn outline_header_counter_follows_the_labels_focus_toggle() {
+        // The outline header's `[i/n]` counter used to stay unconditionally bold+foreground —
+        // it now lights/dims together with the label beside it (locked decision #1).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open() && !app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[2/2]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.dim), false),
+            "the outline header counter must dim alongside the label while unfocused"
+        );
+
+        app.focus_outline();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[2/2]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the outline header counter must light alongside the label while focused"
+        );
+    }
+
+    #[test]
+    fn diff_header_file_counter_follows_the_labels_focus_toggle() {
+        // Same toggle as the outline header's counter above, for the diff header's own
+        // `[fidx/nfiles]` counter ([`super::file_segment_spans`]).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open() && !app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, 80, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[1/1]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the diff header counter must light alongside the label while the diff has focus"
+        );
+
+        app.focus_outline();
+        let buf = render_once(&mut app, 80, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[1/1]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.dim), false),
+            "the diff header counter must dim alongside the label once focus leaves the diff"
+        );
+    }
+
+    #[test]
+    fn outline_header_diffstat_colors_stay_semantic_across_focus_toggle() {
+        // Locked decision #2: the `+N -M` diffstat span is semantic information, not identity
+        // chrome — it must keep its own color (and bold) regardless of which pane has focus.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        let theme = Palette::dark();
+
+        let unfocused_buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let unfocused_content = buf_lines(&unfocused_buf);
+        let add_x = find_label_x(&unfocused_content[0], "+1");
+        let unfocused_add = label_style_at(&unfocused_buf, add_x, 0);
+
+        app.focus_outline();
+        let focused_buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let focused_content = buf_lines(&focused_buf);
+        let add_x = find_label_x(&focused_content[0], "+1");
+        let focused_add = label_style_at(&focused_buf, add_x, 0);
+
+        assert_eq!(
+            unfocused_add, focused_add,
+            "the outline header's diffstat span must not change with focus"
+        );
+        assert_eq!(
+            unfocused_add,
+            (Some(theme.add_strong), true),
+            "the diffstat span keeps its own semantic color and bold regardless of focus"
+        );
+    }
+
+    #[test]
+    fn changeset_prefix_text_follows_focus_while_the_warn_glyph_stays_semantic() {
+        // `changeset_prefix_spans` (the diff header's changeset-position prefix, shown only with
+        // the outline closed) splits into a `[i/n] {title}` text span that now follows the same
+        // `focused` flag `diff_header_line` passes to `file_segment_spans`, and a glyph-only warn
+        // span that keeps `theme.warn_fg` regardless (locked decision #2) — exercised directly
+        // rather than through a rendered frame to probe both flag values in isolation. (A real
+        // frame CAN show the prefix dim: outline closed + Split zoom, where a caption is the lit
+        // label and `diff_header_line` receives `focused == false`.)
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        let theme = Palette::dark();
+        let icons = crate::icons::IconMode::None;
+
+        let lit = changeset_prefix_spans(&app, &theme, icons, true);
+        let dim = changeset_prefix_spans(&app, &theme, icons, false);
+
+        let text_style = |spans: &[TSpan<'static>]| {
+            spans
+                .iter()
+                .find(|s| s.content.contains("[2/2]"))
+                .expect("counter+title span present")
+                .style
+        };
+        assert_eq!(
+            text_style(&lit),
+            pane_header_label_style(&theme, true),
+            "the changeset-prefix text lights with focus"
+        );
+        assert_eq!(
+            text_style(&dim),
+            pane_header_label_style(&theme, false),
+            "the changeset-prefix text dims without focus"
+        );
+
+        let warn_style = |spans: &[TSpan<'static>]| {
+            spans
+                .iter()
+                .find(|s| s.content.contains('⚠'))
+                .expect("warn glyph span present")
+                .style
+        };
+        assert_eq!(
+            warn_style(&lit).fg,
+            Some(theme.warn_fg),
+            "the warn glyph keeps its semantic color while the prefix text is focused"
+        );
+        assert_eq!(
+            warn_style(&lit),
+            warn_style(&dim),
+            "the warn glyph's style is unaffected by the prefix text's focus"
         );
     }
 }
