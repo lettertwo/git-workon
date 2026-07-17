@@ -786,6 +786,35 @@ impl OutlineRowIdentity {
     }
 }
 
+/// What "the same changeset" means once a refresh has re-resolved the world: branch name plus
+/// span KIND. Name alone is ambiguous — [`workon::assemble_changesets`]'s uncommitted layer is
+/// named after the current branch, so that branch's committed node and the uncommitted layer
+/// share a name, and a name-only re-find silently lands on the committed node (the "staging
+/// teleports the diff viewer" / "discard does nothing" dogfood bugs). Deliberately NOT the full
+/// [`workon::ChangesetSpan`]: a staging op rewrites the index, and a future stack op rewrites
+/// base/head OIDs, yet the result is still "the same changeset" to the reviewer — identity must
+/// survive exactly the operations that change the span's contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesetIdentity {
+    name: String,
+    uncommitted: bool,
+}
+
+impl ChangesetIdentity {
+    /// Capture `cs`'s identity ahead of an operation that rebuilds [`App::changesets`].
+    fn of(cs: &Changeset) -> Self {
+        Self {
+            name: cs.name.clone(),
+            uncommitted: cs.span == ChangesetSpan::Uncommitted,
+        }
+    }
+
+    /// Whether `cs` is the changeset this identity was captured from, across a rebuild.
+    fn matches(&self, cs: &Changeset) -> bool {
+        cs.name == self.name && (cs.span == ChangesetSpan::Uncommitted) == self.uncommitted
+    }
+}
+
 /// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
 /// than the diff) currently has keyboard focus, its own cursor (an index into
 /// [`App::outline_items`]'s row list — a wholly separate coordinate space from [`App::cursor`]),
@@ -1300,17 +1329,18 @@ pub enum PendingOp {
         file_idx: usize,
         selections: Vec<(usize, LineSelection)>,
     },
-    /// CS7: discard every file in `files` — `(changeset name, file path)` pairs — from the
+    /// CS7: discard every file in `files` — `(changeset identity, file path)` pairs — from the
     /// worktree: an outline File row's single target, or a Dir row's every file under its path.
-    /// Stored by NAME + PATH rather than raw `(cs_idx, file_idx)` indices because the confirm
-    /// modal doesn't stop the tick beat: an external index change (e.g. `git add` from another
-    /// terminal) can run a full refresh between `d` and `y`, rebuilding the per-changeset file
-    /// lists and shifting positions — [`App::resolve_confirm`] re-resolves each pair against the
-    /// LIVE changesets at answer time (silently skipping any that vanished) so a stale index can
-    /// never discard the wrong file. `identity` is the acted-on outline row's
-    /// [`OutlineRowIdentity`], captured at request-time for the post-op outline cursor restore.
+    /// Stored by [`ChangesetIdentity`] + PATH rather than raw `(cs_idx, file_idx)` indices
+    /// because the confirm modal doesn't stop the tick beat: an external index change (e.g.
+    /// `git add` from another terminal) can run a full refresh between `d` and `y`, rebuilding
+    /// the per-changeset file lists and shifting positions — [`App::resolve_confirm`]
+    /// re-resolves each pair against the LIVE changesets at answer time (silently skipping any
+    /// that vanished) so a stale index can never discard the wrong file. `identity` is the
+    /// acted-on outline row's [`OutlineRowIdentity`], captured at request-time for the post-op
+    /// outline cursor restore.
     DiscardOutlineFiles {
-        files: Vec<(String, String)>,
+        files: Vec<(ChangesetIdentity, String)>,
         identity: OutlineRowIdentity,
     },
 }
@@ -1686,7 +1716,7 @@ impl App {
             return;
         }
 
-        let prev_cs_name = self.cur().cs.name.clone();
+        let prev_cs_id = ChangesetIdentity::of(&self.cur().cs);
         let current_path = self
             .cur()
             .diff
@@ -1733,7 +1763,7 @@ impl App {
 
         self.current_cs = new_views
             .iter()
-            .position(|v| v.cs.name == prev_cs_name)
+            .position(|v| prev_cs_id.matches(&v.cs))
             .unwrap_or_else(|| current_cs_index(&new_views));
         self.base_label = base_label_for(&new_views[self.current_cs].cs);
         self.changesets = new_views;
@@ -3323,12 +3353,12 @@ impl App {
                 targets.len()
             ),
         };
-        let files: Vec<(String, String)> = targets
+        let files: Vec<(ChangesetIdentity, String)> = targets
             .iter()
             .filter_map(|&(cs_idx, file_idx)| {
                 let view = self.changesets.get(cs_idx)?;
                 let path = view.files().get(file_idx)?.path.clone();
-                Some((view.cs.name.clone(), path))
+                Some((ChangesetIdentity::of(&view.cs), path))
             })
             .collect();
         self.request_confirm(prompt, PendingOp::DiscardOutlineFiles { files, identity });
@@ -4120,14 +4150,14 @@ impl App {
                 self.run_op(LineSelectionOp::new(file, selections, StageVerb::Discard));
             }
             PendingOp::DiscardOutlineFiles { files, identity } => {
-                // Re-resolve each (changeset name, path) pair against the LIVE changesets — an
+                // Re-resolve each (changeset identity, path) pair against the LIVE changesets — an
                 // intervening tick refresh may have shifted every index since `d` was pressed
                 // (see the variant's doc); a pair that no longer resolves is silently skipped
                 // (its file already left the diff, so there's nothing left to discard).
                 let ops: Vec<Box<dyn StagingOp>> = files
                     .iter()
-                    .filter_map(|(cs_name, path)| {
-                        let view = self.changesets.iter().find(|v| v.cs.name == *cs_name)?;
+                    .filter_map(|(cs_id, path)| {
+                        let view = self.changesets.iter().find(|v| cs_id.matches(&v.cs))?;
                         let file = view.files().iter().find(|f| f.path == *path)?.clone();
                         Some(Box::new(FileStagingOp::file(file, StageVerb::Discard))
                             as Box<dyn StagingOp>)
@@ -10383,6 +10413,100 @@ mod tests {
             "a.txt",
             "NEW\nCHANGED\n",
         ));
+    }
+
+    /// A Graphite stack whose current branch `b` has BOTH a committed changeset and the
+    /// uncommitted layer — [`workon::assemble_changesets`]'s `insert_uncommitted_layer` names
+    /// the layer after the current branch, so two changesets share the name "b". Built through
+    /// the production resolve path ([`crate::acquire::resolve_changesets`]) so `App::refresh`
+    /// re-resolves the same shape.
+    fn graphite_stack_app_on_uncommitted_layer() -> (Fixture, App) {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .branch_metadata("b", "a")
+            .untracked_file("scratch.txt", "hi\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        repo.set_head("refs/heads/b").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let changesets = crate::acquire::resolve_changesets(repo, "b").expect("resolve");
+        assert!(
+            changesets
+                .iter()
+                .any(|cs| cs.name == "b" && cs.span != ChangesetSpan::Uncommitted),
+            "precondition: a committed changeset named after the current branch"
+        );
+        assert!(
+            changesets
+                .iter()
+                .any(|cs| cs.name == "b" && cs.span == ChangesetSpan::Uncommitted),
+            "precondition: the uncommitted layer shares that name"
+        );
+        let mut views = Vec::with_capacity(changesets.len());
+        for cs in changesets {
+            let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+            views.push(ChangesetView::from_changeset_diff(cs, diff));
+        }
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.open_current();
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Uncommitted,
+            "precondition: the review opens on the uncommitted layer"
+        );
+        (fixture, app)
+    }
+
+    /// Refresh re-finds the current changeset by NAME alone — with the uncommitted layer named
+    /// after its branch, the first name match is the committed "b" changeset, and the reviewer
+    /// is silently teleported off the uncommitted layer. Every staging op refreshes, so this is
+    /// the "stage a file and the diff viewer jumps to another changeset" dogfood bug.
+    #[test]
+    fn refresh_stays_on_the_uncommitted_layer_despite_a_same_named_committed_changeset() {
+        let (_fixture, mut app) = graphite_stack_app_on_uncommitted_layer();
+
+        app.refresh();
+
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Uncommitted,
+            "refresh must keep the reviewer on the uncommitted layer, not its same-named \
+             committed changeset"
+        );
+    }
+
+    /// The confirm-time re-resolve for an outline discard looks the changeset up by NAME alone
+    /// (`resolve_confirm`'s `DiscardOutlineFiles` arm) — the first match is the committed "b"
+    /// changeset, the file isn't in ITS diff, and the pair is silently dropped: `y` does
+    /// nothing. This is the "discard from the outline has no effect" dogfood bug.
+    #[test]
+    fn outline_discard_still_applies_when_a_committed_changeset_shares_the_layers_name() {
+        let (fixture, mut app) = graphite_stack_app_on_uncommitted_layer();
+        // Set mode/order BEFORE the row lookup — the index is only valid in the build it was
+        // found in.
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        app.outline.cursor = outline_file_row(&app, "scratch.txt");
+
+        app.outline_discard();
+        assert!(
+            app.pending_confirm.is_some(),
+            "discard must request confirm; notice: {:?}",
+            app.notice
+        );
+        app.resolve_confirm(true);
+
+        let repo = fixture.repo().unwrap();
+        let scratch = repo.workdir().unwrap().join("scratch.txt");
+        // No absence predicate exists yet; a direct existence check keeps the assertion honest.
+        assert!(
+            !scratch.exists(),
+            "y must discard the untracked file from the worktree"
+        );
     }
 
     #[test]
