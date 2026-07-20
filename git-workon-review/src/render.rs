@@ -285,12 +285,14 @@ fn apply_right_edge_marker(
     }
 }
 
-/// One resolved (bg, fg) pair for a byte range of a line.
+/// One resolved (bg, fg, italic) triple for a byte range of a line.
 struct Segment {
     start: usize,
     end: usize,
     bg: Option<Color>,
     fg: Color,
+    /// Whether the covering syntax capture renders in italics (`theme::syntax_italic` — comments).
+    italic: bool,
 }
 
 /// Merge background-role spans and syntax fg spans into a flat list of non-overlapping
@@ -333,11 +335,22 @@ fn compose_segments(
             .rev()
             .find(|(s, e, _)| mid >= *s && mid < *e)
             .map(|(_, _, c)| *c);
-        let fg = fg_spans
+        let (fg, italic) = fg_spans
             .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
-            .map(|s| theme.syntax(s.capture))
-            .unwrap_or(theme.foreground);
-        segments.push(Segment { start, end, bg, fg });
+            .map(|s| {
+                (
+                    theme.syntax(s.capture),
+                    crate::theme::syntax_italic(s.capture),
+                )
+            })
+            .unwrap_or((theme.foreground, false));
+        segments.push(Segment {
+            start,
+            end,
+            bg,
+            fg,
+            italic,
+        });
     }
     segments
 }
@@ -581,6 +594,9 @@ fn content_spans(
         let mut style = Style::default().fg(seg.fg);
         if let Some(bg) = seg.bg {
             style = style.bg(bg);
+        }
+        if seg.italic {
+            style = style.add_modifier(Modifier::ITALIC);
         }
         spans.push(TSpan::styled(text[seg.start..seg.end].to_string(), style));
     }
@@ -2352,12 +2368,13 @@ mod tests {
     use unicode_width::UnicodeWidthChar;
 
     use super::{
-        changeset_prefix_spans, hscroll_cut, pan_spans, pane_header_label_style, render,
-        STATUS_PLACEHOLDER,
+        changeset_prefix_spans, compose_segments, hscroll_cut, pan_spans, pane_header_label_style,
+        render, STATUS_PLACEHOLDER,
     };
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::{App, EffectiveZoom, Role};
+    use crate::highlight::FgSpan;
     use crate::keymap::Keymap;
     use crate::outline::OutlineItem;
     use crate::theme::Palette;
@@ -2374,6 +2391,30 @@ mod tests {
         let theme = Palette::dark();
         terminal.draw(|f| render(f, app, &keymap, &theme)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn compose_segments_marks_comment_captures_italic() {
+        // The italics are structural (crate::theme::SYNTAX_ITALICS), resolved per capture at the
+        // same place the syntax color is — a comment segment carries italic, its neighbors don't.
+        let theme = Palette::dark();
+        let comment = crate::highlight::capture_index("comment").unwrap();
+        let keyword = crate::highlight::capture_index("keyword").unwrap();
+        let fgs = vec![
+            FgSpan {
+                start: 0,
+                end: 4,
+                capture: comment,
+            },
+            FgSpan {
+                start: 4,
+                end: 8,
+                capture: keyword,
+            },
+        ];
+        let segments = compose_segments(8, &[], Some(&fgs), &theme);
+        assert!(segments[0].italic, "comment segment renders italic");
+        assert!(!segments[1].italic, "keyword segment stays upright");
     }
 
     /// Like [`render_once`] but with a caller-chosen theme — for the canvas-paint tests, which

@@ -246,6 +246,25 @@ pub fn syntax_slot_count() -> usize {
     SYNTAX_SLOTS.len()
 }
 
+/// Per-capture italics template, parallel to [`SYNTAX_SLOTS`] (the array length ties the two at
+/// compile time): `true` for the captures rendered in italics under every scheme. Only comments
+/// today — the near-universal editor convention (and the prototype's look) — carried as a
+/// structural style like `render`'s BOLD chrome rather than a palette field: it isn't a color, so
+/// it survives [`Palette::mono`]/`NO_COLOR` (where it becomes the only remaining comment marker)
+/// and needs no per-theme value.
+const SYNTAX_ITALICS: [bool; SYNTAX_SLOTS.len()] = {
+    let mut italics = [false; SYNTAX_SLOTS.len()];
+    italics[1] = true; // comment (index in `crate::highlight::HIGHLIGHT_NAMES`)
+    italics
+};
+
+/// Whether a capture index renders in italics (see [`SYNTAX_ITALICS`]). Panics on an
+/// out-of-range index, exactly as [`Palette::syntax`] does — the index always comes from the
+/// bound capture space.
+pub fn syntax_italic(capture: usize) -> bool {
+    SYNTAX_ITALICS[capture]
+}
+
 /// The resolved on-tint palette a frame is painted with (ADR-029's theme-controlled half).
 ///
 /// Syntax foreground is looked up per capture index via [`Palette::syntax`]; the diff-background
@@ -923,6 +942,16 @@ mod tests {
         }
         slots[0] = base00;
         Base16 { slots }
+    }
+
+    #[test]
+    fn only_the_comment_capture_renders_italic() {
+        // Guards SYNTAX_ITALICS's hardcoded index against HIGHLIGHT_NAMES reordering: the italic
+        // entry must be the one "comment" resolves to, and representative neighbors stay upright.
+        assert!(syntax_italic(capture_index("comment").unwrap()));
+        assert!(!syntax_italic(capture_index("keyword").unwrap()));
+        assert!(!syntax_italic(capture_index("string").unwrap()));
+        assert!(!syntax_italic(capture_index("attribute").unwrap()));
     }
 
     #[test]
