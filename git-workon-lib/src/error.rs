@@ -79,13 +79,6 @@ pub enum RepoError {
 /// Worktree-specific errors
 #[derive(Error, Diagnostic, Debug)]
 pub enum WorktreeError {
-    #[error("Invalid .git file format")]
-    #[diagnostic(
-        code(workon::worktree::invalid_git_file),
-        help("The .git file should contain 'gitdir: <path>' pointing to the git directory")
-    )]
-    InvalidGitFile,
-
     #[error("Could not find worktree '{0}'")]
     #[diagnostic(
         code(workon::worktree::not_found),

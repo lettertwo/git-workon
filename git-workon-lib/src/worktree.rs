@@ -33,7 +33,11 @@
 //! - Help remember why a worktree was created
 //! - Storage strategy TBD (git notes, config, or metadata file)
 
-use std::{fmt, fs::create_dir_all, path::Path};
+use std::{
+    fmt,
+    fs::create_dir_all,
+    path::{Path, PathBuf},
+};
 
 use git2::WorktreeAddOptions;
 use git2::{Repository, Worktree};
@@ -60,19 +64,24 @@ pub enum BranchType {
 /// commit history, and status checks used by the CLI commands.
 pub struct WorktreeDescriptor {
     worktree: Worktree,
+    /// The worktree's private admin gitdir (`<commondir>/worktrees/<name>`), captured at
+    /// construction. Unlike `<workdir>/.git`, this path survives deletion of the working
+    /// directory, so [`branch`](Self::branch) can still resolve HEAD for a `prunable` worktree.
+    git_dir: PathBuf,
 }
 
 impl WorktreeDescriptor {
     /// Open a worktree by name within the given repository.
     pub fn new(repo: &Repository, name: &str) -> Result<Self> {
-        Ok(Self {
-            worktree: repo.find_worktree(name)?,
-        })
+        let worktree = repo.find_worktree(name)?;
+        let git_dir = worktree_admin_git_dir(repo, &worktree);
+        Ok(Self { worktree, git_dir })
     }
 
-    /// Wrap an existing [`git2::Worktree`] without a repository lookup.
-    pub fn of(worktree: Worktree) -> Self {
-        Self { worktree }
+    /// Wrap an existing [`git2::Worktree`] using `repo` to resolve its admin gitdir.
+    pub fn of(repo: &Repository, worktree: Worktree) -> Self {
+        let git_dir = worktree_admin_git_dir(repo, &worktree);
+        Self { worktree, git_dir }
     }
 
     /// Returns the name of the worktree, or `None` if the name is invalid UTF-8.
@@ -87,36 +96,24 @@ impl WorktreeDescriptor {
 
     /// Returns the branch name if the worktree is on a branch, or None if detached.
     ///
-    /// This reads the HEAD file from the worktree's git directory to determine
-    /// if HEAD points to a branch reference or directly to a commit SHA.
+    /// Reads HEAD from the worktree's admin gitdir (`<commondir>/worktrees/<name>`) rather than
+    /// `<workdir>/.git`. The admin gitdir survives deletion of the working directory, so this
+    /// still resolves for a `prunable` worktree — reading `<workdir>/.git/HEAD` directly would
+    /// ENOENT and take down callers that walk every worktree (notably `prune`, whose whole job
+    /// is to clean such dead worktrees up).
     pub fn branch(&self) -> Result<Option<String>> {
-        use std::fs;
+        // Read HEAD from the admin gitdir (captured at construction), never from <workdir>/.git —
+        // the working directory may be gone (a `prunable` worktree). HEAD is always a loose file.
+        let head_content = std::fs::read_to_string(self.git_dir.join("HEAD"))?;
 
-        // Get the path to the worktree's HEAD file
-        let git_dir = self.worktree.path().join(".git");
-        let head_path = if git_dir.is_file() {
-            // Linked worktree - read .git file to find actual git directory
-            let git_file_content = fs::read_to_string(&git_dir)?;
-            let git_dir_path = git_file_content
-                .strip_prefix("gitdir: ")
-                .and_then(|s| s.trim().strip_suffix('\n').or(Some(s.trim())))
-                .ok_or(WorktreeError::InvalidGitFile)?;
-            Path::new(git_dir_path).join("HEAD")
-        } else {
-            // Main worktree
-            git_dir.join("HEAD")
-        };
-
-        let head_content = fs::read_to_string(&head_path)?;
-
-        // HEAD file contains either:
-        // - "ref: refs/heads/branch-name" for a branch
-        // - A direct SHA for detached HEAD
+        // HEAD contains either "ref: refs/heads/<branch>" (on a branch, born or unborn) or a
+        // direct commit SHA (detached HEAD).
         if let Some(ref_line) = head_content.strip_prefix("ref: ") {
-            let ref_name = ref_line.trim();
-            Ok(ref_name.strip_prefix("refs/heads/").map(|s| s.to_string()))
+            Ok(ref_line
+                .trim()
+                .strip_prefix("refs/heads/")
+                .map(str::to_string))
         } else {
-            // Direct SHA - detached HEAD
             Ok(None)
         }
     }
@@ -591,6 +588,18 @@ impl fmt::Display for WorktreeDescriptor {
     }
 }
 
+/// The private admin gitdir for a linked worktree: `<commondir>/worktrees/<name>`.
+///
+/// This is where git keeps the worktree's own `HEAD`, `index`, and refs — it survives deletion
+/// of the working directory, unlike the `<workdir>/.git` gitfile. Falls back to the commondir
+/// itself if the worktree name is unreadable (an invalid worktree we can't resolve anyway).
+fn worktree_admin_git_dir(repo: &Repository, worktree: &Worktree) -> PathBuf {
+    match worktree.name() {
+        Ok(Some(name)) => repo.commondir().join("worktrees").join(name),
+        _ => repo.commondir().to_path_buf(),
+    }
+}
+
 /// Return all worktrees registered with the repository.
 pub fn get_worktrees(repo: &Repository) -> Result<Vec<WorktreeDescriptor>> {
     repo.worktrees()?
@@ -947,7 +956,7 @@ pub fn add_worktree(
         debug!("orphan branch setup complete for {:?}", branch_name);
     }
 
-    Ok(WorktreeDescriptor::of(worktree))
+    Ok(WorktreeDescriptor::of(repo, worktree))
 }
 
 /// Set upstream tracking for a worktree branch

@@ -230,6 +230,36 @@ mod tests {
     }
 
     #[test]
+    fn test_worktree_branch_resolves_when_workdir_deleted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Regression: a `prunable` worktree — its working directory deleted out from under git
+        // (e.g. a /tmp worktree wiped on reboot) — must still resolve its branch from the admin
+        // gitdir. Previously `branch()` read `<workdir>/.git` and, finding it gone, fell through
+        // to reading a nonexistent `<workdir>/.git/HEAD`, failing the whole command with a bare
+        // ENOENT. `prune` in particular must survive this: it exists to clean such worktrees up.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        let worktree = add_worktree(repo, "feature", None, BranchType::Normal, None, false)?;
+        let workdir = worktree.path().to_path_buf();
+        assert!(workdir.exists());
+
+        // Delete the working directory, leaving the worktree's admin metadata intact
+        // (git would report this worktree as `prunable`).
+        std::fs::remove_dir_all(&workdir)?;
+        assert!(!workdir.exists());
+
+        // branch() must still resolve from the admin gitdir rather than ENOENT-ing.
+        assert_eq!(worktree.branch()?, Some("feature".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_is_dirty_clean_worktree() -> Result<(), Box<dyn std::error::Error>> {
         // Create a bare fixture with a default branch
         let fixture = FixtureBuilder::new()
