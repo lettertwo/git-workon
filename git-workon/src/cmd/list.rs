@@ -121,20 +121,27 @@ impl Run for List {
         // never satisfy a worktree-status filter, so injecting them under a filter would
         // surface irrelevant stacks. See ADR-025.
         if effective_model != workon::StackModel::None && !filter.any_active() {
-            let covered: std::collections::HashSet<(String, Vec<String>)> = grouping
-                .groups
-                .iter()
-                .map(|g| {
-                    let mut sorted = g.stack.diffs.clone();
-                    sorted.sort();
-                    (g.stack.trunk.clone(), sorted)
-                })
-                .collect();
+            // Branches already shown by a worktree group, indexed by trunk. A meta stack is
+            // redundant when *every* one of its branches is already covered on the same trunk —
+            // not just on an exact-set match. `current_stack` (worktree groups) keeps ghost
+            // nodes while `enumerate_stacks` prunes them, so an enumerate stack is often a strict
+            // subset of the worktree group for the same physical stack. Injecting that subset
+            // would create an overlapping same-trunk group whose shared branches the tree
+            // renderer would re-visit; suppress it here rather than lean on the render guard.
+            let mut covered_by_trunk: std::collections::HashMap<
+                String,
+                std::collections::HashSet<String>,
+            > = std::collections::HashMap::new();
+            for g in &grouping.groups {
+                let set = covered_by_trunk.entry(g.stack.trunk.clone()).or_default();
+                set.extend(g.stack.diffs.iter().cloned());
+            }
             if let Ok(meta_stacks) = enumerate_stacks(&repo, effective_model) {
                 for meta_stack in meta_stacks {
-                    let mut sorted_diffs = meta_stack.diffs.clone();
-                    sorted_diffs.sort();
-                    if !covered.contains(&(meta_stack.trunk.clone(), sorted_diffs)) {
+                    let already_shown = covered_by_trunk
+                        .get(&meta_stack.trunk)
+                        .is_some_and(|set| meta_stack.diffs.iter().all(|b| set.contains(b)));
+                    if !already_shown {
                         grouping.groups.push(workon::StackGroup {
                             stack: meta_stack,
                             members: vec![],

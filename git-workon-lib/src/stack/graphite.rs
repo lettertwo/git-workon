@@ -238,6 +238,11 @@ fn read_branch_metadata_from_refs(
 
 /// Build a `branch → parent_branch` map (thin wrapper over [`read_branch_metadata`] for
 /// callers that only need parent-branch topology, not recorded revisions).
+///
+/// Ghost branches (metadata present, no live ref) are deliberately **retained** here: `list`
+/// prunes them via [`enumerate_stacks`], but `current_stack` must keep them so routing can
+/// distinguish a deleted stack node (`Resolution::DeletedNode`) from a plain typo. The two
+/// consumers filter differently on purpose — see [`enumerate_stacks`].
 fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
     Ok(read_branch_metadata(repo)?
         .into_iter()
@@ -295,6 +300,7 @@ pub fn enumerate_stacks(repo: &Repository) -> Result<Vec<Stack>, StackError> {
     // Drop ghost branches: Graphite leaves metadata rows behind after a branch is merged or
     // deleted. Filter before the BFS so orphaned subtrees are pruned consistently. Trunks are
     // not in the parent map (they are values, not keys), so they are always preserved.
+    // (`current_stack` deliberately does NOT prune — routing needs deleted nodes to stay visible.)
     parent_map.retain(|branch, _| crate::resolve::branch_exists(repo, branch));
 
     if parent_map.is_empty() {

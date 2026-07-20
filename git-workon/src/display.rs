@@ -48,7 +48,7 @@
 //!
 //! Used by `list` for output and `find` for interactive selection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use fuzzy_matcher::skim::SkimMatcherV2;
@@ -327,6 +327,10 @@ pub fn build_tree(
     trunk_set.sort();
 
     let mut forest: Vec<TreeNode> = Vec::new();
+    // Forest-global: a branch name is unique across the repo, so it belongs in exactly one place
+    // in the tree. Overlapping stack groups merged into `per_trunk_reverse` can list the same
+    // branch more than once; `visited` ensures the first placement wins and duplicates are dropped.
+    let mut visited: HashSet<String> = HashSet::new();
 
     for trunk in &trunk_set {
         let trunk_idx = branch_to_idx.get(trunk).copied();
@@ -338,7 +342,13 @@ pub fn build_tree(
 
         // Direct children of the trunk: branches whose parent == trunk
         let direct_children = rev_map.get(trunk.as_str()).cloned().unwrap_or_default();
-        let children = build_children(&direct_children, rev_map, &branch_to_idx, &mut rows);
+        let children = build_children(
+            &direct_children,
+            rev_map,
+            &branch_to_idx,
+            &mut rows,
+            &mut visited,
+        );
 
         let subtree_activity = subtree_max(trunk_activity, &children);
 
@@ -384,31 +394,40 @@ pub fn build_tree(
 }
 
 /// Recursively build child nodes for a list of branch names.
+///
+/// `visited` guards against a branch being emitted more than once. A well-formed topology has a
+/// single parent per branch, but overlapping stack groups sharing a trunk merge into `rev_map`
+/// with duplicate edges (see [`build_tree`]); without this guard `build_children` would re-expand
+/// the shared subtree once per duplicate, multiplying rows combinatorially at every fork. Every
+/// BFS in `graphite.rs` carries the same guard — this is the one tree walk that also needs it.
 fn build_children(
     branch_names: &[String],
     rev_map: &HashMap<String, Vec<String>>,
     branch_to_idx: &HashMap<String, usize>,
     rows: &mut HashMap<usize, WorktreeDisplayRow>,
+    visited: &mut HashSet<String>,
 ) -> Vec<TreeNode> {
-    branch_names
-        .iter()
-        .map(|branch| {
-            let idx = branch_to_idx.get(branch).copied();
-            let row = idx.and_then(|i| rows.remove(&i));
-            let epoch = row.as_ref().and_then(|r| r.activity_epoch);
+    let mut nodes = Vec::new();
+    for branch in branch_names {
+        if !visited.insert(branch.clone()) {
+            continue;
+        }
+        let idx = branch_to_idx.get(branch).copied();
+        let row = idx.and_then(|i| rows.remove(&i));
+        let epoch = row.as_ref().and_then(|r| r.activity_epoch);
 
-            let grandchildren_names = rev_map.get(branch.as_str()).cloned().unwrap_or_default();
-            let children = build_children(&grandchildren_names, rev_map, branch_to_idx, rows);
-            let subtree_activity = subtree_max(epoch, &children);
+        let grandchildren_names = rev_map.get(branch.as_str()).cloned().unwrap_or_default();
+        let children = build_children(&grandchildren_names, rev_map, branch_to_idx, rows, visited);
+        let subtree_activity = subtree_max(epoch, &children);
 
-            TreeNode {
-                branch: branch.clone(),
-                row,
-                subtree_activity,
-                children,
-            }
-        })
-        .collect()
+        nodes.push(TreeNode {
+            branch: branch.clone(),
+            row,
+            subtree_activity,
+            children,
+        });
+    }
+    nodes
 }
 
 /// Return the most recent activity among a node's own epoch and its children's subtree_activity.
@@ -1530,6 +1549,70 @@ mod tests {
             .find(needle)
             .unwrap_or_else(|| panic!("{context}: '{needle}' not found in: {haystack:?}"));
         haystack[..byte_pos].width()
+    }
+
+    // ── build_tree: overlapping same-trunk groups (ghost-tail regression backstop) ──
+
+    /// Collect every branch name in a forest, once per node occurrence.
+    fn collect_branches(forest: &[TreeNode], out: &mut Vec<String>) {
+        for node in forest {
+            out.push(node.branch.clone());
+            collect_branches(&node.children, out);
+        }
+    }
+
+    fn meta_group(diffs: &[&str], parents: &[(&str, &str)]) -> workon::StackGroup {
+        workon::StackGroup {
+            stack: workon::Stack {
+                trunk: "main".to_string(),
+                diffs: diffs.iter().map(|s| s.to_string()).collect(),
+                current: diffs.first().copied().unwrap_or_default().to_string(),
+                parents: parents
+                    .iter()
+                    .map(|(c, p)| (c.to_string(), p.to_string()))
+                    .collect(),
+            },
+            members: vec![],
+        }
+    }
+
+    #[test]
+    fn build_tree_dedupes_overlapping_same_trunk_groups() {
+        // Two groups on trunk "main" describe one physical stack: a full one (carrying a ghost
+        // tail off `base`'s second fork) and a pruned subset. Their edges merge into
+        // `per_trunk_reverse` with duplicates; the `visited` guard in `build_children` must still
+        // emit each branch exactly once instead of re-expanding the shared subtree at every fork
+        // — the "thousands of broken lines" bug when ghost metadata makes the two paths diverge.
+        let full = meta_group(
+            &["base", "live-leaf", "ghost-mid", "ghost-leaf"],
+            &[
+                ("base", "main"),
+                ("live-leaf", "base"),
+                ("ghost-mid", "base"),
+                ("ghost-leaf", "ghost-mid"),
+            ],
+        );
+        let subset = meta_group(
+            &["base", "live-leaf"],
+            &[("base", "main"), ("live-leaf", "base")],
+        );
+
+        let groups = vec![full, subset];
+        let forest = build_tree(&[], &groups, &[], Path::new("/repo"), Path::new("/repo"));
+
+        let mut branches = Vec::new();
+        collect_branches(&forest, &mut branches);
+        branches.sort();
+        let mut unique = branches.clone();
+        unique.dedup();
+        assert_eq!(
+            branches, unique,
+            "each branch must appear once despite overlapping groups; got {branches:?}"
+        );
+        assert_eq!(
+            branches,
+            vec!["base", "ghost-leaf", "ghost-mid", "live-leaf", "main"]
+        );
     }
 
     #[test]

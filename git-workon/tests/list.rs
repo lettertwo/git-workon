@@ -1042,6 +1042,53 @@ fn list_omits_ghost_branches_with_no_git_ref() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+/// Regression: `list` rendered thousands of duplicated rows when a checked-out worktree's
+/// stack contained ghost branches. `current_stack` (the worktree group) keeps the ghost tail;
+/// `enumerate_stacks` (the meta injection) prunes it — so the two produced overlapping
+/// same-trunk groups for one physical stack, and the tree renderer re-expanded the shared
+/// subtree at every fork. Each branch must now appear exactly once.
+#[test]
+fn list_stack_with_ghost_tail_does_not_duplicate_rows() -> Result<(), Box<dyn std::error::Error>> {
+    // main → base → { live-leaf (checked out), ghost-mid → ghost-leaf (deleted refs) }.
+    // The ghost tail hangs off base's other fork, so current_stack from live-leaf reaches it.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("live-leaf")
+        .config("workon.stackModel", "graphite")
+        .graphite_config(&["main"])
+        .branch_metadata("base", "main")
+        .branch_metadata("live-leaf", "base")
+        .ghost_branch_metadata("ghost-mid", "base")
+        .ghost_branch_metadata("ghost-leaf", "ghost-mid")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    // Shared branches must render exactly once — pre-fix the overlapping groups doubled them
+    // (and the fork multiplied that into thousands of rows).
+    assert_eq!(
+        stdout.matches("live-leaf").count(),
+        1,
+        "live-leaf must appear exactly once, not duplicated across overlapping groups: {stdout}"
+    );
+    assert_eq!(
+        stdout.matches("base").count(),
+        1,
+        "base must appear exactly once: {stdout}"
+    );
+
+    Ok(())
+}
+
 // ── Filter × stack interaction ────────────────────────────────────────────────
 
 /// `list --dirty` in a stack-enabled repo must show a flat list of only the dirty

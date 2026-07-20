@@ -404,6 +404,51 @@ fn enumerate_stacks_filters_ghost_branch_but_keeps_live_sibling(
 }
 both_formats!(enumerate_stacks_filters_ghost_branch_but_keeps_live_sibling);
 
+fn current_stack_keeps_ghost_tail_but_enumerate_prunes_it(
+    format: MetadataFormat,
+) -> Result<(), Box<dyn Error>> {
+    // The two APIs filter ghosts differently *on purpose*: `enumerate_stacks` (used by `list`)
+    // prunes deleted-ref nodes, while `current_stack` keeps them so routing can flag a deleted
+    // stack node instead of silently recreating it. This divergence is what produced two
+    // overlapping same-trunk groups in `list` — the covered-check + the `build_children` visited
+    // guard are what keep it from double-rendering, NOT collapsing the two sets here.
+    //
+    // Shape: main → base → {live-leaf (checked out), ghost-mid → ghost-leaf}.
+    let fixture = FixtureBuilder::new()
+        .metadata_format(format)
+        .graphite_config(&["main"])
+        .branch_metadata("base", "main")
+        .branch_metadata("live-leaf", "base")
+        .ghost_branch_metadata("ghost-mid", "base")
+        .ghost_branch_metadata("ghost-leaf", "ghost-mid")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    // current_stack (routing path) keeps the ghost tail visible.
+    let mut from_worktree = current_stack(repo, "live-leaf", StackModel::Graphite)?
+        .unwrap()
+        .diffs;
+    from_worktree.sort();
+    assert_eq!(
+        from_worktree,
+        vec!["base", "ghost-leaf", "ghost-mid", "live-leaf"],
+        "current_stack must retain ghost nodes for DeletedNode routing"
+    );
+
+    // enumerate_stacks (list path) prunes the ghost tail.
+    let stacks = enumerate_stacks(repo, StackModel::Graphite)?;
+    assert_eq!(stacks.len(), 1);
+    let mut from_enumerate = stacks[0].diffs.clone();
+    from_enumerate.sort();
+    assert_eq!(
+        from_enumerate,
+        vec!["base", "live-leaf"],
+        "enumerate_stacks must prune ghost nodes for list"
+    );
+    Ok(())
+}
+both_formats!(current_stack_keeps_ghost_tail_but_enumerate_prunes_it);
+
 // ── cycle guard ────────────────────────────────────────────────────────────────
 
 #[test]
