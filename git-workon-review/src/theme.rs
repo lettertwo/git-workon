@@ -153,6 +153,7 @@ pub struct ThemeOverrides {
     pub selection_bg: Option<Color>,
     pub cursor_unfocused_bg: Option<Color>,
     pub pane_header_focused_fg: Option<Color>,
+    pub filler_fg: Option<Color>,
 }
 
 impl ThemeOverrides {
@@ -320,6 +321,14 @@ pub struct Palette {
     pub dim: Color,
     /// Gutter/divider foreground (base04) — line-number gutters and pane dividers.
     pub gutter: Color,
+    /// Foreground for the deleted-gap filler hatch (`render`'s `Row::Filler` `╱` runs) — base01,
+    /// the ramp slot nearest the background: the hatch is pure texture ("nothing on this side of
+    /// the split"), not text, so it recedes behind even dim labels. Previously painted with
+    /// [`Palette::dim`], which tied it to the comment tone (base03) and dragged the hatch
+    /// brighter whenever comments were retuned; base02 (the next step up) still read too bright
+    /// under `auto` on a terminal whose bright-black is a vivid accent rather than a gray (the
+    /// probed ramp interpolates toward base03, so 2/3 of a bright accent is a bright hatch).
+    pub filler_fg: Color,
     /// Footer text color for an [`crate::app::Severity::Error`] notice, a pending-discard confirm
     /// prompt, and a Failed changeset's marker/message — a clearly-red tone (base08). Promoted
     /// from `render.rs`'s `FG_ERROR` const (CS2, revising ADR-029's hybrid boundary — see this
@@ -389,6 +398,7 @@ impl Palette {
             foreground: base.slot(5),
             dim: base.slot(3),
             gutter: base.slot(4),
+            filler_fg: base.slot(1),
             // The shipped M3–M5 semantic-chrome colors, reproduced verbatim (the pixel-identity
             // gate — CS2 promotes these from `render.rs` consts without changing a single value).
             error_fg: Color::Rgb(220, 60, 60),
@@ -451,6 +461,7 @@ impl Palette {
             foreground: base.slot(5),
             dim: base.slot(3),
             gutter: base.slot(4),
+            filler_fg: base.slot(1),
             error_fg: red,
             warn_fg: base.slot(10), // base0A
             current_fg: green,
@@ -516,6 +527,7 @@ impl Palette {
             pane_header_focused_fg: base.slot(5),
             dim: base.slot(3),
             gutter: base.slot(4),
+            filler_fg: base.slot(1),
             // Semantic chrome also matches the terminal — probed base08/base0A/base0B, not the
             // curated fallback's (mirrors the syntax slots' reasoning just above).
             error_fg: base.slot(8),
@@ -591,6 +603,7 @@ impl Palette {
             foreground: Color::Reset,
             dim: Color::Reset,
             gutter: Color::Reset,
+            filler_fg: Color::Reset,
             error_fg: Color::Reset,
             warn_fg: Color::Reset,
             current_fg: Color::Reset,
@@ -716,6 +729,9 @@ impl Palette {
         }
         if let Some(color) = overrides.pane_header_focused_fg {
             self.pane_header_focused_fg = color;
+        }
+        if let Some(color) = overrides.filler_fg {
+            self.filler_fg = color;
         }
     }
 }
@@ -942,6 +958,28 @@ mod tests {
         }
         slots[0] = base00;
         Base16 { slots }
+    }
+
+    #[test]
+    fn filler_fg_is_base01_the_ramp_slot_nearest_the_background() {
+        // The deleted-gap hatch recedes behind dim text: base01 (the bg-nearest ramp slot),
+        // decoupled from base03 so a retuned comment/dim tone no longer drags the hatch with it.
+        // Holds in every scheme, including `auto`'s probed ramp.
+        let lum = |c: Color| match c {
+            Color::Rgb(r, g, b) => r as u32 + g as u32 + b as u32,
+            other => panic!("expected RGB, got {other:?}"),
+        };
+        for palette in [
+            Palette::dark(),
+            Palette::from_terminal(probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a))),
+        ] {
+            assert!(
+                lum(palette.filler_fg) < lum(palette.dim),
+                "dark-scheme filler hatch must sit closer to the background than dim"
+            );
+        }
+        assert_eq!(Palette::dark().filler_fg, Base16::EIGHTIES_DARK.slot(1));
+        assert_eq!(Palette::light().filler_fg, Base16::ONE_LIGHT.slot(1));
     }
 
     #[test]

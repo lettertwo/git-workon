@@ -621,7 +621,7 @@ fn build_pane_line(
     match row {
         Row::Filler => {
             let pattern: String = "╱".repeat(content_w + gutter_w + 1);
-            Line::from(TSpan::styled(pattern, Style::default().fg(theme.dim)))
+            Line::from(TSpan::styled(pattern, Style::default().fg(theme.filler_fg)))
         }
         Row::Line(n) => {
             let text = match side {
