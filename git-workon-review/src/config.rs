@@ -176,6 +176,7 @@ fn tint_slot<'a>(overrides: &'a mut ThemeOverrides, key: &str) -> Option<&'a mut
         "selection-bg" => &mut overrides.selection_bg,
         "cursor-unfocused-bg" => &mut overrides.cursor_unfocused_bg,
         "pane-header-focused-fg" => &mut overrides.pane_header_focused_fg,
+        "filler-fg" => &mut overrides.filler_fg,
         _ => return None,
     })
 }
@@ -692,6 +693,26 @@ mod tests {
         let mut palette = Palette::dark();
         palette.apply_overrides(&overrides);
         assert_eq!(palette.pane_header_focused_fg, Color::Rgb(0xc0, 0xff, 0xee));
+    }
+
+    #[test]
+    fn theme_overrides_reads_the_filler_fg_tint_key() {
+        use crate::theme::Palette;
+
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme.filler-fg", "#403a48")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let (overrides, warnings) = ReviewConfig::new(repo)
+            .theme_overrides()
+            .expect("theme_overrides");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(overrides.filler_fg, Some(Color::Rgb(0x40, 0x3a, 0x48)));
+
+        let mut palette = Palette::dark();
+        palette.apply_overrides(&overrides);
+        assert_eq!(palette.filler_fg, Color::Rgb(0x40, 0x3a, 0x48));
     }
 
     #[test]
