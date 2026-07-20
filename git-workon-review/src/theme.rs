@@ -25,7 +25,8 @@
 //! them too. `dark()` keeps the three shipped RGB values verbatim (the same pixel-identity
 //! precedent as its diff/cursor tints); `light()` takes `ONE_LIGHT`'s base08/base0A/base0B;
 //! `from_terminal()` takes the probed scheme's base08/base0A/base0B directly (matching the syntax
-//! slots' reasoning, not the curated-tint-borrowing the diff/cursor washes use).
+//! slots' reasoning; its diff washes also derive from the probed accents, while cursor/selection
+//! borrow curated washes — see [`Palette::from_terminal`]'s doc comment).
 //!
 //! **CS1 addition (`outline-header-polish`):** [`Palette::heading_fg`] (base0C, cyan) is a fourth
 //! semantic-chrome field, same reasoning and same three-scheme mapping as the CS2 trio above —
@@ -443,29 +444,49 @@ impl Palette {
 
     /// A scheme derived from the terminal's own colors (ADR-035's `auto`, CS6). The 16 base16
     /// slots come from the probed [`Base16`] (built from the terminal's ANSI palette + background;
-    /// see [`crate::terminal_query`]), so **syntax matches the terminal**. The diff/cursor tints,
-    /// however, stay **curated by background luminance** rather than derived from the probed
-    /// accents — the CS6 refinement of ADR-035: dark-tint derivation is unsolved (see
-    /// [`Palette::dark`]) and deriving washes from an arbitrary terminal's accent is
-    /// unpredictable, whereas the value of terminal-derivation — code colors matching the
-    /// terminal — is fully delivered by the probed syntax slots. A probed dark background borrows
-    /// [`Palette::dark`]'s tints, a light one [`Palette::light`]'s.
+    /// see [`crate::terminal_query`]), so **syntax matches the terminal**.
+    ///
+    /// The **diff washes are derived from the probed accents** (the ADR-035 derived-washes
+    /// addendum, revising the CS6 curated-tints refinement): del washes blend probed base08 (ANSI
+    /// red) toward the probed background, add washes probed base0B (ANSI green) — the same
+    /// `accent:mix(bg, 90)` arithmetic terminal theme authors use for their own editor diff
+    /// backgrounds (laserwave's `BG_DELETE`/`BG_ADD`, the dogfood reference), so `auto`'s washes
+    /// carry the terminal theme's hues instead of a generic red/green. Ratios are
+    /// luminance-picked: a probed light background reuses [`Palette::light`]'s hand-tuned set; a
+    /// dark one uses the dogfood-validated 10%/25% accent mixes (staged pushed further toward the
+    /// background, preserving locked decision #7's "staged reads dimmer").
+    ///
+    /// The **cursor/selection washes stay curated by luminance**: they have no counterpart in a
+    /// terminal theme's ANSI palette (deriving them from probed blue/cyan gives, e.g., a teal
+    /// cursor row on an aqua-leaning theme), so per-theme judgment there belongs to the override
+    /// tier, not derivation.
     pub fn from_terminal(base: Base16) -> Self {
-        let curated = if is_light_background(base.slot(0)) {
+        let background = base.slot(0);
+        let light = is_light_background(background);
+        let curated = if light {
             Palette::light()
         } else {
             Palette::dark()
         };
+        let red = base.slot(8); // base08 — probed ANSI red
+        let green = base.slot(11); // base0B — probed ANSI green
+                                   // (subtle, strong, staged_subtle, staged_strong): how far each wash blends from the
+                                   // accent toward the probed background. Light reuses `Palette::light`'s tuned ratios.
+        let (subtle, strong, staged_subtle, staged_strong) = if light {
+            (0.88, 0.65, 0.94, 0.80)
+        } else {
+            (0.90, 0.75, 0.94, 0.85)
+        };
         Palette {
             syntax: SYNTAX_SLOTS.iter().map(|&s| base.slot(s)).collect(),
-            del_subtle: curated.del_subtle,
-            del_strong: curated.del_strong,
-            add_subtle: curated.add_subtle,
-            add_strong: curated.add_strong,
-            del_staged_subtle: curated.del_staged_subtle,
-            del_staged_strong: curated.del_staged_strong,
-            add_staged_subtle: curated.add_staged_subtle,
-            add_staged_strong: curated.add_staged_strong,
+            del_subtle: tint_toward(red, background, subtle),
+            del_strong: tint_toward(red, background, strong),
+            add_subtle: tint_toward(green, background, subtle),
+            add_strong: tint_toward(green, background, strong),
+            del_staged_subtle: tint_toward(red, background, staged_subtle),
+            del_staged_strong: tint_toward(red, background, staged_strong),
+            add_staged_subtle: tint_toward(green, background, staged_subtle),
+            add_staged_strong: tint_toward(green, background, staged_strong),
             cursor_bg: curated.cursor_bg,
             selection_bg: curated.selection_bg,
             cursor_unfocused_bg: curated.cursor_unfocused_bg,
@@ -924,26 +945,69 @@ mod tests {
     }
 
     #[test]
-    fn from_terminal_with_a_dark_background_borrows_darks_curated_tints() {
+    fn from_terminal_derives_diff_washes_from_the_probed_accents() {
+        // The ADR-035 derived-washes addendum: del/add washes blend the PROBED base08/base0B
+        // toward the PROBED background — theme-author arithmetic (`accent:mix(bg, 90)`), not the
+        // curated fallback's generic red/green.
+        let bg = Color::Rgb(0x1a, 0x1a, 0x1a); // dark
+        let probed = probed_base16(bg);
+        let palette = Palette::from_terminal(probed);
+        let red = probed.slot(8);
+        let green = probed.slot(11);
+        assert_eq!(palette.del_subtle, tint_toward(red, bg, 0.90));
+        assert_eq!(palette.del_strong, tint_toward(red, bg, 0.75));
+        assert_eq!(palette.add_subtle, tint_toward(green, bg, 0.90));
+        assert_eq!(palette.add_strong, tint_toward(green, bg, 0.75));
+        assert_ne!(palette.del_subtle, Palette::dark().del_subtle);
+    }
+
+    #[test]
+    fn from_terminal_staged_washes_read_dimmer_than_unstaged() {
+        // Locked decision #7 survives derivation: a staged wash sits closer to the background
+        // than its unstaged counterpart (a strictly larger blend toward bg).
+        let bg = Color::Rgb(0x1a, 0x1a, 0x1a);
+        let probed = probed_base16(bg);
+        let palette = Palette::from_terminal(probed);
+        let red = probed.slot(8);
+        let green = probed.slot(11);
+        assert_eq!(palette.del_staged_subtle, tint_toward(red, bg, 0.94));
+        assert_eq!(palette.del_staged_strong, tint_toward(red, bg, 0.85));
+        assert_eq!(palette.add_staged_subtle, tint_toward(green, bg, 0.94));
+        assert_eq!(palette.add_staged_strong, tint_toward(green, bg, 0.85));
+        assert_ne!(palette.del_staged_subtle, palette.del_subtle);
+        assert_ne!(palette.add_staged_strong, palette.add_strong);
+    }
+
+    #[test]
+    fn from_terminal_with_a_light_background_derives_with_lights_ratios() {
+        // A probed LIGHT background reuses `Palette::light`'s hand-tuned blend ratios, applied
+        // to the probed accents.
+        let bg = Color::Rgb(0xf5, 0xf5, 0xf5);
+        let probed = probed_base16(bg);
+        let palette = Palette::from_terminal(probed);
+        assert_eq!(palette.del_subtle, tint_toward(probed.slot(8), bg, 0.88));
+        assert_eq!(palette.add_strong, tint_toward(probed.slot(11), bg, 0.65));
+    }
+
+    #[test]
+    fn from_terminal_with_a_dark_background_borrows_darks_curated_cursor_washes() {
+        // Cursor/selection stay curated-by-luminance (no ANSI counterpart to derive from) even
+        // though the diff washes now derive.
         let palette = Palette::from_terminal(probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a)));
         let dark = Palette::dark();
-        assert_eq!(palette.del_subtle, dark.del_subtle);
-        assert_eq!(palette.add_strong, dark.add_strong);
         assert_eq!(palette.cursor_bg, dark.cursor_bg);
         assert_eq!(palette.selection_bg, dark.selection_bg);
         assert_eq!(palette.cursor_unfocused_bg, dark.cursor_unfocused_bg);
     }
 
     #[test]
-    fn from_terminal_with_a_light_background_borrows_lights_curated_tints() {
+    fn from_terminal_with_a_light_background_borrows_lights_curated_cursor_washes() {
         let palette = Palette::from_terminal(probed_base16(Color::Rgb(0xf5, 0xf5, 0xf5)));
         let light = Palette::light();
-        assert_eq!(palette.del_subtle, light.del_subtle);
-        assert_eq!(palette.add_strong, light.add_strong);
         assert_eq!(palette.cursor_bg, light.cursor_bg);
         assert_eq!(palette.selection_bg, light.selection_bg);
         // ...and NOT dark's, confirming the luminance branch flipped.
-        assert_ne!(palette.del_subtle, Palette::dark().del_subtle);
+        assert_ne!(palette.cursor_bg, Palette::dark().cursor_bg);
     }
 
     #[test]
@@ -963,8 +1027,9 @@ mod tests {
     #[test]
     fn from_terminal_takes_semantic_fg_from_the_probed_scheme_not_the_curated_fallback() {
         // Same reasoning as syntax/chrome: `auto`'s error/warn/current colors should match the
-        // terminal, not borrow the curated dark/light fallback's (unlike the diff/cursor tints,
-        // which DO borrow — see `from_terminal_with_a_dark_background_borrows_darks_curated_tints`).
+        // terminal, not borrow the curated dark/light fallback's (unlike the cursor/selection
+        // washes, which DO borrow — see
+        // `from_terminal_with_a_dark_background_borrows_darks_curated_cursor_washes`).
         let probed = probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a));
         let palette = Palette::from_terminal(probed);
         assert_eq!(palette.error_fg, probed.slot(8));

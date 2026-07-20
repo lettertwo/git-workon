@@ -116,6 +116,24 @@ ANSI-less slots are still synthesized as above; `parse` → `build_base16` → `
 `palette_for_auto` fallback decision are all pure and unit-tested, with only the timed `/dev/tty`
 read left untested (see `terminal_query.rs`).
 
+**Derived-washes addendum (2026-07-20) — `auto`'s diff washes derive from the probed accents
+after all; cursor/selection washes stay curated.** The CS6 refinement above is partially
+reversed. Its objection (1) — "a convex blend toward a dark base00 can't reproduce the
+hand-tuned washes" — turned out to answer the wrong question: the goal isn't to reproduce the
+curated washes from probed inputs, it's to produce the washes the terminal's *theme author*
+would have picked. Dogfooding `auto` against laserwave showed the curated washes as the one
+discordant element (generic red/green under a personalized syntax palette), and laserwave itself
+computes its editor diff backgrounds as `accent:mix(bg, 90)` — exactly the
+`tint_toward(accent, bg, k)` shape. `Palette::from_terminal` now derives del washes from probed
+base08 and add washes from probed base0B toward the probed base00: a dark probed background uses
+the dogfood-validated ratios (subtle 0.90, strong 0.75, staged 0.94/0.85 — staged still reads
+dimmer, locked decision #7), a light one reuses `Palette::light`'s hand-tuned ratio set.
+Objection (2) — arbitrary-palette unpredictability — is accepted residual risk, bounded by the
+`workon.review.theme.*` override tier (a wash that derives badly on some exotic palette is
+pinnable per-user). Cursor/selection/unfocused washes keep borrowing the curated set: they have
+no ANSI counterpart to derive from, and deriving them from probed base0D/base0C produces
+surprises (a teal cursor row on an aqua-leaning theme), so that judgment stays curated-or-overridden.
+
 ## Consequences
 
 - Light/dark ships as curated base16 schemes now; **terminal-derivation is first-class from
