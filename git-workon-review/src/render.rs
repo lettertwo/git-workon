@@ -5631,6 +5631,41 @@ mod tests {
     }
 
     #[test]
+    fn content_rows_carry_the_painted_canvas_background() {
+        // The empty-screen canvas tests above miss the real dogfood surface: rows the diff body
+        // actually writes. A context line's untinted cells (its text and the padding after it)
+        // must sit on the theme's own canvas, not the terminal default — `theme light` in a dark
+        // terminal otherwise renders every content row on a black canvas.
+        // A partially staged file renders the split UNSTAGED/STAGED view — the everyday dogfood
+        // shape, and a different render path from the single-pane view the tests above exercise.
+        let committed = "l1\nl2\nl3\nold word here\nl5\nl6\n";
+        let staged = "l1\nl2\nl3\nstaged word here\nl5\nl6\n";
+        let workdir = "l1\nl2\nl3\nnew word here\nl5\nl6\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("small.txt", committed, staged, workdir)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let theme = Palette::light();
+        let buf = render_once_themed(&mut app, 60, 20, &theme);
+
+        let content = buf_lines(&buf);
+        let context_y = content
+            .iter()
+            .position(|line| line.contains("l2"))
+            .expect("context row present") as u16;
+        let x = content[context_y as usize].find("l2").unwrap() as u16;
+        let cell = buf.cell((x, context_y)).unwrap();
+        assert_eq!(
+            cell.style().bg,
+            Some(theme.background),
+            "expected a context-row content cell to carry the painted canvas background"
+        );
+    }
+
+    #[test]
     fn dark_theme_paints_the_canvas_with_the_dark_background() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
