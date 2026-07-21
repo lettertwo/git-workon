@@ -56,7 +56,9 @@ use workon::{
 
 use crate::cli::{Checkout, Find, New};
 use crate::cmd::filter::StatusFilter;
-use crate::display::{build_tree, render_flat, render_tree, worktree_display_row};
+use crate::display::{
+    build_tree, render_flat, render_tree, worktree_display_row, WorktreeDisplayRow,
+};
 use crate::picker::{self, PickerAction};
 
 use super::Run;
@@ -369,10 +371,18 @@ fn select_from_tree(
     }
 
     // ── Non-stack: flat picker ────────────────────────────────────────────────
-    let rows: Vec<_> = worktrees
-        .iter()
-        .filter_map(|wt| worktree_display_row(wt, root, &current_dir).ok())
-        .collect();
+    // Keep each row's originating worktree index: `worktree_display_row` can drop
+    // a worktree (e.g. `branch()` errors on a deleted workdir), so a row's position
+    // in `rows` no longer tracks its position in `worktrees`. Mapping the selection
+    // back by row-position would return the worktree one above the displayed one.
+    let mut rows: Vec<WorktreeDisplayRow> = Vec::with_capacity(worktrees.len());
+    let mut row_wt_idx: Vec<usize> = Vec::with_capacity(worktrees.len());
+    for (i, wt) in worktrees.iter().enumerate() {
+        if let Ok(row) = worktree_display_row(wt, root, &current_dir) {
+            rows.push(row);
+            row_wt_idx.push(i);
+        }
+    }
 
     let selected_key =
         match picker::select("Select a worktree", |q| render_flat(&rows, q, &matcher))
@@ -382,10 +392,76 @@ fn select_from_tree(
             None => return Ok(None),
         };
 
-    // Map the selected dir_name key back to a worktree.
-    let idx = rows
+    // Map the selected dir_name key back to its originating worktree via the
+    // row→worktree index, not the row's own position (see `row_wt_idx` above).
+    let wt_idx = resolve_flat_selection(&rows, &row_wt_idx, &selected_key);
+    Ok(Some(worktrees.into_iter().nth(wt_idx).unwrap()))
+}
+
+/// Resolve a flat-picker selection (a `dir_name` key) back to its index in the
+/// original `worktrees` slice.
+///
+/// `rows` is the filtered display list shown to the user; `row_wt_idx[i]` is the
+/// `worktrees` index that produced `rows[i]`. Because `worktree_display_row` can
+/// drop a worktree (e.g. `branch()` errors on a deleted workdir), a row's position
+/// in `rows` is *not* its position in `worktrees`, so the selection must be
+/// resolved through `row_wt_idx` — never by row-position, which returns the
+/// worktree one above the displayed one once any earlier row is dropped.
+///
+/// Falls back to `0` when the key is absent (unreachable in practice — the picker
+/// only ever returns a key it rendered from `rows`).
+fn resolve_flat_selection(
+    rows: &[WorktreeDisplayRow],
+    row_wt_idx: &[usize],
+    selected_key: &str,
+) -> usize {
+    let row_idx = rows
         .iter()
         .position(|r| r.dir_name == selected_key)
         .unwrap_or(0);
-    Ok(Some(worktrees.into_iter().nth(idx).unwrap()))
+    row_wt_idx.get(row_idx).copied().unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(dir_name: &str) -> WorktreeDisplayRow {
+        WorktreeDisplayRow {
+            is_active: false,
+            dir_name: dir_name.to_string(),
+            branch_annotation: None,
+            indicators: vec![],
+            last_activity: String::new(),
+            activity_epoch: None,
+        }
+    }
+
+    #[test]
+    fn resolve_flat_selection_maps_through_worktree_index() {
+        // worktrees = [a, b, c, d]; `b` (index 1) was dropped by
+        // `worktree_display_row`, so it never became a row.
+        let rows = [row("a"), row("c"), row("d")];
+        let row_wt_idx = [0usize, 2, 3];
+
+        // Selecting `c` — at row-position 1 — must resolve to worktree index 2,
+        // not 1 (which is the dropped `b`, the off-by-one regression).
+        assert_eq!(resolve_flat_selection(&rows, &row_wt_idx, "c"), 2);
+        assert_eq!(resolve_flat_selection(&rows, &row_wt_idx, "d"), 3);
+        assert_eq!(resolve_flat_selection(&rows, &row_wt_idx, "a"), 0);
+    }
+
+    #[test]
+    fn resolve_flat_selection_identity_when_no_rows_dropped() {
+        let rows = [row("a"), row("b"), row("c")];
+        let row_wt_idx = [0usize, 1, 2];
+        assert_eq!(resolve_flat_selection(&rows, &row_wt_idx, "b"), 1);
+    }
+
+    #[test]
+    fn resolve_flat_selection_absent_key_falls_back_to_zero() {
+        let rows = [row("a"), row("b")];
+        let row_wt_idx = [0usize, 1];
+        assert_eq!(resolve_flat_selection(&rows, &row_wt_idx, "missing"), 0);
+    }
 }
