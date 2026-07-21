@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.9.0...git-workon-v0.10.0) - 2026-07-21
+
+### Fixed
+
+- *(cli)* map flat-picker selection through worktree index
+- *(cli)* stop stacked list duplicating rows on ghost branches
+- *(cli)* read no-color override on every use_color call
+
+### Other
+
+- *(cli)* make color-sensitive tests robust to FORCE_COLOR
+- bump workspace rust-version to 1.88
+
 ## [0.9.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.8.0...git-workon-v0.9.0) - 2026-07-05
 
 ### Added
