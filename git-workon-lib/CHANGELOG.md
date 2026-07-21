@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.9.0...git-workon-lib-v0.10.0) - 2026-07-21
+
+### Added
+
+- *(lib)* read parentBranchRevision from both graphite metadata formats
+
+### Fixed
+
+- *(worktree)* keep branch() working when workdir is deleted
+- *(cli)* stop stacked list duplicating rows on ghost branches
+- *(lib)* resolve graphite metadata files from the git common dir
+
+### Other
+
+- *(lib)* detect gt on PATH without spawning it
+- bump workspace rust-version to 1.88
+- *(lib)* drop unused dialoguer and env_logger dependencies
+
 ## [0.9.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.8.0...git-workon-lib-v0.9.0) - 2026-07-05
 
 ### Added
