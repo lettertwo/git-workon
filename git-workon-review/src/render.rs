@@ -15,7 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{
-    App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role, Severity, Summary,
+    App, DiffTextMode, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role,
+    Severity, Summary,
 };
 use crate::attribute::Attribution;
 use crate::config::View;
@@ -295,14 +296,22 @@ struct Segment {
     italic: bool,
 }
 
-/// Merge background-role spans and syntax fg spans into a flat list of non-overlapping
-/// segments covering `[0, len)`. A syntax span carries only its capture index; its color is
-/// resolved HERE against `theme` (ADR-035's render-time resolution) — a segment with no covering
-/// syntax span falls back to [`Palette::foreground`].
+/// Merge background-role spans, syntax fg spans, and `workon.review.diff.text` tint-foreground
+/// override spans into a flat list of non-overlapping segments covering `[0, len)`. A syntax span
+/// carries only its capture index; its color is resolved HERE against `theme` (ADR-035's
+/// render-time resolution) — a segment with no covering syntax span falls back to
+/// [`Palette::foreground`].
+///
+/// `fg_override_spans` (CS11, `content_spans`' `text_mode`) wins over the syntax-resolved color
+/// wherever it covers a byte range — `syntax` mode passes an empty slice, so this stays a no-op
+/// and the segment's color/italic resolution is byte-identical to before CS11 (the changeset's
+/// pixel-identity gate). Italic still resolves from the covering syntax capture regardless of
+/// which foreground wins — the two are orthogonal (a tinted comment stays italic).
 fn compose_segments(
     len: usize,
     bg_spans: &[(usize, usize, Color)],
     fg_spans: Option<&Vec<FgSpan>>,
+    fg_override_spans: &[(usize, usize, Color)],
     theme: &Palette,
 ) -> Vec<Segment> {
     let mut boundaries: Vec<usize> = vec![0, len];
@@ -315,6 +324,10 @@ fn compose_segments(
             boundaries.push(span.start.min(len));
             boundaries.push(span.end.min(len));
         }
+    }
+    for (s, e, _) in fg_override_spans {
+        boundaries.push((*s).min(len));
+        boundaries.push((*e).min(len));
     }
     boundaries.sort_unstable();
     boundaries.dedup();
@@ -335,15 +348,21 @@ fn compose_segments(
             .rev()
             .find(|(s, e, _)| mid >= *s && mid < *e)
             .map(|(_, _, c)| *c);
-        let (fg, italic) = fg_spans
+        let italic = fg_spans
             .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
-            .map(|s| {
-                (
-                    theme.syntax(s.capture),
-                    crate::theme::syntax_italic(s.capture),
-                )
-            })
-            .unwrap_or((theme.foreground, false));
+            .map(|s| crate::theme::syntax_italic(s.capture))
+            .unwrap_or(false);
+        let fg = fg_override_spans
+            .iter()
+            .rev()
+            .find(|(s, e, _)| mid >= *s && mid < *e)
+            .map(|(_, _, c)| *c)
+            .unwrap_or_else(|| {
+                fg_spans
+                    .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
+                    .map(|s| theme.syntax(s.capture))
+                    .unwrap_or(theme.foreground)
+            });
         segments.push(Segment {
             start,
             end,
@@ -436,6 +455,41 @@ fn add_bg_pair(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> (Color,
                 unstaged
             } else {
                 staged
+            }
+        }
+    }
+}
+
+/// The tint foreground for a Del cell at `old_lnum`, given `mode` — the same attribution match as
+/// [`del_bg_pair`] (locked decision #6: staged-ness must resolve identically for background and
+/// foreground, not through a second path), resolved from `theme`'s unstaged vs. staged Del
+/// foreground fields ([`Palette::del_fg`]/[`Palette::del_staged_fg`]).
+fn del_tint_fg(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> Color {
+    match mode {
+        AttributionMode::Plain => theme.del_fg,
+        AttributionMode::StagedUniform => theme.del_staged_fg,
+        AttributionMode::Attributed(attribution) => {
+            if attribution.del_is_staged(old_lnum) {
+                theme.del_staged_fg
+            } else {
+                theme.del_fg
+            }
+        }
+    }
+}
+
+/// The tint foreground for an Add cell at `new_lnum`, given `mode` — the same attribution match as
+/// [`add_bg_pair`], resolved from `theme`'s unstaged vs. staged Add foreground fields
+/// ([`Palette::add_fg`]/[`Palette::add_staged_fg`]).
+fn add_tint_fg(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> Color {
+    match mode {
+        AttributionMode::Plain => theme.add_fg,
+        AttributionMode::StagedUniform => theme.add_staged_fg,
+        AttributionMode::Attributed(attribution) => {
+            if attribution.add_is_unstaged(new_lnum) {
+                theme.add_fg
+            } else {
+                theme.add_staged_fg
             }
         }
     }
@@ -557,6 +611,15 @@ fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TS
 /// paired — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at
 /// all).
 ///
+/// `text_mode`/`tint_fg` (CS11, `workon.review.diff.text`) select which foreground a `Del`/`Add`
+/// line renders with, on top of the background `emphasis` already governs: `Syntax` never touches
+/// the foreground (`tint_fg` is ignored, keeping this byte-identical to before CS11 — the
+/// changeset's pixel-identity gate); `Tint` paints `tint_fg` across the line's full width, exactly
+/// where `emphasis`'s line background is painted; `Edit` paints `tint_fg` over the SAME ranges
+/// `emphasis`'s edit background is painted — `word_spans` when `is_word_pair`, the full line when
+/// not (the invariant this mode exists to hold: wherever the edit wash is painted, the tint
+/// foreground is painted). `tint_fg` is `None` for `Context`/`Filler`, same as `emphasis`.
+///
 /// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans via [`pan_spans`] — the
 /// segments below are always composed over the FULL, unsliced `text` first (byte-identical to the
 /// pre-hscroll behavior), and [`pan_spans`] applies the cut/pad/marker afterward.
@@ -569,8 +632,11 @@ fn content_spans(
     is_word_pair: bool,
     theme: &Palette,
     hscroll: usize,
+    text_mode: DiffTextMode,
+    tint_fg: Option<Color>,
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
+    let mut fg_override_spans: Vec<(usize, usize, Color)> = Vec::new();
     if let Some((line_bg, edit_bg)) = emphasis {
         if is_word_pair {
             bg_spans.push((0, text.len(), line_bg));
@@ -583,9 +649,29 @@ fn content_spans(
             // domain term precisely because this branch would falsify "word").
             bg_spans.push((0, text.len(), edit_bg));
         }
+
+        if let Some(fg) = tint_fg {
+            match text_mode {
+                DiffTextMode::Syntax => {}
+                DiffTextMode::Tint => {
+                    fg_override_spans.push((0, text.len(), fg));
+                }
+                DiffTextMode::Edit => {
+                    // Mirrors the edit-background branch above exactly (same condition, same
+                    // ranges) — the invariant this mode exists to hold.
+                    if is_word_pair {
+                        for s in word_spans {
+                            fg_override_spans.push((s.start, s.end, fg));
+                        }
+                    } else {
+                        fg_override_spans.push((0, text.len(), fg));
+                    }
+                }
+            }
+        }
     }
 
-    let segments = compose_segments(text.len(), &bg_spans, hl, theme);
+    let segments = compose_segments(text.len(), &bg_spans, hl, &fg_override_spans, theme);
     let mut spans = Vec::with_capacity(segments.len().max(1));
     if segments.is_empty() && !text.is_empty() {
         spans.push(TSpan::styled(
@@ -620,6 +706,7 @@ fn build_pane_line(
     content_w: usize,
     theme: &Palette,
     hscroll: usize,
+    text_mode: DiffTextMode,
 ) -> Line<'static> {
     match row {
         Row::Filler => {
@@ -640,10 +727,16 @@ fn build_pane_line(
             let gutter = format!("{n:>gutter_w$} ");
             let mut spans = vec![TSpan::styled(gutter, Style::default().fg(theme.gutter))];
 
-            let emphasis = match kind {
-                CellKind::Del => Some(del_bg_pair(mode, n as u32, theme)),
-                CellKind::Add => Some(add_bg_pair(mode, n as u32, theme)),
-                CellKind::Context | CellKind::Filler => None,
+            let (emphasis, tint_fg) = match kind {
+                CellKind::Del => (
+                    Some(del_bg_pair(mode, n as u32, theme)),
+                    Some(del_tint_fg(mode, n as u32, theme)),
+                ),
+                CellKind::Add => (
+                    Some(add_bg_pair(mode, n as u32, theme)),
+                    Some(add_tint_fg(mode, n as u32, theme)),
+                ),
+                CellKind::Context | CellKind::Filler => (None, None),
             };
             spans.extend(content_spans(
                 text,
@@ -653,6 +746,8 @@ fn build_pane_line(
                 is_word_pair,
                 theme,
                 hscroll,
+                text_mode,
+                tint_fg,
             ));
             Line::from(spans)
         }
@@ -2033,6 +2128,8 @@ fn render_pane_sbs(
     // One offset shared by every content pane (locked decision #1) — read once, before any of
     // the `app` borrows below.
     let hscroll = app.hscroll;
+    // `workon.review.diff.text` (CS11) — read once per frame, same posture as `hscroll` above.
+    let text_mode = app.diff_text;
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), old_area);
@@ -2110,6 +2207,7 @@ fn render_pane_sbs(
                     old_area.width as usize,
                     theme,
                     hscroll,
+                    text_mode,
                 );
                 let new_line = build_pane_line(
                     view,
@@ -2123,6 +2221,7 @@ fn render_pane_sbs(
                     new_area.width as usize,
                     theme,
                     hscroll,
+                    text_mode,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
@@ -2195,6 +2294,7 @@ fn build_inline_line(
     new_gutter_w: usize,
     theme: &Palette,
     hscroll: usize,
+    text_mode: DiffTextMode,
 ) -> Line<'static> {
     let (old_opt, new_opt, text, hl, kind) = match *row {
         InlineRow::Context { old, new } => (
@@ -2238,6 +2338,11 @@ fn build_inline_line(
         CellKind::Add => new_opt.map(|n| add_bg_pair(mode, n as u32, theme)),
         CellKind::Context | CellKind::Filler => None,
     };
+    let tint_fg = match kind {
+        CellKind::Del => old_opt.map(|n| del_tint_fg(mode, n as u32, theme)),
+        CellKind::Add => new_opt.map(|n| add_tint_fg(mode, n as u32, theme)),
+        CellKind::Context | CellKind::Filler => None,
+    };
     spans.extend(content_spans(
         text,
         hl,
@@ -2246,6 +2351,8 @@ fn build_inline_line(
         is_word_pair,
         theme,
         hscroll,
+        text_mode,
+        tint_fg,
     ));
     Line::from(spans)
 }
@@ -2269,6 +2376,8 @@ fn render_pane_inline(
     // One offset shared by every content pane (locked decision #1) — read once, before any of
     // the `app` borrows below.
     let hscroll = app.hscroll;
+    // `workon.review.diff.text` (CS11) — read once per frame, same posture as `hscroll` above.
+    let text_mode = app.diff_text;
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
@@ -2333,6 +2442,7 @@ fn render_pane_inline(
                     new_gutter_w,
                     theme,
                     hscroll,
+                    text_mode,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let line = if is_cursor {
@@ -2363,16 +2473,17 @@ mod tests {
     use unicode_width::UnicodeWidthChar;
 
     use super::{
-        changeset_prefix_spans, compose_segments, hscroll_cut, pan_spans, pane_header_label_style,
-        render, STATUS_PLACEHOLDER,
+        changeset_prefix_spans, compose_segments, content_spans, hscroll_cut, pan_spans,
+        pane_header_label_style, render, STATUS_PLACEHOLDER,
     };
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
-    use crate::app::{App, EffectiveZoom, Role};
+    use crate::app::{App, DiffTextMode, EffectiveZoom, Role};
     use crate::highlight::FgSpan;
     use crate::keymap::Keymap;
     use crate::outline::OutlineItem;
     use crate::theme::Palette;
+    use crate::wordiff::Span as WordSpan;
 
     /// Render one frame against the default (unrebound) keymap and the dark theme — the vast
     /// majority of `render.rs` tests don't care about keybindings and only ever ran dark. Tests
@@ -2407,9 +2518,184 @@ mod tests {
                 capture: keyword,
             },
         ];
-        let segments = compose_segments(8, &[], Some(&fgs), &theme);
+        let segments = compose_segments(8, &[], Some(&fgs), &[], &theme);
         assert!(segments[0].italic, "comment segment renders italic");
         assert!(!segments[1].italic, "keyword segment stays upright");
+    }
+
+    // ── CS11: `workon.review.diff.text` (`DiffTextMode`) foreground selection ──────────
+
+    /// Every span's resolved foreground, in order — the shape these `content_spans` tests
+    /// assert on, since `Style` doesn't expose its fg as a bare `Color` any other way.
+    fn fgs_of(spans: &[TSpan<'static>]) -> Vec<Option<Color>> {
+        spans.iter().map(|s| s.style.fg).collect()
+    }
+
+    #[test]
+    fn content_spans_syntax_mode_ignores_tint_fg_entirely() {
+        // The changeset's primary gate (ADR-035 CS11): with `text_mode: Syntax`, `tint_fg` must
+        // never reach the output — a `Del`/`Add` line renders byte-identically whether `tint_fg`
+        // is `Some` or `None`, for both a paired (word-diff) and an unpaired (excess) line.
+        let theme = Palette::dark();
+        let emphasis = Some((theme.del_line_bg, theme.del_edit_bg));
+        let word_spans = [WordSpan { start: 0, end: 2 }];
+
+        for (is_word_pair, words) in [(true, word_spans.as_slice()), (false, &[])] {
+            let with_tint = content_spans(
+                "hello",
+                None,
+                emphasis,
+                words,
+                is_word_pair,
+                &theme,
+                0,
+                DiffTextMode::Syntax,
+                Some(theme.del_fg),
+            );
+            let without_tint = content_spans(
+                "hello",
+                None,
+                emphasis,
+                words,
+                is_word_pair,
+                &theme,
+                0,
+                DiffTextMode::Syntax,
+                None,
+            );
+            assert_eq!(
+                with_tint, without_tint,
+                "Syntax mode must ignore tint_fg (is_word_pair={is_word_pair})"
+            );
+            // And it must actually resolve through syntax/theme.foreground, not the tint, so
+            // this isn't vacuously true from both sides being untinted the same wrong way.
+            assert!(
+                fgs_of(&with_tint)
+                    .iter()
+                    .all(|fg| *fg != Some(theme.del_fg)),
+                "Syntax mode must never paint the tint foreground"
+            );
+        }
+    }
+
+    #[test]
+    fn content_spans_context_lines_never_take_tint_fg_in_any_mode() {
+        // Locked decision #3: the knob governs changed lines only. `emphasis: None` is what
+        // marks a Context/Filler line — even if a caller somehow passed a `tint_fg` alongside it
+        // (callers never do), no mode may paint it, since there is no edit/line wash for a tint
+        // foreground to attach meaning to.
+        let theme = Palette::dark();
+        for mode in [DiffTextMode::Syntax, DiffTextMode::Tint, DiffTextMode::Edit] {
+            let spans = content_spans(
+                "hello",
+                None,
+                None,
+                &[],
+                false,
+                &theme,
+                0,
+                mode,
+                Some(theme.del_fg),
+            );
+            assert!(
+                fgs_of(&spans).iter().all(|fg| *fg != Some(theme.del_fg)),
+                "context line must not take the tint fg under {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_spans_tint_mode_paints_the_tint_fg_across_the_full_line() {
+        let theme = Palette::dark();
+        let emphasis = Some((theme.add_line_bg, theme.add_edit_bg));
+        let spans = content_spans(
+            "hello",
+            None,
+            emphasis,
+            &[WordSpan { start: 0, end: 2 }],
+            true,
+            &theme,
+            0,
+            DiffTextMode::Tint,
+            Some(theme.add_fg),
+        );
+        assert!(
+            fgs_of(&spans).iter().all(|fg| *fg == Some(theme.add_fg)),
+            "Tint mode must paint every segment of a changed line with the tint fg: {:?}",
+            fgs_of(&spans)
+        );
+    }
+
+    #[test]
+    fn content_spans_edit_mode_paints_only_the_word_span_on_a_paired_line() {
+        let theme = Palette::dark();
+        let emphasis = Some((theme.add_line_bg, theme.add_edit_bg));
+        // "hello" with the word span covering only "he" (bytes 0..2) — the rest of the line
+        // should keep its syntax/plain foreground, not the tint.
+        let spans = content_spans(
+            "hello",
+            None,
+            emphasis,
+            &[WordSpan { start: 0, end: 2 }],
+            true,
+            &theme,
+            0,
+            DiffTextMode::Edit,
+            Some(theme.add_fg),
+        );
+        let tinted: Vec<&TSpan> = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(theme.add_fg))
+            .collect();
+        let plain: Vec<&TSpan> = spans
+            .iter()
+            .filter(|s| s.style.fg != Some(theme.add_fg))
+            .collect();
+        assert!(!tinted.is_empty(), "the word span itself must be tinted");
+        assert!(
+            !plain.is_empty(),
+            "the rest of a paired line must NOT be tinted in Edit mode"
+        );
+        assert_eq!(
+            tinted
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "he",
+            "only the word-diff range takes the tint fg"
+        );
+    }
+
+    #[test]
+    fn content_spans_edit_mode_paints_the_full_unpaired_line_matching_the_edit_wash() {
+        // Locked decision #4, the invariant this changeset exists to hold: an unpaired line (no
+        // word-diff counterpart) takes the edit background wash across its FULL width
+        // (`content_spans`' own `is_word_pair == false` branch) — so in Edit mode it must take
+        // the tint foreground across that exact same full width, never a subset and never none.
+        let theme = Palette::dark();
+        let emphasis = Some((theme.del_line_bg, theme.del_edit_bg));
+        let spans = content_spans(
+            "hello",
+            None,
+            emphasis,
+            &[], // no word spans: this line has no pair to word-diff against
+            false,
+            &theme,
+            0,
+            DiffTextMode::Edit,
+            Some(theme.del_fg),
+        );
+        assert!(
+            fgs_of(&spans).iter().all(|fg| *fg == Some(theme.del_fg)),
+            "wherever the edit wash is painted (here: the whole unpaired line), the tint \
+             foreground must be painted too: {:?}",
+            fgs_of(&spans)
+        );
+        // And the background side of the same invariant, unchanged by this changeset — the edit
+        // wash really does cover the full width here, which is what makes the fg assertion above
+        // meaningful rather than accidental.
+        let segments = compose_segments(5, &[(0, 5, theme.del_edit_bg)], None, &[], &theme);
+        assert!(segments.iter().all(|s| s.bg == Some(theme.del_edit_bg)));
     }
 
     /// Like [`render_once`] but with a caller-chosen theme — for the canvas-paint tests, which
@@ -3146,6 +3432,135 @@ mod tests {
             staged_add_bg, unstaged_add_bg,
             "staged and unstaged Add rows must render with visibly distinct backgrounds"
         );
+    }
+
+    #[test]
+    fn combined_view_tint_mode_colors_a_staged_change_dim_fg_and_an_unstaged_change_bright_fg() {
+        // Full-stack companion to `combined_view_colors_a_staged_change_dim_and_an_unstaged_change_
+        // bright`, same fixture/positions, but proving `workon.review.diff.text = tint`'s
+        // foreground threading end-to-end (App -> render_pane_sbs -> build_pane_line ->
+        // content_spans) rather than at the pure-function level: locked decision #6, the staged
+        // vs. unstaged tint foreground must follow the SAME attribution the backgrounds already
+        // use, not a second path.
+        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
+        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
+        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", committed, staged, workdir)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cycle_zoom(); // Split -> Combined
+        assert_eq!(app.zoom, crate::app::Zoom::Combined);
+        app.set_diff_text(DiffTextMode::Tint);
+        app.cursor = 0;
+        app.derive_scroll();
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+
+        let staged_row = content
+            .iter()
+            .position(|line| line.contains("old word here"))
+            .expect("staged change's old-side text visible");
+        let unstaged_row = content
+            .iter()
+            .position(|line| line.contains("old4 word four"))
+            .expect("unstaged change's old-side text visible");
+
+        let old_content_x = 4; // gutter width 3 + 1 space, same convention as the sibling test
+        let staged_del_fg = buf
+            .cell((old_content_x, staged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+        let unstaged_del_fg = buf
+            .cell((old_content_x, unstaged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+
+        let t = Palette::dark();
+        assert_eq!(
+            staged_del_fg,
+            Some(t.del_staged_fg),
+            "the staged row's Del side must take del_staged_fg, not del_fg"
+        );
+        assert_eq!(
+            unstaged_del_fg,
+            Some(t.del_fg),
+            "the unstaged row's Del side must take del_fg, not del_staged_fg"
+        );
+
+        let left_w = (buf.area.width.saturating_sub(1)) / 2;
+        let new_content_x = left_w + 1 + 4;
+        let staged_add_fg = buf
+            .cell((new_content_x, staged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+        let unstaged_add_fg = buf
+            .cell((new_content_x, unstaged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+
+        assert_eq!(
+            staged_add_fg,
+            Some(t.add_staged_fg),
+            "the staged row's Add side must take add_staged_fg, not add_fg"
+        );
+        assert_eq!(
+            unstaged_add_fg,
+            Some(t.add_fg),
+            "the unstaged row's Add side must take add_fg, not add_staged_fg"
+        );
+    }
+
+    #[test]
+    fn combined_view_syntax_mode_is_pixel_identical_regardless_of_attribution() {
+        // The changeset's primary identity gate, exercised on the exact fixture/positions the two
+        // tint-mode tests above use: with `diff.text` at its default (`Syntax`), the combined
+        // view's per-cell foreground for a staged AND an unstaged changed row must be unaffected
+        // by `DiffTextMode` — rendering under every mode variant applied to the SAME app state
+        // (only `diff_text` flipped) but reading it back to `Syntax` must reproduce the original
+        // frame exactly.
+        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
+        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
+        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", committed, staged, workdir)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cycle_zoom(); // Split -> Combined
+        app.cursor = 0;
+        app.derive_scroll();
+
+        assert_eq!(
+            app.diff_text,
+            DiffTextMode::default(),
+            "test setup: diff_text must start at its unset/syntax default"
+        );
+        let baseline = render_once(&mut app, 60, 20);
+
+        for mode in [DiffTextMode::Tint, DiffTextMode::Edit] {
+            app.set_diff_text(mode);
+            let _ = render_once(&mut app, 60, 20); // render under a tinting mode, then...
+            app.set_diff_text(DiffTextMode::Syntax); // ...switch back before comparing.
+            let restored = render_once(&mut app, 60, 20);
+            assert_eq!(
+                baseline, restored,
+                "Syntax mode must render identically to the pre-CS11 baseline regardless of \
+                 what DiffTextMode {mode:?} was live before it"
+            );
+        }
     }
 
     #[test]

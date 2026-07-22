@@ -624,6 +624,26 @@ pub enum Role {
     Staged,
 }
 
+/// `workon.review.diff.text` (see ADR-035's "Revised (CS11, diff foreground/background split)"
+/// section): which foreground source changed lines render with. A **behavior selector, not a
+/// color** — it lives on `App` rather than [`crate::theme::Palette`] because it decides which
+/// already-resolved palette color a segment picks, not what a color IS. Context lines always keep
+/// syntax highlighting regardless of this setting; only changed (`Del`/`Add`) lines are affected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffTextMode {
+    /// Tree-sitter foreground everywhere, changed lines included — today's behavior, and the
+    /// pixel-identity default.
+    #[default]
+    Syntax,
+    /// Changed lines take the tint foreground (`add_fg`/`del_fg`, or the staged pair per the
+    /// line's attribution) across their full width.
+    Tint,
+    /// Syntax stays on the line; only the edit spans take the tint foreground. On an unpaired
+    /// line (no word-diff counterpart), the tint foreground spans the full width — wherever the
+    /// edit background wash is painted, the tint foreground is painted too.
+    Edit,
+}
+
 /// The zoom the user *requested* via `Z` — persists across file navigation (like [`Layout`]). The
 /// actual state rendered per file is [`EffectiveZoom`], resolved by [`effective_zoom`] from this
 /// plus the file's available sub-diffs; a file lacking the requested role collapses to
@@ -755,6 +775,18 @@ fn parse_diff_zoom(raw: &str) -> Option<Zoom> {
         "combined" => Some(Zoom::Combined),
         "unstaged" => Some(Zoom::Unstaged),
         "staged" => Some(Zoom::Staged),
+        _ => None,
+    }
+}
+
+/// Parse `workon.review.diff.text` (CS11) into a [`DiffTextMode`]. Canonical strings mirror the
+/// variant names: `syntax`, `tint`, `edit`. `None` on anything else — [`App::apply_view_config`]
+/// falls back to [`DiffTextMode::default`] and warns.
+fn parse_diff_text(raw: &str) -> Option<DiffTextMode> {
+    match raw {
+        "syntax" => Some(DiffTextMode::Syntax),
+        "tint" => Some(DiffTextMode::Tint),
+        "edit" => Some(DiffTextMode::Edit),
         _ => None,
     }
 }
@@ -1249,6 +1281,10 @@ pub struct App {
     /// The requested zoom (cycled by `Z`); the effective per-file zoom is resolved each frame via
     /// [`effective_zoom`]. Persists across file navigation, like [`Self::layout`].
     pub zoom: Zoom,
+    /// `workon.review.diff.text` (CS11) — which foreground source changed lines render with.
+    /// Read directly by `render.rs`, same as [`Self::layout`]/[`Self::zoom`]; see
+    /// [`DiffTextMode`]'s doc comment.
+    pub diff_text: DiffTextMode,
     /// Which split pane has focus. Only meaningful under [`EffectiveZoom::Split`]; reset to
     /// `Unstaged` (the top pane) whenever a file opens or the zoom changes.
     split_focus: SplitPane,
@@ -1522,6 +1558,7 @@ impl App {
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
             zoom: Zoom::default(),
+            diff_text: DiffTextMode::default(),
             split_focus: SplitPane::Unstaged,
             notice: None,
             queue: StagingQueue::new(),
@@ -3959,8 +3996,17 @@ impl App {
         self.layout = layout;
     }
 
-    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom` (CS7) as
-    /// the App's initial view-config state, via the same setters the interactive keys drive
+    /// Set `workon.review.diff.text`'s resolved mode directly — the config-startup (CS11)
+    /// counterpart, mirroring [`Self::set_layout`]/[`Self::set_zoom`]. Purely a render-time
+    /// foreground selector: no cursor/scroll state depends on it, so unlike `set_layout` there is
+    /// nothing else to clamp or re-derive, at startup OR on reload.
+    pub fn set_diff_text(&mut self, mode: DiffTextMode) {
+        self.diff_text = mode;
+    }
+
+    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom|text` (CS7,
+    /// CS11) as the App's initial view-config state, via the same setters the interactive keys
+    /// drive
     /// (see each setter's doc comment for why that's enough to stay on the gated path). Call
     /// once, right after construction and before [`Self::open_current`] (see `main.rs`) — the
     /// setters here don't themselves re-derive `cursor`/`scroll`, and the caller's
@@ -4044,6 +4090,17 @@ impl App {
             None => Zoom::default(),
         };
         self.set_zoom(zoom);
+
+        let diff_text = match &raw.diff_text {
+            Some(t) => parse_diff_text(t).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.diff.text = '{t}' unrecognized; using default"
+                ));
+                DiffTextMode::default()
+            }),
+            None => DiffTextMode::default(),
+        };
+        self.set_diff_text(diff_text);
 
         warnings
     }
@@ -5182,8 +5239,8 @@ mod tests {
     use super::test_support::app_from_fixture;
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity, Summary,
-        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, SCROLLOFF,
+        DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity,
+        Summary, SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::{RawViewConfig, ReviewConfig};
@@ -10175,6 +10232,7 @@ mod tests {
         assert_eq!(app.icon_mode(), IconMode::default());
         assert_eq!(app.layout, Layout::default());
         assert_eq!(app.zoom, Zoom::default());
+        assert_eq!(app.diff_text, DiffTextMode::default());
     }
 
     #[test]
@@ -10361,6 +10419,37 @@ mod tests {
         assert_eq!(app.zoom, Zoom::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("diff.zoom"));
+    }
+
+    #[test]
+    fn diff_text_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.text", "tint")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.diff_text, DiffTextMode::Tint);
+    }
+
+    #[test]
+    fn diff_text_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.text", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.diff_text, DiffTextMode::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("diff.text"));
     }
 
     // ── `reload-config` (`R`): request flag + mid-session view-config apply ────
