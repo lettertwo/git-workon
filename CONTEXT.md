@@ -22,6 +22,20 @@ Terms used throughout the `git-workon` codebase. Implementation details do not b
 
 **Uncommitted layer** — the synthetic changeset spanning the dirty working tree + index. Appears in a review only when the review is focused where `HEAD` actually is, since uncommitted changes diff against `HEAD`.
 
+## Review Theming
+
+**Wash** — a background color painted behind diff text to signal that the text changed. Washes carry the diff signal; foreground carries syntax meaning unless a theme says otherwise. _Avoid_: "tint" for the background specifically (see below), "highlight".
+
+**Line wash** — the wash covering an entire line that contains a change. Answers "something here changed". _Avoid_: "subtle" (renamed — it named intensity, not scope).
+
+**Edit** — the exact text that changed. On a line paired with a counterpart, the word-diff ranges within it; on a line with no counterpart, the whole line. _Avoid_: "word" (true only for the paired case), "change" (reserved for a file's change kind).
+
+**Edit wash** — the wash covering an edit. Answers "this precisely is the change". _Avoid_: "strong" (renamed — its intensity-flavored name is what let it drift into a foreground role).
+
+**Tint foreground** — a text color that encodes added-ness or deleted-ness rather than syntax meaning. Distinct from a wash: same fact, opposite channel. _Avoid_: "diff color" (ambiguous between the two channels).
+
+**Slot** — one of the sixteen base16 palette positions (`base00`–`base0f`) a theme assigns colors to. A slot has a *role* only when some part of the TUI reads it; the key space accepts all sixteen regardless.
+
 ## Prune Candidate Reasons
 
 **BranchDeleted** — the local branch ref for the worktree no longer exists in the repository. Always a prune candidate regardless of flags.
