@@ -272,6 +272,7 @@ pub fn syntax_italic(capture: usize) -> bool {
 /// gradient, its staged variants, and the cursor/selection/outline washes are read directly. All
 /// values in [`Palette::dark`] reproduce the M3–M5 hardcoded colors exactly (CS4 is a
 /// behavior-preserving refactor).
+#[derive(Clone)]
 pub struct Palette {
     /// Per-capture syntax fg, indexed by the same capture index as
     /// [`crate::highlight::HIGHLIGHT_NAMES`] (see [`SYNTAX_SLOTS`]).
@@ -367,6 +368,24 @@ pub struct Palette {
     /// `render.rs`'s icon paint sites check this flag directly and collapse to
     /// [`Palette::foreground`] when it's set, rather than trusting the icon's own color.
     pub colorless: bool,
+}
+
+/// The startup context [`crate::config::resolve_runtime`] needs to resolve a palette but can't
+/// derive itself, because it's pure/I/O-free and doesn't own the tty. Built once in `main.rs`
+/// (after the `theme = auto` probe, if one ran) and reused by every later `resolve_runtime` call —
+/// including a config reload — so `auto` is never re-probed mid-session (re-probing needs the tty,
+/// which the TUI owns once the alternate screen is live; a second conversation there would corrupt
+/// input).
+pub struct PaletteContext {
+    /// Base palette to use when `theme = auto`: the startup probe's result, or the startup base for
+    /// a non-`auto` launch (no probe ever ran, so this is just whatever `Dark`/`Light`/the
+    /// config-read-error fallback resolved to). Never re-probed — a `theme` reload that switches
+    /// TO `auto` reuses this cached base rather than asking the terminal again.
+    pub auto_base: Palette,
+    /// `NO_COLOR` was set in the environment at launch — mono wins over every override, applied
+    /// last in [`crate::config::resolve_runtime`]'s ladder. Read once at startup (`main.rs`); a
+    /// reload can't change it, since it isn't a config value.
+    pub no_color: bool,
 }
 
 impl Palette {
