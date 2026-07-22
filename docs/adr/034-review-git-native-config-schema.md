@@ -75,6 +75,16 @@ workon.review.<view>.<setting>         = <value>         ; view config
   cascade (confirm > outline-unfocus > selection-cancel > quit) stay hardcoded — they are
   conventional, safety-sensitive, and the Esc cascade's documented precedence would break
   if rebound.
+- **`reload-config` (`R`, global view, rebindable like any other action):** re-reads the
+  whole `workon.review.*` tree and swaps it in without restarting — this ADR's schema was
+  originally "read once at startup"; live reload makes it "read once, re-readable on
+  demand" instead, with no schema change (the same getters just run again). One exception:
+  `theme = auto`'s terminal-derivation probe (ADR-035) never re-runs mid-session — it needs
+  the tty, which the TUI owns once the alternate screen is live, and a second probe
+  conversation there would corrupt input. Reload caches the startup probe result and reuses
+  it whenever the resolved theme is `auto`, so switching `theme` to `dark`/`light` takes
+  effect on reload, but switching back to `auto` reuses the cached base rather than
+  re-probing.
 
 ## Consequences
 
