@@ -56,7 +56,7 @@ See [ADR-004](docs/adr/004-smart-routing-default-command.md) | Key source: `git-
 ```bash
 cargo build                                        # build workspace
 cargo test --workspace                             # run all tests
-cargo test -p git-workon-lib --test clone          # run a single test
+cargo test -p git-workon-lib --test suite clone::   # run one file's tests (now a module in the merged `suite` harness)
 cargo run -p git-workon -- <command>               # run CLI during development
 cargo watch --ignore contrib --ignore man -- cargo check --tests  # watch mode
 ```

@@ -5,14 +5,31 @@ use std::path::{Path, PathBuf};
 use std::sync::Once;
 use workon::empty_commit;
 
-/// Point libgit2's system/global/XDG config search paths at an empty directory, once per
+/// Point libgit2's system/global/XDG config search paths at an isolated directory, once per
 /// process, so fixture repos never layer in the developer's real `~/.gitconfig` (a global
 /// `workon.*` key would otherwise poison every "unset config" assertion in the workspace).
 /// Only affects in-process git2 use — spawned `git` binaries still read the real files.
+///
+/// The isolated directory carries a minimal `user.name`/`user.email` at the Global level (not
+/// truly empty): since the test harness now runs every `tests/*.rs` file as one merged binary
+/// (single process) instead of one process per file, this isolation — which used to apply only
+/// within whichever single file called it — now applies process-wide to every test, including
+/// ones that never touch `FixtureBuilder` but still need `repo.signature()` to resolve (e.g.
+/// `init.rs`'s direct exercise of `workon::init`/`empty_commit`). Those tests used to pass by
+/// accident, reading the developer's real identity in their own isolated process; a fully empty
+/// search path now makes them fail deterministically instead. A placeholder identity keeps this
+/// isolated (never the developer's real config) while giving every in-process signature lookup
+/// something to resolve.
 fn isolate_ambient_git_config() {
     static ISOLATE: Once = Once::new();
     ISOLATE.call_once(|| {
         let empty = TempDir::new().expect("temp dir for git config isolation");
+        std::fs::write(
+            empty.path().join(".gitconfig"),
+            "[user]\n\tname = git-workon-fixture\n\temail = fixture@git-workon.invalid\n\
+             [init]\n\tdefaultBranch = main\n",
+        )
+        .expect("write isolated global git config");
         for level in [ConfigLevel::System, ConfigLevel::XDG, ConfigLevel::Global] {
             // SAFETY: mutates libgit2's process-global search paths; guarded by `ISOLATE`
             // and called from `build()` before this fixture's repo (and, in practice, any
@@ -20,7 +37,7 @@ fn isolate_ambient_git_config() {
             unsafe { git2::opts::set_search_path(level, empty.path()) }
                 .expect("set git config search path");
         }
-        // Keep the (empty) directory alive for the whole process — the search paths hold it.
+        // Keep the (isolated) directory alive for the whole process — the search paths hold it.
         std::mem::forget(empty);
     });
 }
