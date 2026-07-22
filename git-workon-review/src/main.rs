@@ -93,65 +93,57 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve the keymap from git config once at startup, BEFORE `repo` moves into `App`
-    // (ADR-034). A failed config read degrades to the registry defaults rather than aborting the
-    // review. Collision/unknown-action warnings surface through the footer notice below.
-    let keymap = match ReviewConfig::new(&repo).bindings() {
-        Ok(bindings) => Keymap::from_bindings(&bindings),
-        Err(_) => Keymap::defaults(),
-    };
-
-    // Resolve the palette selection the same way, before `repo` moves — a config-read error
-    // degrades to dark rather than aborting the review (CS5). `Auto` runs the terminal-derivation
-    // probe (CS6), which needs the controlling tty and so lives outside the pure `theme.rs`; it is
-    // bounded by a hard timeout and always yields a curated fallback on a silent/hostile terminal,
-    // never a hang. `Dark`/`Light` stay CS5's I/O-free `for_theme` path.
-    // `probed` is whether a real probe conversation happened on the tty this launch — NOT just
-    // "theme was auto". `detect_auto_palette` reports `false` on a cached "silent terminal"
-    // verdict (see `probe_cache`), since a cache hit writes nothing to the tty and so owes no
-    // flush; every other path (an answered probe, a timed-out-uncached probe, a non-auto theme)
-    // is `false`/`true` exactly as before.
+    // Resolve the palette selection first, before `repo` moves — a config-read error degrades to
+    // dark rather than aborting the review (CS5). `Auto` runs the terminal-derivation probe (CS6),
+    // which needs the controlling tty and so lives outside the pure `theme.rs`; it is bounded by a
+    // hard timeout and always yields a curated fallback on a silent/hostile terminal, never a
+    // hang. `Dark`/`Light` stay CS5's I/O-free `for_theme` path — but that ladder now lives in
+    // `resolve_runtime` below; here we only need `auto_base` (what to cache for `PaletteContext`)
+    // and `probed`. `probed` is whether a real probe conversation happened on the tty this launch
+    // — NOT just "theme was auto". `detect_auto_palette` reports `false` on a cached "silent
+    // terminal" verdict (see `probe_cache`), since a cache hit writes nothing to the tty and so
+    // owes no flush; every other path (an answered probe, a timed-out-uncached probe, a non-auto
+    // theme) is `false`/`true` exactly as before.
     let selection = ReviewConfig::new(&repo).theme();
-    let (mut theme, probed) = match selection {
+    let (auto_base, probed) = match selection {
         Ok(config::Theme::Auto) => terminal_query::detect_auto_palette(),
         Ok(selection) => (Palette::for_theme(selection), false),
         Err(_) => (Palette::dark(), false),
     };
 
-    // CS1 (user-configurable colors tier): apply any `workon.review.theme.*` slot/tint
-    // overrides on top of whichever base was just resolved above — works uniformly on
-    // `dark`/`light`/`auto`'s probe result (see `Palette::apply_overrides`'s doc comment). A
-    // config-read error degrades to no overrides, same posture as every other getter here; a
-    // malformed value or unknown key is collected as a warning and joined into the startup
-    // notice in `seat_app` below, alongside the keymap/view-config warnings.
-    let theme_override_warnings = match ReviewConfig::new(&repo).theme_overrides() {
-        Ok((overrides, warnings)) => {
-            theme.apply_overrides(&overrides);
-            warnings
-        }
-        Err(_) => Vec::new(),
-    };
-
-    // CS2 (`no-color-mono`): `NO_COLOR` is an env kill-switch — it wins over any override
-    // applied just above, so it must be checked last, after resolution AND overrides. The
-    // ladder choice (`is_light_background`) reads the pre-mono `theme.background` so `auto`'s
-    // probe still picks the right dark/pale ladder. `FORCE_COLOR` is deliberately not consulted
-    // (see `no_color`'s doc comment).
-    if no_color(std::env::var_os("NO_COLOR").as_deref()) {
-        theme = Palette::mono(theme::is_light_background(theme.background));
+    // CS2 (`no-color-mono`): read the env kill-switch once here — `resolve_runtime` applies it
+    // last in its ladder (after resolution AND overrides), so it always wins over an override.
+    // `FORCE_COLOR` is deliberately not consulted (see `no_color`'s doc comment).
+    let no_color_env = no_color(std::env::var_os("NO_COLOR").as_deref());
+    if no_color_env {
         // Crossterm ALSO honors NO_COLOR, by stripping every color SGR at the output layer —
         // which would erase `mono()`'s achromatic washes and leave cursor/selection/staged
         // attribution invisible (the exact unusability the grayscale ladders exist to prevent).
         // This app owns NO_COLOR semantics at the palette level instead, so disable crossterm's
-        // blanket suppression and let the grayscale washes through.
+        // blanket suppression and let the grayscale washes through. One-time: `resolve_runtime`
+        // itself has no terminal to reconfigure, so this stays here rather than moving with it.
         crossterm::style::force_color_output(true);
     }
 
-    // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,
-    // before `repo` moves — CS7. `view_config` reads into an owned `RawViewConfig`, so no
-    // borrow of `repo` survives past this statement (unlike a bare `ReviewConfig<'repo>`, which
-    // would still be borrowing `repo` when `App::from_changesets` tries to move it below).
-    let view_config = ReviewConfig::new(&repo).view_config();
+    // `PaletteContext` bundles what `resolve_runtime` can't derive itself (it's pure/I/O-free): the
+    // probe result (or the non-auto/error base) to use whenever `theme = auto`, never re-probed,
+    // and the NO_COLOR kill-switch. Reused verbatim by a later `reload-config` (ADR-034) so `auto`
+    // stays cached across the session — see `PaletteContext`'s doc comment.
+    let palette_ctx = theme::PaletteContext {
+        auto_base,
+        no_color: no_color_env,
+    };
+
+    // Resolve the keymap, palette, and view-config settings in one call, BEFORE `repo` moves into
+    // `App` — the same structural core a config reload uses (see `config::resolve_runtime`'s doc
+    // comment), so startup and reload can never drift apart. Every getter degrades to a default on
+    // a config-read error rather than aborting the review (ADR-034); collision/unknown-action/
+    // malformed-override warnings surface through the footer notice below.
+    let runtime = config::resolve_runtime(&repo, &palette_ctx);
+    let keymap = runtime.keymap;
+    let theme = runtime.palette;
+    let theme_override_warnings = runtime.warnings;
+    let view_config = runtime.view_config;
 
     // After a probe, OSC replies from a slow terminal (e.g. one ssh round-trip away) may have
     // straggled in while the theme was being derived above. Discard them now, BEFORE crossterm

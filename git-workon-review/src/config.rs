@@ -57,7 +57,8 @@
 use git2::Repository;
 use ratatui::style::Color;
 
-use crate::theme::{self, ThemeOverrides};
+use crate::keymap::Keymap;
+use crate::theme::{self, Palette, PaletteContext, ThemeOverrides};
 
 /// Which view a keybinding or view-setting applies to.
 ///
@@ -125,6 +126,66 @@ pub struct RawViewConfig {
     pub icons: Option<String>,
     pub diff_layout: Option<String>,
     pub diff_zoom: Option<String>,
+}
+
+/// Everything `main.rs`'s startup resolution ladder reads out of `workon.review.*`, resolved in
+/// one call so a config reload (see the `reload-config` handoff) reproduces startup's resolution
+/// exactly rather than duplicating it — guaranteed drift otherwise. `view_config` is left raw
+/// (unvalidated): [`crate::app::App::apply_view_config`]/`reload_view_config` are what apply
+/// defaults and range-check it, same division [`RawViewConfig`] already documents.
+pub struct RuntimeConfig {
+    pub keymap: Keymap,
+    pub palette: Palette,
+    pub view_config: RawViewConfig,
+    /// `workon.review.theme.*` override warnings only — keymap warnings still come off
+    /// [`Keymap::warnings`], not bundled in here, so a caller that only cares about one doesn't
+    /// have to pick them back apart.
+    pub warnings: Vec<String>,
+}
+
+/// Resolve the whole `workon.review.*` tree into a [`RuntimeConfig`], reproducing `main.rs`'s
+/// startup ladder exactly: keymap (bindings, defaulting on a read error) → palette (selection →
+/// base, `Auto` from `ctx.auto_base` rather than re-probing, `Dark`/`Light` via
+/// [`Palette::for_theme`], a read error to [`Palette::dark`]) → `theme.*` overrides applied on
+/// top → `ctx.no_color`'s mono override, applied last so it always wins. Every getter here
+/// degrades to a default on a config-read error rather than propagating one — the same posture
+/// every getter in this module already has, so a reload can never abort mid-session over a
+/// transient/malformed `.git/config`.
+///
+/// Shared by both the startup resolution (`main.rs`) and a live `reload-config` (`tui.rs`) so the
+/// two can never drift apart — see the handoff's "Structural core" section.
+pub fn resolve_runtime(repo: &Repository, ctx: &PaletteContext) -> RuntimeConfig {
+    let config = ReviewConfig::new(repo);
+
+    let keymap = match config.bindings() {
+        Ok(bindings) => Keymap::from_bindings(&bindings),
+        Err(_) => Keymap::defaults(),
+    };
+
+    let mut palette = match config.theme() {
+        Ok(Theme::Auto) => ctx.auto_base.clone(),
+        Ok(selection) => Palette::for_theme(selection),
+        Err(_) => Palette::dark(),
+    };
+
+    let warnings = match config.theme_overrides() {
+        Ok((overrides, warnings)) => {
+            palette.apply_overrides(&overrides);
+            warnings
+        }
+        Err(_) => Vec::new(),
+    };
+
+    if ctx.no_color {
+        palette = Palette::mono(theme::is_light_background(palette.background));
+    }
+
+    RuntimeConfig {
+        keymap,
+        palette,
+        view_config: config.view_config(),
+        warnings,
+    }
 }
 
 /// Decompose a fully-qualified config variable name (as returned by
@@ -768,6 +829,104 @@ mod tests {
         assert_eq!(warnings.len(), 2, "got: {warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("base10")));
         assert!(warnings.iter().any(|w| w.contains("cursorbg")));
+    }
+
+    // ── `resolve_runtime` (the shared startup/reload structural core) ──────────
+
+    fn auto_ctx() -> PaletteContext {
+        PaletteContext {
+            auto_base: Palette::dark(),
+            no_color: false,
+        }
+    }
+
+    #[test]
+    fn resolve_runtime_applies_theme_overrides_on_top_of_the_auto_base_for_theme_auto() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme.base00", "#101010")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let runtime = resolve_runtime(repo, &auto_ctx());
+        assert_eq!(runtime.palette.background, Color::Rgb(0x10, 0x10, 0x10));
+        // Every other field still traces back to `auto_base` (`Palette::dark()`), not some other
+        // base — spot-check one untouched field.
+        assert_eq!(runtime.palette.dim, Palette::dark().dim);
+        assert!(runtime.warnings.is_empty());
+    }
+
+    #[test]
+    fn resolve_runtime_honors_dark_and_light_selection() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme", "light")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        // A distinctive `auto_base` proves `theme = light` ignores it entirely, rather than
+        // falling through to the cached probe base.
+        let runtime = resolve_runtime(
+            repo,
+            &PaletteContext {
+                auto_base: Palette::mono(false),
+                no_color: false,
+            },
+        );
+        assert_eq!(runtime.palette.background, Palette::light().background);
+    }
+
+    #[test]
+    fn resolve_runtime_no_color_yields_a_mono_palette_no_override_can_recolor() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme.base00", "#101010")
+            .config("workon.review.theme.cursor-bg", "#1a2b3c")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let runtime = resolve_runtime(
+            repo,
+            &PaletteContext {
+                auto_base: Palette::dark(),
+                no_color: true,
+            },
+        );
+        assert!(
+            runtime.palette.colorless,
+            "NO_COLOR must win over any override"
+        );
+        assert_ne!(
+            runtime.palette.background,
+            Color::Rgb(0x10, 0x10, 0x10),
+            "the base00 override must not survive the mono substitution"
+        );
+        assert_ne!(
+            runtime.palette.cursor_bg,
+            Color::Rgb(0x1a, 0x2b, 0x3c),
+            "the cursor-bg override must not survive the mono substitution"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_degrades_on_a_config_read_error_instead_of_panicking() {
+        // Corrupt `.git/config` with unparseable syntax so every `repo.config()?` call inside
+        // `resolve_runtime`'s ladder fails — the degrade-not-abort posture every getter in this
+        // module already has (see the module doc comment), exercised end-to-end here rather than
+        // per-getter.
+        let fixture = FixtureBuilder::new().build().expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let cfg_path = repo.path().join("config");
+        std::fs::write(&cfg_path, "[this is not valid gitconfig\n").expect("corrupt config");
+
+        let runtime = resolve_runtime(repo, &auto_ctx());
+        assert!(
+            runtime.keymap.warnings().is_empty(),
+            "defaults, not warnings"
+        );
+        assert_eq!(runtime.palette.background, Palette::dark().background);
+        assert!(runtime.warnings.is_empty());
+        assert_eq!(runtime.view_config, RawViewConfig::default());
     }
 
     #[test]
