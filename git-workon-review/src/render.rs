@@ -123,14 +123,14 @@ fn diffstat_spans(
         TSpan::styled(
             format!("{added_prefix}{adds}"),
             Style::default()
-                .fg(theme.add_strong)
+                .fg(theme.add_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         TSpan::styled(" ".to_string(), Style::default().fg(theme.foreground)),
         TSpan::styled(
             format!("{removed_prefix}{dels}"),
             Style::default()
-                .fg(theme.del_strong)
+                .fg(theme.del_fg)
                 .add_modifier(Modifier::BOLD),
         ),
     ]
@@ -326,10 +326,10 @@ fn compose_segments(
             continue;
         }
         let mid = start;
-        // Later-pushed bg spans are more specific (word-level strong emphasis is pushed after
-        // the whole-line subtle span in `content_spans`) and must win, so the lookup scans in
+        // Later-pushed bg spans are more specific (the word-level edit emphasis is pushed after
+        // the whole-line emphasis in `content_spans`) and must win, so the lookup scans in
         // REVERSE push order. The spike's forward `find` silently dropped word-level emphasis:
-        // the whole-line subtle span contains every offset, so it always matched first.
+        // the whole-line span contains every offset, so it always matched first.
         let bg = bg_spans
             .iter()
             .rev()
@@ -359,7 +359,7 @@ fn gutter_width(max_lineno: usize) -> usize {
     max_lineno.to_string().len().max(3)
 }
 
-/// How a rendered pane resolves a changed cell's (subtle, strong) background pair — one per
+/// How a rendered pane resolves a changed cell's (line, edit) background pair — one per
 /// [`Role`] (locked decision #7): the combined view is the only one that needs a per-cell lookup,
 /// since it's the only role that fuses staged and unstaged content into one set of rows.
 #[derive(Clone, Copy)]
@@ -405,35 +405,35 @@ fn attribution_mode(role: Role, attribution: &Option<Attribution>) -> Attributio
     }
 }
 
-/// The (subtle, strong) background pair for a Del cell at `old_lnum`, given `mode`, resolved from
-/// `theme`'s bright vs. staged Del tints.
+/// The (line, edit) background pair for a Del cell at `old_lnum`, given `mode`, resolved from
+/// `theme`'s unstaged vs. staged Del tints.
 fn del_bg_pair(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> (Color, Color) {
-    let bright = (theme.del_subtle, theme.del_strong);
-    let staged = (theme.del_staged_subtle, theme.del_staged_strong);
+    let unstaged = (theme.del_line_bg, theme.del_edit_bg);
+    let staged = (theme.del_staged_line_bg, theme.del_staged_edit_bg);
     match mode {
-        AttributionMode::Plain => bright,
+        AttributionMode::Plain => unstaged,
         AttributionMode::StagedUniform => staged,
         AttributionMode::Attributed(attribution) => {
             if attribution.del_is_staged(old_lnum) {
                 staged
             } else {
-                bright
+                unstaged
             }
         }
     }
 }
 
-/// The (subtle, strong) background pair for an Add cell at `new_lnum`, given `mode`, resolved from
-/// `theme`'s bright vs. staged Add tints.
+/// The (line, edit) background pair for an Add cell at `new_lnum`, given `mode`, resolved from
+/// `theme`'s unstaged vs. staged Add tints.
 fn add_bg_pair(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> (Color, Color) {
-    let bright = (theme.add_subtle, theme.add_strong);
-    let staged = (theme.add_staged_subtle, theme.add_staged_strong);
+    let unstaged = (theme.add_line_bg, theme.add_edit_bg);
+    let staged = (theme.add_staged_line_bg, theme.add_staged_edit_bg);
     match mode {
-        AttributionMode::Plain => bright,
+        AttributionMode::Plain => unstaged,
         AttributionMode::StagedUniform => staged,
         AttributionMode::Attributed(attribution) => {
             if attribution.add_is_unstaged(new_lnum) {
-                bright
+                unstaged
             } else {
                 staged
             }
@@ -552,9 +552,10 @@ fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TS
 /// resolve `text`/`hl`/`emphasis` from a [`Row`] vs an [`InlineRow`] and in their gutter, not in
 /// how a resolved line gets colored.
 ///
-/// `emphasis` is `Some((subtle, strong))` for a `Del`/`Add` line (whole-line subtle background,
-/// plus per-`word_spans` strong background when `is_word_pair`; whole-line strong when not paired
-/// — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at all).
+/// `emphasis` is `Some((line, edit))` for a `Del`/`Add` line (whole-line background, plus
+/// per-`word_spans` edit background when `is_word_pair`; whole-line edit background when not
+/// paired — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at
+/// all).
 ///
 /// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans via [`pan_spans`] — the
 /// segments below are always composed over the FULL, unsliced `text` first (byte-identical to the
@@ -570,15 +571,17 @@ fn content_spans(
     hscroll: usize,
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
-    if let Some((subtle_bg, strong_bg)) = emphasis {
+    if let Some((line_bg, edit_bg)) = emphasis {
         if is_word_pair {
-            bg_spans.push((0, text.len(), subtle_bg));
+            bg_spans.push((0, text.len(), line_bg));
             for s in word_spans {
-                bg_spans.push((s.start, s.end, strong_bg));
+                bg_spans.push((s.start, s.end, edit_bg));
             }
         } else {
-            // Unpaired excess line: whole-line strong emphasis.
-            bg_spans.push((0, text.len(), strong_bg));
+            // Unpaired excess line: no word-diff spans, so the whole line takes the edit wash
+            // full width — the line "is" the edit here (ADR-035's CS11 section: "edit" is the
+            // domain term precisely because this branch would falsify "word").
+            bg_spans.push((0, text.len(), edit_bg));
         }
     }
 
@@ -991,15 +994,15 @@ fn tree_prefix(guides: &[bool]) -> String {
 /// a ragged single-letter row.
 const STATUS_PLACEHOLDER: char = '\u{b7}';
 
-/// A committed changeset's single-letter status color (CS3): A green (`add_strong`), D red
-/// (`del_strong`), M/R/C (a change to EXISTING content, not a create/destroy) the dedicated amber
-/// [`Palette::modified_fg`], and `?`/`U` dim (Untracked never reaches here — see
+/// A committed changeset's single-letter status color (CS3, CS11): A green ([`Palette::add_fg`]),
+/// D red ([`Palette::del_fg`]), M/R/C (a change to EXISTING content, not a create/destroy) the
+/// dedicated amber [`Palette::modified_fg`], and `?`/`U` dim (Untracked never reaches here — see
 /// [`outline_status_spans`]'s doc comment — and Unmerged is a worktree-only conflict state a
 /// committed changeset can't carry; both fold to `dim` only so this match stays exhaustive).
 fn committed_letter_color(change: FileStatus, theme: &Palette) -> Color {
     match change {
-        FileStatus::Added => theme.add_strong,
-        FileStatus::Deleted => theme.del_strong,
+        FileStatus::Added => theme.add_fg,
+        FileStatus::Deleted => theme.del_fg,
         FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => theme.modified_fg,
         FileStatus::Untracked | FileStatus::Unmerged => theme.dim,
     }
@@ -1019,8 +1022,10 @@ fn committed_letter_color(change: FileStatus, theme: &Palette) -> Color {
 /// - `Unstaged`/`Staged`/`Partial` render the git-porcelain X/Y matrix: `letter` (from the SAME
 ///   underlying [`FileStatus`] — there's only one change kind per file, not separate staged/
 ///   unstaged kinds) in whichever column(s) that axis has a change, [`STATUS_PLACEHOLDER`] in the
-///   other; X (staged/index) is `add_strong` green, Y (worktree) is `del_strong` red, matching
-///   git's own status convention.
+///   other; X (staged/index) is [`Palette::add_fg`] green, Y (worktree) is [`Palette::del_fg`]
+///   red, matching git's own status convention. (CS11: these were the intensity-named edit-wash
+///   background fields used as a foreground — read at ~1.6:1 contrast on a dark-wash theme; see
+///   ADR-035's CS11 section.)
 fn outline_status_spans(
     status: crate::outline::StagedStatus,
     change: FileStatus,
@@ -1051,12 +1056,8 @@ fn outline_status_spans(
             let unstaged = matches!(status, StagedStatus::Unstaged | StagedStatus::Partial);
             let x_char = if staged { letter } else { STATUS_PLACEHOLDER };
             let y_char = if unstaged { letter } else { STATUS_PLACEHOLDER };
-            let x_color = if staged { theme.add_strong } else { theme.dim };
-            let y_color = if unstaged {
-                theme.del_strong
-            } else {
-                theme.dim
-            };
+            let x_color = if staged { theme.add_fg } else { theme.dim };
+            let y_color = if unstaged { theme.del_fg } else { theme.dim };
             vec![
                 TSpan::styled(x_char.to_string(), Style::default().fg(x_color)),
                 TSpan::styled(y_char.to_string(), Style::default().fg(y_color)),
@@ -1514,23 +1515,17 @@ fn render_loading_placeholder(
 }
 
 /// Push a `"path  +N -M"` file row's spans onto `lines`: the path in the theme foreground, the
-/// add/del counts tinted with the theme's own diff-add/diff-del colors (the strong variants — the
-/// same tint a hunk's `+`/`-` gutter itself uses, see [`Palette::add_strong`]/
-/// [`Palette::del_strong`]) so the panel's diffstat reads consistently with the diff body it's
+/// add/del counts tinted with the theme's own diff-add/diff-del foregrounds ([`Palette::add_fg`]/
+/// [`Palette::del_fg`] — the same tint the outline's X/Y status letters use, see
+/// [`committed_letter_color`]) so the panel's diffstat reads consistently with the diff body it's
 /// standing in for.
 fn push_summary_file_row(lines: &mut Vec<Line<'static>>, row: &SummaryFileRow, theme: &Palette) {
     lines.push(Line::from(vec![
         TSpan::styled(row.path.clone(), Style::default().fg(theme.foreground)),
         TSpan::raw("  "),
-        TSpan::styled(
-            format!("+{}", row.adds),
-            Style::default().fg(theme.add_strong),
-        ),
+        TSpan::styled(format!("+{}", row.adds), Style::default().fg(theme.add_fg)),
         TSpan::raw(" "),
-        TSpan::styled(
-            format!("-{}", row.dels),
-            Style::default().fg(theme.del_strong),
-        ),
+        TSpan::styled(format!("-{}", row.dels), Style::default().fg(theme.del_fg)),
     ]));
 }
 
@@ -1586,12 +1581,12 @@ fn push_summary_body(
         TSpan::raw("  "),
         TSpan::styled(
             format!("{added_prefix}{total_adds}"),
-            Style::default().fg(theme.add_strong),
+            Style::default().fg(theme.add_fg),
         ),
         TSpan::raw(" "),
         TSpan::styled(
             format!("{removed_prefix}{total_dels}"),
-            Style::default().fg(theme.del_strong),
+            Style::default().fg(theme.del_fg),
         ),
     ]));
 }
@@ -2517,8 +2512,8 @@ mod tests {
             content.join("\n")
         );
 
-        // Word-diff emphasis: the changed word ("old"/"new") on the paired row should carry a
-        // strong background distinct from the rest of the line's subtle background.
+        // Word-diff emphasis: the changed word ("old"/"new") on the paired row should carry the
+        // edit background distinct from the rest of the line's line background.
         let changed_row_y = content
             .iter()
             .position(|line| line.contains("old word here"))
@@ -2538,22 +2533,22 @@ mod tests {
             "expected the word-diff row to carry a background style distinct from plain context"
         );
 
-        // The changed word ("old", bytes 0..3 → columns 4..7) must carry the STRONG emphasis
+        // The changed word ("old", bytes 0..3 → columns 4..7) must carry the EDIT emphasis
         // while the unchanged remainder of the same paired line ("word here", from column 8)
-        // stays subtle — three distinct backgrounds: strong word, subtle line, unstyled
+        // stays at the line wash — three distinct backgrounds: edit word, line, unstyled
         // context. This pins the compositor's span precedence (specific-over-whole-line); a
-        // first-match lookup renders the whole line subtle and only the ctx comparison above
-        // would still pass.
+        // first-match lookup renders the whole line at the line wash and only the ctx comparison
+        // above would still pass.
         let rest_cell = buf.cell((8, changed_row_y)).unwrap();
         assert_ne!(
             word_cell.style().bg,
             rest_cell.style().bg,
-            "expected the changed word's strong bg to differ from the line's subtle bg"
+            "expected the changed word's edit bg to differ from the line's bg"
         );
         assert_ne!(
             rest_cell.style().bg,
             ctx_cell.style().bg,
-            "expected the paired line's subtle bg to differ from plain context"
+            "expected the paired line's bg to differ from plain context"
         );
     }
 
@@ -2896,7 +2891,7 @@ mod tests {
     #[test]
     fn cursor_row_tint_composites_with_word_diff_emphasis_rather_than_replacing_it() {
         // The cursor starts on the file's first hunk (a word-diff paired row) after
-        // `open_current` — confirm the strong word-level bg and the whole-line subtle bg on that
+        // `open_current` — confirm the edit word-level bg and the whole-line bg on that
         // SAME row both stay visually distinct from each other even with the cursor tint
         // layered on top, i.e. the tint composites rather than flattening the existing emphasis.
         let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold word here\nl10\nl11\nl12\nl13\nl14\n";
@@ -2923,7 +2918,7 @@ mod tests {
         let rest_bg = buf.cell((8, changed_row_y)).unwrap().style().bg;
         assert_ne!(
             word_bg, rest_bg,
-            "the cursor tint must not flatten the word-diff strong/subtle distinction on its \
+            "the cursor tint must not flatten the word-diff edit/line distinction on its \
              own row"
         );
     }
@@ -3093,7 +3088,7 @@ mod tests {
             .expect("unstaged change's old-side text visible");
 
         // Old (left) pane, first content column after the gutter — always carries SOME del
-        // emphasis on a changed row, subtle or strong depending on the word-diff split, but
+        // emphasis on a changed row, line or edit depending on the word-diff split, but
         // always from the dim family for a staged row and the bright family for an unstaged one.
         let old_content_x = 4; // gutter width 3 + 1 space, same convention as the other tests
         let staged_del_bg = buf
@@ -3108,8 +3103,8 @@ mod tests {
             .bg;
 
         let t = Palette::dark();
-        let dim_dels = [Some(t.del_staged_subtle), Some(t.del_staged_strong)];
-        let bright_dels = [Some(t.del_subtle), Some(t.del_strong)];
+        let dim_dels = [Some(t.del_staged_line_bg), Some(t.del_staged_edit_bg)];
+        let bright_dels = [Some(t.del_line_bg), Some(t.del_edit_bg)];
         assert!(
             dim_dels.contains(&staged_del_bg),
             "expected the staged row's Del side to use the dim pair, got {staged_del_bg:?}"
@@ -3137,8 +3132,8 @@ mod tests {
             .style()
             .bg;
 
-        let dim_adds = [Some(t.add_staged_subtle), Some(t.add_staged_strong)];
-        let bright_adds = [Some(t.add_subtle), Some(t.add_strong)];
+        let dim_adds = [Some(t.add_staged_line_bg), Some(t.add_staged_edit_bg)];
+        let bright_adds = [Some(t.add_line_bg), Some(t.add_edit_bg)];
         assert!(
             dim_adds.contains(&staged_add_bg),
             "expected the staged row's Add side to use the dim pair, got {staged_add_bg:?}"
@@ -3748,8 +3743,8 @@ mod tests {
         let add_bg = buf.cell((new_content_x, row_y)).unwrap().style().bg;
 
         let t = Palette::dark();
-        let bright_adds = [Some(t.add_subtle), Some(t.add_strong)];
-        let dim_adds = [Some(t.add_staged_subtle), Some(t.add_staged_strong)];
+        let bright_adds = [Some(t.add_line_bg), Some(t.add_edit_bg)];
+        let dim_adds = [Some(t.add_staged_line_bg), Some(t.add_staged_edit_bg)];
         assert!(
             bright_adds.contains(&add_bg),
             "expected a committed changeset's Add cell to render the plain (bright) pair, \
@@ -4898,9 +4893,9 @@ mod tests {
     }
 
     #[test]
-    fn outline_unstaged_file_renders_the_y_column_letter_in_del_strong() {
+    fn outline_unstaged_file_renders_the_y_column_letter_in_del_fg() {
         // Unstaged-only (worktree change, no staged one): X is the placeholder, Y carries the
-        // change letter in del_strong (git convention: worktree column is red).
+        // change letter in del_fg (git convention: worktree column is red).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .unstaged_file("a.rs", "one\n", "one\nCHANGED\n")
@@ -4926,16 +4921,16 @@ mod tests {
         );
         assert_eq!(
             buf.cell((x + 1, y)).unwrap().style().fg,
-            Some(Palette::dark().del_strong),
-            "expected the Y column's Modified letter to carry theme.del_strong"
+            Some(Palette::dark().del_fg),
+            "expected the Y column's Modified letter to carry theme.del_fg"
         );
     }
 
     #[test]
-    fn outline_fully_staged_file_renders_the_x_column_letter_in_add_strong() {
+    fn outline_fully_staged_file_renders_the_x_column_letter_in_add_fg() {
         // `staged_file` writes+stages a brand-new path (Added, not Modified — there's no prior
         // commit for it to modify). Fully staged (index change, no worktree one): X carries the
-        // letter in add_strong, Y is the placeholder.
+        // letter in add_fg, Y is the placeholder.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .staged_file("a.rs", "new content\n")
@@ -4955,8 +4950,8 @@ mod tests {
         );
         assert_eq!(
             buf.cell((x, y)).unwrap().style().fg,
-            Some(Palette::dark().add_strong),
-            "expected the X column's Added letter to carry theme.add_strong"
+            Some(Palette::dark().add_fg),
+            "expected the X column's Added letter to carry theme.add_fg"
         );
         assert_eq!(
             buf.cell((x + 1, y)).unwrap().style().fg,
@@ -4968,7 +4963,7 @@ mod tests {
     #[test]
     fn outline_partially_staged_file_renders_mm_with_green_x_and_red_y() {
         // Partially staged (both a staged AND an unstaged change): both columns show the change
-        // letter, X in add_strong (green), Y in del_strong (red).
+        // letter, X in add_fg (green), Y in del_fg (red).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .partially_staged_file("a.rs", "one\n", "one\nSTAGED\n", "one\nSTAGED\nWORKTREE\n")
@@ -4988,13 +4983,13 @@ mod tests {
         );
         assert_eq!(
             buf.cell((x, y)).unwrap().style().fg,
-            Some(Palette::dark().add_strong),
-            "expected the X (staged) column's letter to carry theme.add_strong"
+            Some(Palette::dark().add_fg),
+            "expected the X (staged) column's letter to carry theme.add_fg"
         );
         assert_eq!(
             buf.cell((x + 1, y)).unwrap().style().fg,
-            Some(Palette::dark().del_strong),
-            "expected the Y (worktree) column's letter to carry theme.del_strong"
+            Some(Palette::dark().del_fg),
+            "expected the Y (worktree) column's letter to carry theme.del_fg"
         );
     }
 
@@ -5102,7 +5097,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_committed_added_and_deleted_files_render_add_strong_and_del_strong() {
+    fn outline_committed_added_and_deleted_files_render_add_fg_and_del_fg() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -5172,8 +5167,8 @@ mod tests {
                 .unwrap()
                 .style()
                 .fg,
-            Some(Palette::dark().add_strong),
-            "expected a committed Added file's letter to carry theme.add_strong"
+            Some(Palette::dark().add_fg),
+            "expected a committed Added file's letter to carry theme.add_fg"
         );
 
         let deleted_row_idx = content
@@ -5190,8 +5185,8 @@ mod tests {
                 .unwrap()
                 .style()
                 .fg,
-            Some(Palette::dark().del_strong),
-            "expected a committed Deleted file's letter to carry theme.del_strong"
+            Some(Palette::dark().del_fg),
+            "expected a committed Deleted file's letter to carry theme.del_fg"
         );
     }
 
@@ -6362,7 +6357,7 @@ mod tests {
         );
         assert_eq!(
             unfocused_add,
-            (Some(theme.add_strong), true),
+            (Some(theme.add_fg), true),
             "the diffstat span keeps its own semantic color and bold regardless of focus"
         );
     }
