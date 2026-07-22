@@ -225,6 +225,95 @@ a palette-EXTERNAL color source `mono()`'s own `Color::Reset` fields can't reach
 carries a `colorless` flag (`false` on every curated/probed constructor, `true` only on `mono`)
 and `render.rs`'s icon paint sites collapse to `foreground` themselves whenever it's set.
 
+## Revised (CS11, diff foreground/background split)
+
+CS1's override table above named the diff washes `subtle`/`strong`. That naming is retired: it
+described *intensity*, and intensity names invite reuse wherever something should look emphatic.
+`render.rs`'s outline status column duly reached for `add_strong`/`del_strong` as **foregrounds**
+for the X/Y letters — a background wash used as text color. On a theme whose washes are dark (the
+motivating case: `add-strong #2d4654` on `background #27212e`) those letters land near 1.6:1
+contrast and are effectively invisible.
+
+The underlying axis was never intensity. It is **attribution precision**: one wash says "this line
+contains a change", the other says "this exact text IS the change". Renamed accordingly, and split
+across the two color channels:
+
+| Old key | New key | Meaning |
+| --- | --- | --- |
+| `del-subtle` | `del-line-bg` | wash for a line containing a deletion |
+| `del-strong` | `del-edit-bg` | wash for the deleted text itself |
+| `add-subtle` | `add-line-bg` | wash for a line containing an addition |
+| `add-strong` | `add-edit-bg` | wash for the added text itself |
+| `del-staged-subtle` | `del-staged-line-bg` | staged counterparts of the four above |
+| `del-staged-strong` | `del-staged-edit-bg` | |
+| `add-staged-subtle` | `add-staged-line-bg` | |
+| `add-staged-strong` | `add-staged-edit-bg` | |
+| — | `add-fg` | tint foreground for added text |
+| — | `del-fg` | tint foreground for deleted text |
+| — | `add-staged-fg` | staged counterparts |
+| — | `del-staged-fg` | |
+
+Unqualified keys mean **unstaged (or combined-view)**; only the staged side is spelled out. The
+asymmetry is deliberate — the unqualified form is the one most themes set, and lengthening it to
+`add-unstaged-line-bg` taxes the common case to remove an ambiguity the table resolves.
+
+**Why `edit` and not `word`.** `content_spans` paints the edit wash across a line's full width when
+that line has no counterpart to word-diff against (a pure insertion or deletion). A `word` name
+would be false in exactly that branch. `edit` is honest in both: on an unpaired line, the whole
+line *is* the edit. The term is also standard diff vocabulary (edit script, edit distance) and
+unclaimed elsewhere in this codebase, where `change` already means a file's change kind and
+`Changeset` is a domain object.
+
+**Foregrounds are per-state, not per-scope.** Four foreground keys, not eight: the line/edit
+distinction is already carried by the background, and a foreground shift on top of a background
+shift double-encodes one fact. The cost is that a theme cannot express "dimmed line, bright changed
+words" — accepted, as it needs two foregrounds on one line and no scheme here has asked for it.
+
+**Foreground defaults role-map to the accent slots**, matching how `error_fg`/`modified_fg` already
+take base08/base09: `add-fg` ← base0B, `del-fg` ← base08. The staged pair dims toward base00, so
+staged-ness reads in both channels — but **contrast-clamped**, not a fixed ratio. A flat 40% dim
+collapses to 1.65:1 on a theme that sets its staged washes equal to its unstaged ones (staged-ness
+then has no background signal, and the foreground is dimming against a full-strength wash). The
+derivation dims by up to the nominal ratio and stops early at a relative-luminance floor against
+that state's own edit wash. This is the first real contrast math in `theme.rs`, whose only prior
+arithmetic was `tint_toward`'s per-channel lerp; it is worth the ~25 lines because the failure it
+prevents is silent and theme-dependent. Note this is *not* the CS1 blend trap — that was about a
+convex blend being unable to *reproduce* `dark()`'s hand-tuned washes (channels below base00);
+blending an accent toward base00 for a foreground is well-defined, and `light()` already does it.
+
+**The outline's X/Y status letters take `add-fg`/`del-fg`** — the bug that prompted this revision.
+They are one concept with diff text ("the foreground color of added-ness"), so they share the key
+rather than getting a dedicated pair. This does couple outline chrome to a diff key: retinting diff
+text also retints the status column. Accepted; a theme wanting them apart can be revisited if it
+appears.
+
+**`workon.review.diff.text` selects the foreground source on changed lines** — `syntax` (default,
+pixel-identical to CS1 behavior), `tint` (changed lines take the tint foreground), `edit` (syntax
+stays on the line; only edits take the tint foreground). Context lines always keep syntax
+highlighting in every mode; `NO_COLOR`/`mono` still wins over all of it, unchanged. In `edit` mode
+an unpaired line takes the tint foreground across its full width, preserving the invariant
+**wherever the edit wash is painted, the tint foreground is painted** — one rule covering both
+branches, rather than a foreground/background disagreement of the kind that produced the original
+`strong` drift.
+
+**base01 and base02 gain roles** (→ `filler_fg`, `selection_bg`), joining base03→`dim` and
+base04→`gutter`. They were accepted by the parser and wired to nothing, so setting them failed
+silently. The uniform slot rule is unchanged and the no-clobber rule survives: slot overrides seed,
+tint keys still apply last and verbatim, so an explicit `selection-bg` beats a `base02`.
+**base06, base07, and base0f remain unmapped** — nothing in this TUI is brighter than its
+foreground, and base0f is base16's legacy grab-bag. They parse (namespace uniformity) and do
+nothing, now documented rather than surprising.
+
+**Migration is a hard rename.** The eight old wash keys are simply unrecognized and hit the
+existing unknown-key startup warning. Pre-1.0, and a dual vocabulary would keep the retired model
+discoverable — which is the thing this revision exists to undo.
+
+**Corrections to CS1's table above:** it says "the 11 tint keys" while listing 12, and omits
+`filler-fg` entirely (added later, when the filler hatch was screened back to its own base01
+foreground). The table in this revision supersedes it for the diff keys; `cursor-bg`,
+`selection-bg`, `cursor-unfocused-bg`, `pane-header-focused-fg`, and `filler-fg` are unchanged and
+remain valid.
+
 ## References
 
 - [ADR-028](028-review-git-native-config-schema.md) — `workon.review.theme` config key
