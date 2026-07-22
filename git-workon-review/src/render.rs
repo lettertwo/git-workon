@@ -348,8 +348,12 @@ fn compose_segments(
             .rev()
             .find(|(s, e, _)| mid >= *s && mid < *e)
             .map(|(_, _, c)| *c);
-        let italic = fg_spans
-            .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
+        // One lookup, two consumers: italic and the syntax color must come from the SAME capture,
+        // and a tint override (CS11's `diff.text`) replaces only the color — italics stay
+        // structural, so a tinted comment is still italic.
+        let syntax_hit =
+            fg_spans.and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end));
+        let italic = syntax_hit
             .map(|s| crate::theme::syntax_italic(s.capture))
             .unwrap_or(false);
         let fg = fg_override_spans
@@ -358,8 +362,7 @@ fn compose_segments(
             .find(|(s, e, _)| mid >= *s && mid < *e)
             .map(|(_, _, c)| *c)
             .unwrap_or_else(|| {
-                fg_spans
-                    .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
+                syntax_hit
                     .map(|s| theme.syntax(s.capture))
                     .unwrap_or(theme.foreground)
             });
