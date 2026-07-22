@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(palette.syntax(keyword), expected.slots[14]);
         // The diff washes derive from the PROBED accents (see theme.rs's from_terminal tests for
         // the arithmetic) — a complete probe must not produce the curated fallback's washes.
-        assert_ne!(palette.del_subtle, Palette::dark().del_subtle);
+        assert_ne!(palette.del_line_bg, Palette::dark().del_line_bg);
         // A dark probed bg still borrows dark's curated cursor wash.
         assert_eq!(palette.cursor_bg, Palette::dark().cursor_bg);
     }
@@ -806,8 +806,8 @@ mod tests {
             foreground: None,
         };
         assert_eq!(
-            palette_for_auto(&light_bg).del_subtle,
-            Palette::light().del_subtle
+            palette_for_auto(&light_bg).del_line_bg,
+            Palette::light().del_line_bg
         );
 
         // Background answered dark → curated dark.
@@ -817,8 +817,8 @@ mod tests {
             foreground: None,
         };
         assert_eq!(
-            palette_for_auto(&dark_bg).del_subtle,
-            Palette::dark().del_subtle
+            palette_for_auto(&dark_bg).del_line_bg,
+            Palette::dark().del_line_bg
         );
     }
 
@@ -826,8 +826,8 @@ mod tests {
     fn palette_for_auto_falls_back_to_dark_when_nothing_answered() {
         // The total-failure / timeout path: an empty result → curated dark, never a hang.
         assert_eq!(
-            palette_for_auto(&ProbeResult::default()).del_subtle,
-            Palette::dark().del_subtle
+            palette_for_auto(&ProbeResult::default()).del_line_bg,
+            Palette::dark().del_line_bg
         );
     }
 }

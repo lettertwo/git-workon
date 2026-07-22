@@ -42,7 +42,7 @@
 //!
 //! **CS1 addition (`user-configurable colors tier`):** the deferred "user-configurable colors"
 //! tier from this module's original doc comment lands as [`ThemeOverrides`] — per-slot
-//! (`base00`–`base0f`) and per-tint (`del-subtle`, `cursor-bg`, …) git-config keys under
+//! (`base00`–`base0f`) and per-tint (`del-line-bg`, `cursor-bg`, …) git-config keys under
 //! `workon.review.theme.*`, read by `config::ReviewConfig::theme_overrides` and applied via
 //! [`Palette::apply_overrides`] on top of whichever base (`dark`/`light`/`auto`'s probe) was
 //! already resolved. Named bundled schemes (`theme = solarized`) were explicitly deferred —
@@ -136,19 +136,29 @@ pub(crate) fn parse_hex_color(s: &str) -> Option<Color> {
 /// Per-slot base16 and per-tint color overrides, read from `workon.review.theme.*` git config
 /// (CS1, user-configurable colors tier) and applied on top of an already-resolved [`Palette`] via
 /// [`Palette::apply_overrides`]. `slots` is private — built only through [`ThemeOverrides::set_slot`]
-/// so the 0–15 index invariant lives in one place; the 11 tint fields mirror
+/// so the 0–15 index invariant lives in one place; the tint fields mirror
 /// [`Palette`]'s diff/cursor tint fields verbatim (same names, kebab-case in config).
+///
+/// **CS11 rename:** the old intensity-named tint fields became `del_line_bg`/`del_edit_bg`/…
+/// (attribution-precision-named), and four new foreground fields
+/// (`add_fg`/`del_fg`/`add_staged_fg`/`del_staged_fg`) were added — see ADR-029's "Revised (CS11,
+/// diff foreground/background split)" section. Hard rename, no compat alias: the old kebab-case
+/// keys just fall through to the unrecognized-key warning now.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ThemeOverrides {
     slots: [Option<Color>; 16],
-    pub del_subtle: Option<Color>,
-    pub del_strong: Option<Color>,
-    pub add_subtle: Option<Color>,
-    pub add_strong: Option<Color>,
-    pub del_staged_subtle: Option<Color>,
-    pub del_staged_strong: Option<Color>,
-    pub add_staged_subtle: Option<Color>,
-    pub add_staged_strong: Option<Color>,
+    pub del_line_bg: Option<Color>,
+    pub del_edit_bg: Option<Color>,
+    pub add_line_bg: Option<Color>,
+    pub add_edit_bg: Option<Color>,
+    pub del_staged_line_bg: Option<Color>,
+    pub del_staged_edit_bg: Option<Color>,
+    pub add_staged_line_bg: Option<Color>,
+    pub add_staged_edit_bg: Option<Color>,
+    pub add_fg: Option<Color>,
+    pub del_fg: Option<Color>,
+    pub add_staged_fg: Option<Color>,
+    pub del_staged_fg: Option<Color>,
     pub cursor_bg: Option<Color>,
     pub selection_bg: Option<Color>,
     pub cursor_unfocused_bg: Option<Color>,
@@ -187,6 +197,88 @@ pub(crate) fn tint_toward(color: Color, base: Color, ratio: f32) -> Color {
         }
         _ => color,
     }
+}
+
+/// WCAG relative luminance of a single sRGB channel (`0..=255` → `0.0..=1.0`, linearized): the
+/// low-end segment is linear, the rest is the sRGB gamma curve inverted. Shared by
+/// [`relative_luminance`].
+fn linearize_channel(c: u8) -> f64 {
+    let cs = c as f64 / 255.0;
+    if cs <= 0.03928 {
+        cs / 12.92
+    } else {
+        ((cs + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// WCAG relative luminance (`0.2126 R + 0.7152 G + 0.0722 B` over linearized channels) — `None`
+/// for a non-RGB color, which has no luminance to compute (CS11: this is the first contrast math
+/// in this module beyond [`tint_toward`]'s per-channel lerp; see [`staged_foreground`]).
+fn relative_luminance(color: Color) -> Option<f64> {
+    match color {
+        Color::Rgb(r, g, b) => Some(
+            0.2126 * linearize_channel(r)
+                + 0.7152 * linearize_channel(g)
+                + 0.0722 * linearize_channel(b),
+        ),
+        _ => None,
+    }
+}
+
+/// WCAG contrast ratio between two colors (`(L1+0.05)/(L2+0.05)`, lighter over darker) — `None` if
+/// either side is non-RGB.
+fn contrast_ratio(a: Color, b: Color) -> Option<f64> {
+    let la = relative_luminance(a)?;
+    let lb = relative_luminance(b)?;
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    Some((hi + 0.05) / (lo + 0.05))
+}
+
+/// Nominal dim ratio a staged foreground blends toward [`Palette::background`] (CS11, locked
+/// decision #4) — `40%`, the starting point [`staged_foreground`] backs off from if it fails the
+/// contrast floor.
+const STAGED_FG_DIM_RATIO: f32 = 0.40;
+
+/// The relative-luminance contrast floor a staged foreground must clear against that state's own
+/// *edit* wash (CS11, locked decision #4) — measured, not a fixed dim ratio, because a theme whose
+/// staged wash equals its unstaged one collapses a flat 40% dim to unreadable contrast.
+const STAGED_FG_LUMINANCE_FLOOR: f64 = 3.0;
+
+/// Derive a staged foreground (CS11): dim `accent` toward `background` by up to
+/// [`STAGED_FG_DIM_RATIO`], but back off toward the undimmed accent until the blended color clears
+/// [`STAGED_FG_LUMINANCE_FLOOR`] against `edit_bg` (that state's own edit wash — `add_staged_edit_bg`
+/// for [`Palette::add_staged_fg`], etc.). If even the fully undimmed accent fails the floor, use it
+/// undimmed anyway — the derivation never invents a hue to force compliance (locked decision #4).
+/// Non-RGB inputs (never produced by a curated/probed constructor here, but see [`Palette::mono`],
+/// which doesn't call this) skip the clamp entirely, matching [`tint_toward`]'s own non-RGB
+/// pass-through.
+pub(crate) fn staged_foreground(accent: Color, background: Color, edit_bg: Color) -> Color {
+    let meets_floor = |color: Color| {
+        contrast_ratio(color, edit_bg)
+            .map(|ratio| ratio >= STAGED_FG_LUMINANCE_FLOOR)
+            .unwrap_or(true)
+    };
+    if !meets_floor(accent) {
+        return accent;
+    }
+    let nominal = tint_toward(accent, background, STAGED_FG_DIM_RATIO);
+    if meets_floor(nominal) {
+        return nominal;
+    }
+    // Binary search for the largest ratio in (0, STAGED_FG_DIM_RATIO) that still clears the
+    // floor — `lo` starts at the undimmed accent (known to clear it, checked above), `hi` at the
+    // nominal dim (known to fail it).
+    let mut lo = 0.0_f32;
+    let mut hi = STAGED_FG_DIM_RATIO;
+    for _ in 0..20 {
+        let mid = (lo + hi) / 2.0;
+        if meets_floor(tint_toward(accent, background, mid)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    tint_toward(accent, background, lo)
 }
 
 /// Whether a background color reads as "light" — a sum-of-channels luminance proxy (matching the
@@ -278,19 +370,38 @@ pub struct Palette {
     /// [`crate::highlight::HIGHLIGHT_NAMES`] (see [`SYNTAX_SLOTS`]).
     syntax: Vec<Color>,
 
-    /// Whole-line subtle / word-level strong background for an unstaged (bright) Del cell.
-    pub del_subtle: Color,
-    pub del_strong: Color,
-    /// Bright Add-cell background pair (counterpart of [`Palette::del_subtle`]).
-    pub add_subtle: Color,
-    pub add_strong: Color,
+    /// Whole-line ("this line contains a deletion") / word-level edit ("this exact text IS the
+    /// deletion") background for an unstaged (bright) Del cell (CS11 renamed the old
+    /// intensity-named fields — the axis was always attribution precision, not intensity).
+    pub del_line_bg: Color,
+    pub del_edit_bg: Color,
+    /// Bright Add-cell background pair (counterpart of [`Palette::del_line_bg`]).
+    pub add_line_bg: Color,
+    pub add_edit_bg: Color,
     /// Dim/desaturated Del pair for staged-ness attribution (locked decision #7) — a staged change
     /// reads as "already handled" without disappearing into plain context.
-    pub del_staged_subtle: Color,
-    pub del_staged_strong: Color,
+    pub del_staged_line_bg: Color,
+    pub del_staged_edit_bg: Color,
     /// Dim Add pair — green-tinted counterpart of the staged Del pair.
-    pub add_staged_subtle: Color,
-    pub add_staged_strong: Color,
+    pub add_staged_line_bg: Color,
+    pub add_staged_edit_bg: Color,
+
+    /// Foreground for added text (CS11) — the tint counterpart of [`Palette::add_edit_bg`]/
+    /// [`Palette::add_line_bg`], distinct from either so a wash can be used as a background AND a
+    /// foreground can sit on top of unrelated backgrounds (e.g. the outline's X/Y status letters,
+    /// [`crate::render::committed_letter_color`]/`outline_status_spans`, which is the bug this
+    /// field fixes — see ADR-029's CS11 section). Defaults to base0B, the same accent-slot mapping
+    /// [`Palette::error_fg`]/[`Palette::modified_fg`] already use for their base08/base09.
+    pub add_fg: Color,
+    /// Foreground for deleted text (CS11) — counterpart of [`Palette::add_fg`], defaults to base08.
+    pub del_fg: Color,
+    /// Staged counterpart of [`Palette::add_fg`] — dimmed toward [`Palette::background`],
+    /// contrast-clamped against [`Palette::add_staged_edit_bg`] (see [`Palette::dark`]'s
+    /// constructor for the derivation).
+    pub add_staged_fg: Color,
+    /// Staged counterpart of [`Palette::del_fg`] — dimmed toward [`Palette::background`],
+    /// contrast-clamped against [`Palette::del_staged_edit_bg`].
+    pub del_staged_fg: Color,
 
     /// Tint blended into the cursor row's background — a cool slate-blue.
     pub cursor_bg: Color,
@@ -401,14 +512,20 @@ impl Palette {
         let base = Base16::EIGHTIES_DARK;
         Palette {
             syntax: SYNTAX_SLOTS.iter().map(|&s| base.slot(s)).collect(),
-            del_subtle: Color::Rgb(60, 24, 24),
-            del_strong: Color::Rgb(120, 40, 40),
-            add_subtle: Color::Rgb(20, 48, 24),
-            add_strong: Color::Rgb(32, 100, 48),
-            del_staged_subtle: Color::Rgb(42, 26, 28),
-            del_staged_strong: Color::Rgb(64, 38, 40),
-            add_staged_subtle: Color::Rgb(24, 34, 26),
-            add_staged_strong: Color::Rgb(34, 50, 38),
+            del_line_bg: Color::Rgb(60, 24, 24),
+            del_edit_bg: Color::Rgb(120, 40, 40),
+            add_line_bg: Color::Rgb(20, 48, 24),
+            add_edit_bg: Color::Rgb(32, 100, 48),
+            del_staged_line_bg: Color::Rgb(42, 26, 28),
+            del_staged_edit_bg: Color::Rgb(64, 38, 40),
+            add_staged_line_bg: Color::Rgb(24, 34, 26),
+            add_staged_edit_bg: Color::Rgb(34, 50, 38),
+            // CS11: brand new fields, no historical constant to reproduce — role-map to the
+            // accent slots, same reasoning as `heading_fg`/`modified_fg` below.
+            add_fg: base.slot(11),
+            del_fg: base.slot(8),
+            add_staged_fg: staged_foreground(base.slot(11), base.slot(0), Color::Rgb(34, 50, 38)),
+            del_staged_fg: staged_foreground(base.slot(8), base.slot(0), Color::Rgb(64, 38, 40)),
             cursor_bg: Color::Rgb(45, 50, 90),
             selection_bg: Color::Rgb(30, 66, 66),
             cursor_unfocused_bg: Color::Rgb(35, 38, 55),
@@ -439,10 +556,10 @@ impl Palette {
     /// blending an accent toward a *light* base00 gives the correct pale wash (unlike dark, which
     /// must hold its tints explicit; see [`Palette::dark`]'s doc comment).
     ///
-    /// Ratios were hand-tuned against four requirements: subtle vs strong must read as visibly
-    /// distinct steps, add vs green must be distinguishable at a glance, staged must read dimmer
-    /// (more washed-out) than unstaged, and every wash must stay legible under the scheme's dark
-    /// base05 foreground and accent text. The del/add pair (base08/base0B → base00) derived
+    /// Ratios were hand-tuned against four requirements: the line and edit washes must read as
+    /// visibly distinct steps, add vs green must be distinguishable at a glance, staged must read
+    /// dimmer (more washed-out) than unstaged, and every wash must stay legible under the scheme's
+    /// dark base05 foreground and accent text. The del/add pair (base08/base0B → base00) derived
     /// cleanly at those ratios; cursor/selection reuse the same mechanism against base0D/base0C
     /// (blue/cyan) for a cool wash appropriate on a light background.
     pub fn light() -> Self {
@@ -453,25 +570,32 @@ impl Palette {
         let blue = base.slot(13); // base0D
         let cyan = base.slot(12); // base0C
 
-        // Unstaged: a light wash (subtle) and a more saturated wash (strong) a reader's eye can
+        // Unstaged: a light whole-line wash and a more saturated edit wash a reader's eye can
         // pick out at a glance; staged pushes further toward base00 (less saturated → dimmer).
-        const SUBTLE: f32 = 0.88;
-        const STRONG: f32 = 0.65;
-        const STAGED_SUBTLE: f32 = 0.94;
-        const STAGED_STRONG: f32 = 0.80;
+        const LINE: f32 = 0.88;
+        const EDIT: f32 = 0.65;
+        const STAGED_LINE: f32 = 0.94;
+        const STAGED_EDIT: f32 = 0.80;
         const CURSOR: f32 = 0.82;
         const CURSOR_UNFOCUSED: f32 = 0.90;
 
+        let del_staged_edit_bg = tint_toward(red, base00, STAGED_EDIT);
+        let add_staged_edit_bg = tint_toward(green, base00, STAGED_EDIT);
+
         Palette {
             syntax: SYNTAX_SLOTS.iter().map(|&s| base.slot(s)).collect(),
-            del_subtle: tint_toward(red, base00, SUBTLE),
-            del_strong: tint_toward(red, base00, STRONG),
-            add_subtle: tint_toward(green, base00, SUBTLE),
-            add_strong: tint_toward(green, base00, STRONG),
-            del_staged_subtle: tint_toward(red, base00, STAGED_SUBTLE),
-            del_staged_strong: tint_toward(red, base00, STAGED_STRONG),
-            add_staged_subtle: tint_toward(green, base00, STAGED_SUBTLE),
-            add_staged_strong: tint_toward(green, base00, STAGED_STRONG),
+            del_line_bg: tint_toward(red, base00, LINE),
+            del_edit_bg: tint_toward(red, base00, EDIT),
+            add_line_bg: tint_toward(green, base00, LINE),
+            add_edit_bg: tint_toward(green, base00, EDIT),
+            del_staged_line_bg: tint_toward(red, base00, STAGED_LINE),
+            del_staged_edit_bg,
+            add_staged_line_bg: tint_toward(green, base00, STAGED_LINE),
+            add_staged_edit_bg,
+            add_fg: green,
+            del_fg: red,
+            add_staged_fg: staged_foreground(green, base00, add_staged_edit_bg),
+            del_staged_fg: staged_foreground(red, base00, del_staged_edit_bg),
             cursor_bg: tint_toward(blue, base00, CURSOR),
             selection_bg: tint_toward(cyan, base00, CURSOR),
             cursor_unfocused_bg: tint_toward(blue, base00, CURSOR_UNFOCUSED),
@@ -519,23 +643,33 @@ impl Palette {
         };
         let red = base.slot(8); // base08 — probed ANSI red
         let green = base.slot(11); // base0B — probed ANSI green
-                                   // (subtle, strong, staged_subtle, staged_strong): how far each wash blends from the
-                                   // accent toward the probed background. Light reuses `Palette::light`'s tuned ratios.
-        let (subtle, strong, staged_subtle, staged_strong) = if light {
+                                   // (line, edit, staged_line, staged_edit): how far each wash blends from the accent
+                                   // toward the probed background. Light reuses `Palette::light`'s tuned ratios.
+        let (line, edit, staged_line, staged_edit) = if light {
             (0.88, 0.65, 0.94, 0.80)
         } else {
             (0.90, 0.75, 0.94, 0.85)
         };
+        let del_staged_edit_bg = tint_toward(red, background, staged_edit);
+        let add_staged_edit_bg = tint_toward(green, background, staged_edit);
+
         Palette {
             syntax: SYNTAX_SLOTS.iter().map(|&s| base.slot(s)).collect(),
-            del_subtle: tint_toward(red, background, subtle),
-            del_strong: tint_toward(red, background, strong),
-            add_subtle: tint_toward(green, background, subtle),
-            add_strong: tint_toward(green, background, strong),
-            del_staged_subtle: tint_toward(red, background, staged_subtle),
-            del_staged_strong: tint_toward(red, background, staged_strong),
-            add_staged_subtle: tint_toward(green, background, staged_subtle),
-            add_staged_strong: tint_toward(green, background, staged_strong),
+            del_line_bg: tint_toward(red, background, line),
+            del_edit_bg: tint_toward(red, background, edit),
+            add_line_bg: tint_toward(green, background, line),
+            add_edit_bg: tint_toward(green, background, edit),
+            del_staged_line_bg: tint_toward(red, background, staged_line),
+            del_staged_edit_bg,
+            add_staged_line_bg: tint_toward(green, background, staged_line),
+            add_staged_edit_bg,
+            // Foreground defaults role-map to the accents, same as `dark`/`light` — probed base08
+            // for del, probed base0B for add (matching the syntax/chrome fields just below: `auto`
+            // takes these straight from the terminal, not the curated fallback).
+            add_fg: green,
+            del_fg: red,
+            add_staged_fg: staged_foreground(green, background, add_staged_edit_bg),
+            del_staged_fg: staged_foreground(red, background, del_staged_edit_bg),
             cursor_bg: curated.cursor_bg,
             selection_bg: curated.selection_bg,
             cursor_unfocused_bg: curated.cursor_unfocused_bg,
@@ -574,46 +708,51 @@ impl Palette {
     /// dark terminal, near-white for a light one (picked by `light`, matching `main.rs`'s
     /// `is_light_background(theme.background)` call on the pre-mono base so `auto`'s probe still
     /// picks the right ladder). Hand-tuned to preserve the same three invariants the curated
-    /// schemes maintain: subtle vs strong read as distinct steps, staged reads dimmer (closer to
+    /// schemes maintain: line vs edit read as distinct steps, staged reads dimmer (closer to
     /// the implied background) than unstaged, and cursor vs selection are distinct. Add and Del
     /// share one ladder — colorless mode can't carry add-vs-del by hue, so that distinction
     /// falls to gutter glyph/structure instead, an accepted, documented degradation (see
     /// ADR-029's NO_COLOR note).
     pub fn mono(light: bool) -> Self {
-        // (subtle, strong, staged_subtle, staged_strong, cursor, selection, cursor_unfocused)
-        let (subtle, strong, staged_subtle, staged_strong, cursor, selection, cursor_unfocused) =
-            if light {
-                (
-                    Color::Rgb(215, 215, 215),
-                    Color::Rgb(165, 165, 165),
-                    Color::Rgb(230, 230, 230),
-                    Color::Rgb(205, 205, 205),
-                    Color::Rgb(190, 190, 190),
-                    Color::Rgb(200, 200, 200),
-                    Color::Rgb(210, 210, 210),
-                )
-            } else {
-                (
-                    Color::Rgb(40, 40, 40),
-                    Color::Rgb(90, 90, 90),
-                    Color::Rgb(25, 25, 25),
-                    Color::Rgb(50, 50, 50),
-                    Color::Rgb(65, 65, 65),
-                    Color::Rgb(55, 55, 55),
-                    Color::Rgb(45, 45, 45),
-                )
-            };
+        // (line, edit, staged_line, staged_edit, cursor, selection, cursor_unfocused)
+        let (line, edit, staged_line, staged_edit, cursor, selection, cursor_unfocused) = if light {
+            (
+                Color::Rgb(215, 215, 215),
+                Color::Rgb(165, 165, 165),
+                Color::Rgb(230, 230, 230),
+                Color::Rgb(205, 205, 205),
+                Color::Rgb(190, 190, 190),
+                Color::Rgb(200, 200, 200),
+                Color::Rgb(210, 210, 210),
+            )
+        } else {
+            (
+                Color::Rgb(40, 40, 40),
+                Color::Rgb(90, 90, 90),
+                Color::Rgb(25, 25, 25),
+                Color::Rgb(50, 50, 50),
+                Color::Rgb(65, 65, 65),
+                Color::Rgb(55, 55, 55),
+                Color::Rgb(45, 45, 45),
+            )
+        };
 
         Palette {
             syntax: vec![Color::Reset; SYNTAX_SLOTS.len()],
-            del_subtle: subtle,
-            del_strong: strong,
-            add_subtle: subtle,
-            add_strong: strong,
-            del_staged_subtle: staged_subtle,
-            del_staged_strong: staged_strong,
-            add_staged_subtle: staged_subtle,
-            add_staged_strong: staged_strong,
+            del_line_bg: line,
+            del_edit_bg: edit,
+            add_line_bg: line,
+            add_edit_bg: edit,
+            del_staged_line_bg: staged_line,
+            del_staged_edit_bg: staged_edit,
+            add_staged_line_bg: staged_line,
+            add_staged_edit_bg: staged_edit,
+            // Foreground fields, so they collapse to Reset like every other fg field under
+            // NO_COLOR — colorless mode carries no per-capture hue at all.
+            add_fg: Color::Reset,
+            del_fg: Color::Reset,
+            add_staged_fg: Color::Reset,
+            del_staged_fg: Color::Reset,
             cursor_bg: cursor,
             selection_bg: selection,
             cursor_unfocused_bg: cursor_unfocused,
@@ -664,18 +803,22 @@ impl Palette {
     /// slot, regardless of which base authored the field's current value — base00 →
     /// [`Palette::background`] (and sets [`Palette::paint_canvas`], so an explicitly chosen
     /// background always paints, even under `auto`, which otherwise leaves the canvas
-    /// unpainted), base03 → [`Palette::dim`], base04 → [`Palette::gutter`], base05 →
-    /// [`Palette::foreground`], base08 → [`Palette::error_fg`], base09 → [`Palette::modified_fg`],
-    /// base0A → [`Palette::warn_fg`], base0B → [`Palette::current_fg`], base0C →
-    /// [`Palette::heading_fg`], plus every [`Palette::syntax`] entry whose [`SYNTAX_SLOTS`]
-    /// template maps to that slot. This is deliberately uniform rather than "only override
-    /// fields the base didn't hand-author": the alternative (silently ignoring a slot override
-    /// for `dark()`'s hand-tuned `error_fg`) is the UX trap — a user who sets `base08` expects
-    /// red to change, full stop.
+    /// unpainted), base01 → [`Palette::filler_fg`], base02 → [`Palette::selection_bg`] (CS11:
+    /// these two were parsed but wired to nothing before — setting them failed silently), base03
+    /// → [`Palette::dim`], base04 → [`Palette::gutter`], base05 → [`Palette::foreground`], base08
+    /// → [`Palette::error_fg`], base09 → [`Palette::modified_fg`], base0A → [`Palette::warn_fg`],
+    /// base0B → [`Palette::current_fg`], base0C → [`Palette::heading_fg`], plus every
+    /// [`Palette::syntax`] entry whose [`SYNTAX_SLOTS`] template maps to that slot. This is
+    /// deliberately uniform rather than "only override fields the base didn't hand-author": the
+    /// alternative (silently ignoring a slot override for `dark()`'s hand-tuned `error_fg`) is the
+    /// UX trap — a user who sets `base08` expects red to change, full stop. base06/07/0f stay
+    /// unmapped — nothing in this TUI is brighter than its foreground, and base0f is base16's
+    /// legacy grab-bag; they parse (namespace uniformity) and do nothing.
     ///
-    /// Slot overrides do NOT re-derive the diff/cursor tints — that stays the 11 tint override
-    /// keys' job, applied last and verbatim below, so a slot override can't silently reshape a
-    /// hand-tuned wash it wasn't asked to touch.
+    /// Slot overrides do NOT re-derive the diff/cursor tints — that stays the tint override keys'
+    /// job, applied last and verbatim below (this ordering — slot arms first — is the invariant
+    /// that lets an explicit `selection-bg` override still beat a `base02` slot override), so a
+    /// slot override can't silently reshape a hand-tuned wash it wasn't asked to touch.
     pub fn apply_overrides(&mut self, overrides: &ThemeOverrides) {
         for (capture, &slot) in SYNTAX_SLOTS.iter().enumerate() {
             if let Some(color) = overrides.slots[slot] {
@@ -686,6 +829,12 @@ impl Palette {
         if let Some(color) = overrides.slots[0] {
             self.background = color;
             self.paint_canvas = true;
+        }
+        if let Some(color) = overrides.slots[1] {
+            self.filler_fg = color;
+        }
+        if let Some(color) = overrides.slots[2] {
+            self.selection_bg = color;
         }
         if let Some(color) = overrides.slots[3] {
             self.dim = color;
@@ -713,29 +862,41 @@ impl Palette {
         }
 
         // Tint overrides assign last and verbatim — unaffected by any slot override above.
-        if let Some(color) = overrides.del_subtle {
-            self.del_subtle = color;
+        if let Some(color) = overrides.del_line_bg {
+            self.del_line_bg = color;
         }
-        if let Some(color) = overrides.del_strong {
-            self.del_strong = color;
+        if let Some(color) = overrides.del_edit_bg {
+            self.del_edit_bg = color;
         }
-        if let Some(color) = overrides.add_subtle {
-            self.add_subtle = color;
+        if let Some(color) = overrides.add_line_bg {
+            self.add_line_bg = color;
         }
-        if let Some(color) = overrides.add_strong {
-            self.add_strong = color;
+        if let Some(color) = overrides.add_edit_bg {
+            self.add_edit_bg = color;
         }
-        if let Some(color) = overrides.del_staged_subtle {
-            self.del_staged_subtle = color;
+        if let Some(color) = overrides.del_staged_line_bg {
+            self.del_staged_line_bg = color;
         }
-        if let Some(color) = overrides.del_staged_strong {
-            self.del_staged_strong = color;
+        if let Some(color) = overrides.del_staged_edit_bg {
+            self.del_staged_edit_bg = color;
         }
-        if let Some(color) = overrides.add_staged_subtle {
-            self.add_staged_subtle = color;
+        if let Some(color) = overrides.add_staged_line_bg {
+            self.add_staged_line_bg = color;
         }
-        if let Some(color) = overrides.add_staged_strong {
-            self.add_staged_strong = color;
+        if let Some(color) = overrides.add_staged_edit_bg {
+            self.add_staged_edit_bg = color;
+        }
+        if let Some(color) = overrides.add_fg {
+            self.add_fg = color;
+        }
+        if let Some(color) = overrides.del_fg {
+            self.del_fg = color;
+        }
+        if let Some(color) = overrides.add_staged_fg {
+            self.add_staged_fg = color;
+        }
+        if let Some(color) = overrides.del_staged_fg {
+            self.del_staged_fg = color;
         }
         if let Some(color) = overrides.cursor_bg {
             self.cursor_bg = color;
@@ -783,14 +944,14 @@ mod tests {
         // The pixel-identity gate: `Palette::dark` must reproduce M3–M5's hand-tuned tints exactly.
         // Pinned to the literals so a future refactor can't silently drift dark.
         let t = Palette::dark();
-        assert_eq!(t.del_subtle, Color::Rgb(60, 24, 24));
-        assert_eq!(t.del_strong, Color::Rgb(120, 40, 40));
-        assert_eq!(t.add_subtle, Color::Rgb(20, 48, 24));
-        assert_eq!(t.add_strong, Color::Rgb(32, 100, 48));
-        assert_eq!(t.del_staged_subtle, Color::Rgb(42, 26, 28));
-        assert_eq!(t.del_staged_strong, Color::Rgb(64, 38, 40));
-        assert_eq!(t.add_staged_subtle, Color::Rgb(24, 34, 26));
-        assert_eq!(t.add_staged_strong, Color::Rgb(34, 50, 38));
+        assert_eq!(t.del_line_bg, Color::Rgb(60, 24, 24));
+        assert_eq!(t.del_edit_bg, Color::Rgb(120, 40, 40));
+        assert_eq!(t.add_line_bg, Color::Rgb(20, 48, 24));
+        assert_eq!(t.add_edit_bg, Color::Rgb(32, 100, 48));
+        assert_eq!(t.del_staged_line_bg, Color::Rgb(42, 26, 28));
+        assert_eq!(t.del_staged_edit_bg, Color::Rgb(64, 38, 40));
+        assert_eq!(t.add_staged_line_bg, Color::Rgb(24, 34, 26));
+        assert_eq!(t.add_staged_edit_bg, Color::Rgb(34, 50, 38));
         assert_eq!(t.cursor_bg, Color::Rgb(45, 50, 90));
         assert_eq!(t.selection_bg, Color::Rgb(30, 66, 66));
         assert_eq!(t.cursor_unfocused_bg, Color::Rgb(35, 38, 55));
@@ -896,30 +1057,31 @@ mod tests {
     #[test]
     fn light_del_and_add_tints_are_distinct_from_each_other() {
         let t = Palette::light();
-        assert_ne!(t.del_subtle, t.add_subtle);
-        assert_ne!(t.del_strong, t.add_strong);
-        assert_ne!(t.del_staged_subtle, t.add_staged_subtle);
-        assert_ne!(t.del_staged_strong, t.add_staged_strong);
+        assert_ne!(t.del_line_bg, t.add_line_bg);
+        assert_ne!(t.del_edit_bg, t.add_edit_bg);
+        assert_ne!(t.del_staged_line_bg, t.add_staged_line_bg);
+        assert_ne!(t.del_staged_edit_bg, t.add_staged_edit_bg);
     }
 
     #[test]
-    fn light_subtle_and_strong_are_visibly_distinct_steps() {
+    fn light_line_and_edit_are_visibly_distinct_steps() {
         let t = Palette::light();
-        assert_ne!(t.del_subtle, t.del_strong);
-        assert_ne!(t.add_subtle, t.add_strong);
-        // Strong sits further from base00 (more saturated / less washed-out) than subtle.
-        assert!(distance_from_base00(t.del_strong) > distance_from_base00(t.del_subtle));
-        assert!(distance_from_base00(t.add_strong) > distance_from_base00(t.add_subtle));
+        assert_ne!(t.del_line_bg, t.del_edit_bg);
+        assert_ne!(t.add_line_bg, t.add_edit_bg);
+        // The edit wash sits further from base00 (more saturated / less washed-out) than the
+        // whole-line wash.
+        assert!(distance_from_base00(t.del_edit_bg) > distance_from_base00(t.del_line_bg));
+        assert!(distance_from_base00(t.add_edit_bg) > distance_from_base00(t.add_line_bg));
     }
 
     #[test]
     fn light_staged_reads_dimmer_than_unstaged() {
         // "Dimmer" == more washed toward base00 == closer to base00 than the unstaged pair.
         let t = Palette::light();
-        assert!(distance_from_base00(t.del_staged_subtle) < distance_from_base00(t.del_subtle));
-        assert!(distance_from_base00(t.del_staged_strong) < distance_from_base00(t.del_strong));
-        assert!(distance_from_base00(t.add_staged_subtle) < distance_from_base00(t.add_subtle));
-        assert!(distance_from_base00(t.add_staged_strong) < distance_from_base00(t.add_strong));
+        assert!(distance_from_base00(t.del_staged_line_bg) < distance_from_base00(t.del_line_bg));
+        assert!(distance_from_base00(t.del_staged_edit_bg) < distance_from_base00(t.del_edit_bg));
+        assert!(distance_from_base00(t.add_staged_line_bg) < distance_from_base00(t.add_line_bg));
+        assert!(distance_from_base00(t.add_staged_edit_bg) < distance_from_base00(t.add_edit_bg));
     }
 
     #[test]
@@ -1040,11 +1202,11 @@ mod tests {
         let palette = Palette::from_terminal(probed);
         let red = probed.slot(8);
         let green = probed.slot(11);
-        assert_eq!(palette.del_subtle, tint_toward(red, bg, 0.90));
-        assert_eq!(palette.del_strong, tint_toward(red, bg, 0.75));
-        assert_eq!(palette.add_subtle, tint_toward(green, bg, 0.90));
-        assert_eq!(palette.add_strong, tint_toward(green, bg, 0.75));
-        assert_ne!(palette.del_subtle, Palette::dark().del_subtle);
+        assert_eq!(palette.del_line_bg, tint_toward(red, bg, 0.90));
+        assert_eq!(palette.del_edit_bg, tint_toward(red, bg, 0.75));
+        assert_eq!(palette.add_line_bg, tint_toward(green, bg, 0.90));
+        assert_eq!(palette.add_edit_bg, tint_toward(green, bg, 0.75));
+        assert_ne!(palette.del_line_bg, Palette::dark().del_line_bg);
     }
 
     #[test]
@@ -1056,12 +1218,12 @@ mod tests {
         let palette = Palette::from_terminal(probed);
         let red = probed.slot(8);
         let green = probed.slot(11);
-        assert_eq!(palette.del_staged_subtle, tint_toward(red, bg, 0.94));
-        assert_eq!(palette.del_staged_strong, tint_toward(red, bg, 0.85));
-        assert_eq!(palette.add_staged_subtle, tint_toward(green, bg, 0.94));
-        assert_eq!(palette.add_staged_strong, tint_toward(green, bg, 0.85));
-        assert_ne!(palette.del_staged_subtle, palette.del_subtle);
-        assert_ne!(palette.add_staged_strong, palette.add_strong);
+        assert_eq!(palette.del_staged_line_bg, tint_toward(red, bg, 0.94));
+        assert_eq!(palette.del_staged_edit_bg, tint_toward(red, bg, 0.85));
+        assert_eq!(palette.add_staged_line_bg, tint_toward(green, bg, 0.94));
+        assert_eq!(palette.add_staged_edit_bg, tint_toward(green, bg, 0.85));
+        assert_ne!(palette.del_staged_line_bg, palette.del_line_bg);
+        assert_ne!(palette.add_staged_edit_bg, palette.add_edit_bg);
     }
 
     #[test]
@@ -1071,8 +1233,8 @@ mod tests {
         let bg = Color::Rgb(0xf5, 0xf5, 0xf5);
         let probed = probed_base16(bg);
         let palette = Palette::from_terminal(probed);
-        assert_eq!(palette.del_subtle, tint_toward(probed.slot(8), bg, 0.88));
-        assert_eq!(palette.add_strong, tint_toward(probed.slot(11), bg, 0.65));
+        assert_eq!(palette.del_line_bg, tint_toward(probed.slot(8), bg, 0.88));
+        assert_eq!(palette.add_edit_bg, tint_toward(probed.slot(11), bg, 0.65));
     }
 
     #[test]
@@ -1139,22 +1301,198 @@ mod tests {
         use crate::config::Theme;
 
         assert_eq!(
-            Palette::for_theme(Theme::Light).del_subtle,
-            Palette::light().del_subtle
+            Palette::for_theme(Theme::Light).del_line_bg,
+            Palette::light().del_line_bg
         );
         assert_ne!(
-            Palette::for_theme(Theme::Light).del_subtle,
-            Palette::dark().del_subtle
+            Palette::for_theme(Theme::Light).del_line_bg,
+            Palette::dark().del_line_bg
         );
         assert_eq!(
-            Palette::for_theme(Theme::Dark).del_subtle,
-            Palette::dark().del_subtle
+            Palette::for_theme(Theme::Dark).del_line_bg,
+            Palette::dark().del_line_bg
         );
         // CS6: terminal-derive — Auto falls back to dark until the probe lands.
         assert_eq!(
-            Palette::for_theme(Theme::Auto).del_subtle,
-            Palette::dark().del_subtle
+            Palette::for_theme(Theme::Auto).del_line_bg,
+            Palette::dark().del_line_bg
         );
+    }
+
+    #[test]
+    fn relative_luminance_of_black_and_white_are_the_wcag_endpoints() {
+        assert_eq!(relative_luminance(Color::Rgb(0, 0, 0)), Some(0.0));
+        assert!((relative_luminance(Color::Rgb(255, 255, 255)).unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(relative_luminance(Color::Reset), None);
+    }
+
+    #[test]
+    fn contrast_ratio_of_black_and_white_is_the_wcag_maximum() {
+        // The canonical WCAG example: pure black against pure white is 21:1.
+        let ratio = contrast_ratio(Color::Rgb(0, 0, 0), Color::Rgb(255, 255, 255)).unwrap();
+        assert!((ratio - 21.0).abs() < 1e-6);
+        // Order-independent.
+        let reversed = contrast_ratio(Color::Rgb(255, 255, 255), Color::Rgb(0, 0, 0)).unwrap();
+        assert_eq!(ratio, reversed);
+        assert_eq!(contrast_ratio(Color::Reset, Color::Rgb(0, 0, 0)), None);
+    }
+
+    #[test]
+    fn staged_foreground_dims_by_the_nominal_ratio_when_the_floor_is_cleared() {
+        // A saturated accent against a near-black background: the 40% dim easily clears the
+        // 3.0 floor against a very dark edit wash, so the nominal ratio wins outright.
+        let accent = Color::Rgb(0x99, 0xcc, 0x99); // base0B green
+        let background = Color::Rgb(0x2d, 0x2d, 0x2d); // base00 dark
+        let edit_bg = Color::Rgb(10, 10, 10);
+        let result = staged_foreground(accent, background, edit_bg);
+        assert_eq!(result, tint_toward(accent, background, STAGED_FG_DIM_RATIO));
+        assert!(contrast_ratio(result, edit_bg).unwrap() >= STAGED_FG_LUMINANCE_FLOOR);
+    }
+
+    #[test]
+    fn staged_foreground_backs_off_when_the_staged_wash_equals_the_unstaged_one() {
+        // The motivating failure (ADR-029 CS11): a theme whose staged edit wash equals its
+        // unstaged one collapses a flat 40% dim of the accent to unreadable contrast. The
+        // derivation must back off to a smaller ratio that still clears the floor, rather than
+        // returning the nominal (contrast-failing) dim.
+        let accent = Color::Rgb(0x99, 0xcc, 0x99); // base0B green
+        let background = Color::Rgb(0x2d, 0x2d, 0x2d); // base00 dark
+                                                       // A mid-gray edit wash: the undimmed accent clears the floor against it, but the nominal
+                                                       // 40% dim (which drags the accent's luminance toward the dark background) doesn't.
+        let edit_bg = Color::Rgb(80, 80, 80);
+        let nominal = tint_toward(accent, background, STAGED_FG_DIM_RATIO);
+        assert!(
+            contrast_ratio(nominal, edit_bg).unwrap() < STAGED_FG_LUMINANCE_FLOOR,
+            "the nominal dim must actually fail the floor here, or this test isn't exercising \
+             the back-off path"
+        );
+        let result = staged_foreground(accent, background, edit_bg);
+        assert_ne!(
+            result, nominal,
+            "must back off from the failing nominal dim"
+        );
+        assert!(
+            contrast_ratio(result, edit_bg).unwrap() >= STAGED_FG_LUMINANCE_FLOOR,
+            "the backed-off foreground must clear the floor"
+        );
+    }
+
+    #[test]
+    fn staged_foreground_uses_undimmed_when_even_that_fails_the_floor() {
+        // If the fully undimmed accent already fails the floor against `edit_bg`, the derivation
+        // must not invent a hue to force compliance — it returns the undimmed accent as-is.
+        let accent = Color::Rgb(100, 100, 100);
+        let background = Color::Rgb(0x2d, 0x2d, 0x2d);
+        let edit_bg = Color::Rgb(105, 105, 105); // near-identical luminance to `accent`
+        assert!(contrast_ratio(accent, edit_bg).unwrap() < STAGED_FG_LUMINANCE_FLOOR);
+        assert_eq!(staged_foreground(accent, background, edit_bg), accent);
+    }
+
+    #[test]
+    fn staged_foreground_skips_the_clamp_for_non_rgb_input() {
+        // Non-RGB colors have no luminance to clamp against — the derivation must not panic and
+        // must fall through to the nominal dim (which itself passes through `tint_toward`
+        // unblended for non-RGB, per that function's own contract).
+        assert_eq!(
+            staged_foreground(Color::Reset, Color::Rgb(0, 0, 0), Color::Rgb(0, 0, 0)),
+            Color::Reset
+        );
+    }
+
+    #[test]
+    fn dark_and_light_foregrounds_role_map_to_the_add_del_accents() {
+        let dark = Palette::dark();
+        assert_eq!(dark.add_fg, Base16::EIGHTIES_DARK.slot(11)); // base0B
+        assert_eq!(dark.del_fg, Base16::EIGHTIES_DARK.slot(8)); // base08
+        let light = Palette::light();
+        assert_eq!(light.add_fg, Base16::ONE_LIGHT.slot(11));
+        assert_eq!(light.del_fg, Base16::ONE_LIGHT.slot(8));
+    }
+
+    /// The [`staged_foreground`] contract: the result either clears the contrast floor against
+    /// `edit_bg`, or — only if the fully undimmed `accent` itself already failed the floor —
+    /// equals `accent` verbatim (locked decision #4: never invent a hue to force compliance).
+    fn assert_staged_foreground_contract(result: Color, accent: Color, edit_bg: Color) {
+        let ratio = contrast_ratio(result, edit_bg).unwrap();
+        if ratio < STAGED_FG_LUMINANCE_FLOOR {
+            assert_eq!(
+                result, accent,
+                "a floor-failing result is only acceptable if it's the undimmed accent"
+            );
+            assert!(contrast_ratio(accent, edit_bg).unwrap() < STAGED_FG_LUMINANCE_FLOOR);
+        }
+    }
+
+    #[test]
+    fn dark_staged_foregrounds_clear_the_contrast_floor_and_are_visibly_dimmed() {
+        // `dark()`'s staged edit washes have enough headroom that both staged foregrounds derive
+        // via the nominal-or-backoff path, not the "undimmed already fails" fallback.
+        let t = Palette::dark();
+        assert_staged_foreground_contract(t.add_staged_fg, t.add_fg, t.add_staged_edit_bg);
+        assert_staged_foreground_contract(t.del_staged_fg, t.del_fg, t.del_staged_edit_bg);
+        assert_ne!(t.add_staged_fg, t.add_fg);
+        assert_ne!(t.del_staged_fg, t.del_fg);
+    }
+
+    #[test]
+    fn light_staged_foregrounds_satisfy_the_derivation_contract() {
+        // `light()`'s pale staged edit washes push add's undimmed contrast below the floor —
+        // the accepted "use undimmed" fallback (locked decision #4) — while del's still clears
+        // it via the backoff path. Both are exercised here so the contract, not a specific
+        // numeric outcome, is what's pinned.
+        let t = Palette::light();
+        assert_staged_foreground_contract(t.add_staged_fg, t.add_fg, t.add_staged_edit_bg);
+        assert_staged_foreground_contract(t.del_staged_fg, t.del_fg, t.del_staged_edit_bg);
+    }
+
+    #[test]
+    fn mono_foregrounds_are_all_reset() {
+        for light in [false, true] {
+            let t = Palette::mono(light);
+            assert_eq!(t.add_fg, Color::Reset);
+            assert_eq!(t.del_fg, Color::Reset);
+            assert_eq!(t.add_staged_fg, Color::Reset);
+            assert_eq!(t.del_staged_fg, Color::Reset);
+        }
+    }
+
+    #[test]
+    fn apply_overrides_base01_and_base02_rewrite_filler_fg_and_selection_bg() {
+        // CS11: these two slots were parsed but wired to nothing before.
+        let mut overrides = ThemeOverrides::default();
+        overrides.set_slot(1, Color::Rgb(0x11, 0x11, 0x11)); // base01 → filler_fg
+        overrides.set_slot(2, Color::Rgb(0x22, 0x22, 0x22)); // base02 → selection_bg
+        let mut t = Palette::dark();
+        t.apply_overrides(&overrides);
+        assert_eq!(t.filler_fg, Color::Rgb(0x11, 0x11, 0x11));
+        assert_eq!(t.selection_bg, Color::Rgb(0x22, 0x22, 0x22));
+    }
+
+    #[test]
+    fn apply_overrides_base02_is_beaten_by_an_explicit_selection_bg_tint_override() {
+        // The no-clobber invariant: slot arms run before tint arms, so an explicit
+        // `selection-bg` override still wins over a `base02` slot override.
+        let mut overrides = ThemeOverrides::default();
+        overrides.set_slot(2, Color::Rgb(0x22, 0x22, 0x22));
+        overrides.selection_bg = Some(Color::Rgb(0x33, 0x33, 0x33));
+        let mut t = Palette::dark();
+        t.apply_overrides(&overrides);
+        assert_eq!(t.selection_bg, Color::Rgb(0x33, 0x33, 0x33));
+    }
+
+    #[test]
+    fn apply_overrides_reads_the_four_new_fg_tint_keys_verbatim() {
+        let mut overrides = ThemeOverrides::default();
+        overrides.add_fg = Some(Color::Rgb(1, 2, 3));
+        overrides.del_fg = Some(Color::Rgb(4, 5, 6));
+        overrides.add_staged_fg = Some(Color::Rgb(7, 8, 9));
+        overrides.del_staged_fg = Some(Color::Rgb(10, 11, 12));
+        let mut t = Palette::dark();
+        t.apply_overrides(&overrides);
+        assert_eq!(t.add_fg, Color::Rgb(1, 2, 3));
+        assert_eq!(t.del_fg, Color::Rgb(4, 5, 6));
+        assert_eq!(t.add_staged_fg, Color::Rgb(7, 8, 9));
+        assert_eq!(t.del_staged_fg, Color::Rgb(10, 11, 12));
     }
 
     #[test]
@@ -1189,7 +1527,7 @@ mod tests {
         assert_eq!(t.foreground, before.foreground);
         assert_eq!(t.error_fg, before.error_fg);
         assert_eq!(t.heading_fg, before.heading_fg);
-        assert_eq!(t.del_subtle, before.del_subtle);
+        assert_eq!(t.del_line_bg, before.del_line_bg);
         assert_eq!(t.cursor_bg, before.cursor_bg);
         assert_eq!(t.paint_canvas, before.paint_canvas);
         assert_eq!(
@@ -1245,14 +1583,14 @@ mod tests {
     #[test]
     fn apply_overrides_tint_lands_verbatim_unaffected_by_slot_overrides() {
         let mut overrides = ThemeOverrides::default();
-        overrides.set_slot(8, Color::Rgb(0xaa, 0xbb, 0xcc)); // base08 → error_fg, NOT del_subtle
+        overrides.set_slot(8, Color::Rgb(0xaa, 0xbb, 0xcc)); // base08 → error_fg, NOT del_line_bg
         overrides.cursor_bg = Some(Color::Rgb(0x01, 0x02, 0x03));
         let mut t = Palette::dark();
         t.apply_overrides(&overrides);
         assert_eq!(t.cursor_bg, Color::Rgb(0x01, 0x02, 0x03));
         // The del/add tints are untouched by the base08 slot override — tint overrides are the
         // only thing that moves them.
-        assert_eq!(t.del_subtle, Palette::dark().del_subtle);
+        assert_eq!(t.del_line_bg, Palette::dark().del_line_bg);
     }
 
     #[test]
@@ -1290,14 +1628,14 @@ mod tests {
         for light in [false, true] {
             let t = Palette::mono(light);
             for wash in [
-                t.del_subtle,
-                t.del_strong,
-                t.add_subtle,
-                t.add_strong,
-                t.del_staged_subtle,
-                t.del_staged_strong,
-                t.add_staged_subtle,
-                t.add_staged_strong,
+                t.del_line_bg,
+                t.del_edit_bg,
+                t.add_line_bg,
+                t.add_edit_bg,
+                t.del_staged_line_bg,
+                t.del_staged_edit_bg,
+                t.add_staged_line_bg,
+                t.add_staged_edit_bg,
                 t.cursor_bg,
                 t.selection_bg,
                 t.cursor_unfocused_bg,
@@ -1307,27 +1645,27 @@ mod tests {
 
             // Add and Del share one gray ladder (accepted degradation — hue can't carry
             // add-vs-del in colorless mode, so gutter structure does instead).
-            assert_eq!(t.del_subtle, t.add_subtle);
-            assert_eq!(t.del_strong, t.add_strong);
-            assert_eq!(t.del_staged_subtle, t.add_staged_subtle);
-            assert_eq!(t.del_staged_strong, t.add_staged_strong);
+            assert_eq!(t.del_line_bg, t.add_line_bg);
+            assert_eq!(t.del_edit_bg, t.add_edit_bg);
+            assert_eq!(t.del_staged_line_bg, t.add_staged_line_bg);
+            assert_eq!(t.del_staged_edit_bg, t.add_staged_edit_bg);
 
-            // Subtle vs strong remain visibly distinct steps.
-            assert_ne!(t.del_subtle, t.del_strong);
-            assert_ne!(t.del_staged_subtle, t.del_staged_strong);
+            // Line vs edit remain visibly distinct steps.
+            assert_ne!(t.del_line_bg, t.del_edit_bg);
+            assert_ne!(t.del_staged_line_bg, t.del_staged_edit_bg);
 
             // Staged reads dimmer (closer to the implied background — brighter grays near a
             // light bg, darker grays near a dark bg) than unstaged.
-            let (staged_subtle, _, _) = rgb(t.del_staged_subtle);
-            let (subtle, _, _) = rgb(t.del_subtle);
-            let (staged_strong, _, _) = rgb(t.del_staged_strong);
-            let (strong, _, _) = rgb(t.del_strong);
+            let (staged_line, _, _) = rgb(t.del_staged_line_bg);
+            let (line, _, _) = rgb(t.del_line_bg);
+            let (staged_edit, _, _) = rgb(t.del_staged_edit_bg);
+            let (edit, _, _) = rgb(t.del_edit_bg);
             if light {
-                assert!(staged_subtle > subtle, "staged should sit closer to white");
-                assert!(staged_strong > strong, "staged should sit closer to white");
+                assert!(staged_line > line, "staged should sit closer to white");
+                assert!(staged_edit > edit, "staged should sit closer to white");
             } else {
-                assert!(staged_subtle < subtle, "staged should sit closer to black");
-                assert!(staged_strong < strong, "staged should sit closer to black");
+                assert!(staged_line < line, "staged should sit closer to black");
+                assert!(staged_edit < edit, "staged should sit closer to black");
             }
 
             // Cursor vs selection are distinct, and the unfocused cursor wash reads dimmer
@@ -1370,9 +1708,9 @@ mod tests {
 
     #[test]
     fn mono_dark_ladder_sits_near_black_and_light_ladder_near_white() {
-        let (r, _, _) = rgb(Palette::mono(false).del_strong);
+        let (r, _, _) = rgb(Palette::mono(false).del_edit_bg);
         assert!(r < 128, "dark ladder should be a dark gray");
-        let (r, _, _) = rgb(Palette::mono(true).del_strong);
+        let (r, _, _) = rgb(Palette::mono(true).del_edit_bg);
         assert!(r > 128, "light ladder should be a pale gray");
     }
 }
