@@ -140,8 +140,9 @@ pub struct RawViewConfig {
 }
 
 /// Everything `main.rs`'s startup resolution ladder reads out of `workon.review.*`, resolved in
-/// one call so a config reload (see the `reload-config` handoff) reproduces startup's resolution
-/// exactly rather than duplicating it — guaranteed drift otherwise. `view_config` is left raw
+/// one call so a config reload (the `reload-config` action, see
+/// [ADR-028](../../../docs/adr/028-review-git-native-config-schema.md)) reproduces startup's
+/// resolution exactly rather than duplicating it — guaranteed drift otherwise. `view_config` is left raw
 /// (unvalidated): [`crate::app::App::apply_view_config`]/`reload_view_config` are what apply
 /// defaults and range-check it, same division [`RawViewConfig`] already documents.
 pub struct RuntimeConfig {
@@ -164,7 +165,7 @@ pub struct RuntimeConfig {
 /// transient/malformed `.git/config`.
 ///
 /// Shared by both the startup resolution (`main.rs`) and a live `reload-config` (`tui.rs`) so the
-/// two can never drift apart — see the handoff's "Structural core" section.
+/// two can never drift apart.
 pub fn resolve_runtime(repo: &Repository, ctx: &PaletteContext) -> RuntimeConfig {
     let config = ReviewConfig::new(repo);
 

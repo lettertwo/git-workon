@@ -1259,6 +1259,12 @@ fn event_loop<W: Write>(
             // A half-entered chord against the OLD keymap is meaningless once the bindings under
             // it have changed.
             pending.clear();
+            // Re-plumb the "cycle zoom" refusal hint the same way `main.rs`'s `seat_app` does at
+            // startup — a reload that rebinds `cycle-zoom` would otherwise leave the hint naming
+            // the old key. No binding at all leaves the previous label in place, same as startup.
+            if let Some(label) = workon_review::keymap::primary_key(keymap, Command::CycleZoom) {
+                app.set_zoom_key_label(label);
+            }
             let view_warnings = app.reload_view_config(&runtime.view_config);
             let mut warnings = keymap.warnings().to_vec();
             warnings.extend(runtime.warnings);
