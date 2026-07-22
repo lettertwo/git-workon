@@ -1353,6 +1353,12 @@ pub struct App {
     /// default binding — for every `App::new`/`from_changesets` path that never seats a keymap
     /// (keeps existing unit tests passing without churn).
     zoom_key_label: String,
+    /// A `reload-config` (`R`) request, picked up (and cleared) by [`Self::take_config_reload_request`].
+    /// Mirrors [`Self::pending_wave`]'s request-flag shape: `App` can't own the `Keymap`/`Palette`
+    /// the reload swaps in (they're threaded through `tui.rs`/`main.rs`, same reason
+    /// [`Self::zoom_key_label`] is a label rather than a keymap reference), so it only raises the
+    /// flag here and the event loop — which DOES hold those — does the actual reload.
+    config_reload_requested: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1534,6 +1540,7 @@ impl App {
             wave_failure_notified: false,
             pending_wave: None,
             zoom_key_label: "Z".to_string(),
+            config_reload_requested: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -2265,6 +2272,27 @@ impl App {
     /// nothing wired up to consume this at all.
     pub fn take_pending_wave(&mut self) -> Option<(u64, Vec<(usize, Changeset)>)> {
         self.pending_wave.take()
+    }
+
+    /// `App`'s own repo handle — read-only access for a caller (the reload command) that needs to
+    /// re-read `workon.review.*` config through the SAME handle `App` already opened, rather than
+    /// opening a second one onto the same on-disk repo.
+    pub fn repo(&self) -> &Repository {
+        &self.repo
+    }
+
+    /// Raise a `reload-config` (`R`) request — picked up (and cleared) by the event loop via
+    /// [`Self::take_config_reload_request`]. `App` can't do the reload itself: it doesn't own the
+    /// `Keymap`/`Palette` that get swapped (see [`Self::config_reload_requested`]'s doc comment).
+    pub fn request_config_reload(&mut self) {
+        self.config_reload_requested = true;
+    }
+
+    /// Take the pending `reload-config` request, if any — one-shot, mirroring
+    /// [`Self::take_pending_wave`]'s take-and-clear shape: a second call with nothing new
+    /// requested in between returns `false`.
+    pub fn take_config_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.config_reload_requested)
     }
 
     /// Apply one loader result (ADR-031's chokepoint, the `FileReady` inbox arm routes here):
@@ -4019,6 +4047,58 @@ impl App {
         warnings
     }
 
+    /// Apply a mid-session `workon.review.outline.*`/`workon.review.diff.*` change (the
+    /// `reload-config` command, `R`) — the reload counterpart to [`Self::apply_view_config`].
+    ///
+    /// [`Self::apply_view_config`]'s setters deliberately skip re-deriving `cursor`/`scroll`/
+    /// outline state, because [`Self::open_current`] (called once right after it, at startup)
+    /// derives all of that fresh. Reload can't call `open_current` — that would reset the
+    /// cursor/scroll position and re-arm a deferred load, throwing away the user's place for what
+    /// should be a cheap recolor/rebind (the exact regression this design exists to prevent).
+    /// Instead: run `apply_view_config`, then replay only the TAIL of whichever interactive
+    /// counterpart(s) actually changed something — [`Self::toggle_layout`]'s tail if `layout`
+    /// flipped, [`Self::outline_cycle_mode`]'s tail if `outline.mode`/`outline.order` changed.
+    /// `zoom`'s interactive counterpart, [`Self::cycle_zoom`], has no further tail beyond the bare
+    /// assignment once its committed-changeset notice is dropped — that notice was purely
+    /// interactive feedback for what would otherwise be a silent cycle no-op, not an invariant:
+    /// [`Self::effective_zoom_for`] already collapses a non-stageable changeset to `Combined`
+    /// regardless of the requested zoom, so a config-driven `zoom` change can't bypass the gate
+    /// either. Reload never emits that notice and never re-derives the pane position for a zoom
+    /// change — same "don't call `open_current`" reasoning as everything else here.
+    pub fn reload_view_config(&mut self, raw: &RawViewConfig) -> Vec<String> {
+        let layout_before = self.layout;
+        let outline_mode_before = self.outline.mode;
+        let outline_order_before = self.outline.order;
+
+        let warnings = self.apply_view_config(raw);
+
+        if self.layout != layout_before {
+            // Mirrors `toggle_layout`'s tail: the two layouts' row vectors are different
+            // coordinate spaces, so a selection anchor doesn't translate across them.
+            self.selection_anchor = None;
+            self.clamp_cursor();
+            if let EffectiveZoom::Split = self.effective_zoom_for(self.current) {
+                let role = self.unfocused_split_role();
+                let rows = self.role_row_count(self.current, role);
+                self.alt.cursor = if rows == 0 {
+                    0
+                } else {
+                    self.alt.cursor.min(rows - 1)
+                };
+            }
+            self.derive_scroll();
+        }
+
+        if self.outline.mode != outline_mode_before || self.outline.order != outline_order_before {
+            // Mirrors `outline_cycle_mode`'s tail: the row list's shape just changed, so a stale
+            // pan offset or cursor index could easily land past the new mode's content.
+            self.outline.hscroll = 0;
+            self.sync_outline_to_current();
+        }
+
+        warnings
+    }
+
     /// Set a transient footer notice (see [`Self::notice`]'s doc comment). Overwrites any
     /// currently-showing notice rather than queuing — only one message is ever on screen.
     pub fn notify(&mut self, text: impl Into<String>, severity: Severity) {
@@ -5105,7 +5185,7 @@ mod tests {
         SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
-    use crate::config::ReviewConfig;
+    use crate::config::{RawViewConfig, ReviewConfig};
     use crate::icons::IconMode;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
@@ -10280,6 +10360,87 @@ mod tests {
         assert_eq!(app.zoom, Zoom::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("diff.zoom"));
+    }
+
+    // ── `reload-config` (`R`): request flag + mid-session view-config apply ────
+
+    #[test]
+    fn config_reload_request_is_one_shot() {
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let mut app = app_from_fixture(&fixture);
+
+        assert!(!app.take_config_reload_request(), "nothing requested yet");
+
+        app.request_config_reload();
+        assert!(
+            app.take_config_reload_request(),
+            "the request just raised must be observed"
+        );
+        assert!(
+            !app.take_config_reload_request(),
+            "a second take with nothing new requested must find nothing left"
+        );
+    }
+
+    #[test]
+    fn reload_view_config_does_not_reset_the_diff_cursor_to_row_0() {
+        // The key regression this design exists to prevent: `apply_view_config` alone (as
+        // `open_current` would run after it at startup) resets cursor/scroll via `reset_panes`;
+        // `reload_view_config` must NOT do that, since a config reload should read as a cheap
+        // recolor/rebind, not a jump back to the top of the file.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "a.txt",
+                "one\ntwo\nthree\nfour\nfive\n",
+                "ONE\ntwo\nTHREE\nfour\nFIVE\n",
+            )
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.move_cursor_by(2);
+        let cursor_before = app.cursor;
+        assert!(
+            cursor_before > 0,
+            "test setup: cursor must have moved off row 0"
+        );
+
+        // A layout flip exercises `reload_view_config`'s `toggle_layout`-mirroring tail (the
+        // clamp, not a reset) — the most invasive of the three tails it can run.
+        let raw = RawViewConfig {
+            diff_layout: Some("inline".to_string()),
+            ..Default::default()
+        };
+        let warnings = app.reload_view_config(&raw);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.layout, Layout::Inline);
+        assert_ne!(
+            app.cursor, 0,
+            "reload must not reset the diff cursor to row 0 like open_current/reset_panes would"
+        );
+    }
+
+    #[test]
+    fn reload_view_config_leaves_the_outline_cursor_valid_after_a_mode_change() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.open = true;
+
+        let raw = RawViewConfig {
+            outline_mode: Some("tree".to_string()),
+            ..Default::default()
+        };
+        let warnings = app.reload_view_config(&raw);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_mode(), OutlineMode::Tree);
+        let items = app.outline_items();
+        assert!(
+            app.outline.cursor < items.len(),
+            "outline cursor must stay a valid index into the new mode's row list"
+        );
     }
 
     // ── CS4: summary panel ───────────────────────────────────────────────────────

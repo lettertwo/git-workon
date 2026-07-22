@@ -222,7 +222,7 @@ fn main() -> Result<()> {
         // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
         // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
         tui.into_diagnostic()?
-            .run(&mut app, &keymap, &theme, repo_path)
+            .run(&mut app, keymap, theme, repo_path, &palette_ctx)
             .into_diagnostic()?;
     } else {
         // Every changeset starts `Pending` (ADR-031's "Slots") — `App` is constructible from
@@ -245,7 +245,7 @@ fn main() -> Result<()> {
         );
 
         tui.into_diagnostic()?
-            .run_streamed(&mut app, &keymap, &theme, repo_path, changesets)
+            .run_streamed(&mut app, keymap, theme, repo_path, changesets, &palette_ctx)
             .into_diagnostic()?;
     }
 

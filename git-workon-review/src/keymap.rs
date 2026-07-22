@@ -43,6 +43,7 @@ pub enum Command {
     Quit,
     ToggleOutline,
     ToggleHelp,
+    ReloadConfig,
     // Diff view.
     CursorDown,
     CursorUp,
@@ -132,6 +133,13 @@ pub static REGISTRY: &[Registered] = &[
         name: "toggle-help",
         default_keys: "?",
         description: "Toggle the help overlay",
+    },
+    Registered {
+        command: Command::ReloadConfig,
+        view: View::Global,
+        name: "reload-config",
+        default_keys: "R",
+        description: "Reload config (theme, keys, view settings)",
     },
     // ── Diff view ────────────────────────────────────────────────────────────
     Registered {
@@ -1361,6 +1369,46 @@ mod tests {
         assert!(km.keys_for(Command::StageHunk).is_empty());
         assert_eq!(
             feed(&km, false, &[key(KeyCode::Char('s'))]),
+            Dispatch::Unmatched {
+                mid_sequence: false
+            }
+        );
+    }
+
+    #[test]
+    fn reload_config_is_registered_global_with_default_shift_r() {
+        let km = Keymap::defaults();
+        assert!(km.warnings().is_empty());
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('R'))]),
+            Dispatch::Command(Command::ReloadConfig)
+        );
+        // Global — fires the same whether the outline or the diff has focus.
+        assert_eq!(
+            feed(&km, true, &[key(KeyCode::Char('R'))]),
+            Dispatch::Command(Command::ReloadConfig)
+        );
+    }
+
+    #[test]
+    fn reload_config_is_rebindable_via_workon_review_bind() {
+        let km = Keymap::from_bindings(&[RawBinding {
+            view: View::Global,
+            action: "reload-config".to_string(),
+            keys: "ctrl-r".to_string(),
+        }]);
+        assert!(km.warnings().is_empty());
+        assert_eq!(
+            feed(
+                &km,
+                false,
+                &[KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)]
+            ),
+            Dispatch::Command(Command::ReloadConfig)
+        );
+        // The old default is now unbound.
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('R'))]),
             Dispatch::Unmatched {
                 mid_sequence: false
             }

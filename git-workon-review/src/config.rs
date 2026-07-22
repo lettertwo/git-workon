@@ -33,6 +33,7 @@
 //!
 //! [workon "review.bind"]
 //!   quit = q esc               ; bare `review.bind` = global view (active in every view)
+//!   reload-config = R          ; re-read this whole tree without restarting (default: R)
 //!
 //! [workon "review.outline"]
 //!   width = 32
@@ -43,6 +44,16 @@
 //!   layout = split
 //!   zoom = combined
 //! ```
+//!
+//! ## Live reload (`reload-config`)
+//!
+//! The whole `workon.review.*` tree is re-readable at runtime — `reload-config` (`R` by
+//! default) re-runs [`resolve_runtime`] against the live `.git/config` and swaps in the result,
+//! no restart needed. One caveat: `theme = auto`'s terminal-derivation probe never re-runs mid-
+//! session (it needs the tty, which the TUI owns once the alternate screen is live, and a second
+//! conversation there would corrupt input) — switching `theme` to `dark`/`light` on reload takes
+//! effect immediately, but switching back TO `auto` reuses the cached startup probe rather than
+//! asking the terminal again. See [`crate::theme::PaletteContext`]'s doc comment.
 //!
 //! ## `icons`
 //!
