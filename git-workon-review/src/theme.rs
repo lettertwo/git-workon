@@ -510,6 +510,11 @@ impl Palette {
     /// shipped values verbatim.
     pub fn dark() -> Self {
         let base = Base16::EIGHTIES_DARK;
+        // Bound rather than repeated inline below: the staged foregrounds measure their contrast
+        // floor against these exact washes, so a future retune must not be able to move the wash
+        // while leaving the clamp reading a stale literal.
+        let del_staged_edit_bg = Color::Rgb(64, 38, 40);
+        let add_staged_edit_bg = Color::Rgb(34, 50, 38);
         Palette {
             syntax: SYNTAX_SLOTS.iter().map(|&s| base.slot(s)).collect(),
             del_line_bg: Color::Rgb(60, 24, 24),
@@ -517,15 +522,15 @@ impl Palette {
             add_line_bg: Color::Rgb(20, 48, 24),
             add_edit_bg: Color::Rgb(32, 100, 48),
             del_staged_line_bg: Color::Rgb(42, 26, 28),
-            del_staged_edit_bg: Color::Rgb(64, 38, 40),
+            del_staged_edit_bg,
             add_staged_line_bg: Color::Rgb(24, 34, 26),
-            add_staged_edit_bg: Color::Rgb(34, 50, 38),
+            add_staged_edit_bg,
             // CS11: brand new fields, no historical constant to reproduce — role-map to the
             // accent slots, same reasoning as `heading_fg`/`modified_fg` below.
             add_fg: base.slot(11),
             del_fg: base.slot(8),
-            add_staged_fg: staged_foreground(base.slot(11), base.slot(0), Color::Rgb(34, 50, 38)),
-            del_staged_fg: staged_foreground(base.slot(8), base.slot(0), Color::Rgb(64, 38, 40)),
+            add_staged_fg: staged_foreground(base.slot(11), base.slot(0), add_staged_edit_bg),
+            del_staged_fg: staged_foreground(base.slot(8), base.slot(0), del_staged_edit_bg),
             cursor_bg: Color::Rgb(45, 50, 90),
             selection_bg: Color::Rgb(30, 66, 66),
             cursor_unfocused_bg: Color::Rgb(35, 38, 55),
@@ -1482,11 +1487,13 @@ mod tests {
 
     #[test]
     fn apply_overrides_reads_the_four_new_fg_tint_keys_verbatim() {
-        let mut overrides = ThemeOverrides::default();
-        overrides.add_fg = Some(Color::Rgb(1, 2, 3));
-        overrides.del_fg = Some(Color::Rgb(4, 5, 6));
-        overrides.add_staged_fg = Some(Color::Rgb(7, 8, 9));
-        overrides.del_staged_fg = Some(Color::Rgb(10, 11, 12));
+        let overrides = ThemeOverrides {
+            add_fg: Some(Color::Rgb(1, 2, 3)),
+            del_fg: Some(Color::Rgb(4, 5, 6)),
+            add_staged_fg: Some(Color::Rgb(7, 8, 9)),
+            del_staged_fg: Some(Color::Rgb(10, 11, 12)),
+            ..Default::default()
+        };
         let mut t = Palette::dark();
         t.apply_overrides(&overrides);
         assert_eq!(t.add_fg, Color::Rgb(1, 2, 3));
