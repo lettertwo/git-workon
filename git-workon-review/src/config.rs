@@ -43,6 +43,7 @@
 //! [workon "review.diff"]
 //!   layout = split
 //!   zoom = combined
+//!   text = syntax             ; syntax | tint | edit (default: syntax)
 //! ```
 //!
 //! ## Live reload (`reload-config`)
@@ -137,6 +138,7 @@ pub struct RawViewConfig {
     pub icons: Option<String>,
     pub diff_layout: Option<String>,
     pub diff_zoom: Option<String>,
+    pub diff_text: Option<String>,
 }
 
 /// Everything `main.rs`'s startup resolution ladder reads out of `workon.review.*`, resolved in
@@ -434,6 +436,13 @@ impl<'repo> ReviewConfig<'repo> {
         self.get_view_string(View::Diff, "zoom")
     }
 
+    /// Get `workon.review.diff.text`, raw. `None` if unset — see
+    /// [ADR-029](../../../docs/adr/029-review-theming-base16-hybrid.md)'s "Revised (CS11, diff
+    /// foreground/background split)" section.
+    pub fn diff_text(&self) -> Result<Option<String>, git2::Error> {
+        self.get_view_string(View::Diff, "text")
+    }
+
     /// Read all four CS7 view-config settings at once into an owned [`RawViewConfig`],
     /// collapsing a config-read error to `None` — same as every other getter here, `App`'s
     /// resolution (`App::apply_view_config`) treats an unset setting and a failed read
@@ -449,6 +458,7 @@ impl<'repo> ReviewConfig<'repo> {
             icons: self.icons().ok().flatten(),
             diff_layout: self.diff_layout().ok().flatten(),
             diff_zoom: self.diff_zoom().ok().flatten(),
+            diff_text: self.diff_text().ok().flatten(),
         }
     }
 
@@ -634,6 +644,7 @@ mod tests {
             .config("workon.review.icons", "nerd")
             .config("workon.review.diff.layout", "split")
             .config("workon.review.diff.zoom", "staged")
+            .config("workon.review.diff.text", "tint")
             .build()
             .expect("fixture build");
         let repo = fixture.repo().expect("repo");
@@ -657,6 +668,7 @@ mod tests {
             config.diff_zoom().expect("zoom"),
             Some("staged".to_string())
         );
+        assert_eq!(config.diff_text().expect("text"), Some("tint".to_string()));
     }
 
     #[test]
@@ -671,6 +683,7 @@ mod tests {
         assert_eq!(config.icons().expect("icons"), None);
         assert_eq!(config.diff_layout().expect("layout"), None);
         assert_eq!(config.diff_zoom().expect("zoom"), None);
+        assert_eq!(config.diff_text().expect("text"), None);
     }
 
     #[test]
