@@ -151,9 +151,10 @@ pub struct RuntimeConfig {
     pub keymap: Keymap,
     pub palette: Palette,
     pub view_config: RawViewConfig,
-    /// `workon.review.theme.*` override warnings only — keymap warnings still come off
-    /// [`Keymap::warnings`], not bundled in here, so a caller that only cares about one doesn't
-    /// have to pick them back apart.
+    /// `workon.review.theme.*` override warnings, plus unknown-key warnings for the rest of the
+    /// `workon.review.*` tree (see [`ReviewConfig::unknown_key_warnings`]) — keymap warnings
+    /// still come off [`Keymap::warnings`], not bundled in here, so a caller that only cares
+    /// about one doesn't have to pick them back apart.
     pub warnings: Vec<String>,
 }
 
@@ -182,13 +183,16 @@ pub fn resolve_runtime(repo: &Repository, ctx: &PaletteContext) -> RuntimeConfig
         Err(_) => Palette::dark(),
     };
 
-    let warnings = match config.theme_overrides() {
+    let mut warnings = match config.theme_overrides() {
         Ok((overrides, warnings)) => {
             palette.apply_overrides(&overrides);
             warnings
         }
         Err(_) => Vec::new(),
     };
+    if let Ok(unknown) = config.unknown_key_warnings() {
+        warnings.extend(unknown);
+    }
 
     if ctx.no_color {
         palette = Palette::mono(theme::is_light_background(palette.background));
@@ -266,6 +270,104 @@ fn invalid_color_warning(key: &str, raw: &str) -> String {
     format!("workon.review.theme.{key}: invalid color {raw:?}, ignoring")
 }
 
+// ── Unknown-key registry (config validation completeness) ──────────────────────────────────
+//
+// ADR-028's "Revised (config validation completeness)" section: `theme.*` and bind actions
+// already warn on an unrecognized name; every other `workon.review.*` key was read by an
+// explicit getter and nothing else, so a typo (`workon.review.diff.laoyut`) was silently
+// dropped — no warning, no effect, indistinguishable from a setting that simply did nothing.
+// `ReviewConfig::unknown_key_warnings` closes that gap with one pass over
+// `entries("workon.review.*")`, driven by [`KNOWN_SCALAR_KEYS`] plus the two open-ended
+// subspaces (`theme.<slot-or-tint>`, reusing [`slot_index`]/[`tint_slot`]'s existing key
+// lists; `<view>.bind.<action>`, reusing [`parse_bind_key`]'s existing decomposition) — see
+// [`is_claimed`].
+
+/// Exact `workon.review.<key>` scalar names the registry recognizes — every non-pattern
+/// getter's key, suffixed the same way [`ReviewConfig::scalar_key`] builds it.
+///
+/// This is the drift-prone half of the registry (the pattern arms can't drift: they reuse
+/// [`slot_index`]/[`tint_slot`]/[`parse_bind_key`] directly, so there is nothing to keep in
+/// sync). Every getter that reads one of these keys builds its query through
+/// [`ReviewConfig::scalar_key`], which `debug_assert!`s the suffix is listed here — so adding
+/// a new scalar getter without adding its key to this array doesn't silently drop the key
+/// (the pre-existing failure mode this whole pass exists to close); it panics the first time
+/// ANY test exercises the new getter, in every debug build (which `cargo test` always is),
+/// not just a dedicated registry test. See
+/// `scalar_getters_route_every_key_through_the_known_key_registry` below for the explicit
+/// enumeration this backstops.
+const KNOWN_SCALAR_KEYS: &[&str] = &[
+    "theme",
+    "icons",
+    "outline.width",
+    "outline.mode",
+    "outline.order",
+    "diff.layout",
+    "diff.zoom",
+    "diff.text",
+];
+
+/// Whether `key` (a `workon.review.<key>` suffix, e.g. `"outline.width"` or `"theme.base00"`)
+/// is claimed by some existing part of the schema, so [`ReviewConfig::unknown_key_warnings`]
+/// should stay silent on it. `name` is the fully-qualified key, needed for
+/// [`parse_bind_key`]'s own prefix-stripping.
+///
+/// Claimed does NOT mean valid. `theme.frob` and `diff.bind.made-up-action` are both
+/// claimed — their subspace already owns warning about them (`theme_overrides`'s "unknown
+/// theme key" warning, `keymap`'s "unknown review keybinding action" warning) — warning again
+/// here would double-warn the same typo. Only a shape no subspace recognizes at all (an
+/// unlisted scalar name, or a bind typo like `diff.bnid.stage-hunk` that doesn't even parse as
+/// a bind entry) falls through to this pass.
+fn is_claimed(name: &str, key: &str) -> bool {
+    KNOWN_SCALAR_KEYS.contains(&key) || key.starts_with("theme.") || parse_bind_key(name).is_some()
+}
+
+/// How close two [`unknown_key_warning`] candidates need to be (by [`levenshtein`] distance)
+/// before the nearer one gets suggested — small enough that `laoyut`/`layout` and
+/// `thmee`/`theme` (both distance 2) hit, but an unrelated key suggests nothing.
+const SUGGESTION_THRESHOLD: usize = 2;
+
+/// Iterative-DP Levenshtein edit distance between two strings — no new dependency for
+/// [`unknown_key_warning`]'s "did you mean" suggestion, which only needs this one comparison.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The closest [`KNOWN_SCALAR_KEYS`] entry to `key`, if any entry is within
+/// [`SUGGESTION_THRESHOLD`] edits — `None` if the nearest is still too far to plausibly be a
+/// typo of a real key.
+fn nearest_known_key(key: &str) -> Option<&'static str> {
+    KNOWN_SCALAR_KEYS
+        .iter()
+        .map(|&candidate| (candidate, levenshtein(key, candidate)))
+        .filter(|&(_, dist)| dist <= SUGGESTION_THRESHOLD)
+        .min_by_key(|&(_, dist)| dist)
+        .map(|(candidate, _)| candidate)
+}
+
+/// The warning message for a `workon.review.<key>` name no part of the schema claims — see
+/// [`is_claimed`]. Suggests the nearest [`KNOWN_SCALAR_KEYS`] entry when one is close enough
+/// ([`nearest_known_key`]) to plausibly be what the user meant.
+fn unknown_key_warning(key: &str) -> String {
+    match nearest_known_key(key) {
+        Some(suggestion) => {
+            format!("workon.review.{key}: unknown key, ignoring (did you mean '{suggestion}'?)")
+        }
+        None => format!("workon.review.{key}: unknown key, ignoring"),
+    }
+}
+
 /// Configuration reader for `workon.review.*` settings stored in git config.
 ///
 /// Mirrors `git-workon-lib`'s `WorkonConfig`: opens the repository's layered config (local >
@@ -285,7 +387,7 @@ impl<'repo> ReviewConfig<'repo> {
     /// unset or unrecognized.
     pub fn theme(&self) -> Result<Theme, git2::Error> {
         let config = self.repo.config()?;
-        let theme = match config.get_string("workon.review.theme") {
+        let theme = match config.get_string(&Self::scalar_key("theme")) {
             Ok(raw) => match raw.as_str() {
                 "dark" => Theme::Dark,
                 "light" => Theme::Light,
@@ -420,7 +522,7 @@ impl<'repo> ReviewConfig<'repo> {
     /// `theme`, not a view setting: icon mode gates the outline, summary panel, AND winbar.
     pub fn icons(&self) -> Result<Option<String>, git2::Error> {
         let config = self.repo.config()?;
-        match config.get_string("workon.review.icons") {
+        match config.get_string(&Self::scalar_key("icons")) {
             Ok(val) => Ok(Some(val)),
             Err(_) => Ok(None),
         }
@@ -462,6 +564,20 @@ impl<'repo> ReviewConfig<'repo> {
         }
     }
 
+    /// Build the fully-qualified `workon.review.<suffix>` key for a scalar (non-`bind`,
+    /// non-`theme.*`) setting, `debug_assert!`ing `suffix` is listed in [`KNOWN_SCALAR_KEYS`] —
+    /// see that constant's doc comment for why this assert is the drift guard for Decision 3's
+    /// registry.
+    fn scalar_key(suffix: &str) -> String {
+        debug_assert!(
+            KNOWN_SCALAR_KEYS.contains(&suffix),
+            "scalar key {suffix:?} read by a ReviewConfig getter but missing from \
+             KNOWN_SCALAR_KEYS (config.rs) — add it there, or the new unknown-key \
+             validation pass will warn on a key that actually works"
+        );
+        format!("workon.review.{suffix}")
+    }
+
     /// Build the `workon.review.<view>.<setting>` key for a view setting (never a `.bind.`
     /// entry — [`View::Global`] has no setting namespace, only callers reading `Diff`/`Outline`
     /// use this).
@@ -469,7 +585,7 @@ impl<'repo> ReviewConfig<'repo> {
         let segment = view
             .as_key_segment()
             .expect("view settings are only read for Diff/Outline, never Global");
-        format!("workon.review.{segment}.{setting}")
+        Self::scalar_key(&format!("{segment}.{setting}"))
     }
 
     fn get_view_string(&self, view: View, setting: &str) -> Result<Option<String>, git2::Error> {
@@ -486,6 +602,49 @@ impl<'repo> ReviewConfig<'repo> {
             Ok(val) => Ok(Some(val)),
             Err(_) => Ok(None),
         }
+    }
+
+    /// Warn on every `workon.review.*` key no part of the schema claims — see this module's
+    /// "Unknown-key registry" section doc for the rationale and [`is_claimed`] for exactly what
+    /// counts as claimed. Scoped to `workon.review.*` only: `workon.*` at large
+    /// (`workon.autocopy`, `workon.copyexclude`, …) belongs to `git-workon-lib`, and this crate
+    /// has no business warning about it.
+    ///
+    /// Same dedup concern as [`ReviewConfig::bindings`]/[`ReviewConfig::theme_overrides`]:
+    /// `entries()` yields one entry per config LAYER a key is set in, so a key set in both local
+    /// and global config must warn once, not twice — names are deduped before classifying them.
+    /// A config-read error yields an empty warning list (same degrade-not-abort posture as
+    /// every other getter here); the caller ([`resolve_runtime`]) already treats that the same
+    /// as "nothing to warn about".
+    pub fn unknown_key_warnings(&self) -> Result<Vec<String>, git2::Error> {
+        let config = self.repo.config()?;
+        let mut names: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        {
+            let mut entries = config.entries(Some("workon.review.*"))?;
+            while let Some(entry) = entries.next() {
+                let entry = entry?;
+                let Ok(name) = entry.name() else {
+                    continue;
+                };
+                if seen.insert(name.to_string()) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+
+        let mut warnings = Vec::new();
+        for name in names {
+            // `workon.review.*` matched a name that isn't `workon.review.<key>` (can't happen
+            // given the glob, but keeps this total rather than panicking).
+            let Some(key) = name.strip_prefix("workon.review.") else {
+                continue;
+            };
+            if !is_claimed(&name, key) {
+                warnings.push(unknown_key_warning(key));
+            }
+        }
+        Ok(warnings)
     }
 }
 
@@ -974,5 +1133,232 @@ mod tests {
         let (overrides, warnings) = config.theme_overrides().expect("theme_overrides");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
         assert!(!overrides.is_empty());
+    }
+
+    // ── unknown-key registry (config validation completeness) ──────────────────
+
+    #[test]
+    fn unknown_key_warnings_is_empty_when_unset() {
+        let fixture = FixtureBuilder::new().build().expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        assert!(ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings")
+            .is_empty());
+    }
+
+    #[test]
+    fn unknown_key_warnings_flags_a_typo_in_a_scalar_key() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.laoyut", "split")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let warnings = ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings");
+        assert_eq!(
+            warnings,
+            vec![
+                "workon.review.diff.laoyut: unknown key, ignoring (did you mean 'diff.layout'?)"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_key_warnings_suggests_nothing_for_an_unrelated_key() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.zzzzzzzz", "1")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let warnings = ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings");
+        assert_eq!(
+            warnings,
+            vec!["workon.review.zzzzzzzz: unknown key, ignoring".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_key_warnings_stays_silent_on_an_unrecognized_theme_key() {
+        // `theme.*` unknown keys already warn in `theme_overrides` — the registry pass must
+        // treat the whole `theme.*` shape as claimed, or a bad theme key double-warns.
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme.cursorbg", "#101010") // misspelled tint key
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let config = ReviewConfig::new(repo);
+
+        assert!(config
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings")
+            .is_empty());
+        let (_, theme_warnings) = config.theme_overrides().expect("theme_overrides");
+        assert_eq!(
+            theme_warnings.len(),
+            1,
+            "theme_overrides should still be the one place that warns: {theme_warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_warnings_stays_silent_on_an_unrecognized_bind_action() {
+        // Unknown bind ACTIONS already warn in `keymap` — the registry pass only cares that
+        // the shape parses as a bind entry (`parse_bind_key`), not that the action is real.
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.bind.made-up-action", "x")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        assert!(ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings")
+            .is_empty());
+    }
+
+    #[test]
+    fn unknown_key_warnings_flags_a_malformed_bind_shape() {
+        // A typo of `bind` itself (`bnid`) doesn't parse as a bind entry at all — it's an
+        // unknown key, not a bind-action problem, and `keymap` never sees it (it only iterates
+        // `ReviewConfig::bindings()`, which never yields this entry).
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.bnid.stage-hunk", "s")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let warnings = ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("diff.bnid.stage-hunk"));
+    }
+
+    #[test]
+    fn unknown_key_warnings_dedups_a_key_set_in_multiple_layers() {
+        // Same layering concern as `bindings_dedups_a_key_set_in_multiple_layers_to_the_
+        // winning_value`: `entries()` yields one entry per config LAYER, not one per key.
+        let fixture = FixtureBuilder::new().build().expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let cfg_path = repo.path().join("config");
+        for v in ["a", "b"] {
+            let status = std::process::Command::new("git")
+                .args([
+                    "config",
+                    "--file",
+                    cfg_path.to_str().expect("config path utf8"),
+                    "--add",
+                    "workon.review.bogus-key",
+                    v,
+                ])
+                .status()
+                .expect("git config --add");
+            assert!(status.success(), "git config --add failed");
+        }
+
+        let warnings = ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one warning per key, not one per config layer; got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn unknown_key_warnings_is_empty_for_a_fixture_setting_one_of_every_documented_key() {
+        // The false-positive gate: a validation pass that cries wolf on working config is worse
+        // than no validation at all. Sets every KNOWN_SCALAR_KEYS entry, a theme slot, a theme
+        // tint, a global bind, and a per-view bind — none of it should warn.
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme", "dark")
+            .config("workon.review.icons", "nerd")
+            .config("workon.review.outline.width", "40")
+            .config("workon.review.outline.mode", "tree")
+            .config("workon.review.outline.order", "base-first")
+            .config("workon.review.diff.layout", "split")
+            .config("workon.review.diff.zoom", "staged")
+            .config("workon.review.diff.text", "tint")
+            .config("workon.review.theme.base00", "#101010") // a theme slot
+            .config("workon.review.theme.cursor-bg", "#1a2b3c") // a theme tint
+            .config("workon.review.bind.quit", "q esc") // a global bind
+            .config("workon.review.diff.bind.stage-hunk", "s x") // a per-view bind
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let warnings = ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// Decision 3's drift test. `KNOWN_SCALAR_KEYS` is a second source of truth alongside the
+    /// getters that actually read `workon.review.*` — this enumerates every scalar getter, sets
+    /// its documented key on a fixture, and asserts BOTH that the getter reads it back AND that
+    /// the same key is claimed by the registry (`is_claimed`), so a getter added without a
+    /// matching registry entry fails here (not just "the registry agrees with itself"). The
+    /// `scalar_key` `debug_assert!` backs this up structurally: even a getter this list forgets
+    /// to enumerate would panic the moment ANY test exercises it, not just this one.
+    #[test]
+    fn scalar_getters_route_every_key_through_the_known_key_registry() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme", "dark")
+            .config("workon.review.icons", "nerd")
+            .config("workon.review.outline.width", "40")
+            .config("workon.review.outline.mode", "tree")
+            .config("workon.review.outline.order", "base-first")
+            .config("workon.review.diff.layout", "split")
+            .config("workon.review.diff.zoom", "staged")
+            .config("workon.review.diff.text", "tint")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let config = ReviewConfig::new(repo);
+
+        let probes: Vec<(&str, bool)> = vec![
+            ("theme", config.theme().is_ok()),
+            ("icons", config.icons().expect("icons").is_some()),
+            (
+                "outline.width",
+                config.outline_width().expect("width").is_some(),
+            ),
+            (
+                "outline.mode",
+                config.outline_mode().expect("mode").is_some(),
+            ),
+            (
+                "outline.order",
+                config.outline_order().expect("order").is_some(),
+            ),
+            (
+                "diff.layout",
+                config.diff_layout().expect("layout").is_some(),
+            ),
+            ("diff.zoom", config.diff_zoom().expect("zoom").is_some()),
+            ("diff.text", config.diff_text().expect("text").is_some()),
+        ];
+
+        for (key, getter_saw_it) in &probes {
+            assert!(
+                *getter_saw_it,
+                "getter for {key:?} did not read its own fixture value"
+            );
+            assert!(
+                KNOWN_SCALAR_KEYS.contains(key),
+                "{key:?} is read by a getter but missing from KNOWN_SCALAR_KEYS — it would \
+                 warn as unknown while working correctly"
+            );
+        }
+        assert_eq!(
+            probes.len(),
+            KNOWN_SCALAR_KEYS.len(),
+            "a scalar getter was added without a matching probe above (or vice versa) — \
+             update this list alongside KNOWN_SCALAR_KEYS"
+        );
     }
 }
