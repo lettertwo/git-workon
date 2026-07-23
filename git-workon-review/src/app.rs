@@ -1560,8 +1560,9 @@ impl App {
     }
 
     /// Set the display label shown in [`Self::notify_combined_refusal`]'s "cycle zoom" hint —
-    /// see the `zoom_key_label` field's doc comment. `main.rs::seat_app` calls this with the
-    /// resolved [`crate::keymap::Command::CycleZoom`] binding right after construction.
+    /// see the `zoom_key_label` field's doc comment. `main.rs::plumb_zoom_hint_and_warnings` calls
+    /// this with the resolved [`crate::keymap::Command::CycleZoom`] binding, both right after
+    /// `seat_app` constructs the `App` and on every `reload-config`.
     pub fn set_zoom_key_label(&mut self, label: String) {
         self.zoom_key_label = label;
     }

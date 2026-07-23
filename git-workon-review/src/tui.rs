@@ -1259,20 +1259,16 @@ fn event_loop<W: Write>(
             // A half-entered chord against the OLD keymap is meaningless once the bindings under
             // it have changed.
             pending.clear();
-            // Re-plumb the "cycle zoom" refusal hint the same way `main.rs`'s `seat_app` does at
-            // startup — a reload that rebinds `cycle-zoom` would otherwise leave the hint naming
-            // the old key. No binding at all leaves the previous label in place, same as startup.
-            if let Some(label) = workon_review::keymap::primary_key(keymap, Command::CycleZoom) {
-                app.set_zoom_key_label(label);
-            }
             let view_warnings = app.reload_view_config(&runtime.view_config);
-            let mut warnings = keymap.warnings().to_vec();
-            warnings.extend(runtime.warnings);
-            warnings.extend(view_warnings);
-            if warnings.is_empty() {
+            let mut extra_warnings = runtime.warnings;
+            extra_warnings.extend(view_warnings);
+            // `crate::plumb_zoom_hint_and_warnings` re-plumbs the "cycle zoom" refusal hint the
+            // same way `main.rs`'s `seat_app` does at startup — a reload that rebinds
+            // `cycle-zoom` would otherwise leave the hint naming the old key (no binding at all
+            // leaves the previous label in place, same as startup) — and surfaces any warnings.
+            // A reload with nothing to warn about still owes the user a signal that it worked.
+            if !crate::plumb_zoom_hint_and_warnings(app, keymap, extra_warnings) {
                 app.notify("config reloaded", Severity::Info);
-            } else {
-                app.notify(warnings.join("; "), Severity::Error);
             }
         }
     }
