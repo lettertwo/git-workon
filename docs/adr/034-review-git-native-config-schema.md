@@ -106,6 +106,45 @@ workon.review.<view>.<setting>         = <value>         ; view config
 - Adding a rebindable action = adding it to the enumerable action set (code default +
   dispatch + help entry); it is automatically configurable, validated, and documented.
 
+## Revised (config validation completeness)
+
+The validation posture above ("an unrecognized key … is a startup warning, not an error") turned
+out to hold in only two of the four places it reads as a promise. `workon.review.theme.*` warns on
+an unrecognized key, and the bind pass warns on an unknown action — but every *other* key under
+`workon.review.*` is read by an explicit getter, so a name no getter asks for is never seen by
+anything. A typo'd `workon.review.diff.laoyut` or `workon.review.outline.wdith` is silently
+dropped: no warning, no effect, and nothing to distinguish it from a setting that simply had no
+visible result. This bit in practice, twice in one session, on two different subsections.
+
+**Unknown-key detection now covers the whole `workon.review.*` tree**, via a single validation pass
+over `entries("workon.review.*")` driven by a central known-key registry: exact scalar names, plus
+pattern arms for the two open-ended subspaces (`theme.<slot|tint>`, `<view>.bind.<action>`). Any
+name no arm claims warns and is ignored, same non-fatal posture as everything else here.
+
+Scope stops at `workon.review.*` deliberately. That subsection is this crate's exclusively;
+`workon.*` at large belongs to `git-workon-lib`, and scanning wider would warn about
+`workon.autocopy` and every other key this crate has no business knowing.
+
+**The registry is a second source of truth, and that is the real cost.** A getter added without a
+matching registry entry would make its key warn as unknown *while working correctly* — worse than
+the silent-drop it replaces. The mitigation is a drift test that enumerates the getters' keys and
+asserts each is claimed by the registry, so the failure lands in CI rather than in a user's footer.
+The alternative — threading consumed-key tracking through every getter so the getters *are* the
+registry — removes the drift class outright but reworks every reader's signature or call site; the
+registry-plus-test was judged the better trade at this schema's size, and the choice is revisitable
+if the schema grows a third open-ended subspace.
+
+**Invalid-value warnings now carry the allowed set and the fallback being applied.** The existing
+messages named the offending value but neither what was legal nor what the reader did instead —
+`"workon.review.diff.text = 'edt' unrecognized; using default"` leaves a user to go read source or
+docs for both halves. They now read `(valid: syntax, tint, edit); using default 'syntax'`, and the
+range-checked and color-format cases get the same treatment. Theme keys keep saying `ignoring`
+rather than naming a default, because an ignored override genuinely has no default to apply — the
+underlying scheme's value stands.
+
+**Unknown keys suggest a nearest match** by edit distance against the registry when one is close
+enough, since the overwhelmingly common cause of an unknown key is a typo of a real one.
+
 ## References
 
 - [ADR-006](006-git-native-config.md) — git-native config under `workon.*` this extends
