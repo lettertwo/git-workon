@@ -97,18 +97,18 @@ fn main() -> Result<()> {
     // dark rather than aborting the review (CS5). `Auto` runs the terminal-derivation probe (CS6),
     // which needs the controlling tty and so lives outside the pure `theme.rs`; it is bounded by a
     // hard timeout and always yields a curated fallback on a silent/hostile terminal, never a
-    // hang. `Dark`/`Light` stay CS5's I/O-free `for_theme` path — but that ladder now lives in
-    // `resolve_runtime` below; here we only need `auto_base` (what to cache for `PaletteContext`)
-    // and `probed`. `probed` is whether a real probe conversation happened on the tty this launch
-    // — NOT just "theme was auto". `detect_auto_palette` reports `false` on a cached "silent
-    // terminal" verdict (see `probe_cache`), since a cache hit writes nothing to the tty and so
-    // owes no flush; every other path (an answered probe, a timed-out-uncached probe, a non-auto
-    // theme) is `false`/`true` exactly as before.
+    // hang. `Dark`/`Light`/a read error stay `resolve_runtime`'s own I/O-free ladder below — this
+    // only feeds `auto_base` (what to cache for `PaletteContext`), so a non-`Auto` selection gets
+    // a cheap unread placeholder here rather than running `for_theme` a second time only to have
+    // `resolve_runtime` immediately re-derive and use its own. `probed` is whether a real probe
+    // conversation happened on the tty this launch — NOT just "theme was auto". `detect_auto_
+    // palette` reports `false` on a cached "silent terminal" verdict (see `probe_cache`), since a
+    // cache hit writes nothing to the tty and so owes no flush; every other path (an answered
+    // probe, a timed-out-uncached probe, a non-auto theme) is `false`/`true` exactly as before.
     let selection = ReviewConfig::new(&repo).theme();
     let (auto_base, probed) = match selection {
         Ok(config::Theme::Auto) => terminal_query::detect_auto_palette(),
-        Ok(selection) => (Palette::for_theme(selection), false),
-        Err(_) => (Palette::dark(), false),
+        _ => (Palette::dark(), false),
     };
 
     // CS2 (`no-color-mono`): read the env kill-switch once here — `resolve_runtime` applies it
