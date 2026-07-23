@@ -13,6 +13,28 @@ use workon_review::model::LineKind;
 use workon_review::ops::{apply_file, apply_hunk, apply_lines};
 use workon_review::synthesis::{LineSelection, PatchHunk, PatchLine, PatchText};
 
+/// Pipe `raw` into `git apply --cached` at `workdir`, returning the process output. Shared by
+/// tests that exercise `CliApplier`'s mechanism directly, bypassing `PatchText`/`Applier`.
+fn git_apply_cached(workdir: &std::path::Path, raw: &[u8]) -> std::process::Output {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new("git")
+        .args(["apply", "--cached"])
+        .current_dir(workdir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git apply");
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin was piped")
+        .write_all(raw)
+        .expect("write patch to stdin");
+    child.wait_with_output().expect("wait for git apply")
+}
+
 /// Hand-build the patch a naive whole-hunk stage of a DELETION would render: a hunk deleting
 /// every line, `--- a/<path>` / `+++ b/<path>` (not `/dev/null` — the file still exists at
 /// `path` in the index/HEAD, only its content is fully removed). This is what
@@ -86,8 +108,6 @@ fn naive_hunk_stage_of_deletion_stages_empty_blob() {
 /// `creation_patch_with_proper_headers_is_accepted_by_both_appliers` below for the fixed one).
 #[test]
 fn naive_hunk_stage_of_untracked_errors() {
-    use std::io::Write;
-
     let raw: &[u8] = b"diff --git a/new.txt b/new.txt\n\
 index 0000000..0000000 100644\n\
 --- /dev/null\n\
@@ -103,21 +123,7 @@ index 0000000..0000000 100644\n\
     let repo = fixture.repo().expect("repo");
     let workdir = repo.workdir().expect("workdir");
 
-    let mut child = std::process::Command::new("git")
-        .args(["apply", "--cached"])
-        .current_dir(workdir)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn git apply");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin was piped")
-        .write_all(raw)
-        .expect("write patch to stdin");
-    let output = child.wait_with_output().expect("wait for git apply");
+    let output = git_apply_cached(workdir, raw);
 
     assert!(
         !output.status.success(),
@@ -166,8 +172,6 @@ index 0000000..0000000\n\
 
     // `git apply --cached` directly (CliApplier's mechanism, bypassing PatchText).
     {
-        use std::io::Write;
-
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .untracked_file("new.txt", "hello\nworld\n")
@@ -176,21 +180,7 @@ index 0000000..0000000\n\
         let repo = fixture.repo().expect("repo");
         let workdir = repo.workdir().expect("workdir");
 
-        let mut child = std::process::Command::new("git")
-            .args(["apply", "--cached"])
-            .current_dir(workdir)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn git apply");
-        child
-            .stdin
-            .as_mut()
-            .expect("stdin was piped")
-            .write_all(raw)
-            .expect("write patch to stdin");
-        let output = child.wait_with_output().expect("wait for git apply");
+        let output = git_apply_cached(workdir, raw);
         assert!(
             output.status.success(),
             "git apply --cached rejected the proper creation header: {}",
