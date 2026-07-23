@@ -30,6 +30,7 @@ use crate::ops;
 use crate::outline::{
     self, FoldKey, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder,
 };
+use crate::prompt::PromptState;
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::scope::enclosing_scope_lines;
@@ -965,6 +966,19 @@ pub struct OutlineState {
     /// outlives its own toggling row's disappearance and reappearance (e.g. a discard-then-recreate
     /// of the same path) for as long as the session runs.
     pub folds: HashMap<OutlineMode, HashSet<FoldKey>>,
+    /// CS2 (`outline-filter`, M11): the fuzzy-filter query, `/` while the outline has focus opens.
+    /// Read fresh every [`App::outline_items`] call (via [`outline::apply_filter`]) rather than
+    /// cached — persistence across a rebuild (staging op, mode cycle, refresh) is therefore free:
+    /// the query itself just sits here untouched by any of those, so the very next
+    /// [`App::outline_items`] call re-derives the same filtered view from the fresh row list. See
+    /// [`Self::filter_focused`] for the two-focus model this pairs with.
+    pub filter: PromptState,
+    /// Whether the one-row filter input (not the outline row list) currently has keyboard capture
+    /// — the prototype's two-focus model (locked design #2 in the M11 plan): `/` sets this `true`;
+    /// `Enter`/`Esc` set it back to `false` while KEEPING [`Self::filter`]'s query; `Ctrl-c` clears
+    /// the query AND sets this `false`. Meaningless unless [`OutlineState::focused`] is also
+    /// `true` — the filter input can't have keyboard capture while the diff pane does.
+    pub filter_focused: bool,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1563,6 +1577,8 @@ impl App {
             order: OutlineOrder::default(),
             hscroll: 0,
             folds: HashMap::new(),
+            filter: PromptState::new(),
+            filter_focused: false,
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -2695,37 +2711,12 @@ impl App {
             .collect()
     }
 
-    /// Build (via [`outline::fold_outline`]) the current [`OutlineMode`]'s FOLD-FILTERED row list
-    /// — the outline cursor's SINGLE index space, and the source of truth every other outline
-    /// consumer reads: `render.rs`, [`Self::outline_move_by`]/[`Self::outline_move_to`],
-    /// [`Self::outline_confirm`], [`Self::summary_target`], and the staging-verb resolution in
-    /// [`Self::outline_row_targets`] all funnel through this SAME method (CS5, `outline-fold`) —
-    /// so folding a Header/Dir can never silently retarget a cursor move or a stage/discard verb
-    /// onto the wrong row: there is no OTHER row list any of them could accidentally read
-    /// instead. Rebuilt fresh on every call (cheap: a small stack times a handful of files each,
-    /// no caching, same posture as [`Self::effective_zoom_for`]) rather than cached on `App`, so
-    /// it's never stale across a mode toggle, a nav, a fold, or a refresh. `render.rs`'s marker
-    /// needs the per-row hidden-file counts this discards — see
-    /// [`Self::outline_items_with_hidden_counts`].
-    pub fn outline_items(&self) -> Vec<OutlineItem> {
-        self.outline_folded().items
-    }
-
-    /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count —
-    /// `render_outline`'s data source. Every OTHER outline consumer uses [`Self::outline_items`]
-    /// instead, which just discards the counts it doesn't need; both funnel through the same
-    /// [`Self::outline_folded`] build, so they can never disagree about which rows are visible.
-    pub fn outline_items_with_hidden_counts(&self) -> (Vec<OutlineItem>, Vec<usize>) {
-        let folded = self.outline_folded();
-        (folded.items, folded.hidden_counts)
-    }
-
-    /// The shared build [`Self::outline_items`]/[`Self::outline_items_with_hidden_counts`]/
-    /// [`Self::outline_target_index`] all read from — [`outline::fold_outline`] applied to the
-    /// current mode/order/fold-set, so there's exactly one place that pairs "which changesets by
-    /// which state" with "the fold set for the CURRENT mode" (`self.outline.folds` is keyed by
-    /// [`OutlineMode`]; a mode with no folds recorded yet reads as "everything expanded", the
-    /// default).
+    /// The current [`OutlineMode`]'s FOLD-FILTERED row list — [`Self::outline_items`]'s FOLD-ONLY
+    /// input, before CS2's fuzzy filter (if any) is layered on top. `render.rs`'s marker needs the
+    /// per-row hidden-file counts this alone carries — see [`Self::outline_items_with_hidden_counts`].
+    /// Rebuilt fresh on every call (cheap: a small stack times a handful of files each, no
+    /// caching, same posture as [`Self::effective_zoom_for`]) rather than cached on `App`, so it's
+    /// never stale across a mode toggle, a nav, a fold, or a refresh.
     fn outline_folded(&self) -> outline::FoldedOutline {
         let snapshot = self.outline_snapshot();
         let folds = self.outline.folds.get(&self.outline.mode);
@@ -2734,15 +2725,87 @@ impl App {
         })
     }
 
-    /// Resolve a target row matched against the FULL (unfiltered) row list to its position in
-    /// [`Self::outline_items`]'s FILTERED list — its own index if it's visible, or its nearest
-    /// visible (collapsed) ancestor's if a fold hides it (CS5's "`sync_outline_to_current`
-    /// targeting a file hidden under a collapsed node lands on the collapsed ancestor WITHOUT
-    /// auto-expanding" rule — see [`outline::FoldedOutline::visible_index`]'s doc comment). `find`
-    /// matches against the full build (via `outline::build_items` directly, not
-    /// [`Self::outline_items`]) since a fold-hidden target has no index in the filtered list at
-    /// all to match against.
+    /// [`Self::outline_folded`] with CS2's fuzzy filter layered on top when
+    /// [`OutlineState::filter`] holds a query — the outline cursor's SINGLE index space, and the
+    /// source of truth every other outline consumer reads: `render.rs`,
+    /// [`Self::outline_move_by`]/[`Self::outline_move_to`], [`Self::outline_confirm`],
+    /// [`Self::summary_target`], and the staging-verb resolution in [`Self::outline_row_targets`]
+    /// all funnel through [`Self::outline_items`]/[`Self::outline_items_with_hidden_counts`] below
+    /// — so an active filter can never silently retarget a cursor move or a stage/discard verb
+    /// onto a row the filter itself hid.
+    ///
+    /// An empty query returns [`Self::outline_folded`] UNCHANGED (zero regression when the filter
+    /// is unused — no [`outline::apply_filter`] call at all, so hidden-file markers and fold
+    /// structure render exactly as before this changeset). A non-empty query instead runs
+    /// [`outline::apply_filter`] over the fold-filtered rows and returns its flat, score-ordered
+    /// result with every hidden-file marker zeroed (a filtered row is never itself collapsed —
+    /// [`outline::apply_filter`] already reset its `guides`, and a chevron marker referring to
+    /// counts computed against the PRE-filter row list would be meaningless against this one) and
+    /// an identity `visible_index` (every surviving row maps onto its own position — nothing else
+    /// reads a filtered build's `visible_index`, since [`Self::outline_target_index`] special-cases
+    /// the filtered case instead of using it).
+    fn outline_filtered(&self) -> outline::FoldedOutline {
+        let folded = self.outline_folded();
+        if self.outline.filter.is_empty() {
+            return folded;
+        }
+        let filtered = outline::apply_filter(&folded.items, self.outline.filter.buffer());
+        let hidden_counts = vec![0; filtered.items.len()];
+        let visible_index = (0..filtered.items.len()).collect();
+        outline::FoldedOutline {
+            items: filtered.items,
+            hidden_counts,
+            visible_index,
+        }
+    }
+
+    /// [`Self::outline_filtered`]'s row list — see that method's doc comment for the fold+filter
+    /// composition, and [`Self::outline_items_with_hidden_counts`] for the render-facing variant
+    /// that also carries fold markers and match indices.
+    pub fn outline_items(&self) -> Vec<OutlineItem> {
+        self.outline_filtered().items
+    }
+
+    /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count
+    /// and CS2's fuzzy-match char indices (empty when no filter is active, or for a row the query
+    /// didn't highlight any char of) — `render_outline`'s data source. Every OTHER outline
+    /// consumer uses [`Self::outline_items`] instead, which just discards what it doesn't need;
+    /// both funnel through the same [`Self::outline_filtered`]/[`Self::outline_folded`] build, so
+    /// they can never disagree about which rows are visible.
+    pub fn outline_items_with_hidden_counts(
+        &self,
+    ) -> (Vec<OutlineItem>, Vec<usize>, Vec<Vec<usize>>) {
+        let folded = self.outline_folded();
+        if self.outline.filter.is_empty() {
+            let match_indices = vec![Vec::new(); folded.items.len()];
+            return (folded.items, folded.hidden_counts, match_indices);
+        }
+        let filtered = outline::apply_filter(&folded.items, self.outline.filter.buffer());
+        let hidden_counts = vec![0; filtered.items.len()];
+        (filtered.items, hidden_counts, filtered.match_indices)
+    }
+
+    /// Resolve a target row matched against the FULL (unfiltered, unfolded) row list to its
+    /// position in [`Self::outline_items`]'s row list.
+    ///
+    /// With NO CS2 fuzzy filter active: its own index if it's visible, or its nearest visible
+    /// (collapsed) ancestor's if a fold hides it (CS5's "`sync_outline_to_current` targeting a
+    /// file hidden under a collapsed node lands on the collapsed ancestor WITHOUT auto-expanding"
+    /// rule — see [`outline::FoldedOutline::visible_index`]'s doc comment). `find` matches against
+    /// the full build (via `outline::build_items` directly, not [`Self::outline_items`]) since a
+    /// fold-hidden target has no index in the fold-filtered list at all to match against.
+    ///
+    /// With a CS2 fuzzy filter active: `None` when the target row's own text didn't survive the
+    /// filter — a flat, re-ordered, re-scored filtered list has no ancestor-fallback story the way
+    /// a fold does (the locked design's "parents of matched children are NOT preserved" rule), so
+    /// there is genuinely no row to land `find`'s target on. Callers (currently only
+    /// [`Self::sync_outline_to_current`]) already treat `None` as "leave the cursor where it is,
+    /// clamped" — precisely the CS2 gotcha's "no-op instead of clearing the filter" requirement,
+    /// since neither branch here ever touches [`OutlineState::filter`] itself.
     fn outline_target_index(&self, find: impl Fn(&OutlineItem) -> bool) -> Option<usize> {
+        if !self.outline.filter.is_empty() {
+            return self.outline_items().iter().position(find);
+        }
         let snapshot = self.outline_snapshot();
         let full = outline::build_items(&snapshot, self.outline.mode, self.outline.order);
         let full_idx = full.iter().position(find)?;
@@ -2829,6 +2892,33 @@ impl App {
 
     pub fn outline_cursor(&self) -> usize {
         self.outline.cursor
+    }
+
+    /// CS2 (`outline-filter`): the current filter query, for `render.rs`'s input-row line.
+    pub fn outline_filter_query(&self) -> &str {
+        self.outline.filter.buffer()
+    }
+
+    /// CS2: the filter input's own [`PromptState`] — `render.rs` calls
+    /// [`PromptState::render_line`] on it directly rather than `app.rs` doing so itself, keeping
+    /// this module free of a `ratatui` dependency (see [`Region`]'s doc comment for the same
+    /// discipline elsewhere in this file).
+    pub fn outline_filter_state(&self) -> &PromptState {
+        &self.outline.filter
+    }
+
+    /// CS2: whether the filter INPUT ROW (not the outline row list) currently has keyboard
+    /// capture — see [`OutlineState::filter_focused`]'s doc comment for the two-focus model.
+    pub fn outline_filter_focused(&self) -> bool {
+        self.outline.filter_focused
+    }
+
+    /// CS2: whether `render_outline` should paint the filter input row at all — non-empty query
+    /// OR input-focused (locked design: typing shows the row; leaving it focused with an empty
+    /// query still shows it, so the cursor has somewhere to render). `false` (the pre-CS2 default)
+    /// renders the outline exactly as before this changeset.
+    pub fn outline_filter_active(&self) -> bool {
+        self.outline.filter_focused || !self.outline.filter.is_empty()
     }
 
     /// Top-of-viewport row index into [`Self::outline_items`]'s row list — see
@@ -3335,6 +3425,104 @@ impl App {
             .or_default()
             .clear();
         self.sync_outline_to_current();
+    }
+
+    // ── Outline fuzzy filter (CS2 `outline-filter`, M11) ─────────────────────────
+
+    /// `/` while the outline has focus: give the filter input row keyboard capture. The keymap
+    /// only ever dispatches this while [`OutlineState::focused`] is already `true` (it's a
+    /// [`crate::config::View::Outline`]-namespaced command), so this never has to flip that flag
+    /// itself. Leaves any existing query untouched — re-pressing `/` on an already-active filter
+    /// just returns capture to it rather than resetting anything.
+    pub fn outline_filter_focus(&mut self) {
+        self.outline.filter_focused = true;
+    }
+
+    /// `Enter`/`Esc` while the filter input is focused: hand keyboard capture back to the outline
+    /// row LIST, KEEPING the query — the locked two-focus model (`Ctrl-c` below is the only path
+    /// that clears it). The row list itself needs no re-derivation here: it already reads
+    /// [`OutlineState::filter`] live on every [`Self::outline_items`] call, so nothing about the
+    /// visible rows changes just because capture moves off the input row.
+    pub fn outline_filter_unfocus(&mut self) {
+        self.outline.filter_focused = false;
+    }
+
+    /// `Ctrl-c` while the filter input is focused: clear the query AND hand capture back to the
+    /// list — the one path that discards the filter entirely, unlike [`Self::outline_filter_unfocus`].
+    /// Re-syncs the cursor via [`Self::sync_outline_to_current`] (mirroring
+    /// [`Self::outline_collapse_all`]/[`Self::outline_expand_all`]'s reseat) since clearing the
+    /// query can radically reshape the row list (from a short filtered set back to the full
+    /// fold-filtered one).
+    pub fn outline_filter_clear(&mut self) {
+        self.outline.filter.clear();
+        self.outline.filter_focused = false;
+        self.sync_outline_to_current();
+    }
+
+    /// After any filter-input edit that can change the QUERY TEXT (so the matched/scored row set
+    /// itself just reshaped, not merely the cursor's position within a stable list): reseat the
+    /// outline cursor to the top-scored row — mirroring a picker reopening its list on every
+    /// keystroke — and re-derive the scroll. `render_body`'s summary-vs-diff branch
+    /// ([`Self::summary_target`]) and `outline_move_by`'s own switch-on-landing behavior both key
+    /// off `outline.cursor`, so parking it at `0` (the new best match) rather than leaving it at a
+    /// stale index is what makes typing feel live rather than leaving the cursor pointing at
+    /// whatever row happened to still be there.
+    fn outline_filter_reflow(&mut self) {
+        self.outline.cursor = 0;
+        self.derive_outline_scroll(self.outline_items().len());
+    }
+
+    /// Insert one typed char into the filter query (every non-control, non-Alt `Char` key while
+    /// the filter input is focused).
+    pub fn outline_filter_insert_char(&mut self, c: char) {
+        self.outline.filter.insert_char(c);
+        self.outline_filter_reflow();
+    }
+
+    /// `Backspace` while the filter input is focused.
+    pub fn outline_filter_backspace(&mut self) {
+        self.outline.filter.backspace();
+        self.outline_filter_reflow();
+    }
+
+    /// `Delete` while the filter input is focused.
+    pub fn outline_filter_delete(&mut self) {
+        self.outline.filter.delete();
+        self.outline_filter_reflow();
+    }
+
+    /// `Left` while the filter input is focused — moves the INPUT's own cursor, not the outline
+    /// selection (`Down`/`Up`/`Ctrl-n`/`Ctrl-p` do that instead — see `tui::update`'s filter-input
+    /// capture arm). Doesn't reshape the row list, so no [`Self::outline_filter_reflow`].
+    pub fn outline_filter_move_left(&mut self) {
+        self.outline.filter.move_left();
+    }
+
+    /// `Right` while the filter input is focused — see [`Self::outline_filter_move_left`].
+    pub fn outline_filter_move_right(&mut self) {
+        self.outline.filter.move_right();
+    }
+
+    /// `Home`/`Ctrl-a` while the filter input is focused.
+    pub fn outline_filter_move_home(&mut self) {
+        self.outline.filter.move_home();
+    }
+
+    /// `End`/`Ctrl-e` while the filter input is focused.
+    pub fn outline_filter_move_end(&mut self) {
+        self.outline.filter.move_end();
+    }
+
+    /// `Ctrl-u` while the filter input is focused.
+    pub fn outline_filter_clear_to_start(&mut self) {
+        self.outline.filter.clear_to_start();
+        self.outline_filter_reflow();
+    }
+
+    /// `Ctrl-w` while the filter input is focused.
+    pub fn outline_filter_delete_word_back(&mut self) {
+        self.outline.filter.delete_word_back();
+        self.outline_filter_reflow();
     }
 
     // ── Outline staging (CS7) ───────────────────────────────────────────────────
@@ -12471,5 +12659,159 @@ mod tests {
         assert_eq!(app.cursor, cursor_before);
         assert_eq!(app.outline_cursor(), outline_cursor_before);
         assert_eq!((app.current_cs(), app.current), current_before);
+    }
+
+    // ── CS2 (`outline-filter`, M11): fuzzy filter ─────────────────────────────────
+
+    #[test]
+    fn outline_items_applies_the_active_filter_and_keeps_true_indices() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        assert_eq!(
+            app.outline_items().len(),
+            5,
+            "unfiltered: [Header cs-a, a1.txt, a2.txt, Header cs-b, b1.txt]"
+        );
+
+        app.outline_filter_insert_char('b');
+        app.outline_filter_insert_char('1');
+
+        let items = app.outline_items();
+        assert_eq!(items.len(), 1, "only b1.txt fuzzy-matches 'b1'");
+        assert_eq!(
+            items[0],
+            OutlineItem::File {
+                cs_idx: 1,
+                file_idx: 0,
+                path: "b1.txt".to_string(),
+                status: StagedStatus::None,
+                change: FileStatus::Added,
+                guides: Vec::new(),
+            },
+            "the surviving row keeps its TRUE cs_idx/file_idx into App::changesets"
+        );
+    }
+
+    #[test]
+    fn outline_items_empty_query_reproduces_the_unfiltered_fold_filtered_list() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        let before = app.outline_items();
+
+        // Focusing the filter input alone (no query typed) must be a complete no-op on the row
+        // list — the locked "zero regression when unused" rule.
+        app.outline_filter_focus();
+
+        assert_eq!(app.outline_items(), before);
+    }
+
+    #[test]
+    fn outline_filter_query_persists_across_a_mode_cycle_and_a_staging_op() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("apple.txt", "a\n", "a\nCHANGED\n")
+            .unstaged_file("banana.txt", "b\n", "b\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        open_focused_outline(&mut app, OutlineMode::Flat, 0);
+        app.outline_filter_insert_char('a');
+        app.outline_filter_insert_char('p');
+        app.outline_filter_insert_char('p');
+        assert_eq!(app.outline_filter_query(), "app");
+        assert_eq!(app.outline_items().len(), 1, "only apple.txt matches 'app'");
+
+        // A mode cycle rebuilds the row list from scratch — the query must survive untouched, and
+        // re-filter the newly-rebuilt list the same way.
+        app.outline_cycle_mode();
+        assert_eq!(
+            app.outline_filter_query(),
+            "app",
+            "a mode cycle must not clear the filter query"
+        );
+        assert_eq!(app.outline_items().len(), 1, "still just apple.txt");
+
+        // A staging op runs `coordinated_refresh`, which rebuilds `outline_snapshot`/the fold —
+        // the query must survive that too.
+        let idx = outline_file_row(&app, "apple.txt");
+        app.outline.cursor = idx;
+        app.outline_stage();
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.outline_filter_query(),
+            "app",
+            "a staging op's refresh must not clear the filter query"
+        );
+    }
+
+    #[test]
+    fn outline_filter_clear_restores_the_full_row_list_and_unfocuses_the_input() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        let full_len = app.outline_items().len();
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('b');
+        assert!(app.outline_items().len() < full_len);
+
+        app.outline_filter_clear();
+
+        assert!(app.outline_filter_query().is_empty());
+        assert!(!app.outline_filter_focused());
+        assert_eq!(app.outline_items().len(), full_len);
+    }
+
+    #[test]
+    fn outline_filter_unfocus_keeps_the_query_and_the_narrowed_row_list() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('b');
+        let narrowed_len = app.outline_items().len();
+
+        app.outline_filter_unfocus();
+
+        assert!(!app.outline_filter_focused());
+        assert_eq!(app.outline_filter_query(), "b");
+        assert_eq!(app.outline_items().len(), narrowed_len);
+    }
+
+    #[test]
+    fn sync_outline_to_current_no_ops_the_cursor_when_the_current_file_is_filtered_out() {
+        // A file-nav call (`next_file`) triggers `sync_outline_to_current`; with a filter active
+        // that hides the landing file's own row, the cursor must stay wherever it already was
+        // (clamped into the filtered list's bounds) rather than the filter being silently cleared
+        // to make room for a "found" row.
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Flat, 0);
+        app.outline_filter_insert_char('a'); // matches a1.txt/a2.txt, not b1.txt
+        let items = app.outline_items();
+        assert!(
+            items
+                .iter()
+                .all(|it| !matches!(it, OutlineItem::File { cs_idx: 1, .. })),
+            "b1.txt (cs-b) must be filtered out by the 'a' query"
+        );
+        let cursor_before = app.outline_cursor();
+        let query_before = app.outline_filter_query().to_string();
+
+        // Switch the diff's current file to b1.txt (cs-b), which the active filter hides.
+        // `switch_changeset` itself never calls `sync_outline_to_current` (see that method's own
+        // doc comment on the sync-follow discipline), so call it directly here — exactly what a
+        // diff-initiated nav entry point (`next_file`/`refresh`/…) would do next.
+        app.switch_changeset(1, 0);
+        app.sync_outline_to_current();
+
+        assert_eq!(
+            app.outline_filter_query(),
+            query_before,
+            "the filter must never be cleared as a side effect of a sync no-op"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before.min(app.outline_items().len().saturating_sub(1)),
+            "the cursor merely clamps into the filtered list's bounds, exactly like the \
+             pre-CS2 fallback for an unresolvable sync target"
+        );
     }
 }

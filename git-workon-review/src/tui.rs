@@ -32,7 +32,7 @@ use std::time::Duration;
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -469,6 +469,7 @@ enum Action {
     OutlinePrevChangeset,
     OutlineCollapseAll,
     OutlineExpandAll,
+    OutlineFilterFocus,
     None,
 }
 
@@ -526,6 +527,7 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::OutlinePrevChangeset => Action::OutlinePrevChangeset,
         Command::OutlineCollapseAll => Action::OutlineCollapseAll,
         Command::OutlineExpandAll => Action::OutlineExpandAll,
+        Command::OutlineFilter => Action::OutlineFilterFocus,
     }
 }
 
@@ -672,6 +674,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::OutlinePrevChangeset => app.outline_prev_changeset(),
         Action::OutlineCollapseAll => app.outline_collapse_all(),
         Action::OutlineExpandAll => app.outline_expand_all(),
+        Action::OutlineFilterFocus => app.outline_filter_focus(),
         Action::None => {}
     }
     false
@@ -691,8 +694,8 @@ enum KeyOutcome {
 /// documented Esc-precedence cascade, extracted so [`update`] and [`update_batch`] share the exact
 /// same resolution instead of duplicating it.
 ///
-/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 3-6 do (the
-/// confirm/help modals deliberately do not — that stays in their own arms, not here).
+/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 4-7 do (the
+/// confirm/help/filter-input modals deliberately do not — that stays in their own arms, not here).
 fn resolve_key(
     app: &mut App,
     keymap: &Keymap,
@@ -715,6 +718,43 @@ fn resolve_key(
     ))
 }
 
+/// `update`'s case-3 modal arm: apply one key press while the CS2 outline-filter INPUT has
+/// keyboard capture (see [`App::outline_filter_focused`]). Every branch calls straight into an
+/// `App::outline_filter_*` method — no [`Action`]/[`map_key`] indirection, mirroring the
+/// confirm/help modals' own direct `key.code` matches just above this arm's call site, rather
+/// than routing through the rebindable [`Keymap`] (the filter input's editing keys are readline
+/// muscle memory, not a rebindable action set, matching [`crate::prompt`]'s own module doc).
+///
+/// Ctrl-modified letters are checked before the plain-`Char` catch-all so `Ctrl-a`/`Ctrl-c`/
+/// `Ctrl-e`/`Ctrl-n`/`Ctrl-p`/`Ctrl-u`/`Ctrl-w` never fall through and get inserted as literal
+/// text. `Alt`-modified chars are excluded from the catch-all too (there is no bound behavior for
+/// them here, and inserting an Alt-chorded char as plain text would be surprising).
+fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => app.outline_filter_unfocus(),
+        KeyCode::Char('c') if ctrl => app.outline_filter_clear(),
+        KeyCode::Char('a') if ctrl => app.outline_filter_move_home(),
+        KeyCode::Char('e') if ctrl => app.outline_filter_move_end(),
+        KeyCode::Char('u') if ctrl => app.outline_filter_clear_to_start(),
+        KeyCode::Char('w') if ctrl => app.outline_filter_delete_word_back(),
+        KeyCode::Char('n') if ctrl => app.outline_move_by(1),
+        KeyCode::Char('p') if ctrl => app.outline_move_by(-1),
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            app.outline_filter_insert_char(c);
+        }
+        KeyCode::Backspace => app.outline_filter_backspace(),
+        KeyCode::Delete => app.outline_filter_delete(),
+        KeyCode::Left => app.outline_filter_move_left(),
+        KeyCode::Right => app.outline_filter_move_right(),
+        KeyCode::Home => app.outline_filter_move_home(),
+        KeyCode::End => app.outline_filter_move_end(),
+        KeyCode::Down => app.outline_move_by(1),
+        KeyCode::Up => app.outline_move_by(-1),
+        _ => {}
+    }
+}
+
 /// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize is a
 /// no-op — ratatui re-measures `body_area` every frame regardless. Tick drives
 /// [`App::on_tick`], the M4 index watcher's poll (see the module doc).
@@ -724,10 +764,11 @@ fn resolve_key(
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
 ///
-/// Esc precedence (highest first): a pending discard confirm > the help overlay being open > an
-/// active line selection (diff-focused) > the outline having focus > the diff having focus with
-/// the outline open > the normal key map (where Esc quits). Concretely — the home-base model:
-/// the outline is where Esc always eventually lands you before it quits.
+/// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
+/// CS2 outline-filter input having capture > an active line selection (diff-focused) > the
+/// outline having focus > the diff having focus with the outline open > the normal key map (where
+/// Esc quits). Concretely — the home-base model: the outline is where Esc always eventually lands
+/// you before it quits.
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
@@ -737,21 +778,29 @@ fn resolve_key(
 ///    reacts). Ranked just below the confirm modal — in practice the two are never up
 ///    together, since opening help doesn't run through a confirm, but the confirm winning keeps
 ///    a destructive prompt from ever being silently dismissed by a stray overlay key.
-/// 3. Otherwise, with an active line selection AND the diff focused, Esc CANCELS the selection
+/// 3. Otherwise, the CS2 outline-filter INPUT (`/`, while it has capture — see
+///    [`App::outline_filter_focused`]) captures next, mirroring the same swallow: typing/editing
+///    keys reach [`crate::prompt::PromptState`], `Enter`/`Esc` return capture to the outline row
+///    list KEEPING the query, `Ctrl-c` clears it and returns capture too, and `Down`/`Up`/
+///    `Ctrl-n`/`Ctrl-p` move the outline selection without leaving the input. Ranked below help
+///    (opening help while filtering isn't reachable today — `?` isn't part of the input's own key
+///    set — but the ordering still says which would win if that ever changed) and above every
+///    other case, since none of them should observe a key the filter input itself consumes.
+/// 4. Otherwise, with an active line selection AND the diff focused, Esc CANCELS the selection
 ///    instead of moving focus or quitting (`q` still quits). This arm is guarded to defer to case
-///    4 when the outline has focus (a selection can only be active while looking at the diff, but
+///    5 when the outline has focus (a selection can only be active while looking at the diff, but
 ///    the guard keeps the precedence explicit). Other keys fall through to the normal map —
 ///    `j`/`k` extend the selection, `s`/`d` act on it.
-/// 4. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
+/// 5. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
 ///    outline is home base; there's nowhere further out to walk to.
-/// 5. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
+/// 6. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
 ///    focuses the outline (same effect as `h`/[`App::focus_outline`]) rather than quitting.
-/// 6. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
+/// 7. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
 ///    — there's no outline to walk out to.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 3-6); the
-/// confirm and help modals (cases 1-2) deliberately do not. Cases 3-6 are delegated to
-/// [`resolve_key`], shared with [`update_batch`].
+/// A `Key` event clears any showing footer notice before applying its own action (cases 4-7); the
+/// confirm, help, and filter-input modals (cases 1-3) deliberately do not. Cases 4-7 are delegated
+/// to [`resolve_key`], shared with [`update_batch`].
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
@@ -771,13 +820,24 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             }
             false
         }
+        AppEvent::Key(key) if app.outline_filter_focused() => {
+            apply_filter_input_key(app, key);
+            false
+        }
         AppEvent::Key(key) => match resolve_key(app, keymap, pending, key) {
             KeyOutcome::Handled => false,
             KeyOutcome::Action(action) => apply_action(app, action),
         },
-        // CS10: both modals swallow mouse input exactly like they swallow keys (cases 1-2 above)
-        // — a click/wheel while a discard confirm or the help overlay is up does nothing.
-        AppEvent::Mouse(_) if app.pending_confirm.is_some() || app.help_visible => false,
+        // CS10: all three modals swallow mouse input exactly like they swallow keys (cases 1-3
+        // above) — a click/wheel while a discard confirm, the help overlay, or the CS2
+        // outline-filter input is up does nothing.
+        AppEvent::Mouse(_)
+            if app.pending_confirm.is_some()
+                || app.help_visible
+                || app.outline_filter_focused() =>
+        {
+            false
+        }
         AppEvent::Mouse(m) => {
             app.clear_notice();
             match m.kind {
@@ -888,13 +948,16 @@ fn update_batch(
 
     for event in events {
         match event {
-            // The coalescable path: no modal is up, and this isn't the selection-Esc-cancel
-            // guard (that guard is a context change — an "Esc cascade" — so it falls to the
-            // catch-all arm below, which flushes first and delegates the whole event to
-            // `update`). Notice-clearing still happens per key via `resolve_key`.
+            // The coalescable path: no modal is up (CS2's outline-filter input included — a key
+            // while it has capture must reach `apply_filter_input_key` via the catch-all arm's
+            // `update` delegation below, never `resolve_key`/the coalescing path), and this isn't
+            // the selection-Esc-cancel guard (that guard is a context change — an "Esc cascade" —
+            // so it falls to the catch-all arm below, which flushes first and delegates the whole
+            // event to `update`). Notice-clearing still happens per key via `resolve_key`.
             AppEvent::Key(key)
                 if app.pending_confirm.is_none()
                     && !app.help_visible
+                    && !app.outline_filter_focused()
                     && !(app.selection_anchor.is_some()
                         && key.code == KeyCode::Esc
                         && !app.outline_focused()) =>
@@ -3551,5 +3614,232 @@ mod tests {
             app.hscroll > 0,
             "a ScrollRight event over the diff pane must pan App::hscroll via handle_hwheel"
         );
+    }
+
+    // ── CS2 (`outline-filter`, M11): the filter-input modal cascade arm ──────────
+
+    /// A single (uncommitted) changeset with three distinct files, outline open+focused in Flat
+    /// mode (no header row in the way) — CS2's cascade tests just need "type `/`, then some keys,
+    /// assert `App` state," and Flat mode keeps the row math simple (every row is a `File`).
+    fn filter_test_app() -> App {
+        use git_workon_fixture::prelude::*;
+        use workon_review::outline::OutlineMode;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("apple.txt", "a\n", "a\nCHANGED\n")
+            .unstaged_file("banana.txt", "b\n", "b\nCHANGED\n")
+            .unstaged_file("cherry.txt", "c\n", "c\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.set_outline_mode(OutlineMode::Flat);
+        app.toggle_outline(); // closed -> open+focused
+        app
+    }
+
+    #[test]
+    fn slash_focuses_the_filter_input_from_the_outline() {
+        let mut app = filter_test_app();
+        assert!(
+            app.outline_focused(),
+            "outline must have focus for `/` to dispatch"
+        );
+        assert!(!app.outline_filter_focused());
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('/'))),
+        );
+
+        assert!(
+            app.outline_filter_focused(),
+            "`/` must focus the filter input"
+        );
+    }
+
+    #[test]
+    fn typing_while_the_filter_is_focused_narrows_the_outline_and_never_falls_through_to_a_bound_key(
+    ) {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+
+        // 'j' is bound to `cursor-down` in the Outline view — while the filter input has capture
+        // it must be inserted as literal text instead of moving the outline cursor.
+        for c in "an".chars() {
+            update(
+                &mut app,
+                &km,
+                &mut pending,
+                AppEvent::Key(key(KeyCode::Char(c))),
+            );
+        }
+
+        assert_eq!(app.outline_filter_query(), "an");
+        let items = app.outline_items();
+        assert_eq!(items.len(), 1, "only banana.txt fuzzy-matches 'an'");
+        assert!(matches!(
+            &items[0],
+            workon_review::outline::OutlineItem::File { path, .. } if path == "banana.txt"
+        ));
+    }
+
+    #[test]
+    fn enter_returns_focus_to_the_list_and_keeps_the_query() {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('a');
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Enter)),
+        );
+
+        assert!(
+            !app.outline_filter_focused(),
+            "Enter must hand capture back to the list"
+        );
+        assert_eq!(app.outline_filter_query(), "a", "Enter must KEEP the query");
+    }
+
+    #[test]
+    fn esc_returns_focus_to_the_list_and_keeps_the_query_same_as_enter() {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('a');
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+
+        assert!(!app.outline_filter_focused());
+        assert_eq!(app.outline_filter_query(), "a");
+    }
+
+    #[test]
+    fn ctrl_c_clears_the_query_and_returns_focus_to_the_list() {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('a');
+        assert!(!app.outline_filter_query().is_empty());
+
+        update(&mut app, &km, &mut pending, AppEvent::Key(ctrl_key('c')));
+
+        assert!(!app.outline_filter_focused());
+        assert!(
+            app.outline_filter_query().is_empty(),
+            "Ctrl-c must clear the query, unlike Enter/Esc"
+        );
+    }
+
+    #[test]
+    fn down_moves_the_outline_selection_without_leaving_the_filter_input() {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+        // No query typed: every file row still matches, so all three rows are still reachable to
+        // move across.
+        let cursor_before = app.outline_cursor();
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Down)),
+        );
+
+        assert!(
+            app.outline_filter_focused(),
+            "Down must NOT leave the filter input"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before + 1,
+            "Down must move the outline selection while capture stays on the input"
+        );
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_also_move_the_outline_selection_from_the_filter_input() {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+
+        update(&mut app, &km, &mut pending, AppEvent::Key(ctrl_key('n')));
+        assert_eq!(app.outline_cursor(), 1);
+        assert!(app.outline_filter_focused());
+
+        update(&mut app, &km, &mut pending, AppEvent::Key(ctrl_key('p')));
+        assert_eq!(app.outline_cursor(), 0);
+        assert!(app.outline_filter_focused());
+    }
+
+    #[test]
+    fn a_pending_confirm_wins_over_the_filter_input_capture() {
+        use workon_review::app::PendingOp;
+
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('y'))),
+        );
+
+        assert!(
+            app.pending_confirm.is_none(),
+            "the confirm modal must capture y first, per the documented Esc-precedence ladder"
+        );
+        assert!(
+            app.outline_filter_focused(),
+            "the confirm arm must not have touched filter focus"
+        );
+    }
+
+    #[test]
+    fn a_mouse_event_is_swallowed_while_the_filter_input_has_capture() {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+        let cursor_before = app.outline_cursor();
+
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Mouse(mouse(MouseEventKind::Down(MouseButton::Left))),
+        );
+
+        assert!(!quit);
+        assert!(
+            app.outline_filter_focused(),
+            "the click must not close the input"
+        );
+        assert_eq!(app.outline_cursor(), cursor_before);
     }
 }

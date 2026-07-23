@@ -24,6 +24,9 @@
 
 use std::collections::HashMap;
 
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+
 use crate::model::FileStatus;
 
 /// Which of the outline's row-building strategies is active — cycled by `i` (only while the
@@ -451,6 +454,79 @@ pub(crate) fn fold_outline(
 ) -> FoldedOutline {
     let items = build_items(changesets, mode, order);
     apply_fold(&items, is_folded)
+}
+
+// ── Fuzzy filter (CS2 `outline-filter`) ─────────────────────────────────────
+
+/// `item`'s plain, undecorated text — what CS2's filter scores against and CS-render highlights
+/// matched chars within. Deliberately the row's OWN field, never a reconstruction: a
+/// [`OutlineItem::File`] row's `path` is already the full path in [`OutlineMode::Flat`]/
+/// [`OutlineMode::Stack`] but just the leaf segment in the tree modes (see [`OutlineItem::File`]'s
+/// own doc comment) — the filter matches whatever that row is already carrying, not a
+/// mode-independent "always full path" reconstruction, per the locked design's "matches against
+/// the plain item text — never the decorated label" rule.
+fn filter_text(item: &OutlineItem) -> &str {
+    match item {
+        OutlineItem::Header { label, .. } => label,
+        OutlineItem::Dir { name, .. } => name,
+        OutlineItem::File { path, .. } => path,
+    }
+}
+
+/// [`apply_filter`]'s output: the filtered, score-ordered row list, plus (parallel by index) each
+/// surviving row's matched CHAR indices into [`filter_text`]'s own string — `render.rs`'s
+/// highlight source. `guides` on every row is reset to empty (see [`apply_filter`]'s doc comment
+/// on why a filtered result is always a flat list).
+#[derive(Debug, Clone)]
+pub(crate) struct FilteredOutline {
+    pub items: Vec<OutlineItem>,
+    pub match_indices: Vec<Vec<usize>>,
+}
+
+/// Score every row in `items` (a fold-filtered build's output) against `query` with
+/// [`SkimMatcherV2`], drop non-matches, and order survivors by score descending — ties keep their
+/// ORIGINAL relative order ([`Vec::sort_by`] is a stable sort, and the comparator only orders by
+/// score, so two equal scores never swap). `cs_idx`/`file_idx` on every surviving [`OutlineItem`]
+/// are untouched clones of `items`' own — CS2's "never re-index" invariant.
+///
+/// The locked design's "flat filtered list (parents of matched children are NOT preserved)" rule:
+/// every surviving row's `guides` is reset to empty, regardless of the source [`OutlineMode`] —
+/// a Tree/StackTree row's tree-guide vector describes connectors to ANCESTOR rows that a filtered,
+/// re-ordered result no longer necessarily carries alongside it, so drawing them would show
+/// dangling/wrong connectors. `render::build_outline_line` already reads an empty `guides` as "flat
+/// indent, no tree connectors" for exactly this reason (see [`OutlineItem`]'s own doc comment), so
+/// this reuses that existing fallback rather than adding a new render-side branch.
+///
+/// `query.is_empty()` is the caller's ("is a filter even active") gate, not this fn's — an empty
+/// query here would fuzzy-match every row trivially (a no-op filter with meaningless scores), so
+/// callers only invoke this once a query exists (see `App::outline_items`'s doc comment).
+pub(crate) fn apply_filter(items: &[OutlineItem], query: &str) -> FilteredOutline {
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, OutlineItem, Vec<usize>)> = items
+        .iter()
+        .filter_map(|item| {
+            let (score, indices) = matcher.fuzzy_indices(filter_text(item), query)?;
+            let mut flat = item.clone();
+            match &mut flat {
+                OutlineItem::Dir { guides, .. } | OutlineItem::File { guides, .. } => {
+                    guides.clear();
+                }
+                OutlineItem::Header { .. } => {}
+            }
+            Some((score, flat, indices))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut result = FilteredOutline {
+        items: Vec::with_capacity(scored.len()),
+        match_indices: Vec::with_capacity(scored.len()),
+    };
+    for (_, item, indices) in scored {
+        result.items.push(item);
+        result.match_indices.push(indices);
+    }
+    result
 }
 
 /// [`OutlineMode::Stack`]: a header per changeset, then its files in order — no de-duplication,
@@ -1484,5 +1560,172 @@ mod tests {
             "the header survives collapsed; both files are hidden"
         );
         assert_eq!(folded.hidden_counts, vec![2]);
+    }
+
+    // ── Fuzzy filter (CS2 `outline-filter`) ─────────────────────────────────────
+
+    #[test]
+    fn apply_filter_drops_non_matches_and_keeps_true_indices_on_survivors() {
+        let changesets = vec![cs(
+            "cs-a",
+            true,
+            false,
+            &[
+                ("src/app.rs", StagedStatus::None),
+                ("README.md", StagedStatus::None),
+            ],
+        )];
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
+        let filtered = apply_filter(&items, "app");
+        assert_eq!(
+            filtered.items.len(),
+            1,
+            "only src/app.rs fuzzy-matches 'app'; the header and README.md don't"
+        );
+        assert_eq!(
+            filtered.items[0],
+            OutlineItem::File {
+                cs_idx: 0,
+                file_idx: 0,
+                path: "src/app.rs".to_string(),
+                status: StagedStatus::None,
+                change: FileStatus::Modified,
+                guides: Vec::new(),
+            },
+            "the surviving row keeps its TRUE cs_idx/file_idx into App::changesets"
+        );
+    }
+
+    #[test]
+    fn apply_filter_orders_survivors_by_score_descending_stable_on_ties() {
+        // Two files whose paths are byte-identical apart from a prefix that doesn't affect the
+        // query's match at all — SkimMatcherV2 scores an exact substring match identically
+        // regardless of an unrelated prefix, so these two rows tie, and the stable sort must keep
+        // them in their ORIGINAL (a-before-b) relative order.
+        let items = vec![
+            OutlineItem::File {
+                cs_idx: 0,
+                file_idx: 0,
+                path: "widget.rs".to_string(),
+                status: StagedStatus::None,
+                change: FileStatus::Modified,
+                guides: Vec::new(),
+            },
+            OutlineItem::File {
+                cs_idx: 0,
+                file_idx: 1,
+                path: "widget.rs".to_string(),
+                status: StagedStatus::None,
+                change: FileStatus::Modified,
+                guides: Vec::new(),
+            },
+        ];
+        let filtered = apply_filter(&items, "widget");
+        assert_eq!(filtered.items.len(), 2);
+        assert_eq!(
+            filtered.items, items,
+            "equal-scoring rows keep their original relative order"
+        );
+
+        // A query that scores "app.rs" higher than "src/x/app_helper.rs" (an exact, unbroken
+        // substring match outranks a scattered one) must sort the exact match first even though
+        // it appears LATER in the input.
+        let mixed = vec![
+            OutlineItem::File {
+                cs_idx: 0,
+                file_idx: 0,
+                path: "src/x/app_helper.rs".to_string(),
+                status: StagedStatus::None,
+                change: FileStatus::Modified,
+                guides: Vec::new(),
+            },
+            OutlineItem::File {
+                cs_idx: 0,
+                file_idx: 1,
+                path: "app.rs".to_string(),
+                status: StagedStatus::None,
+                change: FileStatus::Modified,
+                guides: Vec::new(),
+            },
+        ];
+        let filtered = apply_filter(&mixed, "app.rs");
+        assert_eq!(
+            filtered.items[0], mixed[1],
+            "the exact substring match ('app.rs') must outrank the scattered one, despite \
+             appearing second in the input"
+        );
+    }
+
+    #[test]
+    fn apply_filter_scores_the_per_mode_plain_text_not_the_decorated_label() {
+        let changesets = vec![deep_path_changeset("release-widget", true, false)];
+        // Header: matches the changeset's label/title.
+        let items = build_items(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst);
+        let filtered = apply_filter(&items, "release");
+        assert!(
+            filtered.items.iter().any(
+                |it| matches!(it, OutlineItem::Header { label, .. } if label == "release-widget")
+            ),
+            "a Header row must match against its label"
+        );
+
+        // Dir: matches the bare segment name, not the full path.
+        let tree_items = build_items(&changesets, OutlineMode::Tree, OutlineOrder::HeadFirst);
+        let filtered = apply_filter(&tree_items, "src");
+        assert!(
+            filtered
+                .items
+                .iter()
+                .any(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src")),
+            "a Dir row must match against its own segment name"
+        );
+
+        // File: matches the row's own `path` field (leaf-only in tree modes).
+        let filtered = apply_filter(&tree_items, "top.rs");
+        assert!(
+            filtered
+                .items
+                .iter()
+                .any(|it| matches!(it, OutlineItem::File { path, .. } if path == "top.rs")),
+            "a File row must match against its own path field"
+        );
+    }
+
+    #[test]
+    fn apply_filter_resets_guides_to_a_flat_list_even_for_tree_mode_survivors() {
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let items = build_items(&changesets, OutlineMode::Tree, OutlineOrder::HeadFirst);
+        let filtered = apply_filter(&items, "b.rs");
+        assert_eq!(filtered.items.len(), 1);
+        match &filtered.items[0] {
+            OutlineItem::File { guides, path, .. } => {
+                assert_eq!(path, "b.rs");
+                assert!(
+                    guides.is_empty(),
+                    "a filtered result renders flat — no dangling tree connectors to \
+                     now-absent ancestor rows"
+                );
+            }
+            other => panic!("expected a File row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_filter_match_indices_are_parallel_to_the_surviving_items() {
+        let items = vec![OutlineItem::File {
+            cs_idx: 0,
+            file_idx: 0,
+            path: "app.rs".to_string(),
+            status: StagedStatus::None,
+            change: FileStatus::Modified,
+            guides: Vec::new(),
+        }];
+        let filtered = apply_filter(&items, "app");
+        assert_eq!(filtered.items.len(), filtered.match_indices.len());
+        assert_eq!(
+            filtered.match_indices[0],
+            vec![0, 1, 2],
+            "'app' matches the first three chars of 'app.rs' contiguously"
+        );
     }
 }

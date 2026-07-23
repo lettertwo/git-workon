@@ -90,6 +90,7 @@ pub enum Command {
     OutlinePrevChangeset,
     OutlineCollapseAll,
     OutlineExpandAll,
+    OutlineFilter,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -449,6 +450,13 @@ pub static REGISTRY: &[Registered] = &[
         name: "outline-expand-all",
         default_keys: "zR",
         description: "Expand every changeset/directory in the outline",
+    },
+    Registered {
+        command: Command::OutlineFilter,
+        view: View::Outline,
+        name: "filter",
+        default_keys: "/",
+        description: "Fuzzy-filter the outline",
     },
 ];
 

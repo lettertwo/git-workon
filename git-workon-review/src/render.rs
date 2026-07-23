@@ -146,6 +146,11 @@ fn diffstat_spans(
 /// foreground-bold label with no counter, matching its pre-CS1 appearance exactly. Failed/loading
 /// markers are still NOT included: the two call sites place them differently (trailing spans on
 /// the header row vs. a line of their own in the summary).
+///
+/// `match_indices` (CS2, `outline-filter`) are CHAR indices into `label` itself — the outline's
+/// Header call site passes its row's fuzzy-match indices (empty when no filter is active, or the
+/// query didn't match this row); the summary panel's call site always passes `&[]` (it never
+/// filters). See [`highlight_filter_match`]'s doc comment for the highlight styling itself.
 fn changeset_title_spans(
     label: &str,
     current: bool,
@@ -153,6 +158,7 @@ fn changeset_title_spans(
     theme: &Palette,
     icons: IconMode,
     counter: Option<(usize, usize)>,
+    match_indices: &[usize],
 ) -> Vec<TSpan<'static>> {
     let mut spans = Vec::new();
     if current {
@@ -180,14 +186,56 @@ fn changeset_title_spans(
             Style::default().fg(theme.dim),
         ));
     }
-    spans.push(TSpan::styled(
-        label.to_string(),
-        Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
-    ));
+    let label_style = Style::default().fg(label_fg).add_modifier(Modifier::BOLD);
+    spans.extend(highlight_filter_match(label, match_indices, label_style));
     if needs_restack {
         spans.push(TSpan::styled(
             format!(" {}", warn_marker(icons)),
             Style::default().fg(theme.warn_fg),
+        ));
+    }
+    spans
+}
+
+/// CS2 (`outline-filter`): render `text` char-by-char, layering [`Modifier::UNDERLINED`] on top of
+/// `base_style` for every char whose index is in `match_indices` (CHAR indices into `text`, from
+/// [`fuzzy_matcher::skim::SkimMatcherV2::fuzzy_indices`] via [`crate::outline::apply_filter`]) —
+/// reuses the row's own EXISTING foreground/dim color rather than introducing a new theme field:
+/// M11's later diff-search slice is what adds dedicated `tint_slot` match-highlight keys (per the
+/// plan), so this filter — which CS2 owns start to finish — stays theme-neutral. Groups
+/// consecutive matched/unmatched chars into as few spans as possible. `match_indices.is_empty()`
+/// (no filter active, or this row wasn't matched — e.g. the summary panel's call site, which never
+/// filters) is the common case and returns `text` as a single unstyled-beyond-`base_style` span,
+/// so this costs nothing when unused.
+fn highlight_filter_match(
+    text: &str,
+    match_indices: &[usize],
+    base_style: Style,
+) -> Vec<TSpan<'static>> {
+    if match_indices.is_empty() {
+        return vec![TSpan::styled(text.to_string(), base_style)];
+    }
+    let matched: std::collections::HashSet<usize> = match_indices.iter().copied().collect();
+    let match_style = base_style.add_modifier(Modifier::UNDERLINED);
+
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_matched = false;
+    for (i, c) in text.chars().enumerate() {
+        let is_match = matched.contains(&i);
+        if !run.is_empty() && is_match != run_matched {
+            spans.push(TSpan::styled(
+                std::mem::take(&mut run),
+                if run_matched { match_style } else { base_style },
+            ));
+        }
+        run_matched = is_match;
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(TSpan::styled(
+            run,
+            if run_matched { match_style } else { base_style },
         ));
     }
     spans
@@ -1021,6 +1069,13 @@ fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palet
 /// [`App::derive_outline_scroll`] before painting from `app.outline.scroll`, giving the outline
 /// the same stateful scrolloff-margined viewport the diff panes already have, instead of the old
 /// transient bottom-anchor scroll computed fresh each frame.
+///
+/// CS2 (`outline-filter`, M11) adds a SECOND optional carve-out, below the pane header: a one-row
+/// fuzzy-filter input, painted only while [`App::outline_filter_active`] (non-empty query OR the
+/// input has capture) — an unused filter leaves every row below exactly where it was before this
+/// changeset (the locked "zero regression" rule). A query that matches nothing still shows the
+/// (now item-less) outline body with a single dim "no matches" placeholder row rather than a
+/// blank pane.
 fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     // CS1 risk: this `>= 2` guard must exist in BOTH pane renderers (see `render_body`'s matching
     // carve-out) — a 1-row (or shorter) terminal has no room to spare for a header at all.
@@ -1030,9 +1085,15 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     } else {
         area
     };
+    let area = if app.outline_filter_active() && area.height >= 2 {
+        render_outline_filter_input(frame, app, area, theme);
+        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+    } else {
+        area
+    };
     app.outline_height = area.height as usize;
     app.hit_regions.outline = Some(region_from(area));
-    let (items, hidden_counts) = app.outline_items_with_hidden_counts();
+    let (items, hidden_counts, match_indices) = app.outline_items_with_hidden_counts();
     // Bounds-clamp only — NOT a cursor-following derive: under the wheel's peek model a
     // scrolled-away viewport must survive the frame; cursor ops re-derive on their own.
     app.clamp_outline_scroll(items.len());
@@ -1042,13 +1103,29 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
     let scroll = app.outline_scroll();
     let icons = app.icon_mode();
 
+    if items.is_empty() && !app.outline_filter_query().is_empty() {
+        // CS2: the filter matched nothing — a blank pane below the (still-visible) filter input
+        // reads as broken, so paint an explicit placeholder rather than falling through to the
+        // loop below (which would render nothing at all, same as any other empty row list).
+        if area.height > 0 {
+            let line = Line::from(TSpan::styled(
+                "No matches".to_string(),
+                Style::default().fg(theme.dim),
+            ));
+            frame
+                .buffer_mut()
+                .set_line(area.x, area.y, &line, area.width);
+        }
+        return;
+    }
+
     // Render-side upper clamp of the outline's own pan offset (mirroring `clamp_outline_scroll`
     // just above) — from EVERY item's built line width, not just the visible rows: outlines are
     // small (file trees, not file contents), so re-measuring the whole thing here is cheap.
     let max_line_width = items
         .iter()
         .zip(&hidden_counts)
-        .map(|(item, &hidden)| build_outline_line(item, theme, icons, hidden).width())
+        .map(|(item, &hidden)| build_outline_line(item, theme, icons, hidden, &[]).width())
         .max()
         .unwrap_or(0);
     app.clamp_outline_hscroll(max_line_width);
@@ -1062,8 +1139,12 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
             continue;
         };
         let hidden = hidden_counts.get(item_idx).copied().unwrap_or(0);
+        let matches = match_indices
+            .get(item_idx)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         let is_cursor = item_idx == cursor;
-        let line = build_outline_line(item, theme, icons, hidden);
+        let line = build_outline_line(item, theme, icons, hidden, matches);
         let line = Line::from(pan_spans(line.spans, hscroll, theme));
         let line = if is_cursor {
             apply_cursor_row(line, area.width, theme, focused)
@@ -1073,6 +1154,24 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
         buf.set_line(area.x, y, &line, area.width);
         apply_right_edge_marker(buf, area, y, &line, theme);
     }
+}
+
+/// CS2 (`outline-filter`): paint the one-row fuzzy-filter input at `area`'s first row — a leading
+/// dim `/` prompt glyph (vim cmdline feel) followed by [`PromptState::render_line`]'s own
+/// buffer+cursor spans. Theme-agnostic chrome around a theme-agnostic primitive (see
+/// [`crate::prompt`]'s module doc on why `render_line` itself carries no palette dependency) — the
+/// `/` glyph is the only themed element here, and it's just `theme.dim`, matching every other
+/// quiet-chrome glyph in this module (tree guides, fold markers).
+fn render_outline_filter_input(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+    let mut spans = vec![TSpan::styled(
+        "/".to_string(),
+        Style::default().fg(theme.dim),
+    )];
+    spans.extend(app.outline_filter_state().render_line().spans);
+    let line = Line::from(spans);
+    frame
+        .buffer_mut()
+        .set_line(area.x, area.y, &line, area.width);
 }
 
 /// Render a tree-guide prefix from an [`OutlineItem::Dir`]/[`OutlineItem::File`] `guides`
@@ -1202,6 +1301,7 @@ fn build_outline_line(
     theme: &Palette,
     icons: IconMode,
     hidden: usize,
+    match_indices: &[usize],
 ) -> Line<'static> {
     match item {
         OutlineItem::Header {
@@ -1220,6 +1320,7 @@ fn build_outline_line(
                 theme,
                 icons,
                 Some((cs_idx + 1, *n)),
+                match_indices,
             );
             // ADR-031: a Failed changeset's marker wins over Pending's (a slot is never both,
             // but Failed is the more actionable state to surface if it somehow were).
@@ -1242,13 +1343,18 @@ fn build_outline_line(
                 IconMode::Nerd => format!("{} ", crate::icons::DIR_ICON),
                 IconMode::None => String::new(),
             };
-            let text = format!("{}{icon}{name}/", tree_prefix(guides));
+            let dir_style = Style::default()
+                .fg(theme.dim)
+                .add_modifier(Modifier::ITALIC);
+            // CS2 (`outline-filter`): the prefix/icon and trailing slash are never part of the
+            // fuzzy-matched text (only `name` is — see `outline::filter_text`'s doc comment), so
+            // only the `name` span runs through `highlight_filter_match`.
             let mut spans = vec![TSpan::styled(
-                text,
-                Style::default()
-                    .fg(theme.dim)
-                    .add_modifier(Modifier::ITALIC),
+                format!("{}{icon}", tree_prefix(guides)),
+                dir_style,
             )];
+            spans.extend(highlight_filter_match(name, match_indices, dir_style));
+            spans.push(TSpan::styled("/".to_string(), dir_style));
             spans.extend(fold_marker(hidden, theme));
             Line::from(spans)
         }
@@ -1308,28 +1414,39 @@ fn build_outline_line(
             // truncation eats the dim dirname before the name a user is scanning for (CS2
             // gotcha). Tree/StackTree rows (non-empty `guides`) already carry the path via
             // ancestor Dir rows, so `path` there is already just the basename — render it as-is.
+            //
+            // CS2 (`outline-filter`): `match_indices` are CHAR indices into the WHOLE `path`
+            // field (see `outline::filter_text`'s doc comment), but the split-path case renders
+            // `base` FIRST and `dir` SECOND — the reverse of `path`'s own dir-then-base order.
+            // `dir_chars` re-partitions the indices into each rendered run's OWN local coordinate
+            // space: an index `< dir_chars` is in `dir` (kept as-is — `dir` is `path`'s own
+            // prefix); an index `> dir_chars` is in `base`, offset back by `dir_chars + 1` (the
+            // dropped `/` separator); an index `== dir_chars` (the separator itself, never
+            // rendered) is dropped from both.
+            let path_style = Style::default().fg(theme.foreground);
             if guides.is_empty() {
                 match path.rsplit_once('/') {
                     Some((dir, base)) => {
-                        spans.push(TSpan::styled(
-                            base.to_string(),
-                            Style::default().fg(theme.foreground),
-                        ));
-                        spans.push(TSpan::styled(
-                            format!("  {dir}"),
-                            Style::default().fg(theme.dim),
-                        ));
+                        let dir_chars = dir.chars().count();
+                        let base_indices: Vec<usize> = match_indices
+                            .iter()
+                            .filter(|&&i| i > dir_chars)
+                            .map(|&i| i - dir_chars - 1)
+                            .collect();
+                        let dir_indices: Vec<usize> = match_indices
+                            .iter()
+                            .filter(|&&i| i < dir_chars)
+                            .copied()
+                            .collect();
+                        spans.extend(highlight_filter_match(base, &base_indices, path_style));
+                        let dim_style = Style::default().fg(theme.dim);
+                        spans.push(TSpan::styled("  ".to_string(), dim_style));
+                        spans.extend(highlight_filter_match(dir, &dir_indices, dim_style));
                     }
-                    None => spans.push(TSpan::styled(
-                        path.clone(),
-                        Style::default().fg(theme.foreground),
-                    )),
+                    None => spans.extend(highlight_filter_match(path, match_indices, path_style)),
                 }
             } else {
-                spans.push(TSpan::styled(
-                    path.clone(),
-                    Style::default().fg(theme.foreground),
-                ));
+                spans.extend(highlight_filter_match(path, match_indices, path_style));
             }
             Line::from(spans)
         }
@@ -1722,6 +1839,7 @@ fn changeset_summary_lines(
         theme,
         icons,
         None,
+        &[],
     );
 
     let mut lines = Vec::new();
@@ -4496,6 +4614,92 @@ mod tests {
             cell_text(&buf, 35, 1),
             "│",
             "a closed outline must not draw its divider column"
+        );
+    }
+
+    // ── CS2 (`outline-filter`, M11): fuzzy filter input row ─────────────────────
+
+    #[test]
+    fn outline_filter_input_row_renders_only_while_active() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open());
+        assert!(
+            !app.outline_filter_active(),
+            "a fresh outline has no active filter"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            !content.iter().any(|row| row.starts_with('/')),
+            "an unused filter must render no input row — the locked zero-regression rule — \
+             got:\n{}",
+            content.join("\n")
+        );
+
+        // Focusing the input (even with an empty query) makes it active — the input row must now
+        // render so the cursor has somewhere to show.
+        app.outline_filter_focus();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            content.iter().any(|row| row.starts_with('/')),
+            "a focused filter input must render its own '/'-prefixed row, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_filter_query_narrows_the_rendered_rows() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('b');
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            content.iter().any(|row| row.contains("b.txt")),
+            "b.txt (cs-b's file) must still render, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            !content.iter().any(|row| row.contains("a.txt")),
+            "a.txt must be filtered out by the 'b' query, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_filter_with_no_matches_renders_a_placeholder_row() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.outline_filter_focus();
+        for c in "zzzznomatch".chars() {
+            app.outline_filter_insert_char(c);
+        }
+        assert!(
+            app.outline_items().is_empty(),
+            "sanity: nothing should match"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            content.iter().any(|row| row.contains("No matches")),
+            "an empty filtered result must show a placeholder row instead of a blank pane, \
+             got:\n{}",
+            content.join("\n")
         );
     }
 
