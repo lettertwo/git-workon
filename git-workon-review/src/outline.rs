@@ -59,7 +59,7 @@ impl OutlineMode {
     }
 
     /// The kebab-cased display name (CS4, `outline-mode-cycle`) — used by the footer's `i
-    /// →<next>` hint and mirrors `App::parse_outline_mode`'s config strings (`app.rs`), so the
+    /// →<next>` hint and mirrors `OUTLINE_MODE_OPTIONS`'s config strings (`app.rs`), so the
     /// two never drift apart.
     pub fn label(self) -> &'static str {
         match self {
