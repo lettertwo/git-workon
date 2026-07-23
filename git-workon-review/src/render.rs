@@ -2961,12 +2961,7 @@ mod tests {
         let content = buf_lines(&buf);
 
         for label in ["UNSTAGED", "STAGED"] {
-            let cap = content
-                .iter()
-                .position(|line| {
-                    line.contains(label) && (label != "STAGED" || !line.contains("UNSTAGED"))
-                })
-                .expect("caption present");
+            let cap = caption_row(&content, label);
             let row = content[cap].trim_end();
             assert_eq!(
                 row.chars().count(),
@@ -5835,21 +5830,6 @@ mod tests {
         );
 
         let theme = Palette::dark();
-
-        // "STAGED" is a substring of "UNSTAGED", so a naive `contains` search for the STAGED
-        // caption's row can false-positive onto the UNSTAGED caption's row (which also contains
-        // the literal text "STAGED") — same asymmetry
-        // `split_renders_both_role_captions_stacked_with_content_in_each_pane` guards against.
-        // Searching for "UNSTAGED" needs no such exclusion, since "UNSTAGED" never appears inside
-        // the STAGED-only row.
-        let caption_row = |content: &[String], label: &str| -> usize {
-            content
-                .iter()
-                .position(|line| {
-                    line.contains(label) && (label != "STAGED" || !line.contains("UNSTAGED"))
-                })
-                .unwrap_or_else(|| panic!("{label} caption present"))
-        };
 
         let check = |app: &mut App, lit_label: &str, dim_label: &str| {
             let buf = render_once(app, OUTLINE_TEST_WIDTH, 24);
