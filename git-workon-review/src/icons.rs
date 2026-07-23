@@ -24,7 +24,8 @@ use ratatui::style::Color;
 
 /// Which iconography strategy is active TUI-wide — `workon.review.icons` (`nerd`/`none`),
 /// read once at startup by `App::apply_view_config` (`RawViewConfig` field -> `ReviewConfig`
-/// getter -> `parse_icon_mode` -> warn-and-fallback in `apply_view_config` -> `App` field).
+/// getter -> `resolve_option` (against `ICON_MODE_OPTIONS`) -> warn-and-fallback in
+/// `apply_view_config` -> `App` field).
 /// Top-level like the theme, not an outline setting: it gates the outline's file/dir icons,
 /// the summary panel's glyphs, and the winbar's marker/diffstat/file icons alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

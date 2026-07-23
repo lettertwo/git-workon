@@ -745,8 +745,40 @@ fn default_option_name<T: Copy + PartialEq + Default>(
         .expect("T::default() has a canonical name listed in `options`")
 }
 
+/// Look up `raw` in one of the CS7 `*_OPTIONS` tables below — `None` on anything not in
+/// `options`, the "unrecognized" signal [`resolve_option`] falls back to a default and warns on.
+fn parse_option<T: Copy>(options: &[(&str, T)], raw: &str) -> Option<T> {
+    options
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, value)| *value)
+}
+
+/// Resolve one `workon.review.*` view-config string against `options`: [`parse_option`] on a
+/// hit, or `T::default()` plus a pushed "unrecognized (valid: …); using default '…'" warning on
+/// a miss — the shared warn-and-default shape every site in [`App::apply_view_config`] needs.
+/// `key` is the fully-qualified config key (e.g. `"workon.review.outline.mode"`) as it should
+/// read in the warning.
+fn resolve_option<T: Copy + PartialEq + Default>(
+    key: &str,
+    raw: &str,
+    options: &'static [(&'static str, T)],
+    warnings: &mut Vec<String>,
+) -> T {
+    parse_option(options, raw).unwrap_or_else(|| {
+        let valid = valid_options_list(options);
+        let default = default_option_name(options);
+        warnings.push(format!(
+            "{key} = '{raw}' unrecognized (valid: {valid}); using default '{default}'"
+        ));
+        T::default()
+    })
+}
+
 /// `workon.review.outline.mode` (CS7)'s valid config strings, kebab-cased mirrors of the
-/// [`OutlineMode`] variant names, in [`App::apply_view_config`]'s warning order.
+/// [`OutlineMode`] variant names, in [`App::apply_view_config`]'s warning order. Resolved via
+/// [`resolve_option`] — [`App::apply_view_config`] falls back to [`OutlineMode::default`] and
+/// warns on anything not listed here.
 const OUTLINE_MODE_OPTIONS: &[(&str, OutlineMode)] = &[
     ("flat", OutlineMode::Flat),
     ("stack", OutlineMode::Stack),
@@ -754,63 +786,29 @@ const OUTLINE_MODE_OPTIONS: &[(&str, OutlineMode)] = &[
     ("stack-tree", OutlineMode::StackTree),
 ];
 
-/// Parse `workon.review.outline.mode` (CS7) into an [`OutlineMode`]. `None` on anything not in
-/// [`OUTLINE_MODE_OPTIONS`] — [`App::apply_view_config`] falls back to [`OutlineMode::default`]
-/// and warns.
-fn parse_outline_mode(raw: &str) -> Option<OutlineMode> {
-    OUTLINE_MODE_OPTIONS
-        .iter()
-        .find(|(name, _)| *name == raw)
-        .map(|(_, mode)| *mode)
-}
-
 /// `workon.review.outline.order` (CS3)'s valid config strings, kebab-cased mirrors of the
-/// [`OutlineOrder`] variant names.
+/// [`OutlineOrder`] variant names. Resolved via [`resolve_option`] — [`App::apply_view_config`]
+/// falls back to [`OutlineOrder::default`] and warns on anything not listed here.
 const OUTLINE_ORDER_OPTIONS: &[(&str, OutlineOrder)] = &[
     ("head-first", OutlineOrder::HeadFirst),
     ("base-first", OutlineOrder::BaseFirst),
 ];
 
-/// Parse `workon.review.outline.order` (CS3) into an [`OutlineOrder`]. `None` on anything not in
-/// [`OUTLINE_ORDER_OPTIONS`] — [`App::apply_view_config`] falls back to
-/// [`OutlineOrder::default`] and warns.
-fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
-    OUTLINE_ORDER_OPTIONS
-        .iter()
-        .find(|(name, _)| *name == raw)
-        .map(|(_, order)| *order)
-}
-
 /// `workon.review.icons` (CS5)'s valid config strings, kebab-cased mirrors of the [`IconMode`]
-/// variant names.
+/// variant names. Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to
+/// [`IconMode::default`] (also `none` — CS5's no-auto-detection default) and warns on anything
+/// not listed here.
 const ICON_MODE_OPTIONS: &[(&str, IconMode)] =
     &[("none", IconMode::None), ("nerd", IconMode::Nerd)];
 
-/// Parse `workon.review.icons` (CS5) into an [`IconMode`]. `None` on anything not in
-/// [`ICON_MODE_OPTIONS`] — [`App::apply_view_config`] falls back to [`IconMode::default`] (also
-/// `none` — CS5's no-auto-detection default) and warns.
-fn parse_icon_mode(raw: &str) -> Option<IconMode> {
-    ICON_MODE_OPTIONS
-        .iter()
-        .find(|(name, _)| *name == raw)
-        .map(|(_, mode)| *mode)
-}
-
 /// `workon.review.diff.layout` (CS7)'s valid config strings, mirroring the [`Layout`] variant
-/// names.
+/// names. Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to
+/// [`Layout::default`] and warns on anything not listed here.
 const DIFF_LAYOUT_OPTIONS: &[(&str, Layout)] = &[("sbs", Layout::Sbs), ("inline", Layout::Inline)];
 
-/// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. `None` on anything not in
-/// [`DIFF_LAYOUT_OPTIONS`] — [`App::apply_view_config`] falls back to [`Layout::default`] and
-/// warns.
-fn parse_diff_layout(raw: &str) -> Option<Layout> {
-    DIFF_LAYOUT_OPTIONS
-        .iter()
-        .find(|(name, _)| *name == raw)
-        .map(|(_, layout)| *layout)
-}
-
 /// `workon.review.diff.zoom` (CS7)'s valid config strings, mirroring the [`Zoom`] variant names.
+/// Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to [`Zoom::default`]
+/// and warns on anything not listed here.
 const DIFF_ZOOM_OPTIONS: &[(&str, Zoom)] = &[
     ("split", Zoom::Split),
     ("combined", Zoom::Combined),
@@ -818,33 +816,16 @@ const DIFF_ZOOM_OPTIONS: &[(&str, Zoom)] = &[
     ("staged", Zoom::Staged),
 ];
 
-/// Parse `workon.review.diff.zoom` (CS7) into a [`Zoom`]. `None` on anything not in
-/// [`DIFF_ZOOM_OPTIONS`] — [`App::apply_view_config`] falls back to [`Zoom::default`] and warns.
-fn parse_diff_zoom(raw: &str) -> Option<Zoom> {
-    DIFF_ZOOM_OPTIONS
-        .iter()
-        .find(|(name, _)| *name == raw)
-        .map(|(_, zoom)| *zoom)
-}
-
 /// `workon.review.diff.text` (CS11)'s valid config strings, mirroring the [`DiffTextMode`]
-/// variant names.
+/// variant names — see [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s
+/// "Revised (CS11, diff foreground/background split)" section. Resolved via [`resolve_option`]
+/// — [`App::apply_view_config`] falls back to [`DiffTextMode::default`] and warns on anything
+/// not listed here.
 const DIFF_TEXT_OPTIONS: &[(&str, DiffTextMode)] = &[
     ("syntax", DiffTextMode::Syntax),
     ("tint", DiffTextMode::Tint),
     ("edit", DiffTextMode::Edit),
 ];
-
-/// Parse `workon.review.diff.text` (CS11) into a [`DiffTextMode`]. `None` on anything not in
-/// [`DIFF_TEXT_OPTIONS`] — see [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s
-/// "Revised (CS11, diff foreground/background split)" section.
-/// [`App::apply_view_config`] falls back to [`DiffTextMode::default`] and warns.
-fn parse_diff_text(raw: &str) -> Option<DiffTextMode> {
-    DIFF_TEXT_OPTIONS
-        .iter()
-        .find(|(name, _)| *name == raw)
-        .map(|(_, mode)| *mode)
-}
 
 /// CS4: which outline row a Header/Dir cursor selection resolves to — [`App::summary_target`]'s
 /// return type, and the input [`App::summary_for`] consumes to build the renderable summary.
@@ -4093,85 +4074,62 @@ impl App {
         self.set_outline_width(width);
 
         let mode = match &raw.outline_mode {
-            Some(m) => parse_outline_mode(m).unwrap_or_else(|| {
-                let valid = valid_options_list(OUTLINE_MODE_OPTIONS);
-                let default = default_option_name(OUTLINE_MODE_OPTIONS);
-                warnings.push(format!(
-                    "workon.review.outline.mode = '{m}' unrecognized (valid: {valid}); \
-                     using default '{default}'"
-                ));
-                OutlineMode::default()
-            }),
+            Some(m) => resolve_option(
+                "workon.review.outline.mode",
+                m,
+                OUTLINE_MODE_OPTIONS,
+                &mut warnings,
+            ),
             None => OutlineMode::default(),
         };
         self.set_outline_mode(mode);
 
         let order = match &raw.outline_order {
-            Some(o) => parse_outline_order(o).unwrap_or_else(|| {
-                let valid = valid_options_list(OUTLINE_ORDER_OPTIONS);
-                let default = default_option_name(OUTLINE_ORDER_OPTIONS);
-                warnings.push(format!(
-                    "workon.review.outline.order = '{o}' unrecognized (valid: {valid}); \
-                     using default '{default}'"
-                ));
-                OutlineOrder::default()
-            }),
+            Some(o) => resolve_option(
+                "workon.review.outline.order",
+                o,
+                OUTLINE_ORDER_OPTIONS,
+                &mut warnings,
+            ),
             None => OutlineOrder::default(),
         };
         self.set_outline_order(order);
 
         let icons = match &raw.icons {
-            Some(i) => parse_icon_mode(i).unwrap_or_else(|| {
-                let valid = valid_options_list(ICON_MODE_OPTIONS);
-                let default = default_option_name(ICON_MODE_OPTIONS);
-                warnings.push(format!(
-                    "workon.review.icons = '{i}' unrecognized (valid: {valid}); \
-                     using default '{default}'"
-                ));
-                IconMode::default()
-            }),
+            Some(i) => resolve_option("workon.review.icons", i, ICON_MODE_OPTIONS, &mut warnings),
             None => IconMode::default(),
         };
         self.set_icon_mode(icons);
 
         let layout = match &raw.diff_layout {
-            Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
-                let valid = valid_options_list(DIFF_LAYOUT_OPTIONS);
-                let default = default_option_name(DIFF_LAYOUT_OPTIONS);
-                warnings.push(format!(
-                    "workon.review.diff.layout = '{l}' unrecognized (valid: {valid}); \
-                     using default '{default}'"
-                ));
-                Layout::default()
-            }),
+            Some(l) => resolve_option(
+                "workon.review.diff.layout",
+                l,
+                DIFF_LAYOUT_OPTIONS,
+                &mut warnings,
+            ),
             None => Layout::default(),
         };
         self.set_layout(layout);
 
         let zoom = match &raw.diff_zoom {
-            Some(z) => parse_diff_zoom(z).unwrap_or_else(|| {
-                let valid = valid_options_list(DIFF_ZOOM_OPTIONS);
-                let default = default_option_name(DIFF_ZOOM_OPTIONS);
-                warnings.push(format!(
-                    "workon.review.diff.zoom = '{z}' unrecognized (valid: {valid}); \
-                     using default '{default}'"
-                ));
-                Zoom::default()
-            }),
+            Some(z) => resolve_option(
+                "workon.review.diff.zoom",
+                z,
+                DIFF_ZOOM_OPTIONS,
+                &mut warnings,
+            ),
             None => Zoom::default(),
         };
         self.set_zoom(zoom);
 
         let diff_text = match &raw.diff_text {
-            Some(t) => parse_diff_text(t).unwrap_or_else(|| {
-                let valid = valid_options_list(DIFF_TEXT_OPTIONS);
-                let default = default_option_name(DIFF_TEXT_OPTIONS);
-                warnings.push(format!(
-                    "workon.review.diff.text = '{t}' unrecognized (valid: {valid}); \
-                     using default '{default}'"
-                ));
-                DiffTextMode::default()
-            }),
+            Some(t) => resolve_option(
+                "workon.review.diff.text",
+                t,
+                DIFF_TEXT_OPTIONS,
+                &mut warnings,
+            ),
             None => DiffTextMode::default(),
         };
         self.set_diff_text(diff_text);
