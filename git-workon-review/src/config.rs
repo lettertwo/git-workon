@@ -265,9 +265,13 @@ fn tint_slot<'a>(overrides: &'a mut ThemeOverrides, key: &str) -> Option<&'a mut
 }
 
 /// The warning message for a `workon.review.theme.<key>` value that didn't parse as a color —
-/// shared by the slot and tint branches of [`ReviewConfig::theme_overrides`].
+/// shared by the slot and tint branches of [`ReviewConfig::theme_overrides`]. Names no fallback
+/// (unlike the view-setting warnings in `App::apply_view_config`): an ignored override has
+/// none, the underlying scheme's value stands.
 fn invalid_color_warning(key: &str, raw: &str) -> String {
-    format!("workon.review.theme.{key}: invalid color {raw:?}, ignoring")
+    format!(
+        "workon.review.theme.{key}: invalid color {raw:?} (expected #rrggbb or rrggbb); ignoring"
+    )
 }
 
 // ── Unknown-key registry (config validation completeness) ──────────────────────────────────
@@ -999,7 +1003,13 @@ mod tests {
             .expect("theme_overrides");
         assert!(overrides.is_empty(), "invalid value must not set the slot");
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("base00"));
+        // Full-message pin (config-validation-completeness Decision 5): names the expected
+        // format, and `ignoring` with no fallback — an ignored override has none.
+        assert_eq!(
+            warnings[0],
+            "workon.review.theme.base00: invalid color \"not-a-color\" \
+             (expected #rrggbb or rrggbb); ignoring"
+        );
     }
 
     #[test]
