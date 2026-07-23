@@ -598,24 +598,34 @@ fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TS
     out
 }
 
+/// A `Del`/`Add` line's background+foreground emphasis (CS11, `workon.review.diff.text`) —
+/// bundles the `(line, edit)` background pair with the tint foreground that travels alongside it,
+/// so [`content_spans`]'s "both present or both absent" invariant holds by construction instead of
+/// through parallel `Option`s at every call site.
+struct LineEmphasis {
+    line_bg: Color,
+    edit_bg: Color,
+    tint_fg: Color,
+}
+
 /// Build the styled content spans (everything after the gutter) for one line of text, shared by
 /// [`build_pane_line`] (SBS) and [`build_inline_line`] (inline) — the two differ only in how they
 /// resolve `text`/`hl`/`emphasis` from a [`Row`] vs an [`InlineRow`] and in their gutter, not in
 /// how a resolved line gets colored.
 ///
-/// `emphasis` is `Some((line, edit))` for a `Del`/`Add` line (whole-line background, plus
-/// per-`word_spans` edit background when `is_word_pair`; whole-line edit background when not
-/// paired — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at
-/// all).
+/// `emphasis` is `Some(LineEmphasis { line_bg, edit_bg, .. })` for a `Del`/`Add` line (whole-line
+/// background, plus per-`word_spans` edit background when `is_word_pair`; whole-line edit
+/// background when not paired — an unpaired excess line) and `None` for `Context`/`Filler` (no
+/// background emphasis at all).
 ///
-/// `text_mode`/`tint_fg` (CS11, `workon.review.diff.text`) select which foreground a `Del`/`Add`
-/// line renders with, on top of the background `emphasis` already governs: `Syntax` never touches
-/// the foreground (`tint_fg` is ignored, keeping this byte-identical to before CS11 — the
-/// changeset's pixel-identity gate); `Tint` paints `tint_fg` across the line's full width, exactly
-/// where `emphasis`'s line background is painted; `Edit` paints `tint_fg` over the SAME ranges
+/// `text_mode` (CS11) selects which foreground a `Del`/`Add` line renders with, on top of the
+/// background `emphasis` already governs: `Syntax` never touches the foreground (`emphasis`'s
+/// `tint_fg` is ignored, keeping this byte-identical to before CS11 — the changeset's
+/// pixel-identity gate); `Tint` paints `tint_fg` across the line's full width, exactly where
+/// `emphasis`'s line background is painted; `Edit` paints `tint_fg` over the SAME ranges
 /// `emphasis`'s edit background is painted — `word_spans` when `is_word_pair`, the full line when
 /// not (the invariant this mode exists to hold: wherever the edit wash is painted, the tint
-/// foreground is painted). `tint_fg` is `None` for `Context`/`Filler`, same as `emphasis`.
+/// foreground is painted).
 ///
 /// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans via [`pan_spans`] — the
 /// segments below are always composed over the FULL, unsliced `text` first (byte-identical to the
@@ -624,17 +634,21 @@ fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TS
 fn content_spans(
     text: &str,
     hl: Option<&Vec<FgSpan>>,
-    emphasis: Option<(Color, Color)>,
+    emphasis: Option<LineEmphasis>,
     word_spans: &[WordSpan],
     is_word_pair: bool,
     theme: &Palette,
     hscroll: usize,
     text_mode: DiffTextMode,
-    tint_fg: Option<Color>,
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
     let mut fg_override_spans: Vec<(usize, usize, Color)> = Vec::new();
-    if let Some((line_bg, edit_bg)) = emphasis {
+    if let Some(LineEmphasis {
+        line_bg,
+        edit_bg,
+        tint_fg,
+    }) = emphasis
+    {
         if is_word_pair {
             bg_spans.push((0, text.len(), line_bg));
             for s in word_spans {
@@ -647,22 +661,20 @@ fn content_spans(
             bg_spans.push((0, text.len(), edit_bg));
         }
 
-        if let Some(fg) = tint_fg {
-            match text_mode {
-                DiffTextMode::Syntax => {}
-                DiffTextMode::Tint => {
-                    fg_override_spans.push((0, text.len(), fg));
-                }
-                DiffTextMode::Edit => {
-                    // Mirrors the edit-background branch above exactly (same condition, same
-                    // ranges) — the invariant this mode exists to hold.
-                    if is_word_pair {
-                        for s in word_spans {
-                            fg_override_spans.push((s.start, s.end, fg));
-                        }
-                    } else {
-                        fg_override_spans.push((0, text.len(), fg));
+        match text_mode {
+            DiffTextMode::Syntax => {}
+            DiffTextMode::Tint => {
+                fg_override_spans.push((0, text.len(), tint_fg));
+            }
+            DiffTextMode::Edit => {
+                // Mirrors the edit-background branch above exactly (same condition, same
+                // ranges) — the invariant this mode exists to hold.
+                if is_word_pair {
+                    for s in word_spans {
+                        fg_override_spans.push((s.start, s.end, tint_fg));
                     }
+                } else {
+                    fg_override_spans.push((0, text.len(), tint_fg));
                 }
             }
         }
@@ -724,16 +736,24 @@ fn build_pane_line(
             let gutter = format!("{n:>gutter_w$} ");
             let mut spans = vec![TSpan::styled(gutter, Style::default().fg(theme.gutter))];
 
-            let (emphasis, tint_fg) = match kind {
-                CellKind::Del => (
-                    Some(del_bg_pair(mode, n as u32, theme)),
-                    Some(del_tint_fg(mode, n as u32, theme)),
-                ),
-                CellKind::Add => (
-                    Some(add_bg_pair(mode, n as u32, theme)),
-                    Some(add_tint_fg(mode, n as u32, theme)),
-                ),
-                CellKind::Context | CellKind::Filler => (None, None),
+            let emphasis = match kind {
+                CellKind::Del => {
+                    let (line_bg, edit_bg) = del_bg_pair(mode, n as u32, theme);
+                    Some(LineEmphasis {
+                        line_bg,
+                        edit_bg,
+                        tint_fg: del_tint_fg(mode, n as u32, theme),
+                    })
+                }
+                CellKind::Add => {
+                    let (line_bg, edit_bg) = add_bg_pair(mode, n as u32, theme);
+                    Some(LineEmphasis {
+                        line_bg,
+                        edit_bg,
+                        tint_fg: add_tint_fg(mode, n as u32, theme),
+                    })
+                }
+                CellKind::Context | CellKind::Filler => None,
             };
             spans.extend(content_spans(
                 text,
@@ -744,7 +764,6 @@ fn build_pane_line(
                 theme,
                 hscroll,
                 text_mode,
-                tint_fg,
             ));
             Line::from(spans)
         }
@@ -2331,13 +2350,22 @@ fn build_inline_line(
     // `kind` is always Del/Add/Context here — inline has no Filler rows. `old_opt`/`new_opt`
     // carry the exact lineno each kind is documented to have (see this fn's own match above).
     let emphasis = match kind {
-        CellKind::Del => old_opt.map(|n| del_bg_pair(mode, n as u32, theme)),
-        CellKind::Add => new_opt.map(|n| add_bg_pair(mode, n as u32, theme)),
-        CellKind::Context | CellKind::Filler => None,
-    };
-    let tint_fg = match kind {
-        CellKind::Del => old_opt.map(|n| del_tint_fg(mode, n as u32, theme)),
-        CellKind::Add => new_opt.map(|n| add_tint_fg(mode, n as u32, theme)),
+        CellKind::Del => old_opt.map(|n| {
+            let (line_bg, edit_bg) = del_bg_pair(mode, n as u32, theme);
+            LineEmphasis {
+                line_bg,
+                edit_bg,
+                tint_fg: del_tint_fg(mode, n as u32, theme),
+            }
+        }),
+        CellKind::Add => new_opt.map(|n| {
+            let (line_bg, edit_bg) = add_bg_pair(mode, n as u32, theme);
+            LineEmphasis {
+                line_bg,
+                edit_bg,
+                tint_fg: add_tint_fg(mode, n as u32, theme),
+            }
+        }),
         CellKind::Context | CellKind::Filler => None,
     };
     spans.extend(content_spans(
@@ -2349,7 +2377,6 @@ fn build_inline_line(
         theme,
         hscroll,
         text_mode,
-        tint_fg,
     ));
     Line::from(spans)
 }
@@ -2471,7 +2498,7 @@ mod tests {
 
     use super::{
         changeset_prefix_spans, compose_segments, content_spans, hscroll_cut, pan_spans,
-        pane_header_label_style, render, STATUS_PLACEHOLDER,
+        pane_header_label_style, render, LineEmphasis, STATUS_PLACEHOLDER,
     };
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
@@ -2534,31 +2561,35 @@ mod tests {
         // never reach the output — a `Del`/`Add` line renders byte-identically whether `tint_fg`
         // is `Some` or `None`, for both a paired (word-diff) and an unpaired (excess) line.
         let theme = Palette::dark();
-        let emphasis = Some((theme.del_line_bg, theme.del_edit_bg));
+        let emphasis = |tint_fg| {
+            Some(LineEmphasis {
+                line_bg: theme.del_line_bg,
+                edit_bg: theme.del_edit_bg,
+                tint_fg,
+            })
+        };
         let word_spans = [WordSpan { start: 0, end: 2 }];
 
         for (is_word_pair, words) in [(true, word_spans.as_slice()), (false, &[])] {
             let with_tint = content_spans(
                 "hello",
                 None,
-                emphasis,
+                emphasis(theme.del_fg),
                 words,
                 is_word_pair,
                 &theme,
                 0,
                 DiffTextMode::Syntax,
-                Some(theme.del_fg),
             );
             let without_tint = content_spans(
                 "hello",
                 None,
-                emphasis,
+                emphasis(theme.foreground),
                 words,
                 is_word_pair,
                 &theme,
                 0,
                 DiffTextMode::Syntax,
-                None,
             );
             assert_eq!(
                 with_tint, without_tint,
@@ -2578,25 +2609,17 @@ mod tests {
     #[test]
     fn content_spans_context_lines_never_take_tint_fg_in_any_mode() {
         // Locked decision #3: the knob governs changed lines only. `emphasis: None` is what
-        // marks a Context/Filler line — even if a caller somehow passed a `tint_fg` alongside it
-        // (callers never do), no mode may paint it, since there is no edit/line wash for a tint
-        // foreground to attach meaning to.
+        // marks a Context/Filler line — since `LineEmphasis` bundles the tint foreground with the
+        // background wash it belongs to, `None` rules both out together by construction, so no
+        // mode can paint a tint foreground with no edit/line wash for it to attach meaning to.
         let theme = Palette::dark();
         for mode in [DiffTextMode::Syntax, DiffTextMode::Tint, DiffTextMode::Edit] {
-            let spans = content_spans(
-                "hello",
-                None,
-                None,
-                &[],
-                false,
-                &theme,
-                0,
-                mode,
-                Some(theme.del_fg),
-            );
+            let spans = content_spans("hello", None, None, &[], false, &theme, 0, mode);
             assert!(
-                fgs_of(&spans).iter().all(|fg| *fg != Some(theme.del_fg)),
-                "context line must not take the tint fg under {mode:?}"
+                fgs_of(&spans)
+                    .iter()
+                    .all(|fg| *fg == Some(theme.foreground)),
+                "context line must render plain (no tint fg) under {mode:?}"
             );
         }
     }
@@ -2604,7 +2627,11 @@ mod tests {
     #[test]
     fn content_spans_tint_mode_paints_the_tint_fg_across_the_full_line() {
         let theme = Palette::dark();
-        let emphasis = Some((theme.add_line_bg, theme.add_edit_bg));
+        let emphasis = Some(LineEmphasis {
+            line_bg: theme.add_line_bg,
+            edit_bg: theme.add_edit_bg,
+            tint_fg: theme.add_fg,
+        });
         let spans = content_spans(
             "hello",
             None,
@@ -2614,7 +2641,6 @@ mod tests {
             &theme,
             0,
             DiffTextMode::Tint,
-            Some(theme.add_fg),
         );
         assert!(
             fgs_of(&spans).iter().all(|fg| *fg == Some(theme.add_fg)),
@@ -2626,7 +2652,11 @@ mod tests {
     #[test]
     fn content_spans_edit_mode_paints_only_the_word_span_on_a_paired_line() {
         let theme = Palette::dark();
-        let emphasis = Some((theme.add_line_bg, theme.add_edit_bg));
+        let emphasis = Some(LineEmphasis {
+            line_bg: theme.add_line_bg,
+            edit_bg: theme.add_edit_bg,
+            tint_fg: theme.add_fg,
+        });
         // "hello" with the word span covering only "he" (bytes 0..2) — the rest of the line
         // should keep its syntax/plain foreground, not the tint.
         let spans = content_spans(
@@ -2638,7 +2668,6 @@ mod tests {
             &theme,
             0,
             DiffTextMode::Edit,
-            Some(theme.add_fg),
         );
         let tinted: Vec<&TSpan> = spans
             .iter()
@@ -2670,7 +2699,11 @@ mod tests {
         // (`content_spans`' own `is_word_pair == false` branch) — so in Edit mode it must take
         // the tint foreground across that exact same full width, never a subset and never none.
         let theme = Palette::dark();
-        let emphasis = Some((theme.del_line_bg, theme.del_edit_bg));
+        let emphasis = Some(LineEmphasis {
+            line_bg: theme.del_line_bg,
+            edit_bg: theme.del_edit_bg,
+            tint_fg: theme.del_fg,
+        });
         let spans = content_spans(
             "hello",
             None,
@@ -2680,7 +2713,6 @@ mod tests {
             &theme,
             0,
             DiffTextMode::Edit,
-            Some(theme.del_fg),
         );
         assert!(
             fgs_of(&spans).iter().all(|fg| *fg == Some(theme.del_fg)),
