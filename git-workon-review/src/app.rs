@@ -719,76 +719,131 @@ pub fn effective_zoom(
     }
 }
 
-/// Parse `workon.review.outline.mode` (CS7) into an [`OutlineMode`]. Canonical strings mirror
-/// the variant names, kebab-cased: `flat`, `stack`, `tree`, `stack-tree`. `None` on anything
-/// else — [`App::apply_view_config`] falls back to [`OutlineMode::default`] and warns.
+/// The valid config strings for one of the CS7 view-config enums, in declaration order — the
+/// single source both the `parse_*` functions below and their warning messages
+/// (`App::apply_view_config`, config-validation-completeness Decision 5) read from, so the
+/// "valid: …" list in a warning can never list a name the parser doesn't actually accept (or
+/// omit one it does).
+fn valid_options_list<T: Copy>(options: &[(&str, T)]) -> String {
+    options
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The canonical config string for `options`' `T::default()` variant — reads the enum's real
+/// `Default` impl rather than hardcoding a name, so a warning's "using default '…'" can never
+/// drift from what `Default::default()` actually produces.
+fn default_option_name<T: Copy + PartialEq + Default>(
+    options: &'static [(&'static str, T)],
+) -> &'static str {
+    options
+        .iter()
+        .find(|(_, value)| *value == T::default())
+        .map(|(name, _)| *name)
+        .expect("T::default() has a canonical name listed in `options`")
+}
+
+/// `workon.review.outline.mode` (CS7)'s valid config strings, kebab-cased mirrors of the
+/// [`OutlineMode`] variant names, in [`App::apply_view_config`]'s warning order.
+const OUTLINE_MODE_OPTIONS: &[(&str, OutlineMode)] = &[
+    ("flat", OutlineMode::Flat),
+    ("stack", OutlineMode::Stack),
+    ("tree", OutlineMode::Tree),
+    ("stack-tree", OutlineMode::StackTree),
+];
+
+/// Parse `workon.review.outline.mode` (CS7) into an [`OutlineMode`]. `None` on anything not in
+/// [`OUTLINE_MODE_OPTIONS`] — [`App::apply_view_config`] falls back to [`OutlineMode::default`]
+/// and warns.
 fn parse_outline_mode(raw: &str) -> Option<OutlineMode> {
-    match raw {
-        "flat" => Some(OutlineMode::Flat),
-        "stack" => Some(OutlineMode::Stack),
-        "tree" => Some(OutlineMode::Tree),
-        "stack-tree" => Some(OutlineMode::StackTree),
-        _ => None,
-    }
+    OUTLINE_MODE_OPTIONS
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, mode)| *mode)
 }
 
-/// Parse `workon.review.outline.order` (CS3) into an [`OutlineOrder`]. Canonical strings mirror
-/// the variant names, kebab-cased: `head-first`, `base-first`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`OutlineOrder::default`] and warns.
+/// `workon.review.outline.order` (CS3)'s valid config strings, kebab-cased mirrors of the
+/// [`OutlineOrder`] variant names.
+const OUTLINE_ORDER_OPTIONS: &[(&str, OutlineOrder)] = &[
+    ("head-first", OutlineOrder::HeadFirst),
+    ("base-first", OutlineOrder::BaseFirst),
+];
+
+/// Parse `workon.review.outline.order` (CS3) into an [`OutlineOrder`]. `None` on anything not in
+/// [`OUTLINE_ORDER_OPTIONS`] — [`App::apply_view_config`] falls back to
+/// [`OutlineOrder::default`] and warns.
 fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
-    match raw {
-        "head-first" => Some(OutlineOrder::HeadFirst),
-        "base-first" => Some(OutlineOrder::BaseFirst),
-        _ => None,
-    }
+    OUTLINE_ORDER_OPTIONS
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, order)| *order)
 }
 
-/// Parse `workon.review.icons` (CS5) into an [`IconMode`]. Canonical strings mirror
-/// the variant names, kebab-cased: `nerd`, `none`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`IconMode::default`] (also `none` — CS5's
-/// no-auto-detection default) and warns.
+/// `workon.review.icons` (CS5)'s valid config strings, kebab-cased mirrors of the [`IconMode`]
+/// variant names.
+const ICON_MODE_OPTIONS: &[(&str, IconMode)] =
+    &[("none", IconMode::None), ("nerd", IconMode::Nerd)];
+
+/// Parse `workon.review.icons` (CS5) into an [`IconMode`]. `None` on anything not in
+/// [`ICON_MODE_OPTIONS`] — [`App::apply_view_config`] falls back to [`IconMode::default`] (also
+/// `none` — CS5's no-auto-detection default) and warns.
 fn parse_icon_mode(raw: &str) -> Option<IconMode> {
-    match raw {
-        "nerd" => Some(IconMode::Nerd),
-        "none" => Some(IconMode::None),
-        _ => None,
-    }
+    ICON_MODE_OPTIONS
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, mode)| *mode)
 }
 
-/// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. Canonical strings mirror the
-/// variant names: `sbs`, `inline`. `None` on anything else — [`App::apply_view_config`] falls
-/// back to [`Layout::default`] and warns.
+/// `workon.review.diff.layout` (CS7)'s valid config strings, mirroring the [`Layout`] variant
+/// names.
+const DIFF_LAYOUT_OPTIONS: &[(&str, Layout)] = &[("sbs", Layout::Sbs), ("inline", Layout::Inline)];
+
+/// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. `None` on anything not in
+/// [`DIFF_LAYOUT_OPTIONS`] — [`App::apply_view_config`] falls back to [`Layout::default`] and
+/// warns.
 fn parse_diff_layout(raw: &str) -> Option<Layout> {
-    match raw {
-        "sbs" => Some(Layout::Sbs),
-        "inline" => Some(Layout::Inline),
-        _ => None,
-    }
+    DIFF_LAYOUT_OPTIONS
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, layout)| *layout)
 }
 
-/// Parse `workon.review.diff.zoom` (CS7) into a [`Zoom`]. Canonical strings mirror the variant
-/// names: `split`, `combined`, `unstaged`, `staged`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`Zoom::default`] and warns.
+/// `workon.review.diff.zoom` (CS7)'s valid config strings, mirroring the [`Zoom`] variant names.
+const DIFF_ZOOM_OPTIONS: &[(&str, Zoom)] = &[
+    ("split", Zoom::Split),
+    ("combined", Zoom::Combined),
+    ("unstaged", Zoom::Unstaged),
+    ("staged", Zoom::Staged),
+];
+
+/// Parse `workon.review.diff.zoom` (CS7) into a [`Zoom`]. `None` on anything not in
+/// [`DIFF_ZOOM_OPTIONS`] — [`App::apply_view_config`] falls back to [`Zoom::default`] and warns.
 fn parse_diff_zoom(raw: &str) -> Option<Zoom> {
-    match raw {
-        "split" => Some(Zoom::Split),
-        "combined" => Some(Zoom::Combined),
-        "unstaged" => Some(Zoom::Unstaged),
-        "staged" => Some(Zoom::Staged),
-        _ => None,
-    }
+    DIFF_ZOOM_OPTIONS
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, zoom)| *zoom)
 }
 
-/// Parse `workon.review.diff.text` (CS11) into a [`DiffTextMode`]. Canonical strings mirror the
-/// variant names: `syntax`, `tint`, `edit`. `None` on anything else — [`App::apply_view_config`]
-/// falls back to [`DiffTextMode::default`] and warns.
+/// `workon.review.diff.text` (CS11)'s valid config strings, mirroring the [`DiffTextMode`]
+/// variant names.
+const DIFF_TEXT_OPTIONS: &[(&str, DiffTextMode)] = &[
+    ("syntax", DiffTextMode::Syntax),
+    ("tint", DiffTextMode::Tint),
+    ("edit", DiffTextMode::Edit),
+];
+
+/// Parse `workon.review.diff.text` (CS11) into a [`DiffTextMode`]. `None` on anything not in
+/// [`DIFF_TEXT_OPTIONS`] — see [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s
+/// "Revised (CS11, diff foreground/background split)" section.
+/// [`App::apply_view_config`] falls back to [`DiffTextMode::default`] and warns.
 fn parse_diff_text(raw: &str) -> Option<DiffTextMode> {
-    match raw {
-        "syntax" => Some(DiffTextMode::Syntax),
-        "tint" => Some(DiffTextMode::Tint),
-        "edit" => Some(DiffTextMode::Edit),
-        _ => None,
-    }
+    DIFF_TEXT_OPTIONS
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, mode)| *mode)
 }
 
 /// CS4: which outline row a Header/Dir cursor selection resolves to — [`App::summary_target`]'s
@@ -4027,7 +4082,8 @@ impl App {
                 _ => {
                     warnings.push(format!(
                         "workon.review.outline.width = {w} out of range \
-                         ({MIN_OUTLINE_WIDTH}-{MAX_OUTLINE_WIDTH}); using default"
+                         ({MIN_OUTLINE_WIDTH}-{MAX_OUTLINE_WIDTH}); using default \
+                         {DEFAULT_OUTLINE_WIDTH}"
                     ));
                     DEFAULT_OUTLINE_WIDTH
                 }
@@ -4038,8 +4094,11 @@ impl App {
 
         let mode = match &raw.outline_mode {
             Some(m) => parse_outline_mode(m).unwrap_or_else(|| {
+                let valid = valid_options_list(OUTLINE_MODE_OPTIONS);
+                let default = default_option_name(OUTLINE_MODE_OPTIONS);
                 warnings.push(format!(
-                    "workon.review.outline.mode = '{m}' unrecognized; using default"
+                    "workon.review.outline.mode = '{m}' unrecognized (valid: {valid}); \
+                     using default '{default}'"
                 ));
                 OutlineMode::default()
             }),
@@ -4049,8 +4108,11 @@ impl App {
 
         let order = match &raw.outline_order {
             Some(o) => parse_outline_order(o).unwrap_or_else(|| {
+                let valid = valid_options_list(OUTLINE_ORDER_OPTIONS);
+                let default = default_option_name(OUTLINE_ORDER_OPTIONS);
                 warnings.push(format!(
-                    "workon.review.outline.order = '{o}' unrecognized; using default"
+                    "workon.review.outline.order = '{o}' unrecognized (valid: {valid}); \
+                     using default '{default}'"
                 ));
                 OutlineOrder::default()
             }),
@@ -4060,8 +4122,11 @@ impl App {
 
         let icons = match &raw.icons {
             Some(i) => parse_icon_mode(i).unwrap_or_else(|| {
+                let valid = valid_options_list(ICON_MODE_OPTIONS);
+                let default = default_option_name(ICON_MODE_OPTIONS);
                 warnings.push(format!(
-                    "workon.review.icons = '{i}' unrecognized; using default"
+                    "workon.review.icons = '{i}' unrecognized (valid: {valid}); \
+                     using default '{default}'"
                 ));
                 IconMode::default()
             }),
@@ -4071,8 +4136,11 @@ impl App {
 
         let layout = match &raw.diff_layout {
             Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
+                let valid = valid_options_list(DIFF_LAYOUT_OPTIONS);
+                let default = default_option_name(DIFF_LAYOUT_OPTIONS);
                 warnings.push(format!(
-                    "workon.review.diff.layout = '{l}' unrecognized; using default"
+                    "workon.review.diff.layout = '{l}' unrecognized (valid: {valid}); \
+                     using default '{default}'"
                 ));
                 Layout::default()
             }),
@@ -4082,8 +4150,11 @@ impl App {
 
         let zoom = match &raw.diff_zoom {
             Some(z) => parse_diff_zoom(z).unwrap_or_else(|| {
+                let valid = valid_options_list(DIFF_ZOOM_OPTIONS);
+                let default = default_option_name(DIFF_ZOOM_OPTIONS);
                 warnings.push(format!(
-                    "workon.review.diff.zoom = '{z}' unrecognized; using default"
+                    "workon.review.diff.zoom = '{z}' unrecognized (valid: {valid}); \
+                     using default '{default}'"
                 ));
                 Zoom::default()
             }),
@@ -4093,8 +4164,11 @@ impl App {
 
         let diff_text = match &raw.diff_text {
             Some(t) => parse_diff_text(t).unwrap_or_else(|| {
+                let valid = valid_options_list(DIFF_TEXT_OPTIONS);
+                let default = default_option_name(DIFF_TEXT_OPTIONS);
                 warnings.push(format!(
-                    "workon.review.diff.text = '{t}' unrecognized; using default"
+                    "workon.review.diff.text = '{t}' unrecognized (valid: {valid}); \
+                     using default '{default}'"
                 ));
                 DiffTextMode::default()
             }),
@@ -10263,7 +10337,16 @@ mod tests {
 
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("outline.width"));
+        // Full-message pin (config-validation-completeness Decision 5): the range and fallback
+        // must come from the real `MIN_OUTLINE_WIDTH`/`MAX_OUTLINE_WIDTH`/`DEFAULT_OUTLINE_WIDTH`
+        // constants, never hardcoded numbers.
+        assert_eq!(
+            warnings[0],
+            format!(
+                "workon.review.outline.width = 9999 out of range \
+                 ({MIN_OUTLINE_WIDTH}-{MAX_OUTLINE_WIDTH}); using default {DEFAULT_OUTLINE_WIDTH}"
+            )
+        );
     }
 
     #[test]
@@ -10294,7 +10377,13 @@ mod tests {
 
         assert_eq!(app.outline_mode(), OutlineMode::default());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("outline.mode"));
+        // Full-message pin: the valid set and fallback name come from `OUTLINE_MODE_OPTIONS`/
+        // `OutlineMode::default`, not a hardcoded string.
+        assert_eq!(
+            warnings[0],
+            "workon.review.outline.mode = 'bogus' unrecognized \
+             (valid: flat, stack, tree, stack-tree); using default 'stack'"
+        );
     }
 
     #[test]
@@ -10449,7 +10538,12 @@ mod tests {
 
         assert_eq!(app.diff_text, DiffTextMode::default());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("diff.text"));
+        // Full-message pin: matches the handoff's target shape verbatim.
+        assert_eq!(
+            warnings[0],
+            "workon.review.diff.text = 'bogus' unrecognized (valid: syntax, tint, edit); \
+             using default 'syntax'"
+        );
     }
 
     // ── `reload-config` (`R`): request flag + mid-session view-config apply ────
