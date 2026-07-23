@@ -5314,7 +5314,8 @@ mod tests {
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
         DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity,
-        Summary, SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, SCROLLOFF,
+        Summary, SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, MAX_OUTLINE_WIDTH,
+        MIN_OUTLINE_WIDTH, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::{RawViewConfig, ReviewConfig};
