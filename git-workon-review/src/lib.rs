@@ -32,6 +32,7 @@ pub mod queue;
 pub mod refresh;
 pub mod render;
 pub mod scope;
+pub mod search;
 pub mod source;
 pub mod stage_op;
 pub mod summary;

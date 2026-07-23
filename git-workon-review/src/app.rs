@@ -462,6 +462,18 @@ impl FileView {
             .cloned()
             .unwrap_or_default()
     }
+
+    /// M11 CS3 (search): literal, smartcase matches of `query` against this file's PRE-collapse
+    /// row space — see [`crate::search::compute_matches`]'s doc comment for why that space (not
+    /// [`Self::display`]/[`Self::inline`]) is what's scanned.
+    pub(crate) fn search_matches(&self, query: &str) -> Vec<crate::search::SearchMatch> {
+        crate::search::compute_matches(
+            &self.aligned,
+            query,
+            |n| self.old_line(n).to_string(),
+            |n| self.new_line(n).to_string(),
+        )
+    }
 }
 
 /// The tree a COMBINED-role [`FileView`]'s old side reads from (see [`FileView::load`]'s role
@@ -1446,6 +1458,29 @@ pub struct App {
     /// [`Self::zoom_key_label`] is a label rather than a keymap reference), so it only raises the
     /// flag here and the event loop — which DOES hold those — does the actual reload.
     config_reload_requested: bool,
+    /// M11 CS3 (`diff-search`): the ACCEPTED search query, `/` in the diff view opens the prompt
+    /// to edit. Survives file/changeset switches (vim-register semantics — see
+    /// [`Self::recompute_search`]'s doc comment for what recomputes it on which trigger). `None`
+    /// while no search has ever been
+    /// accepted, or after [`Self::search_clear`].
+    search_query: Option<String>,
+    /// The one-row prompt's own live editing buffer — separate from [`Self::search_query`] so
+    /// typing previews highlights without committing them: [`Self::search_accept`] (`Enter`) is
+    /// the only path that copies this into `search_query`; [`Self::search_abort`] (`Esc`) discards
+    /// it, leaving `search_query` (and its highlights) exactly as they were before `/` was pressed.
+    search_prompt: PromptState,
+    /// Whether the search prompt currently has keyboard capture — the diff-view analog of
+    /// [`OutlineState::filter_focused`]'s two-state model, except search has no "focus the prompt,
+    /// keep typing history" step: every `/` starts a fresh, empty prompt (see [`Self::search_focus`]).
+    search_focused: bool,
+    /// The CURRENT search text's matches (the live prompt buffer's while [`Self::search_focused`],
+    /// else [`Self::search_query`]'s) against the focused pane's file, in file order — recomputed
+    /// by [`Self::recompute_search`] on every trigger the M11 CS3 plan names: prompt edits, accept,
+    /// abort, file/changeset switch, refresh, layout/zoom change.
+    search_matches: Vec<crate::search::SearchMatch>,
+    /// Index into [`Self::search_matches`] of the match the cursor is currently parked on —
+    /// `None` while merely previewing (typing, before `Enter`) or when there's nothing to park on.
+    search_current: Option<usize>,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1631,6 +1666,11 @@ impl App {
             pending_wave: None,
             zoom_key_label: "Z".to_string(),
             config_reload_requested: false,
+            search_query: None,
+            search_prompt: PromptState::new(),
+            search_focused: false,
+            search_matches: Vec::new(),
+            search_current: None,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -2193,6 +2233,10 @@ impl App {
         }
         self.derive_scroll();
         // The unfocused pane's scroll is derived at render time, once its height is known.
+        // M11 CS3: `reset_panes` is the one chokepoint every file/changeset switch, refresh, and
+        // zoom cycle already funnels through (`open_current`/`complete_pending_open` both end
+        // here) — see [`Self::recompute_search`]'s doc comment for the full trigger list.
+        self.recompute_search();
     }
 
     /// Jump the focused pane's cursor to its role view's first hunk, then re-derive `scroll`.
@@ -3523,6 +3567,296 @@ impl App {
         self.outline_filter_reflow();
     }
 
+    // ── Diff search (CS3 `diff-search`, M11) ─────────────────────────────────────
+
+    /// Whether the search prompt currently has keyboard capture (`/` opened it, `Enter`/`Esc`
+    /// haven't closed it yet) — `tui.rs`'s modal-capture cascade arm and mouse-swallow guard, and
+    /// `render.rs`'s footer prompt, all gate on this.
+    pub fn search_focused(&self) -> bool {
+        self.search_focused
+    }
+
+    /// Whether an ACCEPTED search is live (survives the prompt closing) — the fallback gate for
+    /// `n`/`N` (contextual hunk-nav fallback when this is `false`) and the Esc-precedence ladder's
+    /// "clear the active search" arm.
+    pub fn search_active(&self) -> bool {
+        self.search_query.is_some()
+    }
+
+    /// The prompt's own live editing buffer, for `render.rs`'s footer prompt (mirrors
+    /// [`Self::outline_filter_state`]).
+    pub fn search_prompt_state(&self) -> &PromptState {
+        &self.search_prompt
+    }
+
+    /// The current search's matches (recomputed by [`Self::recompute_search`]), in file order.
+    pub fn search_matches(&self) -> &[crate::search::SearchMatch] {
+        &self.search_matches
+    }
+
+    /// Index into [`Self::search_matches`] the cursor is currently parked on, if any — the
+    /// distinguishing mark between `search-match-bg` (every match) and `search-current-bg` (this
+    /// one) `render.rs` paints.
+    pub fn search_current_index(&self) -> Option<usize> {
+        self.search_current
+    }
+
+    /// `/` in the diff view: open a FRESH, empty search prompt (unlike the outline filter, the
+    /// search prompt never pre-fills from the last accepted query — vim's `/` doesn't either).
+    pub fn search_focus(&mut self) {
+        self.search_prompt.clear();
+        self.search_focused = true;
+        self.recompute_search();
+    }
+
+    /// The text driving [`Self::search_matches`] right now: the live prompt buffer while
+    /// [`Self::search_focused`] (so typing previews highlights), else the last ACCEPTED query —
+    /// this is what makes [`Self::search_abort`] "restore the previously accepted search" free
+    /// (closing the prompt without touching `search_query` just switches which text
+    /// [`Self::recompute_search`] reads next).
+    fn active_search_text(&self) -> Option<&str> {
+        if self.search_focused && !self.search_prompt.is_empty() {
+            Some(self.search_prompt.buffer())
+        } else {
+            self.search_query.as_deref()
+        }
+    }
+
+    /// Recompute [`Self::search_matches`] from [`Self::active_search_text`] against the FOCUSED
+    /// pane's current file view — called on every trigger the M11 CS3 plan names: every prompt
+    /// edit (live preview), accept/abort, file/changeset switch and refresh (both funnel through
+    /// [`Self::reset_panes`]), and a layout/zoom change (harmless to re-run even when the match
+    /// content can't have changed — matches address the layout-agnostic `AlignedRow` space).
+    /// [`Self::search_current`] always resets to `None` here: a fresh match list has no "the
+    /// cursor is parked on match N" claim to make until [`Self::search_accept`]/
+    /// [`Self::search_next`]/[`Self::search_prev`] jumps to one.
+    fn recompute_search(&mut self) {
+        self.search_current = None;
+        let Some(text) = self.active_search_text() else {
+            self.search_matches.clear();
+            return;
+        };
+        if text.is_empty() {
+            self.search_matches.clear();
+            return;
+        }
+        let text = text.to_string();
+        self.search_matches = match self.current_view_ref() {
+            Some(view) => view.search_matches(&text),
+            None => Vec::new(),
+        };
+    }
+
+    /// `Enter` while the prompt is focused: commit the buffer as the accepted query, close the
+    /// prompt, and jump to the first match at-or-after the cursor (wrapping to the file's first
+    /// match, with a footer notice, if none is at-or-after it). An empty buffer clears the search
+    /// instead of accepting a no-op query.
+    pub fn search_accept(&mut self) {
+        let text = self.search_prompt.buffer().to_string();
+        self.search_focused = false;
+        self.search_prompt.clear();
+        if text.is_empty() {
+            self.search_clear();
+            return;
+        }
+        self.search_query = Some(text);
+        self.recompute_search();
+        if self.search_matches.is_empty() {
+            return;
+        }
+        match self.first_match_at_or_after_cursor() {
+            Some(idx) => self.jump_to_search_match(idx, false),
+            None => self.jump_to_search_match(0, true),
+        }
+    }
+
+    /// `Esc` while the prompt is focused: discard the buffer, close the prompt, and restore
+    /// whichever accepted search (or none) was active before `/` was pressed — free, since
+    /// [`Self::active_search_text`] already falls back to [`Self::search_query`] once
+    /// [`Self::search_focused`] is `false`.
+    pub fn search_abort(&mut self) {
+        self.search_focused = false;
+        self.search_prompt.clear();
+        self.recompute_search();
+    }
+
+    /// `Esc` with the diff focused and an active search (no prompt open) — clears the search
+    /// entirely, the Esc-precedence ladder's own arm (ranked with the line-selection cancel, see
+    /// `tui.rs::resolve_key`).
+    pub fn search_clear(&mut self) {
+        self.search_query = None;
+        self.search_focused = false;
+        self.search_prompt.clear();
+        self.search_matches.clear();
+        self.search_current = None;
+    }
+
+    /// Insert a char at the prompt's cursor and recompute the live preview.
+    pub fn search_insert_char(&mut self, c: char) {
+        self.search_prompt.insert_char(c);
+        self.recompute_search();
+    }
+
+    /// `Backspace` while the prompt is focused.
+    pub fn search_backspace(&mut self) {
+        self.search_prompt.backspace();
+        self.recompute_search();
+    }
+
+    /// `Delete` while the prompt is focused.
+    pub fn search_delete(&mut self) {
+        self.search_prompt.delete();
+        self.recompute_search();
+    }
+
+    /// `Left` while the prompt is focused — doesn't reshape the match list, so no recompute.
+    pub fn search_move_left(&mut self) {
+        self.search_prompt.move_left();
+    }
+
+    /// `Right` while the prompt is focused — see [`Self::search_move_left`].
+    pub fn search_move_right(&mut self) {
+        self.search_prompt.move_right();
+    }
+
+    /// `Ctrl-a`/`Home` while the prompt is focused.
+    pub fn search_move_home(&mut self) {
+        self.search_prompt.move_home();
+    }
+
+    /// `Ctrl-e`/`End` while the prompt is focused.
+    pub fn search_move_end(&mut self) {
+        self.search_prompt.move_end();
+    }
+
+    /// `Ctrl-u` while the prompt is focused.
+    pub fn search_clear_to_start(&mut self) {
+        self.search_prompt.clear_to_start();
+        self.recompute_search();
+    }
+
+    /// `Ctrl-w` while the prompt is focused.
+    pub fn search_delete_word_back(&mut self) {
+        self.search_prompt.delete_word_back();
+        self.recompute_search();
+    }
+
+    /// The cursor's own (old, new) lineno pair, preferring the new-side lineno like
+    /// [`Self::restore_position`]'s convention — the ordering key [`Self::first_match_at_or_after_cursor`]
+    /// compares [`crate::search::SearchMatch`]'s own (old, new) pair against.
+    fn cursor_lineno(&self) -> Option<usize> {
+        let view = self.current_view_ref()?;
+        let (old, new) = match self.layout {
+            Layout::Sbs => display_row_linenos(view.display.get(self.cursor)?),
+            Layout::Inline => inline_row_linenos(view.inline.get(self.cursor)?),
+        };
+        new.or(old)
+    }
+
+    /// The first [`Self::search_matches`] index whose row is at-or-after the cursor's own
+    /// position, by (new-preferring) lineno — [`Self::search_accept`]'s jump target. `None` when
+    /// every match lies strictly before the cursor (the wrap case its caller handles).
+    fn first_match_at_or_after_cursor(&self) -> Option<usize> {
+        let cursor_line = self.cursor_lineno().unwrap_or(0);
+        self.search_matches.iter().position(|m| {
+            let line = m.new_lineno.or(m.old_lineno).unwrap_or(0);
+            line >= cursor_line
+        })
+    }
+
+    /// `n`/`N` (contextual): jump to the next/previous search match when a search is active,
+    /// wrapping (with a footer notice) at either end; falls back to [`Self::next_hunk_row`]/
+    /// [`Self::prev_hunk_row`] when no search is active at all (`search-next`/`search-prev`'s
+    /// registry description names this fallback).
+    fn search_step(&mut self, forward: bool) {
+        if !self.search_active() || self.search_matches.is_empty() {
+            if forward {
+                self.next_hunk_row();
+            } else {
+                self.prev_hunk_row();
+            }
+            return;
+        }
+        let n = self.search_matches.len();
+        let (next_idx, wrapped) = match self.search_current {
+            Some(cur) => {
+                if forward {
+                    let next = (cur + 1) % n;
+                    (next, next < cur)
+                } else {
+                    let next = (cur + n - 1) % n;
+                    (next, next > cur)
+                }
+            }
+            // No prior current (a search just accepted, or `n`/`N` pressed before any jump):
+            // land on the nearest match at-or-after the cursor either direction — same starting
+            // point [`Self::search_accept`] itself would have picked.
+            None => match self.first_match_at_or_after_cursor() {
+                Some(idx) => (idx, false),
+                None => (0, true),
+            },
+        };
+        self.jump_to_search_match(next_idx, wrapped);
+    }
+
+    /// `n` (default binding `search-next`): see [`Self::search_step`].
+    pub fn search_next(&mut self) {
+        self.search_step(true);
+    }
+
+    /// `N` (default binding `search-prev`): see [`Self::search_step`].
+    pub fn search_prev(&mut self) {
+        self.search_step(false);
+    }
+
+    /// Park the cursor on [`Self::search_matches`]`[idx]`: auto-expand the gap it's hidden behind
+    /// (if any — [`crate::align::gap_key_for_aligned_idx`] + [`FileView::expand_gap`], the
+    /// existing CS8/CS9 machinery), then locate the row in the ACTIVE layout's own vector by the
+    /// match's (old, new) lineno pair and land there. `wrapped` raises the footer notice the plan
+    /// calls for; a match whose row can't be located post-expansion (should be unreachable once
+    /// expanded) leaves the cursor where it was rather than panicking.
+    fn jump_to_search_match(&mut self, idx: usize, wrapped: bool) {
+        let Some(&m) = self.search_matches.get(idx) else {
+            return;
+        };
+        self.search_current = Some(idx);
+
+        if let Some(view) = self.current_view() {
+            if let Some(key) = crate::align::gap_key_for_aligned_idx(&view.aligned, m.aligned_idx) {
+                let hidden = crate::align::gap_hidden_range(&view.aligned, key, &view.expansions)
+                    .is_some_and(|(start, end)| m.aligned_idx >= start && m.aligned_idx < end);
+                if hidden {
+                    view.expand_gap(key, 0, 0, true);
+                }
+            }
+        }
+
+        let layout = self.layout;
+        if let Some(view) = self.current_view_ref() {
+            let target = (m.old_lineno, m.new_lineno);
+            let row = match layout {
+                Layout::Sbs => view
+                    .display
+                    .iter()
+                    .position(|r| display_row_linenos(r) == target),
+                Layout::Inline => view
+                    .inline
+                    .iter()
+                    .position(|r| inline_row_linenos(r) == target),
+            };
+            if let Some(row) = row {
+                self.cursor = row;
+            }
+        }
+
+        self.cancel_selection();
+        self.derive_scroll();
+        self.clamp_cursor();
+        if wrapped {
+            self.notify("search wrapped", Severity::Info);
+        }
+    }
+
     // ── Outline staging (CS7) ───────────────────────────────────────────────────
 
     /// Whether the changeset at `cs_idx` is a committed range rather than the uncommitted
@@ -4206,6 +4540,10 @@ impl App {
             };
         }
         self.derive_scroll();
+        // M11 CS3: named as a recompute trigger by the plan even though the match ADDRESSES
+        // (aligned-space) can't actually change here — only which display/inline row each one
+        // resolves to. Cheap to re-run regardless (see [`Self::recompute_search`]'s doc comment).
+        self.recompute_search();
     }
 
     /// Set the render layout directly — the config-startup (CS7) counterpart to
@@ -4363,6 +4701,7 @@ impl App {
                 };
             }
             self.derive_scroll();
+            self.recompute_search();
         }
 
         if self.outline.mode != outline_mode_before || self.outline.order != outline_order_before {
@@ -5330,8 +5669,10 @@ fn row_lineno(row: Row) -> Option<usize> {
 }
 
 /// The (old, new) 1-based line numbers a display row occupies — `None` on a filler side, and
-/// `(None, None)` for a gap row (which belongs to no hunk).
-fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
+/// `(None, None)` for a gap row (which belongs to no hunk). `pub(crate)`: `render.rs`'s M11 CS3
+/// search-highlight lookup reuses this exact pairing (the same key [`crate::search::SearchMatch`]
+/// carries) rather than re-deriving its own.
+pub(crate) fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
     match row {
         DisplayRow::Row(r) => (row_lineno(r.old), row_lineno(r.new)),
         DisplayRow::Gap { .. } => (None, None),
@@ -5375,8 +5716,8 @@ fn gap_scope_start(
     Some((scope_start, anchor_prefers_new))
 }
 
-/// Inline-coordinate analog of [`display_row_linenos`].
-fn inline_row_linenos(row: &InlineRow) -> (Option<usize>, Option<usize>) {
+/// Inline-coordinate analog of [`display_row_linenos`]. `pub(crate)` for the same reason.
+pub(crate) fn inline_row_linenos(row: &InlineRow) -> (Option<usize>, Option<usize>) {
     match *row {
         InlineRow::Context { old, new } => (Some(old), Some(new)),
         InlineRow::Del { old, .. } => (Some(old), None),
@@ -12128,6 +12469,188 @@ mod tests {
             freshly_loaded_len,
             "reset must undo an expand-all just as it undoes a partial expansion"
         );
+    }
+
+    // ── M11 CS3 (`diff-search`) ──────────────────────────────────────────────
+
+    /// [`two_hunks_with_a_wide_gap_fixture`], but the middle of the hidden context run carries a
+    /// unique needle (`ctx20` → `needle_line`) — CS3's "hidden-context rows are searchable, and
+    /// jumping to one auto-expands its gap" fixture.
+    fn two_hunks_with_a_buried_needle_fixture() -> Fixture {
+        let mut committed = String::from("OLD_HUNK_A\n");
+        let mut modified = String::from("NEW_HUNK_A\n");
+        for i in 1..=40 {
+            let line = if i == 20 {
+                "needle_line".to_string()
+            } else {
+                format!("ctx{i}")
+            };
+            committed.push_str(&line);
+            committed.push('\n');
+            modified.push_str(&line);
+            modified.push('\n');
+        }
+        committed.push_str("OLD_HUNK_B\n");
+        modified.push_str("NEW_HUNK_B\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn search_finds_a_match_hidden_inside_a_collapsed_gap() {
+        let fixture = two_hunks_with_a_buried_needle_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        assert_eq!(
+            app.search_matches().len(),
+            1,
+            "the buried needle must be found even while its gap is still collapsed"
+        );
+    }
+
+    #[test]
+    fn search_accept_jumps_to_the_first_match_and_auto_expands_its_gap() {
+        let fixture = two_hunks_with_a_buried_needle_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(
+            app.current_view_ref()
+                .unwrap()
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "precondition: the fixture's wide context run must start out collapsed"
+        );
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "jumping to a match buried in the gap must fully reveal it: {:?}",
+            view.display
+        );
+        match view.display[app.cursor] {
+            DisplayRow::Row(row) => {
+                assert_eq!(row.old, Row::Line(21), "needle_line is old-side line 21");
+            }
+            other => panic!("expected the cursor to land on the needle's row, got {other:?}"),
+        }
+        assert!(!app.search_focused(), "accept must close the prompt");
+        assert!(app.search_active());
+    }
+
+    #[test]
+    fn search_next_and_prev_wrap_with_a_footer_notice() {
+        // Two occurrences of the SAME needle on two different visible lines (both hunk change
+        // rows, so no gap machinery is in play here — this test is purely about n/N wrap).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "f.txt",
+                "alpha old\nctx\nbeta old\n",
+                "alpha needle\nctx\nbeta needle\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+        assert_eq!(app.search_matches().len(), 2);
+        assert_eq!(app.search_current_index(), Some(0));
+
+        app.search_next();
+        assert_eq!(app.search_current_index(), Some(1));
+        assert!(
+            app.notice.is_none(),
+            "advancing without wrapping raises no notice"
+        );
+
+        app.search_next();
+        assert_eq!(
+            app.search_current_index(),
+            Some(0),
+            "n at the last match wraps to the first"
+        );
+        assert!(
+            app.notice.is_some(),
+            "wrapping forward must raise a footer notice"
+        );
+
+        app.clear_notice();
+        app.search_prev();
+        assert_eq!(
+            app.search_current_index(),
+            Some(1),
+            "N at the first match wraps to the last"
+        );
+        assert!(
+            app.notice.is_some(),
+            "wrapping backward must raise a footer notice too"
+        );
+    }
+
+    #[test]
+    fn search_next_and_prev_fall_back_to_hunk_nav_with_no_active_search() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(
+            !app.search_active(),
+            "precondition: no search has ever been accepted"
+        );
+
+        let cursor_before = app.cursor;
+        app.search_next();
+        assert_eq!(
+            app.cursor,
+            find_next_hunk_row(&app.current_view_ref().unwrap().display, cursor_before)
+                .unwrap_or(cursor_before),
+            "with no active search, search-next must fall back to next-hunk"
+        );
+    }
+
+    #[test]
+    fn esc_with_diff_focused_and_an_active_search_clears_it_before_walking_out_to_the_outline() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.open = true;
+
+        app.search_focus();
+        app.search_insert_char('c'); // "ctx..." lines all match a bare 'c'
+        app.search_accept();
+        assert!(app.search_active());
+
+        // The keymap-driven Esc ladder itself lives in `tui.rs`; this pins the `App`-level state
+        // transition `App::search_clear` provides for that ladder's arm.
+        app.search_clear();
+        assert!(
+            !app.search_active(),
+            "Esc's search-clear arm must deactivate the search"
+        );
+        assert!(app.search_matches().is_empty());
     }
 
     // ── CS9: reveal gaps to the enclosing tree-sitter scope ─────────────────

@@ -164,6 +164,12 @@ pub struct ThemeOverrides {
     pub cursor_unfocused_bg: Option<Color>,
     pub pane_header_focused_fg: Option<Color>,
     pub filler_fg: Option<Color>,
+    /// M11 CS3 (`diff-search`): every search match's highlight — a new, open-ended tint (no
+    /// scheme slot maps to it, so this is the ONLY way to set it; see [`Palette::search_match_bg`]'s
+    /// doc comment for the derived defaults).
+    pub search_match_bg: Option<Color>,
+    /// M11 CS3: the CURRENT search match's highlight, distinct from [`Self::search_match_bg`].
+    pub search_current_bg: Option<Color>,
 }
 
 impl ThemeOverrides {
@@ -441,6 +447,14 @@ pub struct Palette {
     /// under `auto` on a terminal whose bright-black is a vivid accent rather than a gray (the
     /// probed ramp interpolates toward base03, so 2/3 of a bright accent is a bright hatch).
     pub filler_fg: Color,
+    /// M11 CS3 (`diff-search`): background wash for every search match — a warm accent
+    /// (base0A-derived), distinct from every other row wash so it reads unambiguously over
+    /// del/add/cursor/selection tints it composites with (see `render.rs`'s `compose_segments`
+    /// bg-merge).
+    pub search_match_bg: Color,
+    /// M11 CS3: background wash for the CURRENT search match — a more saturated step of the same
+    /// hue as [`Palette::search_match_bg`], so "here" reads distinctly from "also matches."
+    pub search_current_bg: Color,
     /// Footer text color for an [`crate::app::Severity::Error`] notice, a pending-discard confirm
     /// prompt, and a Failed changeset's marker/message — a clearly-red tone (base08). Promoted
     /// from `render.rs`'s `FG_ERROR` const (CS2, revising ADR-029's hybrid boundary — see this
@@ -540,6 +554,11 @@ impl Palette {
             dim: base.slot(3),
             gutter: base.slot(4),
             filler_fg: base.slot(1),
+            // M11 CS3: brand new, hand-tuned like the other dark-scheme washes (see `dark`'s doc
+            // comment on why dark tints are held explicit rather than derived) — a dim amber wash,
+            // brightening for the current match.
+            search_match_bg: Color::Rgb(90, 80, 20),
+            search_current_bg: Color::Rgb(150, 120, 20),
             // The shipped M3–M5 semantic-chrome colors, reproduced verbatim (the pixel-identity
             // gate — CS2 promotes these from `render.rs` consts without changing a single value).
             error_fg: Color::Rgb(220, 60, 60),
@@ -610,6 +629,11 @@ impl Palette {
             dim: base.slot(3),
             gutter: base.slot(4),
             filler_fg: base.slot(1),
+            // M11 CS3: derived the same way as `cursor_bg`/`selection_bg` above — blend the
+            // scheme's amber (base0A) toward a light base00; the current match uses a shallower
+            // ratio (closer to the undimmed accent) so it reads more saturated than a plain match.
+            search_match_bg: tint_toward(base.slot(10), base00, CURSOR),
+            search_current_bg: tint_toward(base.slot(10), base00, EDIT),
             error_fg: red,
             warn_fg: base.slot(10), // base0A
             current_fg: green,
@@ -678,6 +702,10 @@ impl Palette {
             cursor_bg: curated.cursor_bg,
             selection_bg: curated.selection_bg,
             cursor_unfocused_bg: curated.cursor_unfocused_bg,
+            // M11 CS3: no probed-accent counterpart to derive from (same reasoning as
+            // cursor/selection just above) — borrow the curated fallback's hand-tuned wash.
+            search_match_bg: curated.search_match_bg,
+            search_current_bg: curated.search_current_bg,
             // Derived straight from the probed terminal scheme (NOT the curated fallback) — this
             // is the whole point of `auto`: chrome that matches the terminal's own colors.
             background: base.slot(0),
@@ -719,8 +747,19 @@ impl Palette {
     /// falls to gutter glyph/structure instead, an accepted, documented degradation (see
     /// ADR-029's NO_COLOR note).
     pub fn mono(light: bool) -> Self {
-        // (line, edit, staged_line, staged_edit, cursor, selection, cursor_unfocused)
-        let (line, edit, staged_line, staged_edit, cursor, selection, cursor_unfocused) = if light {
+        // (line, edit, staged_line, staged_edit, cursor, selection, cursor_unfocused,
+        //  search_match, search_current)
+        let (
+            line,
+            edit,
+            staged_line,
+            staged_edit,
+            cursor,
+            selection,
+            cursor_unfocused,
+            search_match,
+            search_current,
+        ) = if light {
             (
                 Color::Rgb(215, 215, 215),
                 Color::Rgb(165, 165, 165),
@@ -729,6 +768,8 @@ impl Palette {
                 Color::Rgb(190, 190, 190),
                 Color::Rgb(200, 200, 200),
                 Color::Rgb(210, 210, 210),
+                Color::Rgb(180, 180, 180),
+                Color::Rgb(150, 150, 150),
             )
         } else {
             (
@@ -739,6 +780,8 @@ impl Palette {
                 Color::Rgb(65, 65, 65),
                 Color::Rgb(55, 55, 55),
                 Color::Rgb(45, 45, 45),
+                Color::Rgb(75, 75, 75),
+                Color::Rgb(105, 105, 105),
             )
         };
 
@@ -761,6 +804,8 @@ impl Palette {
             cursor_bg: cursor,
             selection_bg: selection,
             cursor_unfocused_bg: cursor_unfocused,
+            search_match_bg: search_match,
+            search_current_bg: search_current,
             pane_header_focused_fg: Color::Reset,
             background: Color::Reset,
             foreground: Color::Reset,
@@ -917,6 +962,12 @@ impl Palette {
         }
         if let Some(color) = overrides.filler_fg {
             self.filler_fg = color;
+        }
+        if let Some(color) = overrides.search_match_bg {
+            self.search_match_bg = color;
+        }
+        if let Some(color) = overrides.search_current_bg {
+            self.search_current_bg = color;
         }
     }
 }
