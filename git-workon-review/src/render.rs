@@ -427,21 +427,36 @@ fn attribution_mode(role: Role, attribution: &Option<Attribution>) -> Attributio
     }
 }
 
+/// Whether a Del cell at `old_lnum` is staged, given `mode` — the single staged-ness decision
+/// shared by [`del_bg_pair`] and [`del_tint_fg`] (locked decision #6: staged-ness must resolve
+/// identically for background and foreground, not through a second path).
+fn del_is_staged(mode: AttributionMode, old_lnum: u32) -> bool {
+    match mode {
+        AttributionMode::Plain => false,
+        AttributionMode::StagedUniform => true,
+        AttributionMode::Attributed(attribution) => attribution.del_is_staged(old_lnum),
+    }
+}
+
+/// Whether an Add cell at `new_lnum` is staged, given `mode` — the single staged-ness decision
+/// shared by [`add_bg_pair`] and [`add_tint_fg`] (locked decision #6).
+fn add_is_staged(mode: AttributionMode, new_lnum: u32) -> bool {
+    match mode {
+        AttributionMode::Plain => false,
+        AttributionMode::StagedUniform => true,
+        AttributionMode::Attributed(attribution) => !attribution.add_is_unstaged(new_lnum),
+    }
+}
+
 /// The (line, edit) background pair for a Del cell at `old_lnum`, given `mode`, resolved from
 /// `theme`'s unstaged vs. staged Del tints.
 fn del_bg_pair(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> (Color, Color) {
     let unstaged = (theme.del_line_bg, theme.del_edit_bg);
     let staged = (theme.del_staged_line_bg, theme.del_staged_edit_bg);
-    match mode {
-        AttributionMode::Plain => unstaged,
-        AttributionMode::StagedUniform => staged,
-        AttributionMode::Attributed(attribution) => {
-            if attribution.del_is_staged(old_lnum) {
-                staged
-            } else {
-                unstaged
-            }
-        }
+    if del_is_staged(mode, old_lnum) {
+        staged
+    } else {
+        unstaged
     }
 }
 
@@ -450,51 +465,30 @@ fn del_bg_pair(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> (Color,
 fn add_bg_pair(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> (Color, Color) {
     let unstaged = (theme.add_line_bg, theme.add_edit_bg);
     let staged = (theme.add_staged_line_bg, theme.add_staged_edit_bg);
-    match mode {
-        AttributionMode::Plain => unstaged,
-        AttributionMode::StagedUniform => staged,
-        AttributionMode::Attributed(attribution) => {
-            if attribution.add_is_unstaged(new_lnum) {
-                unstaged
-            } else {
-                staged
-            }
-        }
+    if add_is_staged(mode, new_lnum) {
+        staged
+    } else {
+        unstaged
     }
 }
 
-/// The tint foreground for a Del cell at `old_lnum`, given `mode` — the same attribution match as
-/// [`del_bg_pair`] (locked decision #6: staged-ness must resolve identically for background and
-/// foreground, not through a second path), resolved from `theme`'s unstaged vs. staged Del
-/// foreground fields ([`Palette::del_fg`]/[`Palette::del_staged_fg`]).
+/// The tint foreground for a Del cell at `old_lnum`, given `mode`, resolved from `theme`'s
+/// unstaged vs. staged Del foreground fields ([`Palette::del_fg`]/[`Palette::del_staged_fg`]).
 fn del_tint_fg(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> Color {
-    match mode {
-        AttributionMode::Plain => theme.del_fg,
-        AttributionMode::StagedUniform => theme.del_staged_fg,
-        AttributionMode::Attributed(attribution) => {
-            if attribution.del_is_staged(old_lnum) {
-                theme.del_staged_fg
-            } else {
-                theme.del_fg
-            }
-        }
+    if del_is_staged(mode, old_lnum) {
+        theme.del_staged_fg
+    } else {
+        theme.del_fg
     }
 }
 
-/// The tint foreground for an Add cell at `new_lnum`, given `mode` — the same attribution match as
-/// [`add_bg_pair`], resolved from `theme`'s unstaged vs. staged Add foreground fields
-/// ([`Palette::add_fg`]/[`Palette::add_staged_fg`]).
+/// The tint foreground for an Add cell at `new_lnum`, given `mode`, resolved from `theme`'s
+/// unstaged vs. staged Add foreground fields ([`Palette::add_fg`]/[`Palette::add_staged_fg`]).
 fn add_tint_fg(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> Color {
-    match mode {
-        AttributionMode::Plain => theme.add_fg,
-        AttributionMode::StagedUniform => theme.add_staged_fg,
-        AttributionMode::Attributed(attribution) => {
-            if attribution.add_is_unstaged(new_lnum) {
-                theme.add_fg
-            } else {
-                theme.add_staged_fg
-            }
-        }
+    if add_is_staged(mode, new_lnum) {
+        theme.add_staged_fg
+    } else {
+        theme.add_fg
     }
 }
 
