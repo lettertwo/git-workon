@@ -1251,23 +1251,12 @@ mod tests {
     fn unknown_key_warnings_dedups_a_key_set_in_multiple_layers() {
         // Same layering concern as `bindings_dedups_a_key_set_in_multiple_layers_to_the_
         // winning_value`: `entries()` yields one entry per config LAYER, not one per key.
-        let fixture = FixtureBuilder::new().build().expect("fixture build");
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.bogus-key", "a")
+            .config("workon.review.bogus-key", "b")
+            .build()
+            .expect("fixture build");
         let repo = fixture.repo().expect("repo");
-        let cfg_path = repo.path().join("config");
-        for v in ["a", "b"] {
-            let status = std::process::Command::new("git")
-                .args([
-                    "config",
-                    "--file",
-                    cfg_path.to_str().expect("config path utf8"),
-                    "--add",
-                    "workon.review.bogus-key",
-                    v,
-                ])
-                .status()
-                .expect("git config --add");
-            assert!(status.success(), "git config --add failed");
-        }
 
         let warnings = ReviewConfig::new(repo)
             .unknown_key_warnings()
