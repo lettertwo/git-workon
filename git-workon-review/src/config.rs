@@ -260,6 +260,8 @@ fn tint_slot<'a>(overrides: &'a mut ThemeOverrides, key: &str) -> Option<&'a mut
         "cursor-unfocused-bg" => &mut overrides.cursor_unfocused_bg,
         "pane-header-focused-fg" => &mut overrides.pane_header_focused_fg,
         "filler-fg" => &mut overrides.filler_fg,
+        "search-match-bg" => &mut overrides.search_match_bg,
+        "search-current-bg" => &mut overrides.search_current_bg,
         _ => return None,
     })
 }
@@ -906,6 +908,39 @@ mod tests {
         let mut palette = Palette::dark();
         palette.apply_overrides(&overrides);
         assert_eq!(palette.cursor_unfocused_bg, Color::Rgb(0x1a, 0x2b, 0x3c));
+    }
+
+    #[test]
+    fn theme_overrides_reads_the_search_match_bg_tint_key() {
+        // M11 CS3 (`diff-search`): `search-match-bg`/`search-current-bg` are brand-new tints with
+        // no scheme slot fallback — this is the ONLY way to set them (see `tint_slot`'s doc
+        // comment), and they must NOT be in `KNOWN_SCALAR_KEYS` (the open-ended `theme.*`
+        // subspace already covers them for the unknown-key warning).
+        use crate::theme::Palette;
+
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.theme.search-match-bg", "#1a2b3c")
+            .config("workon.review.theme.search-current-bg", "#4d5e6f")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+        let (overrides, warnings) = ReviewConfig::new(repo)
+            .theme_overrides()
+            .expect("theme_overrides");
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            overrides.search_match_bg,
+            Some(Color::Rgb(0x1a, 0x2b, 0x3c))
+        );
+        assert_eq!(
+            overrides.search_current_bg,
+            Some(Color::Rgb(0x4d, 0x5e, 0x6f))
+        );
+
+        let mut palette = Palette::dark();
+        palette.apply_overrides(&overrides);
+        assert_eq!(palette.search_match_bg, Color::Rgb(0x1a, 0x2b, 0x3c));
+        assert_eq!(palette.search_current_bg, Color::Rgb(0x4d, 0x5e, 0x6f));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::icons::IconMode;
 use crate::keymap::{footer_hint, help_sections, Keymap};
 use crate::model::FileStatus;
 use crate::outline::OutlineItem;
+use crate::search::SearchSide;
 use crate::summary::{ChangesetSummary, DirSummary, SummaryFileRow};
 use crate::theme::Palette;
 use crate::wordiff::Span as WordSpan;
@@ -689,6 +690,7 @@ fn content_spans(
     theme: &Palette,
     hscroll: usize,
     text_mode: DiffTextMode,
+    search_spans: &[(usize, usize, Color)],
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
     let mut fg_override_spans: Vec<(usize, usize, Color)> = Vec::new();
@@ -729,6 +731,12 @@ fn content_spans(
         }
     }
 
+    // M11 CS3: pushed LAST so search highlighting wins the `compose_segments` reverse-scan lookup
+    // over del/add/word-diff emphasis on the same bytes — the plan's "composite with existing row
+    // washes the way other bg tints do" (see `compose_segments`'s doc comment on push-order
+    // precedence).
+    bg_spans.extend_from_slice(search_spans);
+
     let segments = compose_segments(text.len(), &bg_spans, hl, &fg_override_spans, theme);
     let mut spans = Vec::with_capacity(segments.len().max(1));
     if segments.is_empty() && !text.is_empty() {
@@ -750,6 +758,53 @@ fn content_spans(
     pan_spans(spans, hscroll, theme)
 }
 
+/// Which pane [`search_bg_spans`] is resolving highlights for — [`Side`]'s own name is already
+/// taken by the SBS old/new distinction this mirrors; kept separate since the inline layout has
+/// no [`Side`] of its own (a `Del`/`Add`/`Context` row IS one side already).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchRenderSide {
+    Old,
+    New,
+}
+
+/// M11 CS3 (`diff-search`): the `search-match-bg`/`search-current-bg` background spans to paint
+/// for a row occupying `(old_lineno, new_lineno)`, on `render_side`. Matches whose
+/// [`SearchSide::Both`] (a context row) paint on EITHER render side; `Old`/`New` matches paint
+/// only their own. A linear scan of every active match per row/side call — cheap at review-sized
+/// files/match counts, and simpler than a per-frame lookup table to get right without being able
+/// to compile-test it here (see the changeset's HARD CONSTRAINTS on running cargo).
+fn search_bg_spans(
+    app: &App,
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
+    render_side: SearchRenderSide,
+    theme: &Palette,
+) -> Vec<(usize, usize, Color)> {
+    if old_lineno.is_none() && new_lineno.is_none() {
+        return Vec::new();
+    }
+    let current = app.search_current_index();
+    app.search_matches()
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.old_lineno == old_lineno && m.new_lineno == new_lineno)
+        .filter(|(_, m)| match (m.side, render_side) {
+            (SearchSide::Both, _) => true,
+            (SearchSide::Old, SearchRenderSide::Old) => true,
+            (SearchSide::New, SearchRenderSide::New) => true,
+            _ => false,
+        })
+        .map(|(i, m)| {
+            let color = if Some(i) == current {
+                theme.search_current_bg
+            } else {
+                theme.search_match_bg
+            };
+            (m.start, m.end, color)
+        })
+        .collect()
+}
+
 /// Build a single rendered line for one pane at a display row's resolved [`Row`]/[`CellKind`].
 #[allow(clippy::too_many_arguments)]
 fn build_pane_line(
@@ -765,6 +820,7 @@ fn build_pane_line(
     theme: &Palette,
     hscroll: usize,
     text_mode: DiffTextMode,
+    search_spans: &[(usize, usize, Color)],
 ) -> Line<'static> {
     match row {
         Row::Filler => {
@@ -813,6 +869,7 @@ fn build_pane_line(
                 theme,
                 hscroll,
                 text_mode,
+                search_spans,
             ));
             Line::from(spans)
         }
@@ -1652,9 +1709,10 @@ fn diff_header_line(app: &App, theme: &Palette, icons: IconMode, focused: bool) 
     Line::from(spans)
 }
 
-/// Footer priority: a pending discard confirm's prompt (warn-toned) wins over a transient notice,
-/// which wins over the curated hint line (CS3) — a notice TEMPORARILY REPLACES the hint rather
-/// than adding a second row; it clears on the user's next keypress (`tui::update`).
+/// Footer priority: a pending discard confirm's prompt (warn-toned) wins over the M11 CS3 search
+/// prompt (while it has capture), which wins over a transient notice, which wins over the curated
+/// hint line (CS3) — a notice TEMPORARILY REPLACES the hint rather than adding a second row; it
+/// clears on the user's next keypress (`tui::update`).
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, theme: &Palette) {
     if let Some(confirm) = &app.pending_confirm {
         frame.render_widget(
@@ -1663,6 +1721,38 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
         );
         return;
     }
+    if app.search_focused() {
+        render_search_prompt(frame, app, area, theme);
+        return;
+    }
+    render_footer_notice_or_hint(frame, app, area, keymap, theme);
+}
+
+/// M11 CS3 (`diff-search`): paint the one-row search prompt in the footer while it has capture —
+/// the same leading dim glyph + [`PromptState::render_line`] shape as the outline's fuzzy-filter
+/// input ([`render_outline_filter_input`]), just relocated to the footer (a vim-cmdline feel,
+/// per the plan) instead of a carve-out at the top of a pane.
+fn render_search_prompt(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+    let mut spans = vec![TSpan::styled(
+        "/".to_string(),
+        Style::default().fg(theme.dim),
+    )];
+    spans.extend(app.search_prompt_state().render_line().spans);
+    let line = Line::from(spans);
+    frame
+        .buffer_mut()
+        .set_line(area.x, area.y, &line, area.width);
+}
+
+/// The notice-or-hint half of [`render_footer`] — split out so the confirm/search-prompt priority
+/// tiers above stay a flat early-return chain rather than nesting this whole match inside them.
+fn render_footer_notice_or_hint(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    keymap: &Keymap,
+    theme: &Palette,
+) {
     match &app.notice {
         Some(Notice { text, severity }) => {
             let fg = match severity {
@@ -2346,6 +2436,21 @@ fn render_pane_sbs(
                     (Vec::new(), Vec::new())
                 };
 
+                // M11 CS3: this row's (old, new) lineno pair — the same key `SearchMatch` carries
+                // — resolved once and reused for both sides' highlight lookups below.
+                let old_lineno = match row.old {
+                    Row::Line(n) => Some(n),
+                    Row::Filler => None,
+                };
+                let new_lineno = match row.new {
+                    Row::Line(n) => Some(n),
+                    Row::Filler => None,
+                };
+                let old_search =
+                    search_bg_spans(app, old_lineno, new_lineno, SearchRenderSide::Old, theme);
+                let new_search =
+                    search_bg_spans(app, old_lineno, new_lineno, SearchRenderSide::New, theme);
+
                 let old_line = build_pane_line(
                     view,
                     Side::Old,
@@ -2359,6 +2464,7 @@ fn render_pane_sbs(
                     theme,
                     hscroll,
                     text_mode,
+                    &old_search,
                 );
                 let new_line = build_pane_line(
                     view,
@@ -2373,6 +2479,7 @@ fn render_pane_sbs(
                     theme,
                     hscroll,
                     text_mode,
+                    &new_search,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
@@ -2446,6 +2553,7 @@ fn build_inline_line(
     theme: &Palette,
     hscroll: usize,
     text_mode: DiffTextMode,
+    search_spans: &[(usize, usize, Color)],
 ) -> Line<'static> {
     let (old_opt, new_opt, text, hl, kind) = match *row {
         InlineRow::Context { old, new } => (
@@ -2512,6 +2620,7 @@ fn build_inline_line(
         theme,
         hscroll,
         text_mode,
+        search_spans,
     ));
     Line::from(spans)
 }
@@ -2592,6 +2701,20 @@ fn render_pane_inline(
                     InlineRow::Add { .. } => &new_spans,
                     _ => &[],
                 };
+                // M11 CS3: this row's (old, new) lineno pair, and which side's text is actually
+                // rendered here (a `Context` row renders `view.new_line` — see
+                // `build_inline_line`'s own match — so it queries the New side; content is
+                // identical to Old for a context row, and `compute_matches` only ever tags a
+                // context match `SearchSide::Both`, which matches either render side).
+                let (old_lineno, new_lineno, render_side) = match row {
+                    InlineRow::Context { old, new } => {
+                        (Some(*old), Some(*new), SearchRenderSide::New)
+                    }
+                    InlineRow::Del { old, .. } => (Some(*old), None, SearchRenderSide::Old),
+                    InlineRow::Add { new, .. } => (None, Some(*new), SearchRenderSide::New),
+                    InlineRow::Gap { .. } => (None, None, SearchRenderSide::New),
+                };
+                let search_spans = search_bg_spans(app, old_lineno, new_lineno, render_side, theme);
                 let line = build_inline_line(
                     view,
                     row,
@@ -2602,6 +2725,7 @@ fn render_pane_inline(
                     theme,
                     hscroll,
                     text_mode,
+                    &search_spans,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let line = if is_cursor {
@@ -2715,6 +2839,7 @@ mod tests {
                 &theme,
                 0,
                 DiffTextMode::Syntax,
+                &[],
             );
             let without_tint = content_spans(
                 "hello",
@@ -2725,6 +2850,7 @@ mod tests {
                 &theme,
                 0,
                 DiffTextMode::Syntax,
+                &[],
             );
             assert_eq!(
                 with_tint, without_tint,
@@ -2749,7 +2875,7 @@ mod tests {
         // mode can paint a tint foreground with no edit/line wash for it to attach meaning to.
         let theme = Palette::dark();
         for mode in [DiffTextMode::Syntax, DiffTextMode::Tint, DiffTextMode::Edit] {
-            let spans = content_spans("hello", None, None, &[], false, &theme, 0, mode);
+            let spans = content_spans("hello", None, None, &[], false, &theme, 0, mode, &[]);
             assert!(
                 fgs_of(&spans)
                     .iter()
@@ -2776,6 +2902,7 @@ mod tests {
             &theme,
             0,
             DiffTextMode::Tint,
+            &[],
         );
         assert!(
             fgs_of(&spans).iter().all(|fg| *fg == Some(theme.add_fg)),
@@ -2803,6 +2930,7 @@ mod tests {
             &theme,
             0,
             DiffTextMode::Edit,
+            &[],
         );
         let tinted: Vec<&TSpan> = spans
             .iter()
@@ -2848,6 +2976,7 @@ mod tests {
             &theme,
             0,
             DiffTextMode::Edit,
+            &[],
         );
         assert!(
             fgs_of(&spans).iter().all(|fg| *fg == Some(theme.del_fg)),

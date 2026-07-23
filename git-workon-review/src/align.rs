@@ -386,6 +386,46 @@ pub(crate) fn gap_hidden_range(
     Some((run_start + effective_before, run_end - effective_after))
 }
 
+/// The gap `key` (the hidden run's start index, matching [`DisplayRow::Gap`]'s own `key`) whose
+/// UNEXPANDED context run contains `aligned_idx`, or `None` when `aligned_idx` isn't inside a
+/// context run at all, or that run is too short to ever collapse (same `keep_before`/`keep_after`/
+/// `run_len` test [`collapse_gaps_inner`] uses — a run collapse decision never depends on the
+/// current [`GapExpansion`] state, only on the run's own length and position). M11 CS3 (search):
+/// a match address lives in the pre-collapse `AlignedRow` space, so jumping to one that isn't
+/// currently visible needs this reverse lookup — "which gap, if any, would need expanding to
+/// reveal this row" — before [`crate::app::FileView::expand_gap`] can be called with the right key.
+pub(crate) fn gap_key_for_aligned_idx(rows: &[AlignedRow], aligned_idx: usize) -> Option<usize> {
+    let is_context = |row: &AlignedRow| {
+        matches!(
+            (row.old_kind, row.new_kind),
+            (CellKind::Context, CellKind::Context)
+        )
+    };
+    if aligned_idx >= rows.len() || !is_context(&rows[aligned_idx]) {
+        return None;
+    }
+    let mut run_start = aligned_idx;
+    while run_start > 0 && is_context(&rows[run_start - 1]) {
+        run_start -= 1;
+    }
+    let mut run_end = aligned_idx + 1;
+    while run_end < rows.len() && is_context(&rows[run_end]) {
+        run_end += 1;
+    }
+    let run_len = run_end - run_start;
+
+    let keep_before = if run_start == 0 { 0 } else { CONTEXT_LINES };
+    let keep_after = if run_end == rows.len() {
+        0
+    } else {
+        CONTEXT_LINES
+    };
+    if (keep_before == 0 && keep_after == 0) || run_len <= keep_before + keep_after {
+        return None;
+    }
+    Some(run_start)
+}
+
 /// One row of the inline (unified, single-column) display.
 ///
 /// Built by [`inline_rows`] from the SAME gap-collapsed [`DisplayRow`] vector [`collapse_gaps`]

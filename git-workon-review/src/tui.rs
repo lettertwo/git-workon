@@ -470,6 +470,9 @@ enum Action {
     OutlineCollapseAll,
     OutlineExpandAll,
     OutlineFilterFocus,
+    SearchFocus,
+    SearchNext,
+    SearchPrev,
     None,
 }
 
@@ -505,6 +508,9 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::ExpandAllGaps => Action::ExpandAllGaps,
         Command::HscrollLeft => Action::HscrollLeft,
         Command::HscrollRight => Action::HscrollRight,
+        Command::Search => Action::SearchFocus,
+        Command::SearchNext => Action::SearchNext,
+        Command::SearchPrev => Action::SearchPrev,
         Command::NextFile => Action::NextFile,
         Command::PrevFile => Action::PrevFile,
         Command::NextHunk => Action::NextHunk,
@@ -604,6 +610,8 @@ fn action_needs_loaded_view(action: Action) -> bool {
             | Action::ExpandGapAll
             | Action::ResetGaps
             | Action::ExpandAllGaps
+            | Action::SearchNext
+            | Action::SearchPrev
     )
 }
 
@@ -675,6 +683,9 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::OutlineCollapseAll => app.outline_collapse_all(),
         Action::OutlineExpandAll => app.outline_expand_all(),
         Action::OutlineFilterFocus => app.outline_filter_focus(),
+        Action::SearchFocus => app.search_focus(),
+        Action::SearchNext => app.search_next(),
+        Action::SearchPrev => app.search_prev(),
         Action::None => {}
     }
     false
@@ -690,22 +701,34 @@ enum KeyOutcome {
 }
 
 /// Resolve one `Key` event to a [`KeyOutcome`], given the caller has already ruled out the
-/// modal cases (a pending discard confirm, the help overlay, the outline-filter input) — this is
-/// cases 4-8 of `update`'s documented Esc-precedence cascade, extracted so [`update`] and
-/// [`update_batch`] share the exact same resolution instead of duplicating it.
+/// modal cases (a pending discard confirm, the help overlay, the outline-filter input, the
+/// search prompt) — this is cases 5-9 of `update`'s documented Esc-precedence cascade, extracted
+/// so [`update`] and [`update_batch`] share the exact same resolution instead of duplicating it.
 ///
-/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 4-8 do (the
-/// confirm/help/filter-input modals deliberately do not — that stays in their own arms, not here).
+/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 5-9 do (the
+/// confirm, help, and prompt modals deliberately do not — that stays in their own arms, not
+/// here).
 fn resolve_key(
     app: &mut App,
     keymap: &Keymap,
     pending: &mut Vec<KeyPress>,
     key: KeyEvent,
 ) -> KeyOutcome {
-    if app.selection_anchor.is_some() && key.code == KeyCode::Esc && !app.outline_focused() {
-        app.clear_notice();
-        app.cancel_selection();
-        return KeyOutcome::Handled;
+    if key.code == KeyCode::Esc && !app.outline_focused() {
+        if app.selection_anchor.is_some() {
+            app.clear_notice();
+            app.cancel_selection();
+            return KeyOutcome::Handled;
+        }
+        // M11 CS3 (`diff-search`): Esc with an ACCEPTED search active (the prompt itself already
+        // closed — see [`apply_search_input_key`]'s own Esc arm for the prompt-open case) clears
+        // it, ranked in this same tier (before the outline-focused-quit/focus-outline arms below —
+        // see `update`'s doc comment).
+        if app.search_active() {
+            app.clear_notice();
+            app.search_clear();
+            return KeyOutcome::Handled;
+        }
     }
     // CS2 (outline-filter): with the outline focused (the input row does NOT have capture —
     // that's `update`'s case-3 modal arm) and a query actively narrowing the list, Esc unwinds
@@ -765,6 +788,35 @@ fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// `update`'s search-prompt modal arm (M11 CS3, `diff-search`): apply one key press while the
+/// diff-view search prompt has keyboard capture (see [`App::search_focused`]). Mirrors
+/// [`apply_filter_input_key`]'s shape (direct `App::search_*` calls, Ctrl-chords before the
+/// plain-`Char` catch-all, Alt excluded) but WITHOUT that arm's `Ctrl-c`-clears/`Down`/`Up`-move
+/// extras: the search prompt has no outline-list-underneath to keep navigating while typing (the
+/// plan is explicit that typing previews highlights but never moves the cursor), and `Esc` alone
+/// already covers "abandon this edit."
+fn apply_search_input_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Enter => app.search_accept(),
+        KeyCode::Esc => app.search_abort(),
+        KeyCode::Char('a') if ctrl => app.search_move_home(),
+        KeyCode::Char('e') if ctrl => app.search_move_end(),
+        KeyCode::Char('u') if ctrl => app.search_clear_to_start(),
+        KeyCode::Char('w') if ctrl => app.search_delete_word_back(),
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            app.search_insert_char(c);
+        }
+        KeyCode::Backspace => app.search_backspace(),
+        KeyCode::Delete => app.search_delete(),
+        KeyCode::Left => app.search_move_left(),
+        KeyCode::Right => app.search_move_right(),
+        KeyCode::Home => app.search_move_home(),
+        KeyCode::End => app.search_move_end(),
+        _ => {}
+    }
+}
+
 /// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize is a
 /// no-op — ratatui re-measures `body_area` every frame regardless. Tick drives
 /// [`App::on_tick`], the M4 index watcher's poll (see the module doc).
@@ -775,11 +827,12 @@ fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
 /// tick isn't the user acting on the message.
 ///
 /// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
-/// CS2 outline-filter input having capture > an active line selection (diff-focused) > an active
-/// outline-filter query (outline-focused) > the outline having focus > the diff having focus with
-/// the outline open > the normal key map (where Esc quits). Concretely — the home-base model: the
-/// outline is where Esc always eventually lands you before it quits, unwinding any inner mode
-/// (selection, filter) along the way.
+/// CS2 outline-filter input having capture > the M11 CS3 search prompt having capture > an active
+/// line selection OR an active search (diff-focused) > an active outline-filter query
+/// (outline-focused) > the outline having focus > the diff having focus with the outline open >
+/// the normal key map (where Esc quits). Concretely — the home-base model: the outline is where
+/// Esc always eventually lands you before it quits, unwinding any inner mode (selection, search,
+/// filter) along the way.
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
@@ -797,25 +850,31 @@ fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
 ///    (opening help while filtering isn't reachable today — `?` isn't part of the input's own key
 ///    set — but the ordering still says which would win if that ever changed) and above every
 ///    other case, since none of them should observe a key the filter input itself consumes.
-/// 4. Otherwise, with an active line selection AND the diff focused, Esc CANCELS the selection
-///    instead of moving focus or quitting (`q` still quits). This arm is guarded to defer to case
-///    6 when the outline has focus (a selection can only be active while looking at the diff, but
-///    the guard keeps the precedence explicit). Other keys fall through to the normal map —
-///    `j`/`k` extend the selection, `s`/`d` act on it.
-/// 5. Otherwise, with the outline focused and a NON-EMPTY filter query (capture on the row list,
+/// 4. Otherwise, the M11 CS3 search prompt (`/` in the diff view, while it has capture — see
+///    [`App::search_focused`]) captures next, mirroring the outline-filter input's swallow:
+///    typing/editing keys reach [`crate::prompt::PromptState`] (live-previewing highlights, never
+///    moving the cursor), `Enter` accepts and jumps, `Esc` aborts back to whatever search (or
+///    none) was active before `/` was pressed. Ranked below the outline-filter input for the same
+///    "can't actually collide today, but the ordering says who'd win" reason — the two prompts
+///    can never both have capture (one requires outline focus, the other diff focus).
+/// 5. Otherwise, with the diff focused, Esc CANCELS an active line selection OR clears an active
+///    search (selection wins if, somehow, both are active) instead of moving focus or quitting
+///    (`q` still quits). This arm is guarded to defer to case 7 when the outline has focus. Other
+///    keys fall through to the normal map — `j`/`k` extend a selection, `n`/`N` step a search.
+/// 6. Otherwise, with the outline focused and a NON-EMPTY filter query (capture on the row list,
 ///    not the input — that's case 3), Esc CLEARS the filter ([`App::outline_filter_clear`])
-///    instead of quitting — the outline-side mirror of case 4's unwind-the-innermost-mode rule;
-///    only the next Esc reaches case 6's quit leaf.
-/// 6. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
+///    instead of quitting — the outline-side mirror of case 5's unwind-the-innermost-mode rule;
+///    only the next Esc reaches case 7's quit leaf.
+/// 7. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
 ///    outline is home base; there's nowhere further out to walk to.
-/// 7. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
+/// 8. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
 ///    focuses the outline (same effect as `h`/[`App::focus_outline`]) rather than quitting.
-/// 8. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
+/// 9. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
 ///    — there's no outline to walk out to.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 4-8); the
-/// confirm, help, and filter-input modals (cases 1-3) deliberately do not. Cases 4-8 are delegated
-/// to [`resolve_key`], shared with [`update_batch`].
+/// A `Key` event clears any showing footer notice before applying its own action (cases 5-9); the
+/// confirm, help, and the two prompt modals (cases 1-4) deliberately do not. Cases 5-9 are
+/// delegated to [`resolve_key`], shared with [`update_batch`].
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
@@ -839,17 +898,22 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             apply_filter_input_key(app, key);
             false
         }
+        AppEvent::Key(key) if app.search_focused() => {
+            apply_search_input_key(app, key);
+            false
+        }
         AppEvent::Key(key) => match resolve_key(app, keymap, pending, key) {
             KeyOutcome::Handled => false,
             KeyOutcome::Action(action) => apply_action(app, action),
         },
-        // CS10: all three modals swallow mouse input exactly like they swallow keys (cases 1-3
-        // above) — a click/wheel while a discard confirm, the help overlay, or the CS2
-        // outline-filter input is up does nothing.
+        // CS10: all four modals swallow mouse input exactly like they swallow keys (cases 1-4
+        // above) — a click/wheel while a discard confirm, the help overlay, the CS2 outline-filter
+        // input, or the M11 CS3 search prompt is up does nothing.
         AppEvent::Mouse(_)
             if app.pending_confirm.is_some()
                 || app.help_visible
-                || app.outline_filter_focused() =>
+                || app.outline_filter_focused()
+                || app.search_focused() =>
         {
             false
         }
@@ -963,19 +1027,21 @@ fn update_batch(
 
     for event in events {
         match event {
-            // The coalescable path: no modal is up (CS2's outline-filter input included — a key
-            // while it has capture must reach `apply_filter_input_key` via the catch-all arm's
-            // `update` delegation below, never `resolve_key`/the coalescing path), and this isn't
-            // the selection-Esc-cancel guard (that guard is a context change — an "Esc cascade" —
-            // so it falls to the catch-all arm below, which flushes first and delegates the whole
-            // event to `update`). Notice-clearing still happens per key via `resolve_key`.
+            // The coalescable path: no modal is up (CS2's outline-filter input and the M11 CS3
+            // search prompt both included — a key while either has capture must reach
+            // `apply_filter_input_key`/`apply_search_input_key` via the catch-all arm's `update`
+            // delegation below, never `resolve_key`/the coalescing path), and this isn't the
+            // selection-cancel/search-clear Esc guard (a context change — an "Esc cascade" — so it
+            // falls to the catch-all arm below, which flushes first and delegates the whole event
+            // to `update`). Notice-clearing still happens per key via `resolve_key`.
             AppEvent::Key(key)
                 if app.pending_confirm.is_none()
                     && !app.help_visible
                     && !app.outline_filter_focused()
-                    && !(app.selection_anchor.is_some()
-                        && key.code == KeyCode::Esc
-                        && !app.outline_focused()) =>
+                    && !app.search_focused()
+                    && !(key.code == KeyCode::Esc
+                        && !app.outline_focused()
+                        && (app.selection_anchor.is_some() || app.search_active())) =>
             {
                 match resolve_key(app, keymap, pending, key) {
                     // A coalescable nav action extends the open run when it matches in kind
@@ -2149,6 +2215,84 @@ mod tests {
         assert!(
             !app.outline_focused(),
             "the outline-focus move only happens on a LATER Esc, once the selection is gone"
+        );
+    }
+
+    #[test]
+    fn esc_ladder_search_prompt_then_active_search_then_outline_focus() {
+        // M11 CS3 (`diff-search`): three Esc presses in sequence, each landing on the NEXT lower
+        // tier of the ladder once the higher one no longer applies — the prompt-open case first
+        // (Esc aborts the EDIT, keeping the accepted query and its highlights), then the
+        // accepted-search-active case (Esc clears the search entirely), then the ordinary
+        // diff-with-outline-open case (Esc walks out to the outline).
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.toggle_outline();
+        app.focus_diff();
+        assert!(app.outline_open() && !app.outline_focused());
+
+        // Seed an accepted search, then reopen the prompt and type a DIFFERENT, uncommitted edit.
+        app.search_focus();
+        app.search_insert_char('C'); // "CHANGED" — matches the new-side line
+        app.search_accept();
+        assert!(app.search_active());
+        app.search_focus();
+        app.search_insert_char('x');
+        assert!(app.search_focused(), "precondition: prompt has capture");
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        // 1. Esc while the prompt is focused: aborts the EDIT only.
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+        assert!(!quit);
+        assert!(!app.search_focused(), "the prompt must close");
+        assert!(
+            app.search_active(),
+            "aborting the prompt must restore the previously ACCEPTED search, not clear it"
+        );
+
+        // 2. Esc with the search still active (diff focused): clears the search.
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+        assert!(!quit);
+        assert!(
+            !app.search_active(),
+            "this Esc must clear the active search"
+        );
+        assert!(
+            !app.outline_focused(),
+            "clearing the search must not ALSO walk out to the outline in the same keypress"
+        );
+
+        // 3. Esc with nothing left to clear: walks out to the outline, same as the pre-existing
+        //    ladder's diff-focused/outline-open case.
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+        assert!(!quit);
+        assert!(
+            app.outline_focused(),
+            "with nothing higher-precedence left, Esc must fall through to focus-outline"
         );
     }
 
@@ -3757,7 +3901,7 @@ mod tests {
         assert!(app.outline_focused(), "list (not input) must have capture");
         assert_eq!(app.outline_filter_query(), "a");
 
-        // First Esc: unwind the filter (ladder case 5) — clear the query, do NOT quit.
+        // First Esc: unwind the filter (ladder case 6) — clear the query, do NOT quit.
         let quit = update(
             &mut app,
             &km,
@@ -3770,7 +3914,7 @@ mod tests {
             "Esc on the list must clear the active filter query"
         );
 
-        // Second Esc: the filter is gone, so the outline's terminal quit leaf (case 6) applies.
+        // Second Esc: the filter is gone, so the outline's terminal quit leaf (case 7) applies.
         let quit = update(
             &mut app,
             &km,
