@@ -967,7 +967,8 @@ pub struct OutlineState {
     /// of the same path) for as long as the session runs.
     pub folds: HashMap<OutlineMode, HashSet<FoldKey>>,
     /// CS2 (`outline-filter`, M11): the fuzzy-filter query, `/` while the outline has focus opens.
-    /// Read fresh every [`App::outline_items`] call (via [`outline::apply_filter`]) rather than
+    /// Read fresh every [`App::outline_items`] call (via [`outline::fold_outline_filtered`])
+    /// rather than
     /// cached — persistence across a rebuild (staging op, mode cycle, refresh) is therefore free:
     /// the query itself just sits here untouched by any of those, so the very next
     /// [`App::outline_items`] call re-derives the same filtered view from the fresh row list. See
@@ -2725,64 +2726,53 @@ impl App {
         })
     }
 
-    /// [`Self::outline_folded`] with CS2's fuzzy filter layered on top when
-    /// [`OutlineState::filter`] holds a query — the outline cursor's SINGLE index space, and the
-    /// source of truth every other outline consumer reads: `render.rs`,
+    /// CS2's fuzzy filter, REVISED 2026-07-24: filter-then-rebuild — the outline cursor's SINGLE
+    /// index space, and the source of truth every other outline consumer reads: `render.rs`,
     /// [`Self::outline_move_by`]/[`Self::outline_move_to`], [`Self::outline_confirm`],
     /// [`Self::summary_target`], and the staging-verb resolution in [`Self::outline_row_targets`]
     /// all funnel through [`Self::outline_items`]/[`Self::outline_items_with_hidden_counts`] below
     /// — so an active filter can never silently retarget a cursor move or a stage/discard verb
     /// onto a row the filter itself hid.
     ///
-    /// An empty query returns [`Self::outline_folded`] UNCHANGED (zero regression when the filter
-    /// is unused — no [`outline::apply_filter`] call at all, so hidden-file markers and fold
-    /// structure render exactly as before this changeset). A non-empty query instead runs
-    /// [`outline::apply_filter`] over the fold-filtered rows and returns its flat, score-ordered
-    /// result with every hidden-file marker zeroed (a filtered row is never itself collapsed —
-    /// [`outline::apply_filter`] already reset its `guides`, and a chevron marker referring to
-    /// counts computed against the PRE-filter row list would be meaningless against this one) and
-    /// an identity `visible_index` (every surviving row maps onto its own position — nothing else
-    /// reads a filtered build's `visible_index`, since [`Self::outline_target_index`] special-cases
-    /// the filtered case instead of using it).
-    fn outline_filtered(&self) -> outline::FoldedOutline {
-        let folded = self.outline_folded();
-        if self.outline.filter.is_empty() {
-            return folded;
-        }
-        let filtered = outline::apply_filter(&folded.items, self.outline.filter.buffer());
-        let hidden_counts = vec![0; filtered.items.len()];
-        let visible_index = (0..filtered.items.len()).collect();
-        outline::FoldedOutline {
-            items: filtered.items,
-            hidden_counts,
-            visible_index,
-        }
+    /// Delegates entirely to [`outline::fold_outline_filtered`], which scores every changeset's
+    /// title and every file's FULL path AT THE SOURCE, rebuilds the row list from the surviving
+    /// file set with the ordinary [`outline::build_items`]/[`outline::apply_fold`] machinery, and
+    /// only THEN folds — so headers, dir rows, tree guides, and hidden-count markers all come out
+    /// structurally correct instead of a flattened, re-ordered list. An empty query short-circuits
+    /// inside that fn to a plain [`outline::fold_outline`] call (the "zero regression when the
+    /// filter is unused" rule), so no special-casing is needed here.
+    fn outline_filtered_and_marks(&self) -> (outline::FoldedOutline, outline::FilterMarks) {
+        let snapshot = self.outline_snapshot();
+        let folds = self.outline.folds.get(&self.outline.mode);
+        outline::fold_outline_filtered(
+            &snapshot,
+            self.outline.mode,
+            self.outline.order,
+            |key| folds.is_some_and(|set| set.contains(key)),
+            self.outline.filter.buffer(),
+        )
     }
 
-    /// [`Self::outline_filtered`]'s row list — see that method's doc comment for the fold+filter
-    /// composition, and [`Self::outline_items_with_hidden_counts`] for the render-facing variant
-    /// that also carries fold markers and match indices.
+    /// [`Self::outline_filtered_and_marks`]'s row list alone — see that method's doc comment for
+    /// the filter-then-rebuild composition, and [`Self::outline_items_with_hidden_counts`] for the
+    /// render-facing variant that also carries fold markers and match indices.
+    fn outline_filtered(&self) -> outline::FoldedOutline {
+        self.outline_filtered_and_marks().0
+    }
+
     pub fn outline_items(&self) -> Vec<OutlineItem> {
         self.outline_filtered().items
     }
 
     /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count
-    /// and CS2's fuzzy-match char indices (empty when no filter is active, or for a row the query
-    /// didn't highlight any char of) — `render_outline`'s data source. Every OTHER outline
-    /// consumer uses [`Self::outline_items`] instead, which just discards what it doesn't need;
-    /// both funnel through the same [`Self::outline_filtered`]/[`Self::outline_folded`] build, so
-    /// they can never disagree about which rows are visible.
+    /// and CS2's fuzzy-match char indices (empty when no filter is active, or for a row that
+    /// isn't itself a match — see [`outline::FilterMarks`]'s doc comment) — `render_outline`'s
+    /// data source.
     pub fn outline_items_with_hidden_counts(
         &self,
     ) -> (Vec<OutlineItem>, Vec<usize>, Vec<Vec<usize>>) {
-        let folded = self.outline_folded();
-        if self.outline.filter.is_empty() {
-            let match_indices = vec![Vec::new(); folded.items.len()];
-            return (folded.items, folded.hidden_counts, match_indices);
-        }
-        let filtered = outline::apply_filter(&folded.items, self.outline.filter.buffer());
-        let hidden_counts = vec![0; filtered.items.len()];
-        (filtered.items, hidden_counts, filtered.match_indices)
+        let (folded, marks) = self.outline_filtered_and_marks();
+        (folded.items, folded.hidden_counts, marks.match_indices)
     }
 
     /// Resolve a target row matched against the FULL (unfiltered, unfolded) row list to its
@@ -2796,12 +2786,15 @@ impl App {
     /// fold-hidden target has no index in the fold-filtered list at all to match against.
     ///
     /// With a CS2 fuzzy filter active: `None` when the target row's own text didn't survive the
-    /// filter — a flat, re-ordered, re-scored filtered list has no ancestor-fallback story the way
-    /// a fold does (the locked design's "parents of matched children are NOT preserved" rule), so
-    /// there is genuinely no row to land `find`'s target on. Callers (currently only
-    /// [`Self::sync_outline_to_current`]) already treat `None` as "leave the cursor where it is,
-    /// clamped" — precisely the CS2 gotcha's "no-op instead of clearing the filter" requirement,
-    /// since neither branch here ever touches [`OutlineState::filter`] itself.
+    /// filter — REVISED 2026-07-24's rebuild DOES preserve ancestor Header/Dir rows, but `find`
+    /// here always matches a specific `File` row's true `cs_idx`/`file_idx` (see
+    /// [`Self::sync_outline_to_current`]'s call site), and a `File` row that didn't itself survive
+    /// filtering is genuinely absent from the rebuilt list — there's no "nearest surviving
+    /// ancestor" fallback for a FILTERED-out file the way a FOLDED-hidden one gets, since the
+    /// filter's ancestor rows carry no notion of "the file that would have been here." Callers
+    /// (currently only [`Self::sync_outline_to_current`]) already treat `None` as "leave the
+    /// cursor where it is, clamped" — precisely the CS2 gotcha's "no-op instead of clearing the
+    /// filter" requirement, since neither branch here ever touches [`OutlineState::filter`] itself.
     fn outline_target_index(&self, find: impl Fn(&OutlineItem) -> bool) -> Option<usize> {
         if !self.outline.filter.is_empty() {
             return self.outline_items().iter().position(find);
@@ -3459,17 +3452,22 @@ impl App {
         self.sync_outline_to_current();
     }
 
-    /// After any filter-input edit that can change the QUERY TEXT (so the matched/scored row set
-    /// itself just reshaped, not merely the cursor's position within a stable list): reseat the
-    /// outline cursor to the top-scored row — mirroring a picker reopening its list on every
-    /// keystroke — and re-derive the scroll. `render_body`'s summary-vs-diff branch
-    /// ([`Self::summary_target`]) and `outline_move_by`'s own switch-on-landing behavior both key
-    /// off `outline.cursor`, so parking it at `0` (the new best match) rather than leaving it at a
-    /// stale index is what makes typing feel live rather than leaving the cursor pointing at
-    /// whatever row happened to still be there.
+    /// After any filter-input edit that can change the QUERY TEXT (so the matched row set itself
+    /// just reshaped, not merely the cursor's position within a stable list): reseat the outline
+    /// cursor onto the HIGHEST-scoring row ([`outline::FilterMarks::best_index`], ties keeping the
+    /// earlier row) — mirroring a picker reopening its list on every keystroke — and re-derive the
+    /// scroll. REVISED 2026-07-24: the rebuilt row list is structural, not score-ordered, so "the
+    /// best match" is no longer always row `0` — it can be anywhere the rebuild placed it. Falls
+    /// back to `0` when no row carries a score at all (the query cleared back to empty, or the
+    /// rebuilt list is empty). `render_body`'s summary-vs-diff branch ([`Self::summary_target`])
+    /// and `outline_move_by`'s own switch-on-landing behavior both key off `outline.cursor`, so
+    /// parking it at the new best match rather than leaving it at a stale index is what makes
+    /// typing feel live rather than leaving the cursor pointing at whatever row happened to still
+    /// be there.
     fn outline_filter_reflow(&mut self) {
-        self.outline.cursor = 0;
-        self.derive_outline_scroll(self.outline_items().len());
+        let (folded, marks) = self.outline_filtered_and_marks();
+        self.outline.cursor = marks.best_index().unwrap_or(0);
+        self.derive_outline_scroll(folded.items.len());
     }
 
     /// Insert one typed char into the filter query (every non-control, non-Alt `Char` key while
@@ -12677,9 +12675,21 @@ mod tests {
         app.outline_filter_insert_char('1');
 
         let items = app.outline_items();
-        assert_eq!(items.len(), 1, "only b1.txt fuzzy-matches 'b1'");
+        // REVISED 2026-07-24: the rebuild keeps cs-b's Header alongside its surviving file —
+        // cs-a's Header (and both its files) is dropped entirely, since neither its title
+        // ("cs-a") nor a1.txt/a2.txt match "b1".
         assert_eq!(
-            items[0],
+            items.len(),
+            2,
+            "cs-b's header rebuilds structurally alongside the one file that matches 'b1'"
+        );
+        assert!(
+            matches!(items[0], OutlineItem::Header { cs_idx: 1, .. }),
+            "cs-b's header comes first (its own row), got {:?}",
+            items[0]
+        );
+        assert_eq!(
+            items[1],
             OutlineItem::File {
                 cs_idx: 1,
                 file_idx: 0,
@@ -12689,6 +12699,34 @@ mod tests {
                 guides: Vec::new(),
             },
             "the surviving row keeps its TRUE cs_idx/file_idx into App::changesets"
+        );
+    }
+
+    /// REVISED 2026-07-24: parking the cursor on "the best match" is no longer always row `0` —
+    /// the rebuilt list keeps cs-b's Header ahead of its own (only, and therefore best-scoring)
+    /// matching file, so the cursor must land on the FILE row, not the unscored header above it.
+    #[test]
+    fn outline_filter_reflow_parks_the_cursor_on_the_highest_scoring_row_not_row_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+
+        app.outline_filter_insert_char('b');
+        app.outline_filter_insert_char('1');
+
+        let items = app.outline_items();
+        let file_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path, .. } if path == "b1.txt"))
+            .expect("b1.txt survives the 'b1' filter");
+        assert_ne!(
+            file_idx, 0,
+            "sanity: the file row is NOT row 0 (the header is)"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            file_idx,
+            "the cursor parks on b1.txt (the only scored row), not on cs-b's unscored header \
+             at row 0"
         );
     }
 

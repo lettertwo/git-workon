@@ -199,7 +199,8 @@ fn changeset_title_spans(
 
 /// CS2 (`outline-filter`): render `text` char-by-char, layering [`Modifier::UNDERLINED`] on top of
 /// `base_style` for every char whose index is in `match_indices` (CHAR indices into `text`, from
-/// [`fuzzy_matcher::skim::SkimMatcherV2::fuzzy_indices`] via [`crate::outline::apply_filter`]) —
+/// [`fuzzy_matcher::skim::SkimMatcherV2::fuzzy_indices`], remapped onto this row's own displayed
+/// text by [`crate::outline::fold_outline_filtered`]'s internals) —
 /// reuses the row's own EXISTING foreground/dim color rather than introducing a new theme field:
 /// M11's later diff-search slice is what adds dedicated `tint_slot` match-highlight keys (per the
 /// plan), so this filter — which CS2 owns start to finish — stays theme-neutral. Groups
