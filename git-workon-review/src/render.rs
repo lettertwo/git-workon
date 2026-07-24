@@ -1157,17 +1157,33 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
 }
 
 /// CS2 (`outline-filter`): paint the one-row fuzzy-filter input at `area`'s first row — a leading
-/// dim `/` prompt glyph (vim cmdline feel) followed by [`PromptState::render_line`]'s own
-/// buffer+cursor spans. Theme-agnostic chrome around a theme-agnostic primitive (see
-/// [`crate::prompt`]'s module doc on why `render_line` itself carries no palette dependency) — the
-/// `/` glyph is the only themed element here, and it's just `theme.dim`, matching every other
-/// quiet-chrome glyph in this module (tree guides, fold markers).
+/// `/` prompt glyph (vim cmdline feel) followed by the query. The row renders in two visibly
+/// distinct states, because capture (input vs row list) is otherwise indiscernible — the row is
+/// present in both:
+///
+/// - INPUT FOCUSED: the `/` glyph takes `theme.pane_header_focused_fg` (the same "your keys land
+///   here" signal the pane headers use) and the buffer renders via [`PromptState::render_line`],
+///   whose reversed cursor cell marks the edit point.
+/// - LIST FOCUSED (query still applied): the `/` glyph is `theme.dim` — matching every other
+///   quiet-chrome glyph in this module (tree guides, fold markers) — and the buffer renders as a
+///   plain span with NO cursor cell: a block cursor only ever appears where keys actually land,
+///   mirroring how the outline's own cursor row dims when the pane loses focus.
 fn render_outline_filter_input(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+    let focused = app.outline_filter_focused();
+    let prefix_fg = if focused {
+        theme.pane_header_focused_fg
+    } else {
+        theme.dim
+    };
     let mut spans = vec![TSpan::styled(
         "/".to_string(),
-        Style::default().fg(theme.dim),
+        Style::default().fg(prefix_fg),
     )];
-    spans.extend(app.outline_filter_state().render_line().spans);
+    if focused {
+        spans.extend(app.outline_filter_state().render_line().spans);
+    } else {
+        spans.push(TSpan::raw(app.outline_filter_query().to_string()));
+    }
     let line = Line::from(spans);
     frame
         .buffer_mut()
@@ -4650,6 +4666,61 @@ mod tests {
             content.iter().any(|row| row.starts_with('/')),
             "a focused filter input must render its own '/'-prefixed row, got:\n{}",
             content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_filter_input_row_signals_capture_via_cursor_cell_and_prefix_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('b');
+        let theme = Palette::dark();
+
+        let input_row_y = |buf: &Buffer| {
+            (0..buf.area.height)
+                .find(|&y| outline_row(buf, y).starts_with('/'))
+                .expect("an active filter must render its '/'-prefixed input row")
+        };
+
+        // INPUT focused: accent `/` prefix + a reversed cursor cell right after the query.
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let y = input_row_y(&buf);
+        assert_eq!(
+            buf.cell((0, y)).unwrap().style().fg,
+            Some(theme.pane_header_focused_fg),
+            "a focused input's '/' prefix must take the pane-header focus color"
+        );
+        assert!(
+            buf.cell((2, y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "a focused input must show its block cursor (reversed cell after '/b')"
+        );
+
+        // LIST focused, query kept: dim `/` prefix, and NO reversed cell anywhere in the row —
+        // the block cursor only appears where keys actually land.
+        app.outline_filter_unfocus();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let y = input_row_y(&buf);
+        assert_eq!(
+            buf.cell((0, y)).unwrap().style().fg,
+            Some(theme.dim),
+            "an unfocused input's '/' prefix must drop back to quiet chrome"
+        );
+        assert!(
+            (0..35).all(|x| !buf
+                .cell((x, y))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED)),
+            "no cursor cell may render while the row list has capture"
         );
     }
 
