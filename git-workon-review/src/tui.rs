@@ -689,12 +689,12 @@ enum KeyOutcome {
     Action(Action),
 }
 
-/// Resolve one `Key` event to a [`KeyOutcome`], given the caller has already ruled out the two
-/// modal cases (a pending discard confirm, the help overlay) — this is cases 3-6 of `update`'s
-/// documented Esc-precedence cascade, extracted so [`update`] and [`update_batch`] share the exact
-/// same resolution instead of duplicating it.
+/// Resolve one `Key` event to a [`KeyOutcome`], given the caller has already ruled out the
+/// modal cases (a pending discard confirm, the help overlay, the outline-filter input) — this is
+/// cases 4-8 of `update`'s documented Esc-precedence cascade, extracted so [`update`] and
+/// [`update_batch`] share the exact same resolution instead of duplicating it.
 ///
-/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 4-7 do (the
+/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 4-8 do (the
 /// confirm/help/filter-input modals deliberately do not — that stays in their own arms, not here).
 fn resolve_key(
     app: &mut App,
@@ -705,6 +705,16 @@ fn resolve_key(
     if app.selection_anchor.is_some() && key.code == KeyCode::Esc && !app.outline_focused() {
         app.clear_notice();
         app.cancel_selection();
+        return KeyOutcome::Handled;
+    }
+    // CS2 (outline-filter): with the outline focused (the input row does NOT have capture —
+    // that's `update`'s case-3 modal arm) and a query actively narrowing the list, Esc unwinds
+    // the filter instead of quitting — mirroring how the selection-Esc arm above unwinds the
+    // diff's innermost mode before Esc's outer meanings apply. Only the NEXT Esc reaches the
+    // outline's terminal quit leaf.
+    if key.code == KeyCode::Esc && app.outline_focused() && !app.outline_filter_query().is_empty() {
+        app.clear_notice();
+        app.outline_filter_clear();
         return KeyOutcome::Handled;
     }
     app.clear_notice();
@@ -765,10 +775,11 @@ fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
 /// tick isn't the user acting on the message.
 ///
 /// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
-/// CS2 outline-filter input having capture > an active line selection (diff-focused) > the
-/// outline having focus > the diff having focus with the outline open > the normal key map (where
-/// Esc quits). Concretely — the home-base model: the outline is where Esc always eventually lands
-/// you before it quits.
+/// CS2 outline-filter input having capture > an active line selection (diff-focused) > an active
+/// outline-filter query (outline-focused) > the outline having focus > the diff having focus with
+/// the outline open > the normal key map (where Esc quits). Concretely — the home-base model: the
+/// outline is where Esc always eventually lands you before it quits, unwinding any inner mode
+/// (selection, filter) along the way.
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
@@ -788,18 +799,22 @@ fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
 ///    other case, since none of them should observe a key the filter input itself consumes.
 /// 4. Otherwise, with an active line selection AND the diff focused, Esc CANCELS the selection
 ///    instead of moving focus or quitting (`q` still quits). This arm is guarded to defer to case
-///    5 when the outline has focus (a selection can only be active while looking at the diff, but
+///    6 when the outline has focus (a selection can only be active while looking at the diff, but
 ///    the guard keeps the precedence explicit). Other keys fall through to the normal map —
 ///    `j`/`k` extend the selection, `s`/`d` act on it.
-/// 5. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
+/// 5. Otherwise, with the outline focused and a NON-EMPTY filter query (capture on the row list,
+///    not the input — that's case 3), Esc CLEARS the filter ([`App::outline_filter_clear`])
+///    instead of quitting — the outline-side mirror of case 4's unwind-the-innermost-mode rule;
+///    only the next Esc reaches case 6's quit leaf.
+/// 6. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
 ///    outline is home base; there's nowhere further out to walk to.
-/// 6. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
+/// 7. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
 ///    focuses the outline (same effect as `h`/[`App::focus_outline`]) rather than quitting.
-/// 7. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
+/// 8. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
 ///    — there's no outline to walk out to.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 4-7); the
-/// confirm, help, and filter-input modals (cases 1-3) deliberately do not. Cases 4-7 are delegated
+/// A `Key` event clears any showing footer notice before applying its own action (cases 4-8); the
+/// confirm, help, and filter-input modals (cases 1-3) deliberately do not. Cases 4-8 are delegated
 /// to [`resolve_key`], shared with [`update_batch`].
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
@@ -3729,6 +3744,43 @@ mod tests {
 
         assert!(!app.outline_filter_focused());
         assert_eq!(app.outline_filter_query(), "a");
+    }
+
+    #[test]
+    fn esc_on_the_list_clears_an_active_filter_before_the_next_esc_quits() {
+        let mut app = filter_test_app();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('a');
+        app.outline_filter_unfocus();
+        assert!(app.outline_focused(), "list (not input) must have capture");
+        assert_eq!(app.outline_filter_query(), "a");
+
+        // First Esc: unwind the filter (ladder case 5) — clear the query, do NOT quit.
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+        assert!(!quit, "Esc with an active filter must not quit the review");
+        assert!(
+            app.outline_filter_query().is_empty(),
+            "Esc on the list must clear the active filter query"
+        );
+
+        // Second Esc: the filter is gone, so the outline's terminal quit leaf (case 6) applies.
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+        assert!(
+            quit,
+            "with no filter left to unwind, Esc quits from the outline"
+        );
     }
 
     #[test]
