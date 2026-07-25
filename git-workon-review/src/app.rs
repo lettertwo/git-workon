@@ -2027,7 +2027,7 @@ impl App {
 
     /// The role whose view [`Self::cursor`]/[`Self::scroll`] currently drive for file `idx`: the
     /// single effective role, or the focused split pane's role.
-    fn focused_role_for(&self, idx: usize) -> Role {
+    pub(crate) fn focused_role_for(&self, idx: usize) -> Role {
         match self.effective_zoom_for(idx) {
             EffectiveZoom::Single(role) => role,
             EffectiveZoom::Split => self.split_focus_role(),

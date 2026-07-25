@@ -2381,6 +2381,11 @@ fn render_pane_sbs(
     let hscroll = app.hscroll;
     // `workon.review.diff.text` (CS11) — read once per frame, same posture as `hscroll` above.
     let text_mode = app.diff_text;
+    // `App::search_matches` is computed only against the FOCUSED pane's view (see
+    // `App::recompute_search`) — painting them on the other split pane too can slice its text at
+    // byte offsets that don't land on a char boundary there. Gate highlighting to the pane whose
+    // view the matches were actually computed against.
+    let search_focused_here = role == app.focused_role_for(idx);
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), old_area);
@@ -2456,10 +2461,16 @@ fn render_pane_sbs(
                     Row::Line(n) => Some(n),
                     Row::Filler => None,
                 };
-                let old_search =
-                    search_bg_spans(app, old_lineno, new_lineno, SearchRenderSide::Old, theme);
-                let new_search =
-                    search_bg_spans(app, old_lineno, new_lineno, SearchRenderSide::New, theme);
+                let old_search = if search_focused_here {
+                    search_bg_spans(app, old_lineno, new_lineno, SearchRenderSide::Old, theme)
+                } else {
+                    Vec::new()
+                };
+                let new_search = if search_focused_here {
+                    search_bg_spans(app, old_lineno, new_lineno, SearchRenderSide::New, theme)
+                } else {
+                    Vec::new()
+                };
 
                 let old_line = build_pane_line(
                     view,
@@ -2656,6 +2667,9 @@ fn render_pane_inline(
     let hscroll = app.hscroll;
     // `workon.review.diff.text` (CS11) — read once per frame, same posture as `hscroll` above.
     let text_mode = app.diff_text;
+    // See `render_pane_sbs`'s identical comment — gate search highlighting to the pane the
+    // matches were actually computed against.
+    let search_focused_here = role == app.focused_role_for(idx);
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
@@ -2724,7 +2738,11 @@ fn render_pane_inline(
                     InlineRow::Add { new, .. } => (None, Some(*new), SearchRenderSide::New),
                     InlineRow::Gap { .. } => (None, None, SearchRenderSide::New),
                 };
-                let search_spans = search_bg_spans(app, old_lineno, new_lineno, render_side, theme);
+                let search_spans = if search_focused_here {
+                    search_bg_spans(app, old_lineno, new_lineno, render_side, theme)
+                } else {
+                    Vec::new()
+                };
                 let line = build_inline_line(
                     view,
                     row,
