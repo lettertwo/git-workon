@@ -278,59 +278,115 @@ fn collapse_gaps_inner(
             continue;
         }
 
-        // Measure the full run of context rows starting at i.
-        let run_start = i;
-        let mut run_end = i;
-        while run_end < rows.len() && is_context(&rows[run_end]) {
-            run_end += 1;
-        }
-        let run_len = run_end - run_start;
+        // `i` is always a run's own start here: the loop only ever reaches this branch right
+        // after either the start of `rows` or a non-context row pushed one at a time above.
+        let run = measure_context_run(rows, i, context)
+            .expect("i is the start of a context run, checked above");
 
-        // Keep `context` lines of lead-in unless this run touches the start of the file (no
-        // hunk before it to lead away from) or the end of the file (no hunk after it to lead
-        // into) — those edges get no filler on the missing side.
-        let keep_before = if run_start == 0 { 0 } else { context };
-        let keep_after = if run_end == rows.len() { 0 } else { context };
-
-        if (keep_before == 0 && keep_after == 0) || run_len <= keep_before + keep_after {
+        if !run.collapse_eligible() {
             // Either too short to collapse, or (keep_before == keep_after == 0) this run is
             // the entire row list — a wholly unchanged file with no hunk on either side to
             // contextualize. Emit every row, no gap.
-            for row in &rows[run_start..run_end] {
+            for row in &rows[run.start..run.end] {
                 out.push(DisplayRow::Row(*row));
             }
-            i = run_end;
+            i = run.end;
             continue;
         }
 
         // This run collapses to a gap (before any expansion is applied) — the key is stable
         // across future expansion requests, so compute it once here.
-        let key = run_start;
+        let key = run.start;
         let expansion = expansions.get(&key).copied().unwrap_or_default();
 
-        let effective_before = (keep_before + expansion.before).min(run_len);
-        let effective_after = (keep_after + expansion.after).min(run_len - effective_before);
+        let run_len = run.len();
+        let effective_before = (run.keep_before + expansion.before).min(run_len);
+        let effective_after = (run.keep_after + expansion.after).min(run_len - effective_before);
 
         if expansion.full || effective_before + effective_after >= run_len {
             // The expansion consumes the whole run (or was asked to): no gap left worth
             // collapsing, emit every row.
-            for row in &rows[run_start..run_end] {
+            for row in &rows[run.start..run.end] {
                 out.push(DisplayRow::Row(*row));
             }
         } else {
-            for row in &rows[run_start..run_start + effective_before] {
+            for row in &rows[run.start..run.start + effective_before] {
                 out.push(DisplayRow::Row(*row));
             }
             let skipped = run_len - effective_before - effective_after;
             out.push(DisplayRow::Gap { key, skipped });
-            for row in &rows[run_end - effective_after..run_end] {
+            for row in &rows[run.end - effective_after..run.end] {
                 out.push(DisplayRow::Row(*row));
             }
         }
 
-        i = run_end;
+        i = run.end;
     }
     out
+}
+
+/// A maximal run of [`CellKind::Context`] rows in `[start, end)`, and how many of its own rows
+/// must stay visible at each edge (`keep_before`/`keep_after` — `0` at a run touching the start
+/// or end of the file, where there's no hunk on that side to lead away from/into).
+struct ContextRun {
+    start: usize,
+    end: usize,
+    keep_before: usize,
+    keep_after: usize,
+}
+
+impl ContextRun {
+    fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Whether this run has more rows than its own `keep_before`/`keep_after` window needs kept
+    /// visible — the single collapse-eligibility test [`collapse_gaps_inner`], [`gap_hidden_range`],
+    /// and [`gap_key_for_aligned_idx`] each independently re-derived before this was extracted.
+    fn collapse_eligible(&self) -> bool {
+        !(self.keep_before == 0 && self.keep_after == 0)
+            && self.len() > self.keep_before + self.keep_after
+    }
+}
+
+/// The maximal context run containing `rows[idx_in_run]`, with its `keep_before`/`keep_after`
+/// edges resolved against `context` — the run-boundary + keep-before/after derivation shared by
+/// [`collapse_gaps_inner`], [`gap_hidden_range`], and [`gap_key_for_aligned_idx`] (previously three
+/// independent copies of this same scan). `context` is threaded through rather than hardcoded to
+/// [`CONTEXT_LINES`] since [`collapse_gaps_inner`]'s test-only entry point
+/// ([`collapse_gaps_with`]) takes an explicit count. `None` when `idx_in_run` isn't inside a
+/// context run at all (out of bounds, or the row there isn't [`CellKind::Context`] on both
+/// sides).
+fn measure_context_run(
+    rows: &[AlignedRow],
+    idx_in_run: usize,
+    context: usize,
+) -> Option<ContextRun> {
+    let is_context = |row: &AlignedRow| {
+        matches!(
+            (row.old_kind, row.new_kind),
+            (CellKind::Context, CellKind::Context)
+        )
+    };
+    if idx_in_run >= rows.len() || !is_context(&rows[idx_in_run]) {
+        return None;
+    }
+    let mut start = idx_in_run;
+    while start > 0 && is_context(&rows[start - 1]) {
+        start -= 1;
+    }
+    let mut end = idx_in_run + 1;
+    while end < rows.len() && is_context(&rows[end]) {
+        end += 1;
+    }
+    let keep_before = if start == 0 { 0 } else { context };
+    let keep_after = if end == rows.len() { 0 } else { context };
+    Some(ContextRun {
+        start,
+        end,
+        keep_before,
+        keep_after,
+    })
 }
 
 /// The currently-hidden [`AlignedRow`] sub-range `[start, end)` for the gap keyed `key`, given
@@ -339,51 +395,31 @@ fn collapse_gaps_inner(
 /// uncover. `None` when `key` no longer denotes an actual gap: not a context-run start, the run is
 /// too short to have collapsed in the first place, or `expansion` already reveals the whole run.
 ///
-/// Mirrors the run-measuring steps in [`collapse_gaps_inner`] (same `keep_before`/`keep_after`/
-/// `effective_before`/`effective_after` derivation) rather than sharing code with it, because that
-/// function additionally needs `run_end` and the row slices themselves to emit `DisplayRow`s,
-/// while this one only needs the hidden index range for a `key` a caller already has — keep both
-/// in sync if the collapse rule ever changes.
+/// Uses [`measure_context_run`] (`key` is always the run's own start — see the doc above) for the
+/// run-boundary/`keep_before`/`keep_after` derivation [`collapse_gaps_inner`] and
+/// [`gap_key_for_aligned_idx`] share it with, then re-derives `effective_before`/`effective_after`
+/// against `expansion` itself, since that step also needs `run_end`/the row slices
+/// [`collapse_gaps_inner`] emits `DisplayRow`s from — keep both in sync if the collapse rule ever
+/// changes.
 pub(crate) fn gap_hidden_range(
     rows: &[AlignedRow],
     key: usize,
     expansions: &HashMap<usize, GapExpansion>,
 ) -> Option<(usize, usize)> {
-    let is_context = |row: &AlignedRow| {
-        matches!(
-            (row.old_kind, row.new_kind),
-            (CellKind::Context, CellKind::Context)
-        )
-    };
-
-    let run_start = key;
-    if run_start >= rows.len() || !is_context(&rows[run_start]) {
-        return None;
-    }
-    let mut run_end = run_start;
-    while run_end < rows.len() && is_context(&rows[run_end]) {
-        run_end += 1;
-    }
-    let run_len = run_end - run_start;
-
-    let keep_before = if run_start == 0 { 0 } else { CONTEXT_LINES };
-    let keep_after = if run_end == rows.len() {
-        0
-    } else {
-        CONTEXT_LINES
-    };
-    if (keep_before == 0 && keep_after == 0) || run_len <= keep_before + keep_after {
+    let run = measure_context_run(rows, key, CONTEXT_LINES)?;
+    if !run.collapse_eligible() {
         return None;
     }
 
+    let run_len = run.len();
     let expansion = expansions.get(&key).copied().unwrap_or_default();
-    let effective_before = (keep_before + expansion.before).min(run_len);
-    let effective_after = (keep_after + expansion.after).min(run_len - effective_before);
+    let effective_before = (run.keep_before + expansion.before).min(run_len);
+    let effective_after = (run.keep_after + expansion.after).min(run_len - effective_before);
     if expansion.full || effective_before + effective_after >= run_len {
         return None;
     }
 
-    Some((run_start + effective_before, run_end - effective_after))
+    Some((run.start + effective_before, run.end - effective_after))
 }
 
 /// The gap `key` (the hidden run's start index, matching [`DisplayRow::Gap`]'s own `key`) whose
@@ -395,35 +431,11 @@ pub(crate) fn gap_hidden_range(
 /// currently visible needs this reverse lookup — "which gap, if any, would need expanding to
 /// reveal this row" — before [`crate::app::FileView::expand_gap`] can be called with the right key.
 pub(crate) fn gap_key_for_aligned_idx(rows: &[AlignedRow], aligned_idx: usize) -> Option<usize> {
-    let is_context = |row: &AlignedRow| {
-        matches!(
-            (row.old_kind, row.new_kind),
-            (CellKind::Context, CellKind::Context)
-        )
-    };
-    if aligned_idx >= rows.len() || !is_context(&rows[aligned_idx]) {
+    let run = measure_context_run(rows, aligned_idx, CONTEXT_LINES)?;
+    if !run.collapse_eligible() {
         return None;
     }
-    let mut run_start = aligned_idx;
-    while run_start > 0 && is_context(&rows[run_start - 1]) {
-        run_start -= 1;
-    }
-    let mut run_end = aligned_idx + 1;
-    while run_end < rows.len() && is_context(&rows[run_end]) {
-        run_end += 1;
-    }
-    let run_len = run_end - run_start;
-
-    let keep_before = if run_start == 0 { 0 } else { CONTEXT_LINES };
-    let keep_after = if run_end == rows.len() {
-        0
-    } else {
-        CONTEXT_LINES
-    };
-    if (keep_before == 0 && keep_after == 0) || run_len <= keep_before + keep_after {
-        return None;
-    }
-    Some(run_start)
+    Some(run.start)
 }
 
 /// One row of the inline (unified, single-column) display.
