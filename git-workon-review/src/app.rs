@@ -2631,6 +2631,9 @@ impl App {
             SplitPane::Staged => SplitPane::Unstaged,
         };
         self.derive_scroll();
+        // `current_view_ref` now resolves to the OTHER pane's view — recompute so matches,
+        // jumps, and gap expansion are driven by the newly-focused pane, not a stale one.
+        self.recompute_search();
     }
 
     /// Reshape onto changeset `target` (clamped into range), landing on file `file_idx` of ITS
