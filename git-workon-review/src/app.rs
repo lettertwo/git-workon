@@ -3744,27 +3744,39 @@ impl App {
         self.recompute_search();
     }
 
-    /// The cursor's own (old, new) lineno pair, preferring the new-side lineno like
-    /// [`Self::restore_position`]'s convention — the ordering key [`Self::first_match_at_or_after_cursor`]
-    /// compares [`crate::search::SearchMatch`]'s own (old, new) pair against.
-    fn cursor_lineno(&self) -> Option<usize> {
+    /// The [`crate::align::AlignedRow`] index (into [`FileView::aligned`], the SAME space
+    /// [`crate::search::SearchMatch::aligned_idx`] addresses) the cursor's current row corresponds
+    /// to — resolved by lineno rather than by position in the active layout's row vector, since
+    /// the inline layout's per-run Del-then-Add reordering (see `align::inline_rows`) means a
+    /// row's POSITION there does NOT correspond to `aligned_idx` order the way it does in the SBS
+    /// layout. `None` when the view or the cursor's row can't be resolved.
+    fn cursor_aligned_idx(&self) -> Option<usize> {
         let view = self.current_view_ref()?;
         let (old, new) = match self.layout {
             Layout::Sbs => display_row_linenos(view.display.get(self.cursor)?),
             Layout::Inline => inline_row_linenos(view.inline.get(self.cursor)?),
         };
-        new.or(old)
+        view.aligned.iter().position(|r| {
+            let (row_old, row_new) = (row_lineno(r.old), row_lineno(r.new));
+            match (old, new) {
+                (Some(_), Some(_)) => row_old == old && row_new == new,
+                (Some(_), None) => row_old == old,
+                (None, Some(_)) => row_new == new,
+                (None, None) => false,
+            }
+        })
     }
 
     /// The first [`Self::search_matches`] index whose row is at-or-after the cursor's own
-    /// position, by (new-preferring) lineno — [`Self::search_accept`]'s jump target. `None` when
-    /// every match lies strictly before the cursor (the wrap case its caller handles).
+    /// position, in aligned-row order (not lineno — old/new linenos diverge in files with net
+    /// insertions/deletions, which can otherwise skip or misorder del-side matches) —
+    /// [`Self::search_accept`]'s jump target. `None` when every match lies strictly before the
+    /// cursor (the wrap case its caller handles).
     fn first_match_at_or_after_cursor(&self) -> Option<usize> {
-        let cursor_line = self.cursor_lineno().unwrap_or(0);
-        self.search_matches.iter().position(|m| {
-            let line = m.new_lineno.or(m.old_lineno).unwrap_or(0);
-            line >= cursor_line
-        })
+        let cursor_idx = self.cursor_aligned_idx().unwrap_or(0);
+        self.search_matches
+            .iter()
+            .position(|m| m.aligned_idx >= cursor_idx)
     }
 
     /// `n`/`N` (contextual): jump to the next/previous search match when a search is active,
