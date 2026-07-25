@@ -762,58 +762,102 @@ fn resolve_key(
 /// `Ctrl-e`/`Ctrl-n`/`Ctrl-p`/`Ctrl-u`/`Ctrl-w` never fall through and get inserted as literal
 /// text. `Alt`-modified chars are excluded from the catch-all too (there is no bound behavior for
 /// them here, and inserting an Alt-chorded char as plain text would be surprising).
+/// One readline-style prompt edit, decoded from a key event by [`prompt_edit_for_key`] —
+/// everything [`apply_filter_input_key`] and [`apply_search_input_key`] do that ISN'T specific to
+/// which prompt is focused (their own Enter/Esc, and the filter's outline-list-navigation extras).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromptEdit {
+    InsertChar(char),
+    Backspace,
+    Delete,
+    MoveLeft,
+    MoveRight,
+    MoveHome,
+    MoveEnd,
+    ClearToStart,
+    DeleteWordBack,
+}
+
+/// Decode a key event into the [`PromptEdit`] it means, or `None` for a key neither prompt modal
+/// arm handles (left for that arm's own extras, or unbound). Shared by
+/// [`apply_filter_input_key`]/[`apply_search_input_key`] — previously two independent copies of
+/// this same decode (ctrl-chord extraction, `Ctrl-a`/`e`/`u`/`w`, the plain-`Char` guard excluding
+/// ctrl/alt, `Backspace`/`Delete`/`Left`/`Right`/`Home`/`End`).
+fn prompt_edit_for_key(key: KeyEvent) -> Option<PromptEdit> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('a') if ctrl => Some(PromptEdit::MoveHome),
+        KeyCode::Char('e') if ctrl => Some(PromptEdit::MoveEnd),
+        KeyCode::Char('u') if ctrl => Some(PromptEdit::ClearToStart),
+        KeyCode::Char('w') if ctrl => Some(PromptEdit::DeleteWordBack),
+        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+            Some(PromptEdit::InsertChar(c))
+        }
+        KeyCode::Backspace => Some(PromptEdit::Backspace),
+        KeyCode::Delete => Some(PromptEdit::Delete),
+        KeyCode::Left => Some(PromptEdit::MoveLeft),
+        KeyCode::Right => Some(PromptEdit::MoveRight),
+        KeyCode::Home => Some(PromptEdit::MoveHome),
+        KeyCode::End => Some(PromptEdit::MoveEnd),
+        _ => None,
+    }
+}
+
+/// `update`'s case-3 modal arm: apply one key press while the CS2 outline-filter INPUT has
+/// keyboard capture (see [`App::outline_filter_focused`]). Handles its own Enter/Esc and the
+/// outline-list-navigation extras (`Ctrl-c`/`Ctrl-n`/`Ctrl-p`/`Down`/`Up`) directly, then
+/// delegates every other key to [`prompt_edit_for_key`] — every branch calls straight into an
+/// `App::outline_filter_*` method, no [`Action`]/[`map_key`] indirection, matching
+/// [`crate::prompt`]'s own module doc that this is readline muscle memory, not a rebindable action
+/// set.
 fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Enter | KeyCode::Esc => app.outline_filter_unfocus(),
-        KeyCode::Char('c') if ctrl => app.outline_filter_clear(),
-        KeyCode::Char('a') if ctrl => app.outline_filter_move_home(),
-        KeyCode::Char('e') if ctrl => app.outline_filter_move_end(),
-        KeyCode::Char('u') if ctrl => app.outline_filter_clear_to_start(),
-        KeyCode::Char('w') if ctrl => app.outline_filter_delete_word_back(),
-        KeyCode::Char('n') if ctrl => app.outline_move_by(1),
-        KeyCode::Char('p') if ctrl => app.outline_move_by(-1),
-        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-            app.outline_filter_insert_char(c);
-        }
-        KeyCode::Backspace => app.outline_filter_backspace(),
-        KeyCode::Delete => app.outline_filter_delete(),
-        KeyCode::Left => app.outline_filter_move_left(),
-        KeyCode::Right => app.outline_filter_move_right(),
-        KeyCode::Home => app.outline_filter_move_home(),
-        KeyCode::End => app.outline_filter_move_end(),
-        KeyCode::Down => app.outline_move_by(1),
-        KeyCode::Up => app.outline_move_by(-1),
+        KeyCode::Enter | KeyCode::Esc => return app.outline_filter_unfocus(),
+        KeyCode::Char('c') if ctrl => return app.outline_filter_clear(),
+        KeyCode::Char('n') if ctrl => return app.outline_move_by(1),
+        KeyCode::Char('p') if ctrl => return app.outline_move_by(-1),
+        KeyCode::Down => return app.outline_move_by(1),
+        KeyCode::Up => return app.outline_move_by(-1),
         _ => {}
+    }
+    match prompt_edit_for_key(key) {
+        Some(PromptEdit::InsertChar(c)) => app.outline_filter_insert_char(c),
+        Some(PromptEdit::Backspace) => app.outline_filter_backspace(),
+        Some(PromptEdit::Delete) => app.outline_filter_delete(),
+        Some(PromptEdit::MoveLeft) => app.outline_filter_move_left(),
+        Some(PromptEdit::MoveRight) => app.outline_filter_move_right(),
+        Some(PromptEdit::MoveHome) => app.outline_filter_move_home(),
+        Some(PromptEdit::MoveEnd) => app.outline_filter_move_end(),
+        Some(PromptEdit::ClearToStart) => app.outline_filter_clear_to_start(),
+        Some(PromptEdit::DeleteWordBack) => app.outline_filter_delete_word_back(),
+        None => {}
     }
 }
 
 /// `update`'s search-prompt modal arm (M11 CS3, `diff-search`): apply one key press while the
 /// diff-view search prompt has keyboard capture (see [`App::search_focused`]). Mirrors
-/// [`apply_filter_input_key`]'s shape (direct `App::search_*` calls, Ctrl-chords before the
-/// plain-`Char` catch-all, Alt excluded) but WITHOUT that arm's `Ctrl-c`-clears/`Down`/`Up`-move
-/// extras: the search prompt has no outline-list-underneath to keep navigating while typing (the
-/// plan is explicit that typing previews highlights but never moves the cursor), and `Esc` alone
-/// already covers "abandon this edit."
+/// [`apply_filter_input_key`]'s shape (own Enter/Esc first, then [`prompt_edit_for_key`]) but
+/// WITHOUT that arm's outline-list-navigation extras: the search prompt has no outline-list-
+/// underneath to keep navigating while typing (the plan is explicit that typing previews
+/// highlights but never moves the cursor), and `Esc` alone already covers "abandon this edit."
 fn apply_search_input_key(app: &mut App, key: KeyEvent) {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Enter => app.search_accept(),
-        KeyCode::Esc => app.search_abort(),
-        KeyCode::Char('a') if ctrl => app.search_move_home(),
-        KeyCode::Char('e') if ctrl => app.search_move_end(),
-        KeyCode::Char('u') if ctrl => app.search_clear_to_start(),
-        KeyCode::Char('w') if ctrl => app.search_delete_word_back(),
-        KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-            app.search_insert_char(c);
-        }
-        KeyCode::Backspace => app.search_backspace(),
-        KeyCode::Delete => app.search_delete(),
-        KeyCode::Left => app.search_move_left(),
-        KeyCode::Right => app.search_move_right(),
-        KeyCode::Home => app.search_move_home(),
-        KeyCode::End => app.search_move_end(),
+        KeyCode::Enter => return app.search_accept(),
+        KeyCode::Esc => return app.search_abort(),
         _ => {}
+    }
+    match prompt_edit_for_key(key) {
+        Some(PromptEdit::InsertChar(c)) => app.search_insert_char(c),
+        Some(PromptEdit::Backspace) => app.search_backspace(),
+        Some(PromptEdit::Delete) => app.search_delete(),
+        Some(PromptEdit::MoveLeft) => app.search_move_left(),
+        Some(PromptEdit::MoveRight) => app.search_move_right(),
+        Some(PromptEdit::MoveHome) => app.search_move_home(),
+        Some(PromptEdit::MoveEnd) => app.search_move_end(),
+        Some(PromptEdit::ClearToStart) => app.search_clear_to_start(),
+        Some(PromptEdit::DeleteWordBack) => app.search_delete_word_back(),
+        None => {}
     }
 }
 
