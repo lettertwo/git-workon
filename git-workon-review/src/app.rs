@@ -3839,10 +3839,19 @@ impl App {
                     .display
                     .iter()
                     .position(|r| display_row_linenos(r) == target),
-                Layout::Inline => view
-                    .inline
-                    .iter()
-                    .position(|r| inline_row_linenos(r) == target),
+                // Side-aware, not pair equality: the inline layout splits a paired change row's
+                // match (which carries BOTH linenos) into separate Del/Add rows that each carry
+                // only one — `Both` (a context row, which always carries both) is the only side
+                // where full-pair equality still applies.
+                Layout::Inline => view.inline.iter().position(|r| match m.side {
+                    crate::search::SearchSide::Old => {
+                        matches!(r, InlineRow::Del { old, .. } if Some(*old) == m.old_lineno)
+                    }
+                    crate::search::SearchSide::New => {
+                        matches!(r, InlineRow::Add { new, .. } if Some(*new) == m.new_lineno)
+                    }
+                    crate::search::SearchSide::Both => inline_row_linenos(r) == target,
+                }),
             };
             if let Some(row) = row {
                 self.cursor = row;
