@@ -787,7 +787,15 @@ fn search_bg_spans(
     app.search_matches()
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.old_lineno == old_lineno && m.new_lineno == new_lineno)
+        // Side-aware, not pair-equality: the inline layout splits a paired change row's match
+        // (which carries BOTH linenos) across two rows that each carry only one, so only the
+        // lineno on `render_side` needs to agree — matching the full pair would silently drop
+        // every inline Del/Add highlight and jump target (SBS still resolves identically, since
+        // its caller always passes the row's own full pair).
+        .filter(|(_, m)| match render_side {
+            SearchRenderSide::Old => old_lineno.is_some() && m.old_lineno == old_lineno,
+            SearchRenderSide::New => new_lineno.is_some() && m.new_lineno == new_lineno,
+        })
         .filter(|(_, m)| match (m.side, render_side) {
             (SearchSide::Both, _) => true,
             (SearchSide::Old, SearchRenderSide::Old) => true,
