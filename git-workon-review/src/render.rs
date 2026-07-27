@@ -796,11 +796,13 @@ fn search_bg_spans(
             SearchRenderSide::Old => old_lineno.is_some() && m.old_lineno == old_lineno,
             SearchRenderSide::New => new_lineno.is_some() && m.new_lineno == new_lineno,
         })
-        .filter(|(_, m)| match (m.side, render_side) {
-            (SearchSide::Both, _) => true,
-            (SearchSide::Old, SearchRenderSide::Old) => true,
-            (SearchSide::New, SearchRenderSide::New) => true,
-            _ => false,
+        .filter(|(_, m)| {
+            matches!(
+                (m.side, render_side),
+                (SearchSide::Both, _)
+                    | (SearchSide::Old, SearchRenderSide::Old)
+                    | (SearchSide::New, SearchRenderSide::New)
+            )
         })
         .map(|(i, m)| {
             let color = if Some(i) == current {
