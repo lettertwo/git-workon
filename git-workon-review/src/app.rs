@@ -4026,18 +4026,28 @@ impl App {
     /// since OSC 52 is fire-and-forget (see the `clipboard` module doc) and this can only claim
     /// the bytes reached the tty, never that the terminal actually honored them. Factored out so
     /// the two verbs can't drift on wording.
-    fn copy_payload(&mut self, payload: String) {
+    ///
+    /// Returns whether the write succeeded, so the callers can honor decision 8's "clear the
+    /// selection on success" precisely: a failed write must LEAVE the selection intact, or the
+    /// user loses the range they built and has no way to retry the thing that just failed.
+    fn copy_payload(&mut self, payload: String) -> bool {
         match crate::clipboard::write_osc52(&payload) {
-            Ok(()) => self.notify(format!("copied {payload} to clipboard"), Severity::Info),
-            Err(err) => self.notify(format!("clipboard write failed: {err}"), Severity::Error),
+            Ok(()) => {
+                self.notify(format!("copied {payload} to clipboard"), Severity::Info);
+                true
+            }
+            Err(err) => {
+                self.notify(format!("clipboard write failed: {err}"), Severity::Error);
+                false
+            }
         }
     }
 
     /// `y` (default binding `copy-lines`): copy the active yank range's TEXT to the system
     /// clipboard. See [`Self::resolve_copy_lines`] for resolution and [`Self::copy_payload`] for
     /// the write. Clears the active selection on success (decision 8, matching vim's `y` and
-    /// [`Self::stage_selection`]'s success paths) — NOT on the resolution error path, so the user
-    /// can fix their selection and retry.
+    /// [`Self::stage_selection`]'s success paths) — NOT on either failure path (resolution error
+    /// or a failed clipboard write), so the user keeps the range they built and can retry.
     pub fn copy_lines(&mut self) {
         let payload = match self.resolve_copy_lines() {
             Ok(payload) => payload,
@@ -4046,14 +4056,15 @@ impl App {
                 return;
             }
         };
-        self.copy_payload(payload);
-        self.cancel_selection();
+        if self.copy_payload(payload) {
+            self.cancel_selection();
+        }
     }
 
     /// `Y` (default binding `copy-location`): copy the active yank range's `path:line` (or
     /// `path:lo-hi`) to the system clipboard. See [`Self::resolve_copy_location`] for resolution
     /// and [`Self::copy_payload`] for the write. Clears the active selection on success, same as
-    /// [`Self::copy_lines`] — not on the resolution error path.
+    /// [`Self::copy_lines`] — not on either failure path.
     pub fn copy_location(&mut self) {
         let payload = match self.resolve_copy_location() {
             Ok(payload) => payload,
@@ -4062,8 +4073,9 @@ impl App {
                 return;
             }
         };
-        self.copy_payload(payload);
-        self.cancel_selection();
+        if self.copy_payload(payload) {
+            self.cancel_selection();
+        }
     }
 
     /// Park the cursor on [`Self::search_matches`]`[idx]`: auto-expand the gap it's hidden behind
