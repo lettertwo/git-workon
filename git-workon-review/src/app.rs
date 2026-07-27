@@ -3909,62 +3909,161 @@ impl App {
         self.search_step(false);
     }
 
-    /// The pure half of `copy-path-line`: resolve the cursor's row to a `path:line` string, with
-    /// no I/O. Split out from [`Self::copy_path_line`] so line resolution is testable without a
-    /// controlling tty — the OSC 52 write below needs one (`/dev/tty` is `ENXIO` in a test
-    /// harness/CI), but this resolution never should have depended on one in the first place.
+    /// Which side (old or new) each row the active yank range covers resolves to — the rule M11's
+    /// yank-split handoff locks as decision 4, shared by [`Self::resolve_copy_lines`] and
+    /// [`Self::resolve_copy_location`] so the two verbs cannot drift on side selection or gap
+    /// handling. Walks [`Self::selection_range`] (or the bare cursor row when no selection is
+    /// active) in the FOCUSED pane's ACTIVE layout coordinate space — the same space
+    /// [`Self::selection_range`] itself is already in, so no translation happens here.
     ///
-    /// The line is the NEW side's lineno, falling back to the OLD side on a pure-deletion row
-    /// that carries no new side (M11 handoff locked decision 2 — deliberately NOT "whichever
-    /// side the split cursor is on": that per-side state doesn't exist yet, see the open
-    /// question logged in `docs/rfc/workon-review.md`). `path` is repo-relative, the same string
-    /// already shown everywhere else in this UI (outline, footer) — never an absolute path.
+    /// - **SBS**: the NEW side's lineno, falling back to the OLD side on a pure-deletion row that
+    ///   carries no new side (the same rule the old single-row `copy-path-line` resolver used).
+    ///   `DisplayRow::Gap` rows are skipped, never emitted.
+    /// - **Inline**: `Del` -> old lineno, `Add` -> new lineno, `Context` -> new lineno — mirroring
+    ///   [`Self::selection_line_ops`]'s per-side-precise handling (locked decision #8).
+    ///   `InlineRow::Gap` rows are skipped.
     ///
-    /// `Err` names the reason there's nothing to copy — a row with neither lineno (a gap row) or
-    /// no file/view at all — which [`Self::copy_path_line`] turns straight into a footer notice.
-    fn resolve_copy_path_line(&self) -> Result<String, &'static str> {
+    /// Each entry is `(is_new_side, lineno)`, one per non-gap row in range order — the order the
+    /// caller needs both to pick text (per side) and to collapse a range to its first/last
+    /// lineno (decision 6). `Err("no line to copy")` when nothing in range yields a lineno at
+    /// all: no file/view loaded, or the whole range is gap rows (decision 5 — a gap is hidden
+    /// content, skipping it silently is correct, but an ALL-gap range has nothing left to copy).
+    fn resolve_yank_rows(&self) -> Result<Vec<(bool, usize)>, &'static str> {
+        let view = self.current_view_ref().ok_or("no line to copy")?;
+        let (lo, hi) = self.selection_range().unwrap_or((self.cursor, self.cursor));
+        let mut rows = Vec::new();
+        match self.layout {
+            Layout::Sbs => {
+                for r in lo..=hi {
+                    let Some(row) = view.display.get(r) else {
+                        continue;
+                    };
+                    let (old, new) = display_row_linenos(row);
+                    if let Some(n) = new {
+                        rows.push((true, n));
+                    } else if let Some(n) = old {
+                        rows.push((false, n));
+                    }
+                }
+            }
+            Layout::Inline => {
+                for r in lo..=hi {
+                    match view.inline.get(r) {
+                        Some(InlineRow::Del { old, .. }) => rows.push((false, *old)),
+                        Some(InlineRow::Add { new, .. }) => rows.push((true, *new)),
+                        Some(InlineRow::Context { new, .. }) => rows.push((true, *new)),
+                        Some(InlineRow::Gap { .. }) | None => {}
+                    }
+                }
+            }
+        }
+        if rows.is_empty() {
+            Err("no line to copy")
+        } else {
+            Ok(rows)
+        }
+    }
+
+    /// The pure half of `copy-lines` (`y`): resolve the active yank range (decision 4's side
+    /// rules via [`Self::resolve_yank_rows`]) to the selected rows' raw TEXT, no I/O. One line
+    /// per resolved row, newline-joined, in range order — no `+`/`-` markers, no line numbers, no
+    /// path header (locked decision 3: the dominant use is pasting into a chat or a buffer, and
+    /// markers make the result non-compiling). Text comes straight from [`FileView::old_lines`]/
+    /// [`FileView::new_lines`] indexed by the row's resolved lineno minus 1 — same-module private
+    /// fields, no accessor needed.
+    fn resolve_copy_lines(&self) -> Result<String, &'static str> {
+        let view = self.current_view_ref().ok_or("no line to copy")?;
+        let rows = self.resolve_yank_rows()?;
+        let lines: Vec<&str> = rows
+            .iter()
+            .map(|&(is_new, lineno)| {
+                let buf = if is_new {
+                    &view.new_lines
+                } else {
+                    &view.old_lines
+                };
+                buf.get(lineno - 1).map(String::as_str).unwrap_or("")
+            })
+            .collect();
+        Ok(lines.join("\n"))
+    }
+
+    /// The pure half of `copy-location` (`Y`): today's single-row `resolve_copy_path_line`
+    /// widened to a range. `path` is repo-relative, the same string already shown everywhere else
+    /// in this UI (outline, footer) — never an absolute path.
+    ///
+    /// `lo`/`hi` are the resolved rows' FIRST and LAST entries from [`Self::resolve_yank_rows`]
+    /// (decision 6) — the range's endpoints in resolved-lineno space, not raw row indices (a row
+    /// index is meaningless outside the TUI) and not a min/max sweep (a range's endpoints, per the
+    /// plan, not its extremes). A single-row selection, or no selection, collapses to today's
+    /// `path:12` form byte-for-byte; a genuine multi-row range emits `path:lo-hi`, not GitHub's
+    /// `path#L12-L18`.
+    fn resolve_copy_location(&self) -> Result<String, &'static str> {
         let path = self
             .files()
             .get(self.current)
             .map(|f| f.path.clone())
             .ok_or("no file to copy")?;
-        let view = self.current_view_ref().ok_or("no line to copy")?;
-        let (old, new) = match self.layout {
-            Layout::Sbs => view
-                .display
-                .get(self.cursor)
-                .map(display_row_linenos)
-                .unwrap_or((None, None)),
-            Layout::Inline => view
-                .inline
-                .get(self.cursor)
-                .map(inline_row_linenos)
-                .unwrap_or((None, None)),
-        };
-        let line = new.or(old).ok_or("no line to copy")?;
-        Ok(format!("{path}:{line}"))
+        let rows = self.resolve_yank_rows()?;
+        let lo = rows
+            .first()
+            .expect("resolve_yank_rows never returns Ok(empty)")
+            .1;
+        let hi = rows
+            .last()
+            .expect("resolve_yank_rows never returns Ok(empty)")
+            .1;
+        if lo == hi {
+            Ok(format!("{path}:{lo}"))
+        } else {
+            Ok(format!("{path}:{lo}-{hi}"))
+        }
     }
 
-    /// `y` (default binding `copy-path-line`): copy `path:line` for the cursor's row to the
-    /// system clipboard via OSC 52 ([`crate::clipboard::write_osc52`]). Resolution itself is
-    /// [`Self::resolve_copy_path_line`]; this wraps it with the I/O and the footer notice.
-    ///
-    /// The footer notice fires on both outcomes: success is worded "copied ... to clipboard",
-    /// deliberately not "clipboard updated" — OSC 52 is fire-and-forget (see the `clipboard`
-    /// module doc), so this can only claim the bytes reached the tty, never that the terminal
-    /// actually honored them.
-    pub fn copy_path_line(&mut self) {
-        let payload = match self.resolve_copy_path_line() {
+    /// Shared I/O-and-notify tail for [`Self::copy_lines`]/[`Self::copy_location`]: write
+    /// `payload` via OSC 52 ([`crate::clipboard::write_osc52`]) and post the footer notice on
+    /// either outcome, worded "copied ... to clipboard" — deliberately not "clipboard updated",
+    /// since OSC 52 is fire-and-forget (see the `clipboard` module doc) and this can only claim
+    /// the bytes reached the tty, never that the terminal actually honored them. Factored out so
+    /// the two verbs can't drift on wording.
+    fn copy_payload(&mut self, payload: String) {
+        match crate::clipboard::write_osc52(&payload) {
+            Ok(()) => self.notify(format!("copied {payload} to clipboard"), Severity::Info),
+            Err(err) => self.notify(format!("clipboard write failed: {err}"), Severity::Error),
+        }
+    }
+
+    /// `y` (default binding `copy-lines`): copy the active yank range's TEXT to the system
+    /// clipboard. See [`Self::resolve_copy_lines`] for resolution and [`Self::copy_payload`] for
+    /// the write. Clears the active selection on success (decision 8, matching vim's `y` and
+    /// [`Self::stage_selection`]'s success paths) — NOT on the resolution error path, so the user
+    /// can fix their selection and retry.
+    pub fn copy_lines(&mut self) {
+        let payload = match self.resolve_copy_lines() {
             Ok(payload) => payload,
             Err(reason) => {
                 self.notify(reason, Severity::Error);
                 return;
             }
         };
-        match crate::clipboard::write_osc52(&payload) {
-            Ok(()) => self.notify(format!("copied {payload} to clipboard"), Severity::Info),
-            Err(err) => self.notify(format!("clipboard write failed: {err}"), Severity::Error),
-        }
+        self.copy_payload(payload);
+        self.cancel_selection();
+    }
+
+    /// `Y` (default binding `copy-location`): copy the active yank range's `path:line` (or
+    /// `path:lo-hi`) to the system clipboard. See [`Self::resolve_copy_location`] for resolution
+    /// and [`Self::copy_payload`] for the write. Clears the active selection on success, same as
+    /// [`Self::copy_lines`] — not on the resolution error path.
+    pub fn copy_location(&mut self) {
+        let payload = match self.resolve_copy_location() {
+            Ok(payload) => payload,
+            Err(reason) => {
+                self.notify(reason, Severity::Error);
+                return;
+            }
+        };
+        self.copy_payload(payload);
+        self.cancel_selection();
     }
 
     /// Park the cursor on [`Self::search_matches`]`[idx]`: auto-expand the gap it's hidden behind
@@ -13787,11 +13886,11 @@ mod tests {
         );
     }
 
-    // ── `copy-path-line` (M11) ──────────────────────────────────────────────
+    // ── `copy-lines` / `copy-location` (M11 yank split) ─────────────────────
 
     /// A single pure deletion — `b` (old line 2) removed with nothing added in its place — so
     /// the row it produces has an old lineno but NO new one, the fallback case
-    /// [`App::copy_path_line`]'s doc names.
+    /// [`resolve_yank_rows`]'s doc names.
     fn pure_deletion_fixture() -> Fixture {
         FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -13811,28 +13910,29 @@ mod tests {
             .unwrap()
     }
 
-    // These target `App::resolve_copy_path_line` directly rather than `App::copy_path_line` —
-    // resolution is pure, but `copy_path_line` itself writes to `/dev/tty` via
-    // `crate::clipboard::write_osc52`, which is `ENXIO` in a test harness/CI with no controlling
-    // tty. Asserting through the notice text would make line resolution depend on a real
-    // terminal for no reason; the byte-sequence tests in `clipboard.rs` cover the write side.
+    // These target `App::resolve_copy_location`/`App::resolve_copy_lines` directly rather than
+    // `App::copy_location`/`App::copy_lines` — resolution is pure, but the verbs themselves write
+    // to `/dev/tty` via `crate::clipboard::write_osc52`, which is `ENXIO` in a test harness/CI
+    // with no controlling tty. Asserting through the notice text would make line resolution
+    // depend on a real terminal for no reason; the byte-sequence tests in `clipboard.rs` cover
+    // the write side.
 
     #[test]
-    fn copy_path_line_uses_the_new_side_on_a_context_row_in_both_layouts() {
+    fn copy_location_uses_the_new_side_on_a_context_row_in_both_layouts() {
         let fixture = pure_addition_fixture();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
         app.cursor = 0; // the leading "a" context row: old 1, new 1
 
-        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:1".to_string()));
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:1".to_string()));
 
         app.toggle_layout();
         app.cursor = 0;
-        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:1".to_string()));
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:1".to_string()));
     }
 
     #[test]
-    fn copy_path_line_uses_the_new_side_on_a_pure_addition_row_in_both_layouts() {
+    fn copy_location_uses_the_new_side_on_a_pure_addition_row_in_both_layouts() {
         let fixture = pure_addition_fixture();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
@@ -13845,7 +13945,7 @@ mod tests {
             .expect("the inserted 'b' has its own SBS row at new line 2");
         app.cursor = row;
 
-        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:2".to_string()));
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:2".to_string()));
 
         app.toggle_layout();
         let inline_row = app
@@ -13856,11 +13956,11 @@ mod tests {
             .position(|r| matches!(r, InlineRow::Add { new: 2, .. }))
             .expect("the inserted 'b' has its own inline Add row");
         app.cursor = inline_row;
-        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:2".to_string()));
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:2".to_string()));
     }
 
     #[test]
-    fn copy_path_line_falls_back_to_the_old_lineno_on_a_pure_deletion_row_in_both_layouts() {
+    fn copy_location_falls_back_to_the_old_lineno_on_a_pure_deletion_row_in_both_layouts() {
         let fixture = pure_deletion_fixture();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
@@ -13874,7 +13974,7 @@ mod tests {
         app.cursor = row;
 
         assert_eq!(
-            app.resolve_copy_path_line(),
+            app.resolve_copy_location(),
             Ok("f.txt:2".to_string()),
             "no new side on a pure deletion: falls back to the old lineno"
         );
@@ -13888,18 +13988,18 @@ mod tests {
             .position(|r| matches!(r, InlineRow::Del { old: 2, .. }))
             .expect("the deleted 'b' has its own inline Del row");
         app.cursor = inline_row;
-        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:2".to_string()));
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:2".to_string()));
     }
 
     #[test]
-    fn copy_path_line_resolver_errs_instead_of_returning_garbage_on_a_gap_row_in_both_layouts() {
+    fn copy_location_resolver_errs_instead_of_returning_garbage_on_a_gap_row_in_both_layouts() {
         let fixture = two_hunks_with_a_wide_gap_fixture();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
         app.cursor = only_gap_row(&app);
 
         assert_eq!(
-            app.resolve_copy_path_line(),
+            app.resolve_copy_location(),
             Err("no line to copy"),
             "a gap row carries neither an old nor a new lineno"
         );
@@ -13913,6 +14013,155 @@ mod tests {
             .position(|r| matches!(r, InlineRow::Gap { .. }))
             .expect("the same wide context run collapses to an inline Gap row too");
         app.cursor = inline_gap;
-        assert_eq!(app.resolve_copy_path_line(), Err("no line to copy"));
+        assert_eq!(app.resolve_copy_location(), Err("no line to copy"));
+    }
+
+    /// Multi-row selection -> content, in both layouts, over a range spanning a deletion, an
+    /// addition, and a context row (`two_changes_one_hunk_fixture`: `a b c d e` -> `a B c D e`).
+    /// SBS pairs `b`/`B` and `d`/`D` into single rows each carrying both sides, so the range
+    /// `[paired(b,B), context c, paired(d,D)]` resolves to the NEW side throughout (decision 4):
+    /// `B`, `c`, `D`.
+    #[test]
+    fn multi_row_selection_copies_content_spanning_del_add_context_sbs() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.current_view_ref().unwrap().display.len(), 5);
+        app.cursor = 1;
+        app.selection_anchor = Some(1);
+        app.cursor = 3;
+
+        assert_eq!(app.resolve_copy_lines(), Ok("B\nc\nD".to_string()));
+    }
+
+    /// Inline analog: the same span becomes `Del(b) Add(B) Context(c) Del(d) Add(D)` — selecting
+    /// from the first `Add` through the second `Add` picks up `Add(B) Context(c) Del(d) Add(D)`.
+    /// Unlike SBS, inline is per-side precise (decision 4): the `Del(d)` row in the middle
+    /// contributes its OLD text (`d`), separately from the following `Add(D)`'s NEW text — this
+    /// is the row-precision inline exists for, not a bug.
+    #[test]
+    fn multi_row_selection_copies_content_spanning_del_add_context_inline() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.toggle_layout();
+        let inline = &app.current_view_ref().unwrap().inline;
+        let lo = inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Add { new: 2, .. }))
+            .expect("the b->B add has its own inline row");
+        let hi = inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Add { new: 4, .. }))
+            .expect("the d->D add has its own inline row");
+        app.cursor = lo;
+        app.selection_anchor = Some(lo);
+        app.cursor = hi;
+
+        assert_eq!(app.resolve_copy_lines(), Ok("B\nc\nd\nD".to_string()));
+    }
+
+    /// Multi-row selection -> `path:lo-hi`, both layouts, over the same del/add/context span.
+    #[test]
+    fn multi_row_selection_copies_a_lo_hi_location_range_both_layouts() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cursor = 1;
+        app.selection_anchor = Some(1);
+        app.cursor = 3;
+
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:2-4".to_string()));
+
+        app.cancel_selection();
+        app.toggle_layout();
+        let inline = &app.current_view_ref().unwrap().inline;
+        let lo = inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Add { new: 2, .. }))
+            .expect("the b->B add has its own inline row");
+        let hi = inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Add { new: 4, .. }))
+            .expect("the d->D add has its own inline row");
+        app.cursor = lo;
+        app.selection_anchor = Some(lo);
+        app.cursor = hi;
+
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:2-4".to_string()));
+    }
+
+    /// Single-row selection collapses to the single-line `path:12` form (decision 6), not
+    /// `path:12-12`.
+    #[test]
+    fn single_row_selection_collapses_to_the_single_line_location_form() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cursor = 1; // the paired b->B row
+        app.selection_anchor = Some(1);
+
+        assert_eq!(app.resolve_copy_location(), Ok("f.txt:2".to_string()));
+    }
+
+    /// A selection spanning a gap row: the gap contributes nothing (decision 5), but its
+    /// neighbors on either side are still copied.
+    #[test]
+    fn selection_spanning_a_gap_row_skips_the_gap_but_copies_its_neighbors() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let gap_row = only_gap_row(&app);
+        assert!(gap_row > 0, "expects at least one row before the gap");
+        app.cursor = gap_row - 1;
+        app.selection_anchor = Some(gap_row - 1);
+        app.cursor = gap_row + 1;
+
+        let content = app
+            .resolve_copy_lines()
+            .expect("neighbors on either side of the gap still resolve");
+        assert_eq!(
+            content.lines().count(),
+            2,
+            "exactly the two non-gap neighbors, the gap row itself contributes nothing: {content:?}"
+        );
+    }
+
+    /// A range resolving to no text at all (every row a gap) errs rather than writing an empty
+    /// clipboard payload.
+    #[test]
+    fn an_all_gap_range_errs_instead_of_copying_empty() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.selection_anchor = Some(gap_row);
+
+        assert_eq!(app.resolve_copy_lines(), Err("no line to copy"));
+        assert_eq!(app.resolve_copy_location(), Err("no line to copy"));
+    }
+
+    /// Content yank in `Role::Combined` succeeds — locked decision 7 pins this against a future
+    /// "helpful" refusal: decision 4's side-selection rule is total (it always yields a side), so
+    /// unlike the staging verbs there is nothing to refuse. `start_selection` itself still gates
+    /// combined (it's a staging-shaped verb), so the selection is set directly here rather than
+    /// through `v`.
+    #[test]
+    fn content_yank_succeeds_in_combined_role() {
+        let fixture = two_changes_one_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = super::Zoom::Combined;
+        app.open_current();
+        assert_eq!(
+            app.staging_role(),
+            None,
+            "Zoom::Combined always resolves to Role::Combined (effective_zoom)"
+        );
+        app.cursor = 1;
+        app.selection_anchor = Some(1);
+        app.cursor = 3;
+
+        assert_eq!(app.resolve_copy_lines(), Ok("B\nc\nD".to_string()));
     }
 }
