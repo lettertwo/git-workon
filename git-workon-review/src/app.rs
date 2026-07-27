@@ -19,7 +19,7 @@ use workon::{Changeset, ChangesetSpan};
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{
     align_file, collapse_gaps, collapse_gaps_with_expansions, gap_hidden_range, inline_rows,
-    AlignedRow, CellKind, DisplayRow, GapExpansion, InlineRow, Row,
+    AlignedRow, CellKind, DisplayRow, GapExpansion, InlineRow, Row, CONTEXT_LINES,
 };
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
@@ -1475,11 +1475,14 @@ pub struct App {
     search_focused: bool,
     /// The CURRENT search text's matches (the live prompt buffer's while [`Self::search_focused`],
     /// else [`Self::search_query`]'s) against the focused pane's file, in file order — recomputed
-    /// by [`Self::recompute_search`] on every trigger the M11 CS3 plan names: prompt edits, accept,
-    /// abort, file/changeset switch, refresh, layout/zoom change.
+    /// by [`Self::recompute_search`]/[`Self::recompute_search_keep_current`] on every trigger the
+    /// M11 CS3 plan names: prompt edits, accept, abort, file/changeset switch, refresh, zoom
+    /// change, layout change.
     search_matches: Vec<crate::search::SearchMatch>,
     /// Index into [`Self::search_matches`] of the match the cursor is currently parked on —
-    /// `None` while merely previewing (typing, before `Enter`) or when there's nothing to park on.
+    /// `None` while merely previewing (typing, before `Enter`), when there's nothing to park on, or
+    /// after a trigger with no "cursor is parked on match N" claim to make (see
+    /// [`Self::recompute_search`] vs [`Self::recompute_search_keep_current`]).
     search_current: Option<usize>,
 }
 
@@ -3628,12 +3631,32 @@ impl App {
     /// Recompute [`Self::search_matches`] from [`Self::active_search_text`] against the FOCUSED
     /// pane's current file view — called on every trigger the M11 CS3 plan names: every prompt
     /// edit (live preview), accept/abort, file/changeset switch and refresh (both funnel through
-    /// [`Self::reset_panes`]), and a layout/zoom change (harmless to re-run even when the match
-    /// content can't have changed — matches address the layout-agnostic `AlignedRow` space).
-    /// [`Self::search_current`] always resets to `None` here: a fresh match list has no "the
-    /// cursor is parked on match N" claim to make until [`Self::search_accept`]/
-    /// [`Self::search_next`]/[`Self::search_prev`] jumps to one.
+    /// [`Self::reset_panes`]), and a layout change (harmless to re-run even when the match content
+    /// can't have changed — matches address the layout-agnostic `AlignedRow` space).
+    /// [`Self::search_current`] resets to `None` here: a query edit, accept/abort, or a
+    /// file/changeset switch/refresh has no "the cursor is parked on match N" claim left to make
+    /// until [`Self::search_accept`]/[`Self::search_next`]/[`Self::search_prev`] jumps to one.
     fn recompute_search(&mut self) {
+        self.recompute_search_inner(None);
+    }
+
+    /// [`Self::recompute_search`], but for a trigger that reshapes ONLY how the match list resolves
+    /// to rows — not the match list's own content or which file it's against (`toggle_layout` and
+    /// its `reload_view_config` echo, both same-file layout flips). Carries
+    /// [`Self::search_current`] across: captures the currently-current [`crate::search::SearchMatch`]
+    /// by value before recomputing, then re-finds its index in the new (address-identical) list and
+    /// restores it if still present — `SearchMatch` is `Copy + PartialEq`, so this is cheap. A
+    /// zoom change does NOT use this path even though it also funnels through `reset_panes`: it
+    /// swaps which role's (staged/unstaged/combined) content is current, a genuinely different match
+    /// list, so the plain reset in [`Self::recompute_search`] is the correct behavior there too.
+    fn recompute_search_keep_current(&mut self) {
+        let prior = self
+            .search_current
+            .and_then(|i| self.search_matches.get(i).copied());
+        self.recompute_search_inner(prior);
+    }
+
+    fn recompute_search_inner(&mut self, prior_current: Option<crate::search::SearchMatch>) {
         self.search_current = None;
         let Some(text) = self.active_search_text() else {
             self.search_matches.clear();
@@ -3648,6 +3671,9 @@ impl App {
             Some(view) => view.search_matches(&text),
             None => Vec::new(),
         };
+        if let Some(m) = prior_current {
+            self.search_current = self.search_matches.iter().position(|&x| x == m);
+        }
     }
 
     /// `Enter` while the prompt is focused: commit the buffer as the accepted query, close the
@@ -3830,6 +3856,12 @@ impl App {
     /// match's (old, new) lineno pair and land there. `wrapped` raises the footer notice the plan
     /// calls for; a match whose row can't be located post-expansion (should be unreachable once
     /// expanded) leaves the cursor where it was rather than panicking.
+    ///
+    /// The reveal is BOUNDED, not full: widen only whichever gap edge sits nearer the match, by
+    /// just enough rows to surface it plus a small [`crate::align::CONTEXT_LINES`] margin, rather
+    /// than dumping the entire hidden run (`full: true`) the way an earlier round did. `expand_gap`
+    /// accumulates, so repeated jumps into the same gap widen it further rather than resetting —
+    /// deliberately not reset here.
     fn jump_to_search_match(&mut self, idx: usize, wrapped: bool) {
         let Some(&m) = self.search_matches.get(idx) else {
             return;
@@ -3838,10 +3870,22 @@ impl App {
 
         if let Some(view) = self.current_view() {
             if let Some(key) = crate::align::gap_key_for_aligned_idx(&view.aligned, m.aligned_idx) {
-                let hidden = crate::align::gap_hidden_range(&view.aligned, key, &view.expansions)
-                    .is_some_and(|(start, end)| m.aligned_idx >= start && m.aligned_idx < end);
-                if hidden {
-                    view.expand_gap(key, 0, 0, true);
+                if let Some((start, end)) = gap_hidden_range(&view.aligned, key, &view.expansions) {
+                    if m.aligned_idx >= start && m.aligned_idx < end {
+                        // Reveal from whichever edge is nearer the match: `dist_to_start` rows lie
+                        // between the hidden range's leading edge and the match (inclusive of the
+                        // match's own row), `dist_to_end` the same from the trailing edge. Widen
+                        // that edge by `dist + 1` (through the match's row) plus a small context
+                        // margin, so the reveal reads like the rest of the file rather than
+                        // stopping dead on the match itself.
+                        let dist_to_start = m.aligned_idx - start;
+                        let dist_to_end = end - 1 - m.aligned_idx;
+                        if dist_to_start <= dist_to_end {
+                            view.expand_gap(key, dist_to_start + 1 + CONTEXT_LINES, 0, false);
+                        } else {
+                            view.expand_gap(key, 0, dist_to_end + 1 + CONTEXT_LINES, false);
+                        }
+                    }
                 }
             }
         }
@@ -4564,10 +4608,11 @@ impl App {
             };
         }
         self.derive_scroll();
-        // M11 CS3: named as a recompute trigger by the plan even though the match ADDRESSES
-        // (aligned-space) can't actually change here — only which display/inline row each one
-        // resolves to. Cheap to re-run regardless (see [`Self::recompute_search`]'s doc comment).
-        self.recompute_search();
+        // M11 CS3: the match ADDRESSES (aligned-space) can't actually change here — only which
+        // display/inline row each one resolves to — so carry `search_current` across rather than
+        // losing the "you are on match N" highlight to a same-file layout flip. See
+        // [`Self::recompute_search_keep_current`]'s doc comment.
+        self.recompute_search_keep_current();
     }
 
     /// Set the render layout directly — the config-startup (CS7) counterpart to
@@ -4725,7 +4770,9 @@ impl App {
                 };
             }
             self.derive_scroll();
-            self.recompute_search();
+            // Mirrors `toggle_layout`'s tail: same-file layout flip, so carry `search_current`
+            // across rather than losing it (see [`Self::recompute_search_keep_current`]).
+            self.recompute_search_keep_current();
         }
 
         if self.outline.mode != outline_mode_before || self.outline.order != outline_order_before {
@@ -12542,18 +12589,20 @@ mod tests {
     }
 
     #[test]
-    fn search_accept_jumps_to_the_first_match_and_auto_expands_its_gap() {
+    fn search_accept_jumps_to_the_first_match_and_reveals_its_gap_around_it() {
         let fixture = two_hunks_with_a_buried_needle_fixture();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        assert!(
-            app.current_view_ref()
-                .unwrap()
-                .display
-                .iter()
-                .any(|r| matches!(r, DisplayRow::Gap { .. })),
-            "precondition: the fixture's wide context run must start out collapsed"
-        );
+        let skipped_before = app
+            .current_view_ref()
+            .unwrap()
+            .display
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::Gap { skipped, .. } => Some(*skipped),
+                _ => None,
+            })
+            .expect("precondition: the fixture's wide context run must start out collapsed");
 
         app.search_focus();
         for c in "needle".chars() {
@@ -12562,22 +12611,108 @@ mod tests {
         app.search_accept();
 
         let view = app.current_view_ref().unwrap();
+        let skipped_after = view.display.iter().find_map(|r| match r {
+            DisplayRow::Gap { skipped, .. } => Some(*skipped),
+            _ => None,
+        });
         assert!(
-            !view
-                .display
-                .iter()
-                .any(|r| matches!(r, DisplayRow::Gap { .. })),
-            "jumping to a match buried in the gap must fully reveal it: {:?}",
+            skipped_after.is_some_and(|skipped| skipped < skipped_before),
+            "the reveal is BOUNDED, not full: some of the run must still be collapsed, just \
+             less of it than before (was {skipped_before} skipped, now {skipped_after:?}): {:?}",
             view.display
         );
         match view.display[app.cursor] {
             DisplayRow::Row(row) => {
                 assert_eq!(row.old, Row::Line(21), "needle_line is old-side line 21");
             }
-            other => panic!("expected the cursor to land on the needle's row, got {other:?}"),
+            other => panic!(
+                "expected the cursor to land on the needle's row (revealed by the bounded \
+                 expansion), got {other:?}"
+            ),
         }
         assert!(!app.search_focused(), "accept must close the prompt");
         assert!(app.search_active());
+    }
+
+    /// One wide hidden context run (50 lines) with two needles far apart inside it — `needleA`
+    /// near the leading edge (line 10), `needleB` near the trailing edge (line 35) — so jumping to
+    /// each in turn widens the SAME gap from opposite edges. CS3's "repeated jumps into one gap
+    /// accumulate rather than reset" fixture.
+    fn one_gap_with_two_needles_fixture() -> Fixture {
+        let mut committed = String::from("OLD_HUNK_A\n");
+        let mut modified = String::from("NEW_HUNK_A\n");
+        for i in 1..=50 {
+            let line = match i {
+                10 => "needleA".to_string(),
+                35 => "needleB".to_string(),
+                _ => format!("ctx{i}"),
+            };
+            committed.push_str(&line);
+            committed.push('\n');
+            modified.push_str(&line);
+            modified.push('\n');
+        }
+        committed.push_str("OLD_HUNK_B\n");
+        modified.push_str("NEW_HUNK_B\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn jump_to_search_match_accumulates_expansion_across_repeated_jumps_into_one_gap() {
+        let fixture = one_gap_with_two_needles_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+        assert_eq!(app.search_matches().len(), 2, "both needles must be found");
+
+        let key = *app
+            .current_view_ref()
+            .unwrap()
+            .expansions
+            .keys()
+            .next()
+            .expect("jumping to needleA must have created a gap expansion entry");
+        let after_first = app.current_view_ref().unwrap().expansions[&key];
+        assert!(
+            !after_first.full,
+            "a bounded reveal must not flip the gap's `full` flag"
+        );
+        assert!(
+            after_first.before > 0,
+            "needleA sits nearer the gap's leading edge, so the first jump must widen `before`"
+        );
+        assert_eq!(
+            after_first.after, 0,
+            "the first jump must not have touched the trailing edge yet"
+        );
+
+        // needleB is still buried under the (now-narrower) gap — jumping to it must widen the
+        // TRAILING edge on top of the leading-edge widening the first jump already did, not
+        // discard it.
+        app.search_next();
+        let after_second = app.current_view_ref().unwrap().expansions[&key];
+        assert_eq!(
+            after_second.before, after_first.before,
+            "expand_gap accumulates: the second jump must not reset the first jump's `before` widening"
+        );
+        assert!(
+            after_second.after > 0,
+            "needleB sits nearer the gap's trailing edge, so the second jump must widen `after`"
+        );
+        assert!(
+            !after_second.full,
+            "two bounded reveals into a 50-row run must not have consumed the whole gap"
+        );
     }
 
     #[test]
@@ -12675,6 +12810,111 @@ mod tests {
             "Esc's search-clear arm must deactivate the search"
         );
         assert!(app.search_matches().is_empty());
+    }
+
+    #[test]
+    fn toggle_layout_preserves_the_current_search_match() {
+        // Two matches so landing on the SECOND one (rather than the first, which a fresh
+        // recompute would also happen to pick) proves the index is actually carried across,
+        // not coincidentally re-derived.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "f.txt",
+                "alpha old\nctx\nbeta old\n",
+                "alpha needle\nctx\nbeta needle\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+        app.search_next();
+        assert_eq!(
+            app.search_current_index(),
+            Some(1),
+            "precondition: parked on the second match"
+        );
+
+        app.toggle_layout();
+        assert_eq!(
+            app.search_current_index(),
+            Some(1),
+            "a same-file layout flip must not lose the 'parked on match N' highlight — matches \
+             address the layout-agnostic AlignedRow space, so it's still valid"
+        );
+        assert_eq!(
+            app.search_matches().len(),
+            2,
+            "the match list itself must still be intact after the flip"
+        );
+
+        // Flip back: still preserved, not a one-shot fluke of the first toggle.
+        app.toggle_layout();
+        assert_eq!(app.search_current_index(), Some(1));
+    }
+
+    #[test]
+    fn search_current_still_resets_on_a_query_change_and_a_file_switch() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "a.txt",
+                "alpha old\nctx\nbeta old\n",
+                "alpha needle\nctx\nbeta needle\n",
+            )
+            .unstaged_file("b.txt", "old\n", "needle\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+        app.search_next();
+        assert_eq!(app.search_current_index(), Some(1), "precondition");
+
+        // A file switch funnels through `reset_panes`, not the layout-toggle path — genuinely a
+        // different file's match list, so the old index has no claim to carry over.
+        app.next_file();
+        assert_eq!(
+            app.search_current_index(),
+            None,
+            "switching files must still drop the parked-match highlight"
+        );
+
+        // Back on the first file: re-accepting is a query-change-shaped recompute (the plan's
+        // "changed query" case), which must also reset even though the match list ends up
+        // identical to before.
+        app.prev_file();
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+        app.search_next();
+        assert_eq!(
+            app.search_current_index(),
+            Some(1),
+            "re-primed precondition"
+        );
+
+        app.search_backspace();
+        app.search_insert_char('e'); // buffer back to "needle" — same effective query
+        assert_eq!(
+            app.search_current_index(),
+            None,
+            "a live prompt edit must reset the parked-match highlight even if the resulting \
+             query is unchanged — CS3 only carries the index across a layout flip, nothing else"
+        );
     }
 
     // ── CS9: reveal gaps to the enclosing tree-sitter scope ─────────────────
