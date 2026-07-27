@@ -118,6 +118,12 @@ pub struct FileView {
     display_hunk: Vec<Option<usize>>,
     /// Inline-coordinate analog of [`Self::display_hunk`], indexed against [`Self::inline`].
     inline_hunk: Vec<Option<usize>>,
+    /// Carried straight from [`crate::align::Aligned::mismatched`] — this load's hunk geometry
+    /// disagreed with the old/new line counts it was aligned against (a concurrent workdir write
+    /// between diff acquisition and this load's blob read). `ensure_role_loaded` reads this once,
+    /// right after building the view, to decide whether to trigger a one-shot re-diff; the field
+    /// itself is inert afterward (nothing re-checks it later).
+    pub(crate) geometry_mismatch: bool,
 }
 
 impl FileView {
@@ -162,12 +168,12 @@ impl FileView {
         let old_lines: Vec<String> = old_text.lines().map(str::to_string).collect();
         let new_lines: Vec<String> = new_text.lines().map(str::to_string).collect();
 
-        let aligned = align_file(&file.hunks, old_lines.len(), new_lines.len()).rows;
+        let aligned = align_file(&file.hunks, old_lines.len(), new_lines.len());
         let old_hl = ts.highlight_file(old_source_path, &old_text);
         let new_hl = ts.highlight_file(&file.path, &new_text);
 
         let mut view = Self {
-            aligned,
+            aligned: aligned.rows,
             expansions: HashMap::new(),
             hunks: file.hunks.clone(),
             old_text,
@@ -184,6 +190,7 @@ impl FileView {
             inline_word_spans: HashMap::new(),
             display_hunk: Vec::new(),
             inline_hunk: Vec::new(),
+            geometry_mismatch: aligned.mismatched,
         };
         view.rebuild_rows();
         view
@@ -1484,6 +1491,13 @@ pub struct App {
     /// after a trigger with no "cursor is parked on match N" claim to make (see
     /// [`Self::recompute_search`] vs [`Self::recompute_search_keep_current`]).
     search_current: Option<usize>,
+    /// Set for the DURATION of a [`Self::coordinated_refresh`] triggered by
+    /// [`Self::handle_geometry_mismatch`] — guards against a refresh loop when a file is being
+    /// written to continuously: while `true`, a mismatch detected by a load nested inside that
+    /// refresh (its own `open_current` reloading the same file) is tolerated with the clamp
+    /// instead of triggering ANOTHER refresh. Always `false` outside that call; never persists
+    /// across separate load attempts, so the next one gets its own single retry.
+    refreshing_for_geometry_mismatch: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1674,6 +1688,7 @@ impl App {
             search_focused: false,
             search_matches: Vec::new(),
             search_current: None,
+            refreshing_for_geometry_mismatch: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -2170,6 +2185,12 @@ impl App {
             else {
                 return;
             };
+            if self.handle_geometry_mismatch(&view) {
+                // The nested refresh's own `open_current` already reloaded (and cached) this
+                // file/role through this same chokepoint — see `handle_geometry_mismatch`'s doc
+                // comment. Nothing left for this call to do.
+                return;
+            }
             self.views_for_mut(role)[idx] = Some(view);
             return;
         }
@@ -2182,7 +2203,45 @@ impl App {
         let Some(view) = build_combined_view(&self.repo, &mut self.highlighter, span, &file) else {
             return;
         };
+        if self.handle_geometry_mismatch(&view) {
+            return;
+        }
         self.cur_mut().views_combined[idx] = Some(view);
+    }
+
+    /// A just-built `view` whose [`FileView::geometry_mismatch`] is set means its hunks were
+    /// diffed against a DIFFERENT revision than the one [`FileView::load`] just read blobs from
+    /// (a concurrent workdir write racing the load — see [`crate::align::Aligned::mismatched`]).
+    /// Part 1's clamp already keeps that survivable, but a silently clamped tail is still wrong
+    /// content on screen, so this drives [`Self::coordinated_refresh`] to re-acquire the diff
+    /// against the file's CURRENT state instead of just rendering the clamp.
+    ///
+    /// Returns `true` when it triggered a refresh — the caller must NOT cache `view` in that case;
+    /// [`Self::coordinated_refresh`]'s own [`Self::refresh`] ends in [`Self::open_current`], which
+    /// re-enters [`Self::ensure_role_loaded`] for the same file and caches whatever THAT retry
+    /// produces. Returns `false` (view unaffected) when there's no mismatch, or when this IS that
+    /// retry — [`Self::refreshing_for_geometry_mismatch`] guards against a refresh loop for a file
+    /// under continuous writes: at most one refresh per load attempt. A mismatch that survives the
+    /// retry is accepted via the clamp, with a footer notice telling the user their diff may be
+    /// misaligned, rather than refreshing forever.
+    fn handle_geometry_mismatch(&mut self, view: &FileView) -> bool {
+        if !view.geometry_mismatch {
+            return false;
+        }
+        if self.refreshing_for_geometry_mismatch {
+            // No key hint here (unlike `notify_combined_refusal`'s zoom-key label): `refresh` is
+            // a remappable binding this call site has no seated label for, and inventing one
+            // just for this message isn't worth a second `zoom_key_label`-style field.
+            self.notify(
+                "file changed on disk while loading — diff may be misaligned; refresh to fix",
+                Severity::Info,
+            );
+            return false;
+        }
+        self.refreshing_for_geometry_mismatch = true;
+        self.coordinated_refresh();
+        self.refreshing_for_geometry_mismatch = false;
+        true
     }
 
     pub fn current_view(&mut self) -> Option<&mut FileView> {
@@ -7474,6 +7533,36 @@ mod tests {
             app.notice.is_none(),
             "a PR-source refresh must no-op, not attempt (and fail) a network re-resolution"
         );
+    }
+
+    // ---- stale-diff alignment crash: workdir races diff acquisition ----------------------
+
+    /// The confirmed repro (2026-07-27 handoff): `file.hunks` are diffed against the workdir
+    /// state as it stood at diff-acquisition time, but `FileView::load`'s new-side text for
+    /// `Role::Unstaged`/`Combined` is a LIVE workdir read (see its role table) — if the file grows
+    /// on disk in between (an editor or agent writing to it while the TUI sits idle), the hunk
+    /// geometry and the freshly-read line count describe different revisions of the same file.
+    /// Before the fix this panicked the `debug_assert_eq!` in `align.rs`'s tail-gap clamp
+    /// (`left: 0, right: 3`, `trailing context after the last hunk must be equal length on both
+    /// sides`). Part 1 makes `align_file` tolerant instead of asserting; Part 2 detects the
+    /// mismatch and re-diffs once to correct it — this test only pins that the load survives.
+    ///
+    /// Note the asymmetry the handoff calls out: the file GROWING reproduces this; the same
+    /// fixture with the workdir SHRUNK does not (the mismatch only escapes the pre-fix `.min()`
+    /// clamp in one direction) — this test deliberately only covers the growing case.
+    #[test]
+    fn workdir_growing_after_diff_acquisition_does_not_crash_the_load() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "a\nb\nc\nd\ne\n", "a\nB\nc\nd\ne\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        // Diffs are already acquired. Now the file grows on disk, as it would if an editor or an
+        // agent wrote to it while the TUI sat idle.
+        let workdir = fixture.repo().unwrap().workdir().unwrap().to_path_buf();
+        std::fs::write(workdir.join("f.txt"), "a\nB\nc\nd\ne\nf\ng\nh\n").unwrap();
+        app.open_current();
     }
 
     // ---- ADR-031 refresh: span-keyed reuse, uncommitted always sync, async waves ----------

@@ -75,6 +75,13 @@ impl AlignedRow {
 
 pub struct Aligned {
     pub rows: Vec<AlignedRow>,
+    /// Whether [`align_file`] had to clamp a hunk-gap or trailing-tail span whose old/new
+    /// lengths disagreed — see the clamps below for why this is a real, reachable runtime state
+    /// (stale diff geometry against a freshly-read blob) rather than a bug. `false` for the
+    /// common case where `hunks`/`old_line_count`/`new_line_count` were all derived from the
+    /// same file revision, which is every path except a load racing a concurrent workdir write
+    /// (see [`crate::app::FileView::load`]).
+    pub mismatched: bool,
 }
 
 fn gap_end(start: usize, count: usize) -> usize {
@@ -119,6 +126,9 @@ pub fn align_file(hunks: &[Hunk], old_line_count: usize, new_line_count: usize) 
     let mut rows = Vec::new();
     let mut old_pos = 0usize; // count of old lines already emitted
     let mut new_pos = 0usize;
+    // Set when a gap or the tail below has to clamp instead of pairing 1:1 — see `Aligned::
+    // mismatched`'s doc comment for why this is reachable at runtime rather than a bug.
+    let mut mismatched = false;
 
     for hunk in hunks {
         let old_start = hunk.old_start as usize;
@@ -130,10 +140,18 @@ pub fn align_file(hunks: &[Hunk], old_line_count: usize, new_line_count: usize) 
         let new_ge = gap_end(new_start, new_count);
         let old_gap = old_ge.saturating_sub(old_pos);
         let new_gap = new_ge.saturating_sub(new_pos);
-        debug_assert_eq!(
-            old_gap, new_gap,
-            "context gap between hunks must be equal length on both sides"
-        );
+        // `old_gap`/`new_gap` disagreeing means `hunks` itself carries internally inconsistent
+        // geometry — every hunk in a single valid diff is self-consistent with its neighbors (all
+        // positions relative to the same two blobs), so this branch shouldn't fire for hunks this
+        // module actually receives today. But `align_file` has no way to verify a `hunks` slice
+        // it's handed is well-formed, and the tail clamp below proves a geometry assumption CAN
+        // silently break for a reason outside this function's control (a load racing a concurrent
+        // workdir write — see `Aligned::mismatched`'s doc comment). Treating this the same way —
+        // clamp and flag, don't assert — costs nothing and keeps both clamps symmetric rather
+        // than leaving one crash-on-mismatch path alive for a future caller to rediscover.
+        if old_gap != new_gap {
+            mismatched = true;
+        }
         let gap = old_gap.min(new_gap);
         for i in 0..gap {
             rows.push(AlignedRow {
@@ -173,13 +191,17 @@ pub fn align_file(hunks: &[Hunk], old_line_count: usize, new_line_count: usize) 
         new_pos = new_start + new_count.saturating_sub(1);
     }
 
-    // Tail gap after the last hunk (or the whole file, if there are no hunks).
+    // Tail gap after the last hunk (or the whole file, if there are no hunks). This IS the
+    // empirically-confirmed mismatch (unlike the inter-hunk gap above): `old_line_count`/
+    // `new_line_count` are read from the full old/new text at LOAD time (a live workdir read for
+    // the new side, per `crate::app::FileView::load`), while `old_pos`/`new_pos` derive from
+    // `hunks`, acquired earlier — a concurrent write between the two makes the tail lengths
+    // disagree. Clamp to the shorter side and flag it rather than asserting.
     let old_tail = old_line_count.saturating_sub(old_pos);
     let new_tail = new_line_count.saturating_sub(new_pos);
-    debug_assert_eq!(
-        old_tail, new_tail,
-        "trailing context after the last hunk must be equal length on both sides"
-    );
+    if old_tail != new_tail {
+        mismatched = true;
+    }
     let tail = old_tail.min(new_tail);
     for i in 0..tail {
         rows.push(AlignedRow {
@@ -190,7 +212,7 @@ pub fn align_file(hunks: &[Hunk], old_line_count: usize, new_line_count: usize) 
         });
     }
 
-    Aligned { rows }
+    Aligned { rows, mismatched }
 }
 
 /// A row of the gap-collapsed display, layered over [`AlignedRow`]s.
