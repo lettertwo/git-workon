@@ -75,7 +75,8 @@ pub enum Command {
     Search,
     SearchNext,
     SearchPrev,
-    CopyPathLine,
+    CopyLines,
+    CopyLocation,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -373,11 +374,18 @@ pub static REGISTRY: &[Registered] = &[
         description: "Previous search match (or previous hunk, when no search is active)",
     },
     Registered {
-        command: Command::CopyPathLine,
+        command: Command::CopyLines,
         view: View::Diff,
-        name: "copy-path-line",
+        name: "copy-lines",
         default_keys: "y",
-        description: "Copy path:line for the cursor row to the clipboard",
+        description: "Copy the selected (or cursor) lines' text to the clipboard",
+    },
+    Registered {
+        command: Command::CopyLocation,
+        view: View::Diff,
+        name: "copy-location",
+        default_keys: "Y",
+        description: "Copy path:line (or path:lo-hi) for the selected rows to the clipboard",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {
@@ -1383,21 +1391,27 @@ mod tests {
         );
     }
 
-    /// M11 (`copy-path-line`): `y` was free in both `View::Global` and `View::Diff` (unlike `p`,
-    /// which `[h`'s extra default and the outline's `prev-changeset` already claim), so no
-    /// existing binding needed to move to make room for it — unlike `cycle-zoom`'s `z` -> `Z`
-    /// rebind above. Pins the resolved default clash-free the same way those tests do.
+    /// M11 (`copy-lines`/`copy-location`, the yank split): `y` was free in both `View::Global`
+    /// and `View::Diff` (unlike `p`, which `[h`'s extra default and the outline's
+    /// `prev-changeset` already claim), so no existing binding needed to move to make room for
+    /// it — unlike `cycle-zoom`'s `z` -> `Z` rebind above. `Y` is likewise free (verified against
+    /// every `default_keys` entry in this registry when the yank split was designed). Pins both
+    /// resolved defaults clash-free the same way those tests do.
     #[test]
-    fn y_dispatches_copy_path_line_with_no_collisions() {
+    fn y_dispatches_copy_lines_and_shift_y_dispatches_copy_location_with_no_collisions() {
         let km = Keymap::defaults();
         assert!(
             km.warnings().is_empty(),
-            "copy-path-line's default `y` must not collide with anything: {:?}",
+            "copy-lines/copy-location's default `y`/`Y` must not collide with anything: {:?}",
             km.warnings()
         );
         assert_eq!(
             feed(&km, false, &[key(KeyCode::Char('y'))]),
-            Dispatch::Command(Command::CopyPathLine)
+            Dispatch::Command(Command::CopyLines)
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('Y'))]),
+            Dispatch::Command(Command::CopyLocation)
         );
     }
 

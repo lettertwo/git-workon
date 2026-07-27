@@ -1,4 +1,4 @@
-//! OSC 52 clipboard writes (M11, `copy-path-line`).
+//! OSC 52 clipboard writes (M11, `copy-lines`/`copy-location`).
 //!
 //! The only clipboard mechanism this crate has: an OSC 52 "set clipboard" escape sequence
 //! written to the controlling tty. No `arboard`-style dependency — the M11 handoff's locked
@@ -14,8 +14,9 @@
 //! that doesn't either ignores the sequence or (rarely) echoes stray bytes if some intermediate
 //! layer mishandles it — either way, nothing comes back on the wire to tell the caller which
 //! happened. [`write_osc52`] returning `Ok(())` therefore means only "the bytes reached
-//! `/dev/tty`", never "the clipboard actually changed". [`crate::app::App::copy_path_line`]'s
-//! footer notice is worded to match: "copied ... to clipboard", never "clipboard updated" —
+//! `/dev/tty`", never "the clipboard actually changed". [`crate::app::App::copy_lines`]'s and
+//! [`crate::app::App::copy_location`]'s shared footer notice is worded to match: "copied ... to
+//! clipboard", never "clipboard updated" —
 //! the latter phrasing is a claim a silent failure could falsify.
 //!
 //! ## Known gaps (deliberately deferred)
