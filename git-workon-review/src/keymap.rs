@@ -75,6 +75,7 @@ pub enum Command {
     Search,
     SearchNext,
     SearchPrev,
+    CopyPathLine,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -370,6 +371,13 @@ pub static REGISTRY: &[Registered] = &[
         name: "search-prev",
         default_keys: "N",
         description: "Previous search match (or previous hunk, when no search is active)",
+    },
+    Registered {
+        command: Command::CopyPathLine,
+        view: View::Diff,
+        name: "copy-path-line",
+        default_keys: "y",
+        description: "Copy path:line for the cursor row to the clipboard",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {
@@ -1372,6 +1380,24 @@ mod tests {
                 &[key(KeyCode::Char('z')), key(KeyCode::Char('R'))]
             ),
             Dispatch::Command(Command::ExpandAllGaps)
+        );
+    }
+
+    /// M11 (`copy-path-line`): `y` was free in both `View::Global` and `View::Diff` (unlike `p`,
+    /// which `[h`'s extra default and the outline's `prev-changeset` already claim), so no
+    /// existing binding needed to move to make room for it — unlike `cycle-zoom`'s `z` -> `Z`
+    /// rebind above. Pins the resolved default clash-free the same way those tests do.
+    #[test]
+    fn y_dispatches_copy_path_line_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "copy-path-line's default `y` must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('y'))]),
+            Dispatch::Command(Command::CopyPathLine)
         );
     }
 

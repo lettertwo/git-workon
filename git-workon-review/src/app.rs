@@ -3850,6 +3850,64 @@ impl App {
         self.search_step(false);
     }
 
+    /// The pure half of `copy-path-line`: resolve the cursor's row to a `path:line` string, with
+    /// no I/O. Split out from [`Self::copy_path_line`] so line resolution is testable without a
+    /// controlling tty — the OSC 52 write below needs one (`/dev/tty` is `ENXIO` in a test
+    /// harness/CI), but this resolution never should have depended on one in the first place.
+    ///
+    /// The line is the NEW side's lineno, falling back to the OLD side on a pure-deletion row
+    /// that carries no new side (M11 handoff locked decision 2 — deliberately NOT "whichever
+    /// side the split cursor is on": that per-side state doesn't exist yet, see the open
+    /// question logged in `docs/rfc/workon-review.md`). `path` is repo-relative, the same string
+    /// already shown everywhere else in this UI (outline, footer) — never an absolute path.
+    ///
+    /// `Err` names the reason there's nothing to copy — a row with neither lineno (a gap row) or
+    /// no file/view at all — which [`Self::copy_path_line`] turns straight into a footer notice.
+    fn resolve_copy_path_line(&self) -> Result<String, &'static str> {
+        let path = self
+            .files()
+            .get(self.current)
+            .map(|f| f.path.clone())
+            .ok_or("no file to copy")?;
+        let view = self.current_view_ref().ok_or("no line to copy")?;
+        let (old, new) = match self.layout {
+            Layout::Sbs => view
+                .display
+                .get(self.cursor)
+                .map(display_row_linenos)
+                .unwrap_or((None, None)),
+            Layout::Inline => view
+                .inline
+                .get(self.cursor)
+                .map(inline_row_linenos)
+                .unwrap_or((None, None)),
+        };
+        let line = new.or(old).ok_or("no line to copy")?;
+        Ok(format!("{path}:{line}"))
+    }
+
+    /// `y` (default binding `copy-path-line`): copy `path:line` for the cursor's row to the
+    /// system clipboard via OSC 52 ([`crate::clipboard::write_osc52`]). Resolution itself is
+    /// [`Self::resolve_copy_path_line`]; this wraps it with the I/O and the footer notice.
+    ///
+    /// The footer notice fires on both outcomes: success is worded "copied ... to clipboard",
+    /// deliberately not "clipboard updated" — OSC 52 is fire-and-forget (see the `clipboard`
+    /// module doc), so this can only claim the bytes reached the tty, never that the terminal
+    /// actually honored them.
+    pub fn copy_path_line(&mut self) {
+        let payload = match self.resolve_copy_path_line() {
+            Ok(payload) => payload,
+            Err(reason) => {
+                self.notify(reason, Severity::Error);
+                return;
+            }
+        };
+        match crate::clipboard::write_osc52(&payload) {
+            Ok(()) => self.notify(format!("copied {payload} to clipboard"), Severity::Info),
+            Err(err) => self.notify(format!("clipboard write failed: {err}"), Severity::Error),
+        }
+    }
+
     /// Park the cursor on [`Self::search_matches`]`[idx]`: auto-expand the gap it's hidden behind
     /// (if any — [`crate::align::gap_key_for_aligned_idx`] + [`FileView::expand_gap`], the
     /// existing CS8/CS9 machinery), then locate the row in the ACTIVE layout's own vector by the
@@ -13638,5 +13696,134 @@ mod tests {
             "the cursor merely clamps into the filtered list's bounds, exactly like the \
              pre-CS2 fallback for an unresolvable sync target"
         );
+    }
+
+    // ── `copy-path-line` (M11) ──────────────────────────────────────────────
+
+    /// A single pure deletion — `b` (old line 2) removed with nothing added in its place — so
+    /// the row it produces has an old lineno but NO new one, the fallback case
+    /// [`App::copy_path_line`]'s doc names.
+    fn pure_deletion_fixture() -> Fixture {
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "a\nb\nc\n", "a\nc\n")
+            .build()
+            .unwrap()
+    }
+
+    /// A single pure addition — `b` (new line 2) inserted with nothing removed — the mirror of
+    /// [`pure_deletion_fixture`]: this row has a new lineno but no old one, the ordinary case
+    /// (new-side wins, no fallback needed).
+    fn pure_addition_fixture() -> Fixture {
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "a\nc\n", "a\nb\nc\n")
+            .build()
+            .unwrap()
+    }
+
+    // These target `App::resolve_copy_path_line` directly rather than `App::copy_path_line` —
+    // resolution is pure, but `copy_path_line` itself writes to `/dev/tty` via
+    // `crate::clipboard::write_osc52`, which is `ENXIO` in a test harness/CI with no controlling
+    // tty. Asserting through the notice text would make line resolution depend on a real
+    // terminal for no reason; the byte-sequence tests in `clipboard.rs` cover the write side.
+
+    #[test]
+    fn copy_path_line_uses_the_new_side_on_a_context_row_in_both_layouts() {
+        let fixture = pure_addition_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cursor = 0; // the leading "a" context row: old 1, new 1
+
+        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:1".to_string()));
+
+        app.toggle_layout();
+        app.cursor = 0;
+        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:1".to_string()));
+    }
+
+    #[test]
+    fn copy_path_line_uses_the_new_side_on_a_pure_addition_row_in_both_layouts() {
+        let fixture = pure_addition_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let row = app
+            .current_view_ref()
+            .unwrap()
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Row(row) if row.new == Row::Line(2)))
+            .expect("the inserted 'b' has its own SBS row at new line 2");
+        app.cursor = row;
+
+        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:2".to_string()));
+
+        app.toggle_layout();
+        let inline_row = app
+            .current_view_ref()
+            .unwrap()
+            .inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Add { new: 2, .. }))
+            .expect("the inserted 'b' has its own inline Add row");
+        app.cursor = inline_row;
+        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:2".to_string()));
+    }
+
+    #[test]
+    fn copy_path_line_falls_back_to_the_old_lineno_on_a_pure_deletion_row_in_both_layouts() {
+        let fixture = pure_deletion_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let row = app
+            .current_view_ref()
+            .unwrap()
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Row(row) if row.old == Row::Line(2)))
+            .expect("the deleted 'b' has its own SBS row at old line 2");
+        app.cursor = row;
+
+        assert_eq!(
+            app.resolve_copy_path_line(),
+            Ok("f.txt:2".to_string()),
+            "no new side on a pure deletion: falls back to the old lineno"
+        );
+
+        app.toggle_layout();
+        let inline_row = app
+            .current_view_ref()
+            .unwrap()
+            .inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Del { old: 2, .. }))
+            .expect("the deleted 'b' has its own inline Del row");
+        app.cursor = inline_row;
+        assert_eq!(app.resolve_copy_path_line(), Ok("f.txt:2".to_string()));
+    }
+
+    #[test]
+    fn copy_path_line_resolver_errs_instead_of_returning_garbage_on_a_gap_row_in_both_layouts() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cursor = only_gap_row(&app);
+
+        assert_eq!(
+            app.resolve_copy_path_line(),
+            Err("no line to copy"),
+            "a gap row carries neither an old nor a new lineno"
+        );
+
+        app.toggle_layout();
+        let inline_gap = app
+            .current_view_ref()
+            .unwrap()
+            .inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Gap { .. }))
+            .expect("the same wide context run collapses to an inline Gap row too");
+        app.cursor = inline_gap;
+        assert_eq!(app.resolve_copy_path_line(), Err("no line to copy"));
     }
 }

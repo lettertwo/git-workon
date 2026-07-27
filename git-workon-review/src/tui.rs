@@ -473,6 +473,7 @@ enum Action {
     SearchFocus,
     SearchNext,
     SearchPrev,
+    CopyPathLine,
     None,
 }
 
@@ -511,6 +512,7 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::Search => Action::SearchFocus,
         Command::SearchNext => Action::SearchNext,
         Command::SearchPrev => Action::SearchPrev,
+        Command::CopyPathLine => Action::CopyPathLine,
         Command::NextFile => Action::NextFile,
         Command::PrevFile => Action::PrevFile,
         Command::NextHunk => Action::NextHunk,
@@ -686,6 +688,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::SearchFocus => app.search_focus(),
         Action::SearchNext => app.search_next(),
         Action::SearchPrev => app.search_prev(),
+        Action::CopyPathLine => app.copy_path_line(),
         Action::None => {}
     }
     false
