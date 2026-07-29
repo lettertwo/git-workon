@@ -264,7 +264,7 @@ impl Run for New {
                 {
                     output::warn(&format!(
                         "Branch '{}' already exists; --base ignored",
-                        &worktree_name
+                        worktree_name
                     ));
                 }
                 (worktree_name.clone(), None)
