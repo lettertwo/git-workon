@@ -71,9 +71,16 @@ pub enum StackModel {
 impl StackModel {
     /// Auto-detect the active stack model from the repository environment.
     ///
-    /// Returns [`StackModel::Graphite`] when `gt` is on PATH **and** the repo has been
-    /// initialized with `gt init` (`.graphite_repo_config` exists). Otherwise returns
+    /// Returns [`StackModel::Graphite`] when the repo has been initialized with `gt init`
+    /// (`.graphite_repo_config` or `.graphite_metadata.db` exists). Otherwise returns
     /// [`StackModel::None`].
+    ///
+    /// Deliberately does NOT consult [`graphite::detect_gt`]: the repo's own metadata is the
+    /// ground truth for "is this a Graphite stack," and reading it is pure libgit2 (see the
+    /// module docs — no `gt` process is needed for detection or visualization). Gating on the
+    /// binary's presence would report `None` for a genuine Graphite stack whenever `gt` happens
+    /// to be missing from PATH, silently emptying the review TUI's stack. Whether `gt` can be
+    /// *executed* is a separate question, and belongs to the call sites that execute it.
     ///
     /// Never returns [`StackModel::Git`]: auto-detection only distinguishes "a stack tool is
     /// active" from "no stack tool," since CLI routing treats any non-`None` model as
@@ -82,7 +89,7 @@ impl StackModel {
     /// explicit `workon.stackModel = git` config, or a caller mapping `None` to `Git` before
     /// calling [`crate::assemble_changesets`] (the review crate does this from M3 onward).
     pub fn detect(repo: &Repository) -> Self {
-        if graphite::detect_gt() && graphite::is_graphite_repo(repo) {
+        if graphite::is_graphite_repo(repo) {
             Self::Graphite
         } else {
             Self::None
@@ -241,6 +248,33 @@ pub fn group_by_stack(stacks: &[Option<Stack>]) -> StackGrouping {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use git_workon_fixture::prelude::*;
+
+    /// `detect` must resolve `Graphite` from repo metadata alone, with no dependency on whether
+    /// `gt` is installed on the host running the tests.
+    ///
+    /// The "gt absent" half cannot be forced from inside this process: it would mean mutating
+    /// `PATH`, which is process-global (`unsafe` under Rust 2024) and would race every other test
+    /// in this binary. Only the CLI suite can scrub `PATH` hermetically, by passing it to a child
+    /// process (`git-workon/tests/suite/new.rs`'s `path_without_gt_new`). So the guard here is
+    /// environmental rather than hermetic — CI has no `gt`, so a reintroduced `detect_gt()` gate
+    /// turns this red there. Its value is making that failure say "detection must not require gt"
+    /// instead of surfacing as a handful of unrelated review-TUI changeset-count assertions.
+    #[test]
+    fn detect_resolves_graphite_from_repo_metadata_without_requiring_the_gt_binary() {
+        let fixture = FixtureBuilder::new()
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(
+            StackModel::detect(repo),
+            StackModel::Graphite,
+            "a gt-initialized repo is a Graphite stack regardless of PATH"
+        );
+    }
 
     fn stack(trunk: &str, diffs: &[&str], current: &str) -> Stack {
         Stack {

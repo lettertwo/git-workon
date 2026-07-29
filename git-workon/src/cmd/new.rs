@@ -321,6 +321,12 @@ impl Run for New {
         .wrap_err(format!("Failed to create worktree '{}'", effective_branch))?;
 
         // Register the new branch with gt when stack-active (non-fatal on failure).
+        //
+        // Deliberately NOT guarded on `detect_gt()`: `StackModel::detect` resolves `Graphite`
+        // from repo metadata alone, so this can run on a machine without `gt`. The resulting
+        // "gt track unavailable" warning is the point — the new branch really is untracked, and
+        // silence would hide that until the stack looked wrong later. See
+        // `new_gt_track_failure_is_non_fatal`.
         if effective_model == StackModel::Graphite
             && !self.no_stack
             && !branch_pre_existed
