@@ -306,13 +306,20 @@ jobs:
           pattern: artifacts-*
           path: Formula/
           merge-multiple: true
-      # Patch each generated formula to install man page and shell completions.
+      # Patch the git-workon formula to install its man page and shell completions.
       # cargo-dist 0.31 does not support this natively (see axodotdev/cargo-dist#27).
       # We inject before the `doc_files = Dir[...]` line so that our files are
       # installed explicitly and do not fall through to pkgshare.install.
+      #
+      # Scoped to git-workon.rb by name, not `Formula/*.rb`: every filename injected
+      # below ships in git-workon's archive and only in git-workon's archive, so
+      # patching every formula would emit install lines for files a second binary's
+      # archive does not contain, and `brew install` on it would fail. Another
+      # distributed binary needs its own step here with its own filenames.
       - name: Patch formulae with man and completion install steps
         run: |
-          for formula in Formula/*.rb; do
+          formula=Formula/git-workon.rb
+          if [ -f "$formula" ]; then
             ruby -pi -e '
               if /^(\s*)install_binary_aliases!/ =~ $_
                 indent = $1
@@ -323,7 +330,7 @@ jobs:
                     + "#{indent}fish_completion.install \"git-workon.fish\"\n"
               end
             ' "$formula"
-          done
+          fi
       # This is extra complex because you can make your Formula name not match your app name
       # so we need to find releases with a *.rb file, and publish with that filename.
       - name: Commit formula files
