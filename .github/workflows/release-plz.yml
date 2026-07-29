@@ -40,10 +40,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASES: ${{ steps.release-plz.outputs.releases }}
         run: |
-          TAG=$(echo "$RELEASES" | jq -r '.[] | select(.package_name == "git-workon") | .tag')
-          if [ -n "$TAG" ]; then
-            gh workflow run release.yml --field tag="$TAG"
-          fi
+          # Dispatch the cargo-dist release workflow once per released binary.
+          #
+          # This is an explicit allowlist, not "every released package": release-plz
+          # tags libraries too (git-workon-lib), and cargo-dist has no App for those,
+          # so dispatching on a library tag would start a release run with nothing to
+          # build. Packages here must be ones cargo-dist actually builds artifacts for
+          # — add a package when it flips to `dist = true` in its Cargo.toml.
+          #
+          # Independently-versioned binaries release under separate tags, so more than
+          # one dispatch per push is expected and each run builds only its own tag.
+          DIST_PACKAGES='git-workon'
+          for pkg in $DIST_PACKAGES; do
+            TAG=$(echo "$RELEASES" | jq -r --arg pkg "$pkg" '.[] | select(.package_name == $pkg) | .tag')
+            if [ -n "$TAG" ]; then
+              gh workflow run release.yml --field tag="$TAG"
+            fi
+          done
 
   release-plz-pr:
     name: Release PR
