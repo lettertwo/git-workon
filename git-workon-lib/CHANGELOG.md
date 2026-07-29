@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.10.0...git-workon-lib-v0.11.0) - 2026-07-29
+
+### Added
+
+- *(lib)* add changeset assembly with needs-restack detection
+- *(lib)* add git stack model variant
+
+### Fixed
+
+- *(lib)* walk first-parent line in git-inference assembly
+
+### Other
+
+- merge per-file integration tests into one harness per crate
+
 ## [0.10.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.9.0...git-workon-lib-v0.10.0) - 2026-07-21
 
 ### Added
