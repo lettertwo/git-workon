@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.11.0...git-workon-v0.11.1) - 2026-07-31
+
+### Fixed
+
+- *(cli)* assign stack lanes relative to the parent lane ([#58](https://github.com/lettertwo/git-workon/pull/58))
+- *(lib)* detect Graphite from repo metadata, not gt on PATH
+
 ## [0.11.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.10.0...git-workon-v0.11.0) - 2026-07-29
 
 ### Added
