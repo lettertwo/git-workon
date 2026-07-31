@@ -535,8 +535,7 @@ where
     let mut rows = Vec::new();
     for node in forest {
         if include(node) {
-            let mut next_lane = 1usize; // root occupies lane 0; siblings start at 1
-            emit_lane_rows(node, 0, &[], &mut next_lane, include, &mut rows);
+            emit_lane_rows(node, 0, &[], include, &mut rows);
         }
     }
     rows
@@ -546,13 +545,17 @@ where
 ///
 /// - `own_lane`: lane assigned to this node.
 /// - `passthrough_lanes`: lanes open above that pass through this subtree unchanged.
-/// - `next_lane`: shared counter; each new sibling lane claims the next value.
 /// - `include`: returns true when a node (or its subtree) should appear in output.
+///
+/// Sibling lanes are assigned relative to `own_lane` (`own_lane + 1`, `+ 2`, …) rather than from a
+/// forest-global counter. A sibling lane is only open between its subtree's first row and this
+/// node's converging row, so the same index is free to be reused by any other subtree — and the
+/// `─┴─╯` connector, which is drawn positionally from `closing_count`, only lines up with the
+/// sibling lanes when they sit immediately to the right of `own_lane`.
 fn emit_lane_rows<'a, F>(
     node: &'a TreeNode,
     own_lane: usize,
     passthrough_lanes: &[usize],
-    next_lane: &mut usize,
     include: &F,
     rows: &mut Vec<LaneRow<'a>>,
 ) where
@@ -578,31 +581,18 @@ fn emit_lane_rows<'a, F>(
         .max_by_key(|(i, c)| (c.subtree_activity, std::cmp::Reverse(*i)))
         .map(|(i, _)| i);
 
-    // Non-primary children (siblings) each claim a new lane.
+    // Non-primary children (siblings) each claim a lane immediately right of this node's.
     let siblings: Vec<(&TreeNode, usize)> = visible
         .iter()
         .enumerate()
-        .filter_map(|(i, &c)| {
-            if Some(i) == primary_idx {
-                None
-            } else {
-                let lane = *next_lane;
-                *next_lane += 1;
-                Some((c, lane))
-            }
-        })
+        .filter(|(i, _)| Some(*i) != primary_idx)
+        .enumerate()
+        .map(|(si, (_, &c))| (c, own_lane + 1 + si))
         .collect();
 
     // 1. Emit primary subtree (same lane, same passthrough).
     if let Some(pi) = primary_idx {
-        emit_lane_rows(
-            visible[pi],
-            own_lane,
-            passthrough_lanes,
-            next_lane,
-            include,
-            rows,
-        );
+        emit_lane_rows(visible[pi], own_lane, passthrough_lanes, include, rows);
     }
 
     // 2. Emit each sibling's subtree.
@@ -614,7 +604,7 @@ fn emit_lane_rows<'a, F>(
             sib_pass.push(lane);
         }
         sib_pass.sort_unstable();
-        emit_lane_rows(sib, sib_lane, &sib_pass, next_lane, include, rows);
+        emit_lane_rows(sib, sib_lane, &sib_pass, include, rows);
     }
 
     // 3. Emit this node — sibling lanes converge here.
@@ -1515,6 +1505,33 @@ mod tests {
             !result.lines[3].contains("│ "),
             "a1 after fork should have no passthrough, got: {}",
             result.lines[3]
+        );
+    }
+
+    #[test]
+    fn render_tree_fork_under_primary_child_reuses_sibling_lane() {
+        // main → [a (primary), z (sibling)]; a → [p (primary), q (sibling)].
+        // z's lane is open only across z's own rows — which come *below* a's subtree — so q may
+        // reuse lane 1. Assigning q a fresh forest-global lane instead over-indents its row and
+        // leaves a's "─╯" pointing at an empty column.
+        no_color();
+        let mut a = leaf("a", false);
+        a.children = vec![leaf("p", false), leaf("q", false)];
+        let mut root = leaf("main", false);
+        root.children = vec![a, leaf("z", false)];
+        let forest = vec![root];
+        let result = render_tree(&forest, "", &matcher());
+
+        assert_eq!(result.keys, vec!["p", "q", "a", "z", "main"]);
+        let q_line = &result.lines[1];
+        assert!(
+            q_line.starts_with("│ ◎ q"),
+            "q should sit in lane 1 directly right of a's lane, got: {q_line}"
+        );
+        let a_line = &result.lines[2];
+        assert!(
+            a_line.starts_with("◎─╯ a"),
+            "a's connector should close onto lane 1, got: {a_line}"
         );
     }
 
