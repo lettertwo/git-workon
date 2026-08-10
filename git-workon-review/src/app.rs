@@ -664,44 +664,34 @@ pub enum DiffTextMode {
     Edit,
 }
 
-/// The zoom the user *requested* via `Z` — persists across file navigation (like [`Layout`]). The
-/// actual state rendered per file is [`EffectiveZoom`], resolved by [`effective_zoom`] from this
-/// plus the file's available sub-diffs; a file lacking the requested role collapses to
-/// [`Role::Combined`] rather than showing an empty pane.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Zoom {
-    /// Unstaged pane stacked above staged pane, each independently navigable. The default —
-    /// the gate downgrades it to a single pane for files that don't have both sub-diffs, so the
-    /// common all-unstaged worktree still renders as one pane.
-    #[default]
-    Split,
-    Combined,
-    Unstaged,
-    Staged,
-}
-
-/// The zoom actually rendered for a given file this frame — the gated resolution of a [`Zoom`]
-/// against that file's available sub-diffs (see [`effective_zoom`]). Either a single pane over one
-/// [`Role`], or the two-pane [`EffectiveZoom::Split`].
+/// The state actually rendered for a given file this frame — the gated resolution of
+/// [`App::split_focus`]/[`App::maximized`] against that file's available sub-diffs (see
+/// [`effective_zoom`]). Either a single pane over one [`Role`], or the two-pane
+/// [`EffectiveZoom::Split`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectiveZoom {
     Single(Role),
     Split,
 }
 
-/// Resolve the requested [`Zoom`] to the [`EffectiveZoom`] a file can actually show, given which of
-/// its sub-diffs exist (`has_unstaged`/`has_staged` = the file's path appears in that role's
+/// Resolve the diff pane's requested state — the focused split pane's role and whether it's
+/// [`App::maximized`] — to the [`EffectiveZoom`] a file can actually show, given which of its
+/// sub-diffs exist (`has_unstaged`/`has_staged` = the file's path appears in that role's
 /// `DiffModel`) and whether it's stageable at all (`can_stage` = non-binary in M4).
 ///
-/// Rules (a pure gate, unit-tested against the full truth table):
+/// Rules (a pure gate, unit-tested against the full truth table — ADR-038 decision 3):
 /// - not stageable → [`Role::Combined`] (binary files render the placeholder; no attribution);
-/// - `Combined` → `Combined`;
-/// - `Unstaged` → `Unstaged` if it has one, else `Combined`;
-/// - `Staged` → `Staged` if it has one, else `Combined`;
-/// - `Split` → `Split` only if it has BOTH sub-diffs; else downgrade to whichever single sub-diff
-///   exists; else `Combined`.
+/// - both sub-diffs, maximized → `Single(focus_role)`;
+/// - both sub-diffs, not maximized → `Split`;
+/// - unstaged only → `Single(Unstaged)`;
+/// - staged only → `Single(Staged)`;
+/// - neither → `Single(Combined)`.
+///
+/// Maximize applies only where the result would otherwise be `Split` — everywhere else the pane
+/// already fills the body, so the flag is inert rather than special-cased.
 pub fn effective_zoom(
-    requested: Zoom,
+    focus_role: Role,
+    maximized: bool,
     has_unstaged: bool,
     has_staged: bool,
     can_stage: bool,
@@ -709,33 +699,18 @@ pub fn effective_zoom(
     if !can_stage {
         return EffectiveZoom::Single(Role::Combined);
     }
-    match requested {
-        Zoom::Combined => EffectiveZoom::Single(Role::Combined),
-        Zoom::Unstaged => {
-            if has_unstaged {
-                EffectiveZoom::Single(Role::Unstaged)
-            } else {
-                EffectiveZoom::Single(Role::Combined)
-            }
+    if has_unstaged && has_staged {
+        if maximized {
+            EffectiveZoom::Single(focus_role)
+        } else {
+            EffectiveZoom::Split
         }
-        Zoom::Staged => {
-            if has_staged {
-                EffectiveZoom::Single(Role::Staged)
-            } else {
-                EffectiveZoom::Single(Role::Combined)
-            }
-        }
-        Zoom::Split => {
-            if has_unstaged && has_staged {
-                EffectiveZoom::Split
-            } else if has_unstaged {
-                EffectiveZoom::Single(Role::Unstaged)
-            } else if has_staged {
-                EffectiveZoom::Single(Role::Staged)
-            } else {
-                EffectiveZoom::Single(Role::Combined)
-            }
-        }
+    } else if has_unstaged {
+        EffectiveZoom::Single(Role::Unstaged)
+    } else if has_staged {
+        EffectiveZoom::Single(Role::Staged)
+    } else {
+        EffectiveZoom::Single(Role::Combined)
     }
 }
 
@@ -825,16 +800,6 @@ const ICON_MODE_OPTIONS: &[(&str, IconMode)] =
 /// names. Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to
 /// [`Layout::default`] and warns on anything not listed here.
 const DIFF_LAYOUT_OPTIONS: &[(&str, Layout)] = &[("sbs", Layout::Sbs), ("inline", Layout::Inline)];
-
-/// `workon.review.diff.zoom` (CS7)'s valid config strings, mirroring the [`Zoom`] variant names.
-/// Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to [`Zoom::default`]
-/// and warns on anything not listed here.
-const DIFF_ZOOM_OPTIONS: &[(&str, Zoom)] = &[
-    ("split", Zoom::Split),
-    ("combined", Zoom::Combined),
-    ("unstaged", Zoom::Unstaged),
-    ("staged", Zoom::Staged),
-];
 
 /// `workon.review.diff.text` (CS11)'s valid config strings, mirroring the [`DiffTextMode`]
 /// variant names — see [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s
@@ -1010,6 +975,17 @@ enum SplitPane {
     Staged,
 }
 
+impl SplitPane {
+    /// The [`Role`] this pane renders — `Unstaged`'s top pane is [`Role::Unstaged`], `Staged`'s
+    /// bottom pane is [`Role::Staged`]. Feeds [`effective_zoom`]'s `focus_role` under maximize.
+    fn role(self) -> Role {
+        match self {
+            SplitPane::Unstaged => Role::Unstaged,
+            SplitPane::Staged => Role::Staged,
+        }
+    }
+}
+
 /// Cursor + derived scroll for a split's *unfocused* pane. The focused pane's equivalent state
 /// lives directly on [`App`] (`cursor`/`scroll`) so every existing cursor-moving method keeps
 /// operating on the focused pane unchanged; `w` swaps this in and out (see
@@ -1023,7 +999,7 @@ struct PaneState {
 /// CS6: a staging op's pre-op position, captured by [`App::capture_position`] before
 /// `coordinated_refresh` and restored by [`App::restore_position`] after — so a staging op keeps
 /// the reviewer's place instead of `reset_panes`' first-hunk reseat (that reseat still runs for
-/// every MANUAL nav: file/changeset switches, zoom cycles). `path` + `role` say WHERE (the same
+/// every MANUAL nav: file/changeset switches, maximize toggles). `path` + `role` say WHERE (the same
 /// file, the pane the reviewer was in); `old_lineno`/`new_lineno` say WHAT (the acted-on row's
 /// position in `role`'s own coordinate frame — the two sides a role's rows are diffed against,
 /// per [`FileView::load`]'s table). Deliberately NO pre-op zoom snapshot: [`App::restore_position`]
@@ -1348,15 +1324,18 @@ pub struct App {
     highlighter: TsHighlighter,
     /// Current render layout; see [`Layout`]'s doc comment for the persistence contract.
     pub layout: Layout,
-    /// The requested zoom (cycled by `Z`); the effective per-file zoom is resolved each frame via
-    /// [`effective_zoom`]. Persists across file navigation, like [`Self::layout`].
-    pub zoom: Zoom,
+    /// Whether the focused split pane requests the whole body (toggled by `Z`); the effective
+    /// per-file resolution is [`effective_zoom`]. Persists across file navigation, like
+    /// [`Self::layout`] — see ADR-038 decision 6. Applies only where the gate would otherwise
+    /// return `Split`; inert everywhere else (decision 3).
+    pub maximized: bool,
     /// `workon.review.diff.text` (CS11) — which foreground source changed lines render with.
-    /// Read directly by `render.rs`, same as [`Self::layout`]/[`Self::zoom`]; see
+    /// Read directly by `render.rs`, same as [`Self::layout`]/[`Self::maximized`]; see
     /// [`DiffTextMode`]'s doc comment.
     pub diff_text: DiffTextMode,
-    /// Which split pane has focus. Only meaningful under [`EffectiveZoom::Split`]; reset to
-    /// `Unstaged` (the top pane) whenever a file opens or the zoom changes.
+    /// Which split pane has focus. Only meaningful under [`EffectiveZoom::Split`] or
+    /// [`Self::maximized`]; reset to `Unstaged` (the top pane) whenever a file opens, UNLESS
+    /// [`Self::maximized`] is set — see [`Self::reset_panes`] (ADR-038 decision 5).
     split_focus: SplitPane,
     /// A transient, footer-rendered message — set by [`Self::notify`], cleared by
     /// [`Self::clear_notice`] (the latter called by the event loop on the next keypress, so a
@@ -1382,8 +1361,8 @@ pub struct App {
     /// space, exactly like [`Self::cursor`]: the selected range is
     /// `[min(anchor, cursor), max(anchor, cursor)]`, so `j`/`k` extend it for free as the cursor
     /// moves. Cancelled (not translated) whenever the coordinate space reshapes — layout toggle,
-    /// zoom change, file switch, split-focus swap — since a raw row index carries no meaning across
-    /// a reshape.
+    /// maximize toggle, file switch, split-focus swap — since a raw row index carries no meaning
+    /// across a reshape.
     pub selection_anchor: Option<usize>,
     /// Trap-4/5 livelock/interlock state for the M4 index watcher (locked decision #4: a
     /// synchronous poll-on-`Tick`, no threads). See [`Self::on_tick`] and
@@ -1393,7 +1372,7 @@ pub struct App {
     /// [`Self::from_changesets`] to open-when-`len() > 1`/unfocused/[`OutlineMode::default`]
     /// (the "decided without interview" default in the M5 plan), and repositioned (never
     /// rebuilt-from-scratch — `open`/`focused`/`mode` persist, like [`Self::layout`]/
-    /// [`Self::zoom`]) by every diff-initiated nav and by [`Self::refresh`].
+    /// [`Self::maximized`]) by every diff-initiated nav and by [`Self::refresh`].
     outline: OutlineState,
     /// Opt-in nerd-font iconography — `workon.review.icons`, defaulting to [`IconMode::None`]
     /// (no auto-detection story exists — a terminal can't report the user's font). A TUI-wide
@@ -1452,17 +1431,9 @@ pub struct App {
     /// touches a thread or a `Repository`-carrying `Sender` itself, so it stays constructible (and
     /// `refresh` stays synchronously testable) with nothing wired up to actually dispatch this.
     pending_wave: Option<(u64, Vec<(usize, Changeset)>)>,
-    /// Display label for the resolved [`crate::keymap::Command::CycleZoom`] binding, shown in
-    /// [`Self::notify_combined_refusal`]'s "cycle zoom" hint. `App` deliberately has no keymap
-    /// field (the keymap is threaded through `tui.rs`/`main.rs` separately), so `main.rs::seat_app`
-    /// sets this once at seat time from the resolved binding; defaults to `"Z"` — the command's
-    /// default binding — for every `App::new`/`from_changesets` path that never seats a keymap
-    /// (keeps existing unit tests passing without churn).
-    zoom_key_label: String,
     /// A `reload-config` (`R`) request, picked up (and cleared) by [`Self::take_config_reload_request`].
     /// Mirrors [`Self::pending_wave`]'s request-flag shape: `App` can't own the `Keymap`/`Palette`
-    /// the reload swaps in (they're threaded through `tui.rs`/`main.rs`, same reason
-    /// [`Self::zoom_key_label`] is a label rather than a keymap reference), so it only raises the
+    /// the reload swaps in (they're threaded through `tui.rs`/`main.rs`), so it only raises the
     /// flag here and the event loop — which DOES hold those — does the actual reload.
     config_reload_requested: bool,
     /// M11 CS3 (`diff-search`): the ACCEPTED search query, `/` in the diff view opens the prompt
@@ -1662,7 +1633,7 @@ impl App {
             base_label,
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
-            zoom: Zoom::default(),
+            maximized: false,
             diff_text: DiffTextMode::default(),
             split_focus: SplitPane::Unstaged,
             notice: None,
@@ -1681,7 +1652,6 @@ impl App {
             generation: 1,
             wave_failure_notified: false,
             pending_wave: None,
-            zoom_key_label: "Z".to_string(),
             config_reload_requested: false,
             search_query: None,
             search_prompt: PromptState::new(),
@@ -1705,14 +1675,6 @@ impl App {
     /// never calls it, leaving [`Self::review_source`] at its `None` default.
     pub fn set_review_source(&mut self, source: Source) {
         self.review_source = Some(source);
-    }
-
-    /// Set the display label shown in [`Self::notify_combined_refusal`]'s "cycle zoom" hint —
-    /// see the `zoom_key_label` field's doc comment. `main.rs::plumb_zoom_hint_and_warnings` calls
-    /// this with the resolved [`crate::keymap::Command::CycleZoom`] binding, both right after
-    /// `seat_app` constructs the `App` and on every `reload-config`.
-    pub fn set_zoom_key_label(&mut self, label: String) {
-        self.zoom_key_label = label;
     }
 
     /// The current `.git/index`'s cheap fingerprint (mtime + size), or `None` if the read fails —
@@ -2013,34 +1975,19 @@ impl App {
         };
     }
 
-    /// Resolve the [`EffectiveZoom`] for file `idx` this frame: the requested [`Self::zoom`] gated
-    /// against that file's available sub-diffs and stageability. Cheap (three lookups + the pure
-    /// [`effective_zoom`]) — re-evaluated per file per frame, no caching (locked decision #3).
+    /// Resolve the [`EffectiveZoom`] for file `idx` this frame: [`Self::split_focus`]/
+    /// [`Self::maximized`] gated against that file's available sub-diffs and stageability. Cheap
+    /// (three lookups + the pure [`effective_zoom`]) — re-evaluated per file per frame, no caching
+    /// (locked decision #3).
     pub(crate) fn effective_zoom_for(&self, idx: usize) -> EffectiveZoom {
-        let can_stage = self
-            .cur()
-            .diff
-            .files
-            .get(idx)
-            .map(|f| !f.is_binary)
-            .unwrap_or(false);
-        let has_unstaged = self
-            .cur()
-            .diff
-            .unstaged_idx
-            .get(idx)
-            .copied()
-            .flatten()
-            .is_some();
-        let has_staged = self
-            .cur()
-            .diff
-            .staged_idx
-            .get(idx)
-            .copied()
-            .flatten()
-            .is_some();
-        effective_zoom(self.zoom, has_unstaged, has_staged, can_stage)
+        let (can_stage, has_unstaged, has_staged) = self.stage_shape(idx);
+        effective_zoom(
+            self.split_focus.role(),
+            self.maximized,
+            has_unstaged,
+            has_staged,
+            can_stage,
+        )
     }
 
     /// The role whose view [`Self::cursor`]/[`Self::scroll`] currently drive for file `idx`: the
@@ -2054,9 +2001,8 @@ impl App {
 
     /// The sub-[`FileChange`] backing file `idx`'s `role` view: `self.files[idx]` itself for
     /// [`Role::Combined`], or the matching entry in the unstaged/staged model (`None` if that
-    /// role has no change for this file). Used by the renderer to build a fresh
-    /// [`crate::attribute::Attribution`] for the combined role each frame — see that module's
-    /// docs for why the two sub-roles' hunks (not the combined ones) are the attribution source.
+    /// role has no change for this file). Used by staging verbs to apply against the ROLE's own
+    /// sub-diff rather than the combined one.
     pub(crate) fn role_change(&self, idx: usize, role: Role) -> Option<&FileChange> {
         let diff = &self.cur().diff;
         match role {
@@ -2229,9 +2175,9 @@ impl App {
             return false;
         }
         if self.refreshing_for_geometry_mismatch {
-            // No key hint here (unlike `notify_combined_refusal`'s zoom-key label): `refresh` is
-            // a remappable binding this call site has no seated label for, and inventing one
-            // just for this message isn't worth a second `zoom_key_label`-style field.
+            // No key hint here: `refresh` is a remappable binding this call site has no seated
+            // label for, and `App` deliberately has no keymap field to look one up from (the
+            // keymap is threaded through `tui.rs`/`main.rs` separately).
             self.notify(
                 "file changed on disk while loading — diff may be misaligned; refresh to fix",
                 Severity::Info,
@@ -2269,20 +2215,27 @@ impl App {
     }
 
     /// Reset BOTH panes to their role views' first hunks and refocus the top (unstaged) pane —
-    /// run on file open and zoom change. The two role coordinate spaces disagree, so carrying a
-    /// raw cursor index across a role/zoom switch would be meaningless; jumping to the role's own
+    /// run on file open and maximize toggle. The two role coordinate spaces disagree, so carrying
+    /// a raw cursor index across a role switch would be meaningless; jumping to the role's own
     /// first hunk (the same position a fresh file open lands on) is always valid and predictable.
+    ///
+    /// [`Self::split_focus`] is the one exception (ADR-038 decision 5): while [`Self::maximized`]
+    /// is set, focus IS the view, so resetting it here would silently switch which role the
+    /// reviewer is reading on every file open. Preserved rather than reset in that case; reset to
+    /// `Unstaged` otherwise, same as before maximize existed.
     ///
     /// This is also what `coordinated_refresh` leaves behind after a staging op (via
     /// `open_current`), since a refresh is itself a file "open" of the post-op state — CS6's
     /// `App::restore_position` runs immediately after, overwriting this first-hunk reseat with
     /// the reviewer's pre-op position when it can. Every OTHER caller (manual file/changeset
-    /// nav, zoom cycles) has no such follow-up, so first-hunk-on-open is still what they see.
+    /// nav, maximize toggles) has no such follow-up, so first-hunk-on-open is still what they see.
     fn reset_panes(&mut self) {
-        // Any file open / zoom change reshapes the coordinate space an active selection is keyed
-        // in, so drop it (see [`Self::selection_anchor`]).
+        // Any file open / maximize change reshapes the coordinate space an active selection is
+        // keyed in, so drop it (see [`Self::selection_anchor`]).
         self.selection_anchor = None;
-        self.split_focus = SplitPane::Unstaged;
+        if !self.maximized {
+            self.split_focus = SplitPane::Unstaged;
+        }
         self.alt = PaneState::default();
         match self.effective_zoom_for(self.current) {
             EffectiveZoom::Single(role) => {
@@ -2296,7 +2249,7 @@ impl App {
         self.derive_scroll();
         // The unfocused pane's scroll is derived at render time, once its height is known.
         // M11 CS3: `reset_panes` is the one chokepoint every file/changeset switch, refresh, and
-        // zoom cycle already funnels through (`open_current`/`complete_pending_open` both end
+        // maximize toggle already funnels through (`open_current`/`complete_pending_open` both end
         // here) — see [`Self::recompute_search`]'s doc comment for the full trigger list.
         self.recompute_search();
     }
@@ -2506,10 +2459,10 @@ impl App {
     /// Either way, when the readied file IS the current pending open, it's seated like
     /// [`Self::complete_pending_open`]'s tail — with one refinement over a plain "always clear"
     /// rule: an `Ok` result only clears the pending open when its SHAPE satisfies the current
-    /// effective zoom (see [`loaded_views_satisfy`]). Without this, a zoom cycled mid-load
+    /// effective zoom (see [`loaded_views_satisfy`]). Without this, a maximize toggled mid-load
     /// (`Z` is exempt from force-completion — [`Self::open_current`] re-defers with
     /// `open_pending_dispatched = false`) lets the stale-shaped in-flight result seat only the
-    /// old view, clear the pending flags, and strand the new zoom's view forever un-dispatched.
+    /// old view, clear the pending flags, and strand the new shape's view forever un-dispatched.
     /// When unsatisfied, `open_pending` stays set and `open_pending_dispatched` resets to
     /// `false` so the next idle Tick re-dispatches against the NOW-current zoom — mirroring a
     /// fresh [`Self::open_current`] defer. An `Err` result keeps clearing unconditionally: a
@@ -2639,39 +2592,56 @@ impl App {
         }
     }
 
-    /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`Z`). The new zoom
-    /// persists across file navigation; both panes reset to their first hunks so `cursor`/`scroll`
-    /// are always valid for the now-active view(s).
-    pub fn cycle_zoom(&mut self) {
-        // A committed changeset has no staged/unstaged split to zoom into — lock zoom to combined
-        // (locked decision #2) rather than cycling into a state `effective_zoom` immediately
-        // collapses back anyway.
-        if self.is_committed() {
-            self.notify(
-                "changeset is committed — combined view only",
-                Severity::Info,
-            );
-            return;
-        }
-        self.zoom = match self.zoom {
-            Zoom::Split => Zoom::Combined,
-            Zoom::Combined => Zoom::Unstaged,
-            Zoom::Unstaged => Zoom::Staged,
-            Zoom::Staged => Zoom::Split,
-        };
-        self.open_current();
+    /// The `(can_stage, has_unstaged, has_staged)` triple [`Self::effective_zoom_for`] and
+    /// [`Self::toggle_maximize`] both gate on for file `idx` — factored out so the maximize
+    /// no-op check can't drift from the render gate.
+    fn stage_shape(&self, idx: usize) -> (bool, bool, bool) {
+        let can_stage = self
+            .cur()
+            .diff
+            .files
+            .get(idx)
+            .map(|f| !f.is_binary)
+            .unwrap_or(false);
+        let has_unstaged = self
+            .cur()
+            .diff
+            .unstaged_idx
+            .get(idx)
+            .copied()
+            .flatten()
+            .is_some();
+        let has_staged = self
+            .cur()
+            .diff
+            .staged_idx
+            .get(idx)
+            .copied()
+            .flatten()
+            .is_some();
+        (can_stage, has_unstaged, has_staged)
     }
 
-    /// Set the requested zoom directly — the config-startup (CS7) counterpart to
-    /// [`Self::cycle_zoom`]. Skips `cycle_zoom`'s committed-changeset guard: that guard exists
-    /// only to give interactive feedback when a cycle would be a no-op, not to enforce the
-    /// invariant itself — [`Self::effective_zoom_for`] (driven from [`Self::open_current`]'s
-    /// `reset_panes`, which [`Self::apply_view_config`]'s caller runs right after this) already
-    /// collapses a non-stageable changeset to [`Role::Combined`] regardless of the requested
-    /// zoom, so setting the raw value here can never bypass the gate. Does NOT call
-    /// `open_current` itself — the caller applies every CS7 setting first, then opens once.
-    pub fn set_zoom(&mut self, zoom: Zoom) {
-        self.zoom = zoom;
+    /// Toggle whether the focused split pane fills the whole body (`Z`) — ADR-038 decisions 2–4.
+    /// `effective_zoom` only lets maximize narrow a result that would otherwise be `Split`, so
+    /// this is a SILENT no-op (not a refusal) whenever the current file doesn't have both
+    /// sub-diffs: the user asked for a full-height pane and either already has one, or there is no
+    /// split to give one. The one exception is a committed changeset, which NEVER has a split to
+    /// maximize (see [`Self::is_committed`]'s doc comment) — that case keeps an informational
+    /// notice, worth stating once rather than leaving the key apparently dead.
+    pub fn toggle_maximize(&mut self) {
+        let (can_stage, has_unstaged, has_staged) = self.stage_shape(self.current);
+        if !(can_stage && has_unstaged && has_staged) {
+            if self.is_committed() {
+                self.notify(
+                    "changeset is committed — combined view only, nothing to maximize",
+                    Severity::Info,
+                );
+            }
+            return;
+        }
+        self.maximized = !self.maximized;
+        self.open_current();
     }
 
     /// Swap focus between the two split panes (`w`) — swaps `cursor`/`scroll`/`pane_height` with
@@ -3705,9 +3675,10 @@ impl App {
     /// [`Self::search_current`] across: captures the currently-current [`crate::search::SearchMatch`]
     /// by value before recomputing, then re-finds its index in the new (address-identical) list and
     /// restores it if still present — `SearchMatch` is `Copy + PartialEq`, so this is cheap. A
-    /// zoom change does NOT use this path even though it also funnels through `reset_panes`: it
-    /// swaps which role's (staged/unstaged/combined) content is current, a genuinely different match
-    /// list, so the plain reset in [`Self::recompute_search`] is the correct behavior there too.
+    /// maximize toggle does NOT use this path even though it also funnels through `reset_panes`:
+    /// it swaps which role's (staged/unstaged/combined) content is current, a genuinely different
+    /// match list, so the plain reset in [`Self::recompute_search`] is the correct behavior there
+    /// too.
     fn recompute_search_keep_current(&mut self) {
         let prior = self
             .search_current
@@ -4762,9 +4733,9 @@ impl App {
         }
         // The expansion just reshaped the focused pane's row space — whichever tier did it —
         // so cancel any active selection rather than translating it, per `selection_anchor`'s
-        // invariant (same rule as layout toggles, zoom changes, file switches, and split-focus
-        // swaps). Only reached when a gap actually expanded; the non-gap no-op above leaves a
-        // selection alone.
+        // invariant (same rule as layout toggles, maximize toggles, file switches, and
+        // split-focus swaps). Only reached when a gap actually expanded; the non-gap no-op above
+        // leaves a selection alone.
         self.cancel_selection();
         self.derive_scroll();
         self.clamp_cursor();
@@ -4854,26 +4825,28 @@ impl App {
     }
 
     /// Set `workon.review.diff.text`'s resolved mode directly — the config-startup (CS11)
-    /// counterpart, mirroring [`Self::set_layout`]/[`Self::set_zoom`]. Purely a render-time
-    /// foreground selector: no cursor/scroll state depends on it, so unlike `set_layout` there is
-    /// nothing else to clamp or re-derive, at startup OR on reload.
+    /// counterpart, mirroring [`Self::set_layout`]. Purely a render-time foreground selector: no
+    /// cursor/scroll state depends on it, so unlike `set_layout` there is nothing else to clamp
+    /// or re-derive, at startup OR on reload.
     pub fn set_diff_text(&mut self, mode: DiffTextMode) {
         self.diff_text = mode;
     }
 
-    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom|text` (CS7,
+    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|text` (CS7,
     /// CS11) as the App's initial view-config state, via the same setters the interactive keys
     /// drive
     /// (see each setter's doc comment for why that's enough to stay on the gated path). Call
     /// once, right after construction and before [`Self::open_current`] (see `main.rs`) — the
     /// setters here don't themselves re-derive `cursor`/`scroll`, and the caller's
-    /// `open_current` is what does that for whichever settings just landed.
+    /// `open_current` is what does that for whichever settings just landed. `maximize` has no
+    /// config surface (ADR-038 decision 8, same as `split_focus`) — it's a transient view action,
+    /// not a startup preference, so there is no setting to apply here.
     ///
     /// `raw` is read via [`crate::config::ReviewConfig::view_config`] BEFORE `repo` moves into
     /// `App` (see `main.rs`) — its fields already collapsed an unset setting and a config-read
     /// error to the same `None` (CS7 applies the current hardcoded default for either case, no
     /// warning). Each setting additionally falls back to the default when SET but invalid — out
-    /// of range (width), or an unrecognized string (mode/layout/zoom) — collecting a warning for
+    /// of range (width), or an unrecognized string (mode/layout) — collecting a warning for
     /// those cases, same non-fatal posture as the keymap/theme resolution (ADR-034).
     pub fn apply_view_config(&mut self, raw: &RawViewConfig) -> Vec<String> {
         let mut warnings = Vec::new();
@@ -4933,17 +4906,6 @@ impl App {
         };
         self.set_layout(layout);
 
-        let zoom = match &raw.diff_zoom {
-            Some(z) => resolve_option(
-                "workon.review.diff.zoom",
-                z,
-                DIFF_ZOOM_OPTIONS,
-                &mut warnings,
-            ),
-            None => Zoom::default(),
-        };
-        self.set_zoom(zoom);
-
         let diff_text = match &raw.diff_text {
             Some(t) => resolve_option(
                 "workon.review.diff.text",
@@ -4969,13 +4931,8 @@ impl App {
     /// Instead: run `apply_view_config`, then replay only the TAIL of whichever interactive
     /// counterpart(s) actually changed something — [`Self::toggle_layout`]'s tail if `layout`
     /// flipped, [`Self::outline_cycle_mode`]'s tail if `outline.mode`/`outline.order` changed.
-    /// `zoom`'s interactive counterpart, [`Self::cycle_zoom`], has no further tail beyond the bare
-    /// assignment once its committed-changeset notice is dropped — that notice was purely
-    /// interactive feedback for what would otherwise be a silent cycle no-op, not an invariant:
-    /// [`Self::effective_zoom_for`] already collapses a non-stageable changeset to `Combined`
-    /// regardless of the requested zoom, so a config-driven `zoom` change can't bypass the gate
-    /// either. Reload never emits that notice and never re-derives the pane position for a zoom
-    /// change — same "don't call `open_current`" reasoning as everything else here.
+    /// `maximize` has no config surface at all (ADR-038 decision 8) — `apply_view_config` never
+    /// touches it, so there is no tail to replay for it here.
     pub fn reload_view_config(&mut self, raw: &RawViewConfig) -> Vec<String> {
         let layout_before = self.layout;
         let outline_mode_before = self.outline.mode;
@@ -5064,10 +5021,12 @@ impl App {
     /// Mode-aware refusal notice for a staging verb / line-selection start that only makes sense
     /// outside the combined view — i.e. every call site below whose `staging_role()`/
     /// `staging_role().is_none()` guard failed (locked decision #2's "targeted guard"). A
-    /// committed changeset is ALWAYS combined-only (no staged/unstaged split exists to zoom
-    /// into — see [`Self::is_committed`]), so telling the user to "cycle zoom" there is actively
-    /// wrong; state the real reason instead. `verb` ("stage"/"select") keeps each call site's
-    /// original non-committed wording.
+    /// committed changeset is ALWAYS combined-only (no staged/unstaged split exists — see
+    /// [`Self::is_committed`]), so it gets its own wording. The non-committed branch's only
+    /// remaining caller is a binary file (ADR-038 decision 10): `effective_zoom` short-circuits
+    /// on `!can_stage` before it looks at anything else, so no key press moves it out of
+    /// `Role::Combined` — advising a key would be wrong, so this states non-stageability instead.
+    /// `verb` ("stage"/"select") keeps each call site's original non-committed wording.
     fn notify_combined_refusal(&mut self, verb: &str) {
         if self.is_committed() {
             self.notify(
@@ -5075,9 +5034,8 @@ impl App {
                 Severity::Error,
             );
         } else {
-            let key = &self.zoom_key_label;
             self.notify(
-                format!("{verb} in the unstaged/staged pane — cycle zoom ({key})"),
+                format!("{verb} refused — file is not stageable"),
                 Severity::Error,
             );
         }
@@ -6098,7 +6056,7 @@ mod tests {
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
         DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity,
-        Summary, SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, MAX_OUTLINE_WIDTH,
+        Summary, SummaryTarget, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, MAX_OUTLINE_WIDTH,
         MIN_OUTLINE_WIDTH, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
@@ -6378,29 +6336,55 @@ mod tests {
 
     #[test]
     fn build_file_views_matches_ensure_loaded_for_the_combined_role() {
+        // ADR-038: post-M11 `Role::Combined` is unreachable for an uncommitted file with a real
+        // sub-diff (the gate never resolves there for a maximized both-sub-diffs file, and an
+        // unstaged-only file collapses to `Role::Unstaged`) — a committed changeset is the
+        // natural way to exercise the loader against `Role::Combined`, since its combined role is
+        // its ONLY role (`DiffState::from_committed` leaves both sub-models empty).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
-            .unstaged_file("tracked.txt", "line1\nline2\n", "line1\nCHANGED\n")
             .build()
             .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("tracked.txt", "line1\nline2\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("tracked.txt", "line1\nCHANGED\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "main".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
 
-        let mut eager = app_from_fixture(&fixture);
-        // The file only has an unstaged change, so the default `Split` zoom would collapse to
-        // `Role::Unstaged` — force `Combined` explicitly so this test exercises the role its
-        // name promises (a separate test would be needed for the Split/sub-role shape).
-        eager.set_zoom(Zoom::Combined);
+        let eager_view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let eager_owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut eager = App::from_changesets(eager_owned, vec![eager_view]);
         eager.ensure_loaded(0);
-        let eager_view = eager.current_view_ref().expect("eager view loaded");
+        let eager_view_ref = eager.current_view_ref().expect("eager view loaded");
 
         // A SEPARATE `App` gives us `current_load_spec()` for the same file, and a SEPARATE
         // `Repository` handle + fresh `TsHighlighter` stands in for the loader thread's own —
         // exactly the two-handle shape `Tui::run`/`spawn_loader_thread` build for real.
-        let mut spec_app = app_from_fixture(&fixture);
-        spec_app.set_zoom(Zoom::Combined);
+        let spec_view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let spec_owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let spec_app = App::from_changesets(spec_owned, vec![spec_view]);
         let spec = spec_app
             .current_load_spec()
             .expect("fixture has a file at index 0");
-        let repo = fixture.repo().unwrap();
         let loader_repo =
             Repository::open(repo.workdir().unwrap()).expect("loader's own repo handle");
         let mut loader_ts = crate::highlight::TsHighlighter::new();
@@ -6410,9 +6394,9 @@ mod tests {
             panic!("expected a loaded Combined-role view");
         };
         assert_eq!(role, Role::Combined);
-        assert_eq!(loader_view.old_text(), eager_view.old_text());
-        assert_eq!(loader_view.new_text(), eager_view.new_text());
-        assert_eq!(loader_view.display.len(), eager_view.display.len());
+        assert_eq!(loader_view.old_text(), eager_view_ref.old_text());
+        assert_eq!(loader_view.new_text(), eager_view_ref.new_text());
+        assert_eq!(loader_view.display.len(), eager_view_ref.display.len());
     }
 
     #[test]
@@ -6460,9 +6444,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_file_ready_redispatches_when_zoom_outran_the_in_flight_load() {
-        // F2 regression: a zoom cycled mid-load must not let the stale-shaped in-flight result
-        // seat and clear the pending open — the new zoom's view would then never be dispatched.
+    fn apply_file_ready_redispatches_when_maximize_outran_the_in_flight_load() {
+        // F2 regression: maximizing mid-load must not let the stale-shaped in-flight result seat
+        // and clear the pending open — the new shape's view would then never be dispatched.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .partially_staged_file("f.txt", "committed\n", "staged\n", "workdir\n")
@@ -6471,22 +6455,22 @@ mod tests {
 
         let mut app = app_from_fixture(&fixture);
         app.set_defer_loads(true);
-        // Default zoom is `Split`; this file has both staged and unstaged sub-diffs, so the
-        // effective zoom stays `Split` too.
+        // Default (not maximized); this file has both staged and unstaged sub-diffs, so the
+        // effective zoom is `Split`.
         app.open_current();
         assert!(app.open_pending(), "deferred open must be pending");
 
         let (gen, cs_idx, file_idx, spec) = app
             .take_pending_load_spec()
-            .expect("first take dispatches against the Split zoom");
+            .expect("first take dispatches against the Split shape");
         assert_eq!(spec.zoom, EffectiveZoom::Split);
 
-        // Mid-load `Z`: CycleZoom is exempt from force-completion, so this re-defers the open
-        // against the NEW zoom instead of blocking for it.
-        app.cycle_zoom();
+        // Mid-load `Z`: ToggleMaximize is exempt from force-completion, so this re-defers the
+        // open against the NEW (maximized) shape instead of blocking for it.
+        app.toggle_maximize();
         assert!(
             app.open_pending(),
-            "cycling zoom while a load is pending must still be pending"
+            "maximizing while a load is pending must still be pending"
         );
 
         // The loader answers the now-STALE (Split) request.
@@ -6503,7 +6487,7 @@ mod tests {
         );
         assert!(
             app.take_pending_load_spec().is_some(),
-            "the next Tick must re-dispatch against the current (Combined) zoom"
+            "the next Tick must re-dispatch against the current (maximized) shape"
         );
     }
 
@@ -6600,7 +6584,8 @@ mod tests {
             .unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        app.set_zoom(Zoom::Combined);
+        // Both files are unstaged-only, so the default (unmaximized) gate already collapses to
+        // Single(Unstaged) — nothing to force.
         app.set_defer_loads(true);
         app.open_current(); // a.txt: uncached — defers
         let (gen, cs_idx, file_idx, spec) = app.take_pending_load_spec().unwrap();
@@ -6619,7 +6604,7 @@ mod tests {
         // Still within the same generation — the result is warmth, not staleness: a.txt's cache
         // is populated even though the user is no longer looking at it.
         assert!(
-            app.role_view_ref(0, Role::Combined).is_some(),
+            app.role_view_ref(0, Role::Unstaged).is_some(),
             "a within-generation result must cache even after the user navigated away"
         );
     }
@@ -6633,11 +6618,12 @@ mod tests {
             .unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        app.set_zoom(Zoom::Combined);
+        // Unstaged-only file: the default (unmaximized) gate already collapses to
+        // Single(Unstaged) — nothing to force.
         app.ensure_loaded(0); // eagerly cached already
-        assert!(app.role_view_ref(0, Role::Combined).is_some());
+        assert!(app.role_view_ref(0, Role::Unstaged).is_some());
         let old_text_before = app
-            .role_view_ref(0, Role::Combined)
+            .role_view_ref(0, Role::Unstaged)
             .unwrap()
             .old_text()
             .to_string();
@@ -6649,10 +6635,10 @@ mod tests {
             app.generation(),
             app.current_cs(),
             0,
-            Ok(LoadedViews::Single(Role::Combined, None)),
+            Ok(LoadedViews::Single(Role::Unstaged, None)),
         );
 
-        let view = app.role_view_ref(0, Role::Combined).expect("still cached");
+        let view = app.role_view_ref(0, Role::Unstaged).expect("still cached");
         assert_eq!(view.old_text(), old_text_before);
     }
 
@@ -7108,7 +7094,7 @@ mod tests {
         );
     }
 
-    // ---- M4 zoom: gate, cycling, and split per-pane state ----------------------------------
+    // ---- M4/ADR-038 zoom: gate, maximize, and split per-pane state -------------------------
 
     /// A file with three genuinely distinct HEAD / index / worktree states — so it has BOTH a
     /// staged sub-diff (HEAD ↔ index) and an unstaged one (index ↔ worktree), the precondition
@@ -7132,83 +7118,65 @@ mod tests {
         use super::effective_zoom;
         use super::EffectiveZoom::{Single, Split};
         use super::Role::{Combined, Staged, Unstaged};
-        use super::Zoom;
 
-        // Not stageable (binary) collapses to Combined regardless of the requested zoom or which
+        // Not stageable (binary) collapses to Combined regardless of focus, maximize, or which
         // sub-diffs exist.
-        for req in [Zoom::Split, Zoom::Combined, Zoom::Unstaged, Zoom::Staged] {
-            for hu in [false, true] {
-                for hs in [false, true] {
-                    assert_eq!(
-                        effective_zoom(req, hu, hs, false),
-                        Single(Combined),
-                        "req={req:?} hu={hu} hs={hs} can_stage=false"
-                    );
+        for focus in [Unstaged, Staged] {
+            for maximized in [false, true] {
+                for hu in [false, true] {
+                    for hs in [false, true] {
+                        assert_eq!(
+                            effective_zoom(focus, maximized, hu, hs, false),
+                            Single(Combined),
+                            "focus={focus:?} maximized={maximized} hu={hu} hs={hs} \
+                             can_stage=false"
+                        );
+                    }
                 }
             }
         }
 
-        // Combined requested: always Combined.
-        for hu in [false, true] {
-            for hs in [false, true] {
+        // Both sub-diffs: maximized narrows to the focused pane's role; unmaximized stays Split.
+        assert_eq!(
+            effective_zoom(Unstaged, true, true, true, true),
+            Single(Unstaged)
+        );
+        assert_eq!(
+            effective_zoom(Staged, true, true, true, true),
+            Single(Staged)
+        );
+        assert_eq!(effective_zoom(Unstaged, false, true, true, true), Split);
+        assert_eq!(effective_zoom(Staged, false, true, true, true), Split);
+
+        // Unstaged only: Single(Unstaged) regardless of focus/maximize.
+        for focus in [Unstaged, Staged] {
+            for maximized in [false, true] {
                 assert_eq!(
-                    effective_zoom(Zoom::Combined, hu, hs, true),
-                    Single(Combined)
+                    effective_zoom(focus, maximized, true, false, true),
+                    Single(Unstaged)
                 );
             }
         }
 
-        // Unstaged requested: its sub-diff if present, else Combined.
-        assert_eq!(
-            effective_zoom(Zoom::Unstaged, true, false, true),
-            Single(Unstaged)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Unstaged, true, true, true),
-            Single(Unstaged)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Unstaged, false, true, true),
-            Single(Combined)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Unstaged, false, false, true),
-            Single(Combined)
-        );
+        // Staged only: Single(Staged) regardless of focus/maximize.
+        for focus in [Unstaged, Staged] {
+            for maximized in [false, true] {
+                assert_eq!(
+                    effective_zoom(focus, maximized, false, true, true),
+                    Single(Staged)
+                );
+            }
+        }
 
-        // Staged requested: its sub-diff if present, else Combined.
-        assert_eq!(
-            effective_zoom(Zoom::Staged, false, true, true),
-            Single(Staged)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Staged, true, true, true),
-            Single(Staged)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Staged, true, false, true),
-            Single(Combined)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Staged, false, false, true),
-            Single(Combined)
-        );
-
-        // Split requested: Split only with BOTH; else downgrade to the single sub-diff; else
-        // Combined.
-        assert_eq!(effective_zoom(Zoom::Split, true, true, true), Split);
-        assert_eq!(
-            effective_zoom(Zoom::Split, true, false, true),
-            Single(Unstaged)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Split, false, true, true),
-            Single(Staged)
-        );
-        assert_eq!(
-            effective_zoom(Zoom::Split, false, false, true),
-            Single(Combined)
-        );
+        // Neither: Single(Combined) regardless of focus/maximize.
+        for focus in [Unstaged, Staged] {
+            for maximized in [false, true] {
+                assert_eq!(
+                    effective_zoom(focus, maximized, false, false, true),
+                    Single(Combined)
+                );
+            }
+        }
     }
 
     #[test]
@@ -7217,7 +7185,7 @@ mod tests {
 
         let fixture = partially_staged_fixture();
         let app = app_from_fixture(&fixture);
-        assert_eq!(app.zoom, super::Zoom::Split, "default zoom is split");
+        assert!(!app.maximized, "default maximize is off");
         assert_eq!(
             app.effective_zoom_for(0),
             EffectiveZoom::Split,
@@ -7262,9 +7230,7 @@ mod tests {
     }
 
     #[test]
-    fn cycle_zoom_walks_the_four_states_and_persists_across_file_nav() {
-        use super::Zoom;
-
+    fn toggle_maximize_persists_across_file_nav_and_preserves_focus() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .partially_staged_file(
@@ -7278,27 +7244,29 @@ mod tests {
             .unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        assert_eq!(app.zoom, Zoom::Split, "default");
-        app.cycle_zoom();
-        assert_eq!(app.zoom, Zoom::Combined);
-        app.cycle_zoom();
-        assert_eq!(app.zoom, Zoom::Unstaged);
-        app.cycle_zoom();
-        assert_eq!(app.zoom, Zoom::Staged);
-        app.cycle_zoom();
-        assert_eq!(app.zoom, Zoom::Split, "cycles back to split");
+        assert!(!app.maximized, "default");
+        app.toggle_maximize();
+        assert!(app.maximized);
+        app.toggle_maximize();
+        assert!(!app.maximized, "toggles back off");
 
-        // Persists across file navigation, like layout.
-        app.cycle_zoom(); // -> Combined
-        assert_eq!(app.zoom, Zoom::Combined);
+        // Persists across file navigation, like layout — and (ADR-038 decision 5) so does focus
+        // while maximized: maximize the STAGED pane, navigate away and back, and confirm both
+        // survive — the case the old zoom-cycling test couldn't express.
+        app.toggle_split_focus(); // -> Staged pane
+        assert_eq!(app.split_focus, super::SplitPane::Staged);
+        app.toggle_maximize(); // -> maximized on the staged pane
+        assert!(app.maximized);
         app.next_file();
+        assert!(app.maximized, "maximize must persist across next_file");
         assert_eq!(
-            app.zoom,
-            Zoom::Combined,
-            "zoom must persist across next_file"
+            app.split_focus,
+            super::SplitPane::Staged,
+            "focus must persist across next_file while maximized (decision 5)"
         );
         app.prev_file();
-        assert_eq!(app.zoom, Zoom::Combined, "and across prev_file");
+        assert!(app.maximized, "and across prev_file");
+        assert_eq!(app.split_focus, super::SplitPane::Staged, "and focus too");
     }
 
     #[test]
@@ -7517,8 +7485,8 @@ mod tests {
     }
 
     #[test]
-    fn refresh_preserves_zoom_and_layout() {
-        use super::{Layout, Zoom};
+    fn refresh_preserves_maximize_and_layout() {
+        use super::Layout;
 
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -7529,12 +7497,12 @@ mod tests {
         let mut app = app_from_fixture(&fixture);
         app.open_current();
         app.layout = Layout::Inline;
-        app.zoom = Zoom::Combined;
+        app.maximized = true;
 
         app.refresh();
 
         assert_eq!(app.layout, Layout::Inline, "refresh must not reset layout");
-        assert_eq!(app.zoom, Zoom::Combined, "refresh must not reset zoom");
+        assert!(app.maximized, "refresh must not reset maximize");
     }
 
     /// M7 CS2 fix: a session launched with an explicit `[SOURCE]` argument must have `refresh`
@@ -8314,7 +8282,7 @@ mod tests {
     // ---- M4 staging: verbs -----------------------------------------------------------------
 
     /// A file with three distinct HEAD/index/worktree states — both a staged and an unstaged
-    /// sub-diff, and hunk-patchable (Modified). Same shape the zoom tests use.
+    /// sub-diff, and hunk-patchable (Modified). Same shape the split/maximize gate tests use.
     fn partial_fixture() -> Fixture {
         FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -8351,12 +8319,12 @@ mod tests {
 
     #[test]
     fn stage_hunk_in_staged_pane_unstages_the_hunk() {
-        use super::Zoom;
-
         let fixture = partial_fixture();
         let mut app = app_from_fixture(&fixture);
-        app.zoom = Zoom::Staged;
-        app.open_current();
+        // The file has both sub-diffs, so the default gate is Split — maximize the staged pane
+        // to force a single Staged-role pane (ADR-038; the old test forced this via `Zoom::Staged`).
+        app.toggle_split_focus(); // -> Staged pane
+        app.toggle_maximize(); // -> maximized on the staged pane
         app.stage_hunk(); // staged pane → unstage direction
 
         // Unstaging the only staged hunk reverts the index entry to HEAD.
@@ -8385,9 +8353,8 @@ mod tests {
 
     #[test]
     fn stage_file_in_staged_pane_unstages_whole_file() {
-        use super::Zoom;
-
-        // A freshly `git add`ed (Added) file has only a staged sub-diff.
+        // A freshly `git add`ed (Added) file has only a staged sub-diff — the default gate
+        // already collapses to Single(Staged), nothing to force.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .staged_file("new.txt", "hello\n")
@@ -8395,7 +8362,6 @@ mod tests {
             .unwrap();
 
         let mut app = app_from_fixture(&fixture);
-        app.zoom = Zoom::Staged;
         app.open_current();
         app.stage_file(); // staged pane → unstage; Added file has no HEAD entry, so it goes untracked
 
@@ -8726,70 +8692,48 @@ mod tests {
     // ---- M4 staging: refusals --------------------------------------------------------------
 
     #[test]
-    fn stage_hunk_in_combined_view_refuses_without_touching_the_index() {
-        use super::{Severity, Zoom};
+    fn stage_hunk_on_a_binary_file_refuses_without_touching_the_index() {
+        // ADR-038 decision 10: post-M11, a binary file is `notify_combined_refusal`'s only
+        // non-committed caller — a file with both real sub-diffs can no longer land in
+        // `Role::Combined` at all (maximize only narrows to the focused pane's role), so this
+        // re-points the old `Zoom::Combined`-forced test at the one case that still reaches it.
+        use super::Severity;
 
-        let fixture = partial_fixture();
-        let mut app = app_from_fixture(&fixture);
-        app.zoom = Zoom::Combined;
-        app.open_current();
-        app.stage_hunk();
-
-        let notice = app.notice.as_ref().expect("combined stage must refuse");
-        assert_eq!(notice.severity, Severity::Error);
-        assert!(notice.text.contains("cycle zoom"), "got: {:?}", notice.text);
-        // The index is untouched — still the originally-staged content.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("bin.dat", "hello\n")
+            .build()
+            .unwrap();
+        // Overwrite the worktree copy with binary content post-build, same technique as
+        // `ensure_loaded_skips_binary_files` — the combined diff's content-sniffing then flags it
+        // binary, which forces `Role::Combined` regardless of maximize/focus.
         let repo = fixture.repo().unwrap();
-        repo.assert(predicate::repo::index_blob_equals(
-            "f.txt",
-            "alpha\nBETAEDIT\ngamma\n",
-        ));
-    }
+        std::fs::write(repo.workdir().unwrap().join("bin.dat"), [0u8, 1, 2, 0, 3]).unwrap();
 
-    #[test]
-    fn combined_refusal_defaults_to_the_shift_z_label() {
-        use super::{Severity, Zoom};
-
-        // `App::from_changesets`/`App::new` paths that never seat a keymap (this test included)
-        // must keep showing the command's default binding, byte-identical to before this field
-        // existed.
-        let fixture = partial_fixture();
         let mut app = app_from_fixture(&fixture);
-        app.zoom = Zoom::Combined;
+        assert!(app.files()[0].is_binary);
         app.open_current();
         app.stage_hunk();
 
-        let notice = app.notice.as_ref().expect("combined stage must refuse");
+        let notice = app.notice.as_ref().expect("binary stage must refuse");
         assert_eq!(notice.severity, Severity::Error);
-        assert!(notice.text.contains("(Z)"), "got: {:?}", notice.text);
-    }
-
-    #[test]
-    fn combined_refusal_shows_the_seated_zoom_key_label() {
-        use super::{Severity, Zoom};
-
-        // `main.rs::seat_app` calls `set_zoom_key_label` with the resolved CycleZoom binding —
-        // simulate a rebind by setting a non-default label directly.
-        let fixture = partial_fixture();
-        let mut app = app_from_fixture(&fixture);
-        app.set_zoom_key_label("F5".to_string());
-        app.zoom = Zoom::Combined;
-        app.open_current();
-        app.stage_hunk();
-
-        let notice = app.notice.as_ref().expect("combined stage must refuse");
-        assert_eq!(notice.severity, Severity::Error);
-        assert!(notice.text.contains("(F5)"), "got: {:?}", notice.text);
+        assert!(
+            notice.text.contains("not stageable"),
+            "got: {:?}",
+            notice.text
+        );
+        // The index is untouched — still the originally-staged content.
+        repo.assert(predicate::repo::index_blob_equals("bin.dat", "hello\n"));
     }
 
     #[test]
     fn discard_hunk_in_staged_pane_refuses() {
-        use super::{Severity, Zoom};
-
         let fixture = partial_fixture();
         let mut app = app_from_fixture(&fixture);
-        app.zoom = Zoom::Staged;
-        app.open_current();
+        // The file has both sub-diffs, so the default gate is Split — maximize the staged pane
+        // to force a single Staged-role pane (ADR-038; the old test forced this via `Zoom::Staged`).
+        app.toggle_split_focus(); // -> Staged pane
+        app.toggle_maximize(); // -> maximized on the staged pane
         app.discard_hunk();
 
         assert!(
@@ -9284,12 +9228,20 @@ mod tests {
     }
 
     #[test]
-    fn start_selection_in_combined_view_refuses() {
-        use super::{Severity, Zoom};
+    fn start_selection_on_a_binary_file_refuses() {
+        // Same re-point as `stage_hunk_on_a_binary_file_refuses_without_touching_the_index`: a
+        // binary file is the only non-committed case left that lands in `Role::Combined`.
+        use super::Severity;
 
-        let fixture = partial_fixture();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("bin.dat", "hello\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        std::fs::write(repo.workdir().unwrap().join("bin.dat"), [0u8, 1, 2, 0, 3]).unwrap();
+
         let mut app = app_from_fixture(&fixture);
-        app.zoom = Zoom::Combined;
         app.open_current();
         app.start_selection();
 
@@ -9299,7 +9251,11 @@ mod tests {
         );
         let notice = app.notice.as_ref().expect("combined selection must refuse");
         assert_eq!(notice.severity, Severity::Error);
-        assert!(notice.text.contains("cycle zoom"), "got: {:?}", notice.text);
+        assert!(
+            notice.text.contains("not stageable"),
+            "got: {:?}",
+            notice.text
+        );
     }
 
     #[test]
@@ -9803,19 +9759,19 @@ mod tests {
     }
 
     #[test]
-    fn cycle_zoom_is_a_no_op_on_a_committed_changeset() {
+    fn toggle_maximize_is_a_no_op_on_a_committed_changeset() {
         let mut app = two_committed_changesets_two_and_one_files();
-        let zoom_before = app.zoom;
+        let maximized_before = app.maximized;
 
-        app.cycle_zoom();
+        app.toggle_maximize();
 
         assert_eq!(
-            app.zoom, zoom_before,
-            "z must not change the requested zoom on a committed changeset"
+            app.maximized, maximized_before,
+            "Z must not change maximize on a committed changeset"
         );
         assert!(
             app.notice.is_some(),
-            "z should still surface a notice explaining why it's a no-op"
+            "Z should still surface a notice explaining why it's a no-op"
         );
     }
 
@@ -11120,7 +11076,6 @@ mod tests {
         assert_eq!(app.outline_order(), OutlineOrder::default());
         assert_eq!(app.icon_mode(), IconMode::default());
         assert_eq!(app.layout, Layout::default());
-        assert_eq!(app.zoom, Zoom::default());
         assert_eq!(app.diff_text, DiffTextMode::default());
     }
 
@@ -11292,37 +11247,6 @@ mod tests {
         assert_eq!(app.layout, Layout::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("diff.layout"));
-    }
-
-    #[test]
-    fn diff_zoom_overrides_default_when_set() {
-        let fixture = FixtureBuilder::new()
-            .config("workon.review.diff.zoom", "staged")
-            .build()
-            .unwrap();
-        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
-        let mut app = app_from_fixture(&fixture);
-
-        let warnings = app.apply_view_config(&config);
-
-        assert!(warnings.is_empty());
-        assert_eq!(app.zoom, Zoom::Staged);
-    }
-
-    #[test]
-    fn diff_zoom_invalid_falls_back_to_default_with_warning() {
-        let fixture = FixtureBuilder::new()
-            .config("workon.review.diff.zoom", "bogus")
-            .build()
-            .unwrap();
-        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
-        let mut app = app_from_fixture(&fixture);
-
-        let warnings = app.apply_view_config(&config);
-
-        assert_eq!(app.zoom, Zoom::default());
-        assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("diff.zoom"));
     }
 
     #[test]
@@ -14158,17 +14082,42 @@ mod tests {
     /// "helpful" refusal: decision 4's side-selection rule is total (it always yields a side), so
     /// unlike the staging verbs there is nothing to refuse. `start_selection` itself still gates
     /// combined (it's a staging-shaped verb), so the selection is set directly here rather than
-    /// through `v`.
+    /// through `v`. ADR-038: `Role::Combined` for a file with real content is now only reachable
+    /// on a committed changeset (a binary file has no loaded view to copy from), so this exercises
+    /// it there instead of via a forced `Zoom::Combined`.
     #[test]
     fn content_yank_succeeds_in_combined_role() {
-        let fixture = two_changes_one_hunk_fixture();
-        let mut app = app_from_fixture(&fixture);
-        app.zoom = super::Zoom::Combined;
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("f.txt", "a\nb\nc\nd\ne\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("f.txt", "a\nB\nc\nD\ne\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "main".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
         app.open_current();
         assert_eq!(
             app.staging_role(),
             None,
-            "Zoom::Combined always resolves to Role::Combined (effective_zoom)"
+            "a committed changeset always resolves to Role::Combined (effective_zoom)"
         );
         app.cursor = 1;
         app.selection_anchor = Some(1);

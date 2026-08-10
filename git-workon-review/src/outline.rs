@@ -1,7 +1,8 @@
 //! The outline side pane's pure item model: given a snapshot of every reviewed changeset (label,
 //! current/needs-restack flags, and per-file staged-ness), build the flat row list the pane
 //! renders and the outline cursor indexes — no [`crate::app::App`]/[`crate::app::ChangesetView`]
-//! dependency, mirroring how [`crate::attribute`] stays a pure module consumed by `app`/`render`.
+//! dependency, same posture as [`crate::align`]'s pure row-alignment module consumed by
+//! `app`/`render`.
 //!
 //! CS3 shipped two of the four modes ([`OutlineMode::Flat`]/[`OutlineMode::Stack`]); CS4 added
 //! the two path-trie modes ([`OutlineMode::Tree`]/[`OutlineMode::StackTree`]) via the private

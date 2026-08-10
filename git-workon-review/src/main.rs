@@ -10,7 +10,7 @@ use miette::{IntoDiagnostic, Result};
 use workon_review::acquire::{diff_changesets, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::{self, ReviewConfig};
-use workon_review::keymap::{self, Command, Keymap};
+use workon_review::keymap::Keymap;
 use workon_review::source::{complete_source, resolve_source, Source};
 use workon_review::terminal_query;
 use workon_review::theme::{self, Palette};
@@ -277,7 +277,7 @@ fn seat_app(
     app.set_defer_loads(true);
 
     // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
-    // only set the raw layout/zoom/mode/width fields, and `open_current` is what derives
+    // only set the raw layout/mode/width fields, and `open_current` is what derives
     // `cursor`/`scroll` fresh from whichever settings just landed (see each setter's doc
     // comment).
     let view_config_warnings = app.apply_view_config(view_config);
@@ -285,34 +285,22 @@ fn seat_app(
 
     // A misconfigured keybinding, view-config setting, or theme override is non-fatal: show the
     // collected warnings as a startup notice (cleared on the first keypress, like any notice) and
-    // run with the defaults for those keys/settings/colors — `plumb_zoom_hint_and_warnings` also
-    // re-plumbs the resolved CycleZoom binding into the "cycle zoom" refusal hint, see its doc
-    // comment.
+    // run with the defaults for those keys/settings/colors.
     let mut extra_warnings = view_config_warnings;
     extra_warnings.extend(theme_override_warnings.iter().cloned());
-    plumb_zoom_hint_and_warnings(&mut app, keymap, extra_warnings);
+    surface_warnings(&mut app, keymap, extra_warnings);
 
     app
 }
 
-/// The zoom-hint plumbing + warning-aggregation tail `seat_app` (above) and `tui::event_loop`'s
-/// `reload-config` handling both need — the same structural core as `config::resolve_runtime`,
-/// so a change to how warnings surface or how the zoom hint is plumbed needs only one edit. Sets
-/// the "cycle zoom" refusal hint from `keymap`'s resolved `CycleZoom` binding (App has no keymap
-/// field of its own — see `App::zoom_key_label`'s doc comment; leaves the previous label in
-/// place if the command has no bound key), then merges `keymap.warnings()` with `extra_warnings`
+/// The warning-aggregation tail `seat_app` (above) and `tui::event_loop`'s `reload-config`
+/// handling both need — the same structural core as `config::resolve_runtime`, so a change to
+/// how warnings surface needs only one edit. Merges `keymap.warnings()` with `extra_warnings`
 /// (view-config/theme-override warnings, already collected by the caller) and shows them as a
 /// notice, cleared on the first keypress like any notice. Returns whether any warnings were
 /// shown, so a reload can layer its own "config reloaded" success notice only when nothing
 /// needed reporting.
-fn plumb_zoom_hint_and_warnings(
-    app: &mut App,
-    keymap: &Keymap,
-    extra_warnings: Vec<String>,
-) -> bool {
-    if let Some(label) = keymap::primary_key(keymap, Command::CycleZoom) {
-        app.set_zoom_key_label(label);
-    }
+fn surface_warnings(app: &mut App, keymap: &Keymap, extra_warnings: Vec<String>) -> bool {
     let mut warnings = keymap.warnings().to_vec();
     warnings.extend(extra_warnings);
     let had_warnings = !warnings.is_empty();

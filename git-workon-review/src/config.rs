@@ -42,7 +42,6 @@
 //!
 //! [workon "review.diff"]
 //!   layout = split
-//!   zoom = combined
 //!   text = syntax             ; syntax | tint | edit (default: syntax)
 //! ```
 //!
@@ -137,7 +136,6 @@ pub struct RawViewConfig {
     pub outline_order: Option<String>,
     pub icons: Option<String>,
     pub diff_layout: Option<String>,
-    pub diff_zoom: Option<String>,
     pub diff_text: Option<String>,
 }
 
@@ -308,7 +306,6 @@ const KNOWN_SCALAR_KEYS: &[&str] = &[
     "outline.mode",
     "outline.order",
     "diff.layout",
-    "diff.zoom",
     "diff.text",
 ];
 
@@ -539,11 +536,6 @@ impl<'repo> ReviewConfig<'repo> {
         self.get_view_string(View::Diff, "layout")
     }
 
-    /// Get `workon.review.diff.zoom`, raw. `None` if unset.
-    pub fn diff_zoom(&self) -> Result<Option<String>, git2::Error> {
-        self.get_view_string(View::Diff, "zoom")
-    }
-
     /// Get `workon.review.diff.text`, raw. `None` if unset — see
     /// [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s "Revised (CS11, diff
     /// foreground/background split)" section.
@@ -565,7 +557,6 @@ impl<'repo> ReviewConfig<'repo> {
             outline_order: self.outline_order().ok().flatten(),
             icons: self.icons().ok().flatten(),
             diff_layout: self.diff_layout().ok().flatten(),
-            diff_zoom: self.diff_zoom().ok().flatten(),
             diff_text: self.diff_text().ok().flatten(),
         }
     }
@@ -808,7 +799,6 @@ mod tests {
             .config("workon.review.outline.order", "base-first")
             .config("workon.review.icons", "nerd")
             .config("workon.review.diff.layout", "split")
-            .config("workon.review.diff.zoom", "staged")
             .config("workon.review.diff.text", "tint")
             .build()
             .expect("fixture build");
@@ -829,10 +819,6 @@ mod tests {
             config.diff_layout().expect("layout"),
             Some("split".to_string())
         );
-        assert_eq!(
-            config.diff_zoom().expect("zoom"),
-            Some("staged".to_string())
-        );
         assert_eq!(config.diff_text().expect("text"), Some("tint".to_string()));
     }
 
@@ -847,7 +833,6 @@ mod tests {
         assert_eq!(config.outline_order().expect("order"), None);
         assert_eq!(config.icons().expect("icons"), None);
         assert_eq!(config.diff_layout().expect("layout"), None);
-        assert_eq!(config.diff_zoom().expect("zoom"), None);
         assert_eq!(config.diff_text().expect("text"), None);
     }
 
@@ -1315,7 +1300,6 @@ mod tests {
             .config("workon.review.outline.mode", "tree")
             .config("workon.review.outline.order", "base-first")
             .config("workon.review.diff.layout", "split")
-            .config("workon.review.diff.zoom", "staged")
             .config("workon.review.diff.text", "tint")
             .config("workon.review.theme.base00", "#101010") // a theme slot
             .config("workon.review.theme.cursor-bg", "#1a2b3c") // a theme tint
@@ -1329,6 +1313,25 @@ mod tests {
             .unknown_key_warnings()
             .expect("unknown_key_warnings");
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+    }
+
+    /// ADR-038 decision 8: `workon.review.diff.zoom` was removed with no replacement key and no
+    /// compatibility alias, so a config still setting it now degrades exactly like any other
+    /// unrecognized key — one unknown-key warning, no crash, no effect — rather than silently
+    /// applying a dead setting.
+    #[test]
+    fn unknown_key_warnings_flags_the_removed_diff_zoom_key() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.zoom", "combined")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let warnings = ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("diff.zoom"), "got: {warnings:?}");
     }
 
     /// Decision 3's drift test. `KNOWN_SCALAR_KEYS` is a second source of truth alongside the
@@ -1347,7 +1350,6 @@ mod tests {
             .config("workon.review.outline.mode", "tree")
             .config("workon.review.outline.order", "base-first")
             .config("workon.review.diff.layout", "split")
-            .config("workon.review.diff.zoom", "staged")
             .config("workon.review.diff.text", "tint")
             .build()
             .expect("fixture build");
@@ -1373,7 +1375,6 @@ mod tests {
                 "diff.layout",
                 config.diff_layout().expect("layout").is_some(),
             ),
-            ("diff.zoom", config.diff_zoom().expect("zoom").is_some()),
             ("diff.text", config.diff_text().expect("text").is_some()),
         ];
 

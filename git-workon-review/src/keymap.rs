@@ -52,7 +52,7 @@ pub enum Command {
     ScrollTop,
     ScrollBottom,
     ToggleLayout,
-    CycleZoom,
+    ToggleMaximize,
     ToggleSplitFocus,
     Refresh,
     StageHunk,
@@ -198,16 +198,18 @@ pub static REGISTRY: &[Registered] = &[
         description: "Toggle side-by-side / inline layout",
     },
     Registered {
-        command: Command::CycleZoom,
+        command: Command::ToggleMaximize,
         view: View::Diff,
-        name: "cycle-zoom",
+        name: "toggle-maximize",
         // Rebound from `z` (diff-fold-keys): `z` now anchors the `zM`/`zR` gap fold-all chords in
         // this view, and a bare-key binding can't coexist with a longer chord sharing its prefix
-        // (see `shift_z_dispatches_cycle_zoom_with_no_collisions`'s doc comment for the
+        // (see `shift_z_dispatches_toggle_maximize_with_no_collisions`'s doc comment for the
         // mechanics; `build_context`'s prefix-clash check would now warn on this, not just
-        // silently break dispatch). `Z` was free in `View::Diff`.
+        // silently break dispatch). `Z` was free in `View::Diff`. ADR-038 decision 9: renamed
+        // from `cycle-zoom`, keeping the `Z` binding — a user config still naming `cycle-zoom`
+        // degrades to the keymap's unknown-action warning rather than silently doing nothing.
         default_keys: "Z",
-        description: "Cycle the staged/unstaged zoom",
+        description: "Maximize/restore the focused split pane",
     },
     Registered {
         command: Command::ToggleSplitFocus,
@@ -1334,37 +1336,37 @@ mod tests {
         );
     }
 
-    /// CS3 (diff-fold-keys): `cycle-zoom` was rebound from bare `z` to `Z` to make room for the
-    /// `zM`/`zR` gap fold-all chords in `View::Diff`. This wasn't optional bookkeeping —
-    /// `match_keys` gives a strict-prefix match precedence over an exact one in the SAME scan
-    /// (see its doc comment): had `cycle-zoom` stayed on bare `z` alongside `zM`/`zR`, a lone `z`
-    /// press would always report `Pending` instead of firing `CycleZoom` immediately, and any
-    /// follow-up key that wasn't `M`/`R` would be swallowed as `Unmatched { mid_sequence: true }`
-    /// rather than re-processed — silently breaking `cycle-zoom` with no *runtime* warning; the
-    /// matcher's chord-wins precedence never changed. This test pins the resolved state: `Z`
-    /// fires `CycleZoom` immediately, and `z` only
-    /// ever anchors the `zM`/`zR` chords below — never a bare-key command of its own again.
+    /// CS3 (diff-fold-keys): `toggle-maximize` (named `cycle-zoom` before ADR-038) was rebound
+    /// from bare `z` to `Z` to make room for the `zM`/`zR` gap fold-all chords in `View::Diff`.
+    /// This wasn't optional bookkeeping — `match_keys` gives a strict-prefix match precedence
+    /// over an exact one in the SAME scan (see its doc comment): had it stayed on bare `z`
+    /// alongside `zM`/`zR`, a lone `z` press would always report `Pending` instead of firing
+    /// `ToggleMaximize` immediately, and any follow-up key that wasn't `M`/`R` would be swallowed
+    /// as `Unmatched { mid_sequence: true }` rather than re-processed — silently breaking the
+    /// binding with no *runtime* warning; the matcher's chord-wins precedence never changed. This
+    /// test pins the resolved state: `Z` fires `ToggleMaximize` immediately, and `z` only ever
+    /// anchors the `zM`/`zR` chords below — never a bare-key command of its own again.
     /// (`build_context` now also flags this shape as a prefix clash and warns — see
     /// `a_bare_prefix_binding_warns_about_the_chord_that_shadows_it` below — but the resolved
     /// defaults must still be clash-free, hence the empty-warnings assertion here.)
     #[test]
-    fn shift_z_dispatches_cycle_zoom_with_no_collisions() {
+    fn shift_z_dispatches_toggle_maximize_with_no_collisions() {
         let km = Keymap::defaults();
         assert!(
             km.warnings().is_empty(),
-            "cycle-zoom's rebind to Z must not collide with anything: {:?}",
+            "toggle-maximize's rebind to Z must not collide with anything: {:?}",
             km.warnings()
         );
         assert_eq!(
             feed(&km, false, &[key(KeyCode::Char('Z'))]),
-            Dispatch::Command(Command::CycleZoom)
+            Dispatch::Command(Command::ToggleMaximize)
         );
     }
 
     /// `zM`/`zR` — reset/expand-all gaps in the diff view (companion to the outline's own
     /// `zM`/`zR` fold-all, `z_m_and_z_r_dispatch_outline_fold_all_with_no_collisions` above).
-    /// Coexists cleanly with `Z` (`cycle-zoom`, see the test above) now that `cycle-zoom` no
-    /// longer claims the bare `z` prefix.
+    /// Coexists cleanly with `Z` (`toggle-maximize`, see the test above) now that it no longer
+    /// claims the bare `z` prefix.
     #[test]
     fn z_m_and_z_r_dispatch_diff_gap_fold_all_with_no_collisions() {
         let km = Keymap::defaults();
@@ -1394,7 +1396,7 @@ mod tests {
     /// M11 (`copy-lines`/`copy-location`, the yank split): `y` was free in both `View::Global`
     /// and `View::Diff` (unlike `p`, which `[h`'s extra default and the outline's
     /// `prev-changeset` already claim), so no existing binding needed to move to make room for
-    /// it — unlike `cycle-zoom`'s `z` -> `Z` rebind above. `Y` is likewise free (verified against
+    /// it — unlike the `z` -> `Z` rebind above. `Y` is likewise free (verified against
     /// every `default_keys` entry in this registry when the yank split was designed). Pins both
     /// resolved defaults clash-free the same way those tests do.
     #[test]
@@ -1539,16 +1541,16 @@ mod tests {
 
     #[test]
     fn a_bare_prefix_binding_warns_about_the_chord_that_shadows_it() {
-        // Rebind cycle-zoom back onto bare `z`, which now collides with the `zM`/`zR` gap
+        // Rebind toggle-maximize back onto bare `z`, which now collides with the `zM`/`zR` gap
         // fold-all chords still on their defaults in `View::Diff`. Each chord sharing the `z`
-        // prefix is its own clashing pair — one warning per pair, both naming cycle-zoom.
+        // prefix is its own clashing pair — one warning per pair, both naming toggle-maximize.
         let km = Keymap::from_bindings(&[RawBinding {
             view: View::Diff,
-            action: "cycle-zoom".to_string(),
+            action: "toggle-maximize".to_string(),
             keys: "z".to_string(),
         }]);
         assert_eq!(km.warnings().len(), 2, "warnings: {:?}", km.warnings());
-        assert!(km.warnings().iter().all(|w| w.contains("cycle-zoom")));
+        assert!(km.warnings().iter().all(|w| w.contains("toggle-maximize")));
         assert!(km.warnings().iter().all(|w| w.contains("diff")));
         assert!(km.warnings().iter().any(|w| w.contains("reset-gaps")));
         assert!(km.warnings().iter().any(|w| w.contains("expand-all-gaps")));

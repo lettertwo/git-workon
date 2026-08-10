@@ -16,7 +16,6 @@ pub mod acquire;
 pub mod align;
 pub mod app;
 pub mod apply;
-pub mod attribute;
 pub mod clipboard;
 pub mod config;
 pub mod error;

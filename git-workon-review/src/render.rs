@@ -18,7 +18,6 @@ use crate::app::{
     App, DiffTextMode, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role,
     Severity, Summary,
 };
-use crate::attribute::Attribution;
 use crate::config::View;
 use crate::highlight::FgSpan;
 use crate::icons::IconMode;
@@ -431,111 +430,73 @@ fn gutter_width(max_lineno: usize) -> usize {
     max_lineno.to_string().len().max(3)
 }
 
-/// How a rendered pane resolves a changed cell's (line, edit) background pair — one per
-/// [`Role`] (locked decision #7): the combined view is the only one that needs a per-cell lookup,
-/// since it's the only role that fuses staged and unstaged content into one set of rows.
+/// How a rendered pane resolves a changed cell's (line, edit) background pair — one per [`Role`].
+/// ADR-038 decision 7: `Role::Combined` is reachable only for a committed changeset (no
+/// staged/unstaged split to attribute against) or a binary file (no cells at all), so it never
+/// needs a per-cell staged-ness lookup any more — [`attribution_mode`] maps it straight to
+/// `Plain`, the same as the unstaged pane.
 #[derive(Clone, Copy)]
-enum AttributionMode<'a> {
-    /// Combined view: look up each cell's staged-ness in the given [`Attribution`], built fresh
-    /// for the current file this frame (see [`combined_attribution`]).
-    Attributed(&'a Attribution),
-    /// Unstaged zoom pane: every changed cell IS the not-yet-staged set — render bright,
-    /// unconditionally (today's plain colors).
+enum AttributionMode {
+    /// Combined view, or the unstaged zoom pane: every changed cell IS the not-yet-staged set —
+    /// render bright, unconditionally (today's plain colors).
     Plain,
     /// Staged zoom pane (single-zoom or the split's bottom pane): every changed cell IS already
     /// staged — render dim, unconditionally.
     StagedUniform,
 }
 
-/// Build the current file's [`Attribution`] when rendering the combined role, `None` for the
-/// unstaged/staged roles (which don't need a per-cell lookup — see [`AttributionMode`]). Computed
-/// fresh from the sub-models on every call rather than cached on `App`: cheap (O(hunk lines) on
-/// one file) and always correct even if the index changes between frames (the M4 watcher's
-/// concern, not this one's, but the cost of getting it wrong is a stale color).
-fn combined_attribution(app: &App, idx: usize, role: Role) -> Option<Attribution> {
-    // A committed changeset's combined role is the whole `base..head` range, not a fusion of
-    // staged/unstaged sets — there's nothing to attribute (locked decision #2's "skip
-    // attribution" guard). Every cell renders as plain, undifferentiated change.
-    if role != Role::Combined || app.is_committed() {
-        return None;
-    }
-    let unstaged = app.role_change(idx, Role::Unstaged);
-    let staged = app.role_change(idx, Role::Staged);
-    Some(Attribution::build(unstaged, staged))
-}
-
-/// Resolve the [`AttributionMode`] to render `role` with, given the (possibly absent)
-/// [`Attribution`] built by [`combined_attribution`] — absent for a non-combined role, OR for a
-/// committed changeset's combined role (see that function's doc comment), in which case combined
-/// renders [`AttributionMode::Plain`] rather than panicking.
-fn attribution_mode(role: Role, attribution: &Option<Attribution>) -> AttributionMode<'_> {
-    match (role, attribution) {
-        (Role::Combined, Some(a)) => AttributionMode::Attributed(a),
-        (Role::Combined, None) => AttributionMode::Plain,
-        (Role::Unstaged, _) => AttributionMode::Plain,
-        (Role::Staged, _) => AttributionMode::StagedUniform,
+/// Resolve the [`AttributionMode`] to render `role` with.
+fn attribution_mode(role: Role) -> AttributionMode {
+    match role {
+        Role::Combined | Role::Unstaged => AttributionMode::Plain,
+        Role::Staged => AttributionMode::StagedUniform,
     }
 }
 
-/// Whether a Del cell at `old_lnum` is staged, given `mode` — the single staged-ness decision
-/// shared by [`del_bg_pair`] and [`del_tint_fg`] (locked decision #6: staged-ness must resolve
-/// identically for background and foreground, not through a second path).
-fn del_is_staged(mode: AttributionMode, old_lnum: u32) -> bool {
-    match mode {
-        AttributionMode::Plain => false,
-        AttributionMode::StagedUniform => true,
-        AttributionMode::Attributed(attribution) => attribution.del_is_staged(old_lnum),
-    }
+/// Whether a changed cell is already staged, given `mode` — the single staged-ness decision every
+/// resolver below shares, so a cell's background and its foreground can never disagree by
+/// resolving through separate paths.
+///
+/// Takes no line number: staged-ness is now a property of the pane's role alone. The per-cell
+/// lookup this replaced belonged to the deleted combined-view attribution (ADR-038 decision 7).
+fn is_staged(mode: AttributionMode) -> bool {
+    matches!(mode, AttributionMode::StagedUniform)
 }
 
-/// Whether an Add cell at `new_lnum` is staged, given `mode` — the single staged-ness decision
-/// shared by [`add_bg_pair`] and [`add_tint_fg`] (locked decision #6).
-fn add_is_staged(mode: AttributionMode, new_lnum: u32) -> bool {
-    match mode {
-        AttributionMode::Plain => false,
-        AttributionMode::StagedUniform => true,
-        AttributionMode::Attributed(attribution) => !attribution.add_is_unstaged(new_lnum),
-    }
-}
-
-/// The (line, edit) background pair for a Del cell at `old_lnum`, given `mode`, resolved from
-/// `theme`'s unstaged vs. staged Del tints.
-fn del_bg_pair(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> (Color, Color) {
-    let unstaged = (theme.del_line_bg, theme.del_edit_bg);
-    let staged = (theme.del_staged_line_bg, theme.del_staged_edit_bg);
-    if del_is_staged(mode, old_lnum) {
-        staged
+/// The (line, edit) background pair for a Del cell, given `mode`, resolved from `theme`'s
+/// unstaged vs. staged Del tints.
+fn del_bg_pair(mode: AttributionMode, theme: &Palette) -> (Color, Color) {
+    if is_staged(mode) {
+        (theme.del_staged_line_bg, theme.del_staged_edit_bg)
     } else {
-        unstaged
+        (theme.del_line_bg, theme.del_edit_bg)
     }
 }
 
-/// The (line, edit) background pair for an Add cell at `new_lnum`, given `mode`, resolved from
-/// `theme`'s unstaged vs. staged Add tints.
-fn add_bg_pair(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> (Color, Color) {
-    let unstaged = (theme.add_line_bg, theme.add_edit_bg);
-    let staged = (theme.add_staged_line_bg, theme.add_staged_edit_bg);
-    if add_is_staged(mode, new_lnum) {
-        staged
+/// The (line, edit) background pair for an Add cell, given `mode`, resolved from `theme`'s
+/// unstaged vs. staged Add tints.
+fn add_bg_pair(mode: AttributionMode, theme: &Palette) -> (Color, Color) {
+    if is_staged(mode) {
+        (theme.add_staged_line_bg, theme.add_staged_edit_bg)
     } else {
-        unstaged
+        (theme.add_line_bg, theme.add_edit_bg)
     }
 }
 
-/// The tint foreground for a Del cell at `old_lnum`, given `mode`, resolved from `theme`'s
-/// unstaged vs. staged Del foreground fields ([`Palette::del_fg`]/[`Palette::del_staged_fg`]).
-fn del_tint_fg(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> Color {
-    if del_is_staged(mode, old_lnum) {
+/// The tint foreground for a Del cell, given `mode`, resolved from `theme`'s unstaged vs. staged
+/// Del foreground fields ([`Palette::del_fg`]/[`Palette::del_staged_fg`]).
+fn del_tint_fg(mode: AttributionMode, theme: &Palette) -> Color {
+    if is_staged(mode) {
         theme.del_staged_fg
     } else {
         theme.del_fg
     }
 }
 
-/// The tint foreground for an Add cell at `new_lnum`, given `mode`, resolved from `theme`'s
-/// unstaged vs. staged Add foreground fields ([`Palette::add_fg`]/[`Palette::add_staged_fg`]).
-fn add_tint_fg(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> Color {
-    if add_is_staged(mode, new_lnum) {
+/// The tint foreground for an Add cell, given `mode`, resolved from `theme`'s unstaged vs. staged
+/// Add foreground fields ([`Palette::add_fg`]/[`Palette::add_staged_fg`]).
+fn add_tint_fg(mode: AttributionMode, theme: &Palette) -> Color {
+    if is_staged(mode) {
         theme.add_staged_fg
     } else {
         theme.add_fg
@@ -853,19 +814,19 @@ fn build_pane_line(
 
             let emphasis = match kind {
                 CellKind::Del => {
-                    let (line_bg, edit_bg) = del_bg_pair(mode, n as u32, theme);
+                    let (line_bg, edit_bg) = del_bg_pair(mode, theme);
                     Some(LineEmphasis {
                         line_bg,
                         edit_bg,
-                        tint_fg: del_tint_fg(mode, n as u32, theme),
+                        tint_fg: del_tint_fg(mode, theme),
                     })
                 }
                 CellKind::Add => {
-                    let (line_bg, edit_bg) = add_bg_pair(mode, n as u32, theme);
+                    let (line_bg, edit_bg) = add_bg_pair(mode, theme);
                     Some(LineEmphasis {
                         line_bg,
                         edit_bg,
-                        tint_fg: add_tint_fg(mode, n as u32, theme),
+                        tint_fg: add_tint_fg(mode, theme),
                     })
                 }
                 CellKind::Context | CellKind::Filler => None,
@@ -2190,9 +2151,8 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
 fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, theme: &Palette) {
     // CS1 (`focused-pane-header`, locked decision #5's split case): the outline holding focus
     // dims BOTH captions (the outline header is the frame's one lit label); otherwise exactly the
-    // focused half's caption lights up, matching `split_focus_role()` — never derived from the
-    // requested `Zoom`, since this fn only ever runs once `effective_zoom_for` has already
-    // resolved to `Split` (see `render_body`'s caller).
+    // focused half's caption lights up, matching `split_focus_role()` — this fn only ever runs
+    // once `effective_zoom_for` has already resolved to `Split` (see `render_body`'s caller).
     let outline_focused = app.outline_focused();
     // Too short to fit two captions plus a content line each: fall back to the focused pane alone,
     // rendered over the whole area, so the user still sees SOMETHING navigable.
@@ -2395,10 +2355,7 @@ fn render_pane_sbs(
     let new_gutter_w = gutter_width(view.new_line_count());
     let end = (scroll + area.height as usize).min(view.display.len());
 
-    // Built once per frame, not per row/cached on `App` — see `combined_attribution`'s doc
-    // comment. `None` for non-combined roles, which don't need it.
-    let attribution = combined_attribution(app, idx, role);
-    let mode = attribution_mode(role, &attribution);
+    let mode = attribution_mode(role);
 
     // Phase 1 (mutable): populate the word-span cache for visible paired rows. Phase 2 below
     // re-borrows `app`/`view` immutably to build lines — kept as the same two-phase dance the
@@ -2611,23 +2568,24 @@ fn build_inline_line(
     let mut spans = vec![TSpan::styled(gutter, Style::default().fg(theme.gutter))];
 
     let is_word_pair = row.is_word_diff_pair();
-    // `kind` is always Del/Add/Context here — inline has no Filler rows. `old_opt`/`new_opt`
-    // carry the exact lineno each kind is documented to have (see this fn's own match above).
+    // `kind` is always Del/Add/Context here — inline has no Filler rows. Only the PRESENCE of
+    // `old_opt`/`new_opt` matters: a cell missing the lineno its kind is documented to carry gets
+    // no emphasis. The lineno's value stopped mattering when per-cell attribution was deleted.
     let emphasis = match kind {
-        CellKind::Del => old_opt.map(|n| {
-            let (line_bg, edit_bg) = del_bg_pair(mode, n as u32, theme);
+        CellKind::Del => old_opt.map(|_| {
+            let (line_bg, edit_bg) = del_bg_pair(mode, theme);
             LineEmphasis {
                 line_bg,
                 edit_bg,
-                tint_fg: del_tint_fg(mode, n as u32, theme),
+                tint_fg: del_tint_fg(mode, theme),
             }
         }),
-        CellKind::Add => new_opt.map(|n| {
-            let (line_bg, edit_bg) = add_bg_pair(mode, n as u32, theme);
+        CellKind::Add => new_opt.map(|_| {
+            let (line_bg, edit_bg) = add_bg_pair(mode, theme);
             LineEmphasis {
                 line_bg,
                 edit_bg,
-                tint_fg: add_tint_fg(mode, n as u32, theme),
+                tint_fg: add_tint_fg(mode, theme),
             }
         }),
         CellKind::Context | CellKind::Filler => None,
@@ -2679,9 +2637,7 @@ fn render_pane_inline(
     let new_gutter_w = gutter_width(view.new_line_count());
     let end = (scroll + area.height as usize).min(view.inline.len());
 
-    // See `render_pane_sbs`'s identical comment — built once per frame, not cached on `App`.
-    let attribution = combined_attribution(app, idx, role);
-    let mode = attribution_mode(role, &attribution);
+    let mode = attribution_mode(role);
 
     // Same two-phase mutable/immutable dance as `render_pane_sbs`, over the inline coordinate
     // space instead.
@@ -3620,271 +3576,6 @@ mod tests {
     }
 
     #[test]
-    fn single_pane_zoom_is_identical_to_combined_for_an_unstaged_only_file() {
-        // The common case: a dirty-but-unstaged file. The default split gate downgrades it to a
-        // single unstaged pane, whose view is byte-for-byte the combined view (index == HEAD when
-        // nothing is staged) — so a user who never presses `Z` sees exactly the pre-zoom app.
-        let old = "l1\nl2\nl3\nl4\nl5\nold word here\nl7\nl8\nl9\nl10\n";
-        let new = "l1\nl2\nl3\nl4\nl5\nnew word here\nl7\nl8\nl9\nl10\n";
-        let fixture = FixtureBuilder::new()
-            .config("core.autocrlf", "false")
-            .unstaged_file("small.txt", old, new)
-            .build()
-            .unwrap();
-
-        let mut app = app_from_fixture(&fixture);
-        app.open_current();
-        let default_buf = render_once(&mut app, 60, 20);
-
-        // No split chrome leaks into the single-pane render.
-        for line in buf_lines(&default_buf) {
-            assert!(
-                !line.contains("UNSTAGED") && !line.contains("STAGED"),
-                "single-pane render must not show a split caption, got line: {line:?}"
-            );
-        }
-
-        // Explicitly zoom to Combined and re-render — must be pixel-identical.
-        app.cycle_zoom();
-        assert_eq!(app.zoom, crate::app::Zoom::Combined);
-        let combined_buf = render_once(&mut app, 60, 20);
-        assert_eq!(
-            default_buf, combined_buf,
-            "the default (downgraded-to-unstaged) render must match the combined-zoom render \
-             cell-for-cell for an unstaged-only file"
-        );
-    }
-
-    #[test]
-    fn combined_view_colors_a_staged_change_dim_and_an_unstaged_change_bright() {
-        // A partially-staged file with two independent word changes: line 2 was already staged
-        // (committed -> staged both carry the change), line 4 is still only in the worktree
-        // (staged -> workdir carries it, index doesn't). The combined view (HEAD <-> worktree)
-        // fuses both into one set of rows — attribution must tell them apart: line 2's change
-        // should render with the dim (staged) pair, line 4's with the bright (not-yet-staged)
-        // pair, on BOTH the Del (old) and Add (new) side of each row (the add/del asymmetry:
-        // Del keys off the staged sub-diff, Add off the unstaged sub-diff).
-        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
-        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
-        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
-        let fixture = FixtureBuilder::new()
-            .config("core.autocrlf", "false")
-            .partially_staged_file("f.txt", committed, staged, workdir)
-            .build()
-            .unwrap();
-
-        let mut app = app_from_fixture(&fixture);
-        app.open_current();
-        app.cycle_zoom(); // Split -> Combined
-        assert_eq!(app.zoom, crate::app::Zoom::Combined);
-        // Park the cursor on the file's first (context) row so its highlight tint doesn't blend
-        // into either changed row's background and muddy the color comparison below.
-        app.cursor = 0;
-        app.derive_scroll();
-
-        let buf = render_once(&mut app, 60, 20);
-        let content = buf_lines(&buf);
-
-        let staged_row = content
-            .iter()
-            .position(|line| line.contains("old word here"))
-            .expect("staged change's old-side text visible");
-        let unstaged_row = content
-            .iter()
-            .position(|line| line.contains("old4 word four"))
-            .expect("unstaged change's old-side text visible");
-
-        // Old (left) pane, first content column after the gutter — always carries SOME del
-        // emphasis on a changed row, line or edit depending on the word-diff split, but
-        // always from the dim family for a staged row and the bright family for an unstaged one.
-        let old_content_x = 4; // gutter width 3 + 1 space, same convention as the other tests
-        let staged_del_bg = buf
-            .cell((old_content_x, staged_row as u16))
-            .unwrap()
-            .style()
-            .bg;
-        let unstaged_del_bg = buf
-            .cell((old_content_x, unstaged_row as u16))
-            .unwrap()
-            .style()
-            .bg;
-
-        let t = Palette::dark();
-        let dim_dels = [Some(t.del_staged_line_bg), Some(t.del_staged_edit_bg)];
-        let bright_dels = [Some(t.del_line_bg), Some(t.del_edit_bg)];
-        assert!(
-            dim_dels.contains(&staged_del_bg),
-            "expected the staged row's Del side to use the dim pair, got {staged_del_bg:?}"
-        );
-        assert!(
-            bright_dels.contains(&unstaged_del_bg),
-            "expected the unstaged row's Del side to use the bright pair, got {unstaged_del_bg:?}"
-        );
-        assert_ne!(
-            staged_del_bg, unstaged_del_bg,
-            "staged and unstaged Del rows must render with visibly distinct backgrounds"
-        );
-
-        // New (right) pane: same rows carry "new word here" / "new4 word four" respectively.
-        let left_w = (buf.area.width.saturating_sub(1)) / 2;
-        let new_content_x = left_w + 1 + 4; // divider + gutter width 3 + 1 space
-        let staged_add_bg = buf
-            .cell((new_content_x, staged_row as u16))
-            .unwrap()
-            .style()
-            .bg;
-        let unstaged_add_bg = buf
-            .cell((new_content_x, unstaged_row as u16))
-            .unwrap()
-            .style()
-            .bg;
-
-        let dim_adds = [Some(t.add_staged_line_bg), Some(t.add_staged_edit_bg)];
-        let bright_adds = [Some(t.add_line_bg), Some(t.add_edit_bg)];
-        assert!(
-            dim_adds.contains(&staged_add_bg),
-            "expected the staged row's Add side to use the dim pair, got {staged_add_bg:?}"
-        );
-        assert!(
-            bright_adds.contains(&unstaged_add_bg),
-            "expected the unstaged row's Add side to use the bright pair, got {unstaged_add_bg:?}"
-        );
-        assert_ne!(
-            staged_add_bg, unstaged_add_bg,
-            "staged and unstaged Add rows must render with visibly distinct backgrounds"
-        );
-    }
-
-    #[test]
-    fn combined_view_tint_mode_colors_a_staged_change_dim_fg_and_an_unstaged_change_bright_fg() {
-        // Full-stack companion to `combined_view_colors_a_staged_change_dim_and_an_unstaged_change_
-        // bright`, same fixture/positions, but proving `workon.review.diff.text = tint`'s
-        // foreground threading end-to-end (App -> render_pane_sbs -> build_pane_line ->
-        // content_spans) rather than at the pure-function level: locked decision #6, the staged
-        // vs. unstaged tint foreground must follow the SAME attribution the backgrounds already
-        // use, not a second path.
-        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
-        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
-        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
-        let fixture = FixtureBuilder::new()
-            .config("core.autocrlf", "false")
-            .partially_staged_file("f.txt", committed, staged, workdir)
-            .build()
-            .unwrap();
-
-        let mut app = app_from_fixture(&fixture);
-        app.open_current();
-        app.cycle_zoom(); // Split -> Combined
-        assert_eq!(app.zoom, crate::app::Zoom::Combined);
-        app.set_diff_text(DiffTextMode::Tint);
-        app.cursor = 0;
-        app.derive_scroll();
-
-        let buf = render_once(&mut app, 60, 20);
-        let content = buf_lines(&buf);
-
-        let staged_row = content
-            .iter()
-            .position(|line| line.contains("old word here"))
-            .expect("staged change's old-side text visible");
-        let unstaged_row = content
-            .iter()
-            .position(|line| line.contains("old4 word four"))
-            .expect("unstaged change's old-side text visible");
-
-        let old_content_x = 4; // gutter width 3 + 1 space, same convention as the sibling test
-        let staged_del_fg = buf
-            .cell((old_content_x, staged_row as u16))
-            .unwrap()
-            .style()
-            .fg;
-        let unstaged_del_fg = buf
-            .cell((old_content_x, unstaged_row as u16))
-            .unwrap()
-            .style()
-            .fg;
-
-        let t = Palette::dark();
-        assert_eq!(
-            staged_del_fg,
-            Some(t.del_staged_fg),
-            "the staged row's Del side must take del_staged_fg, not del_fg"
-        );
-        assert_eq!(
-            unstaged_del_fg,
-            Some(t.del_fg),
-            "the unstaged row's Del side must take del_fg, not del_staged_fg"
-        );
-
-        let left_w = (buf.area.width.saturating_sub(1)) / 2;
-        let new_content_x = left_w + 1 + 4;
-        let staged_add_fg = buf
-            .cell((new_content_x, staged_row as u16))
-            .unwrap()
-            .style()
-            .fg;
-        let unstaged_add_fg = buf
-            .cell((new_content_x, unstaged_row as u16))
-            .unwrap()
-            .style()
-            .fg;
-
-        assert_eq!(
-            staged_add_fg,
-            Some(t.add_staged_fg),
-            "the staged row's Add side must take add_staged_fg, not add_fg"
-        );
-        assert_eq!(
-            unstaged_add_fg,
-            Some(t.add_fg),
-            "the unstaged row's Add side must take add_fg, not add_staged_fg"
-        );
-    }
-
-    #[test]
-    fn combined_view_syntax_mode_is_pixel_identical_regardless_of_attribution() {
-        // The changeset's primary identity gate, exercised on the exact fixture/positions the two
-        // tint-mode tests above use: with `diff.text` at its default (`Syntax`), the combined
-        // view's per-cell foreground for a staged AND an unstaged changed row must be unaffected
-        // by `DiffTextMode` — rendering under every mode variant applied to the SAME app state
-        // (only `diff_text` flipped) but reading it back to `Syntax` must reproduce the original
-        // frame exactly.
-        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
-        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
-        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
-        let fixture = FixtureBuilder::new()
-            .config("core.autocrlf", "false")
-            .partially_staged_file("f.txt", committed, staged, workdir)
-            .build()
-            .unwrap();
-
-        let mut app = app_from_fixture(&fixture);
-        app.open_current();
-        app.cycle_zoom(); // Split -> Combined
-        app.cursor = 0;
-        app.derive_scroll();
-
-        assert_eq!(
-            app.diff_text,
-            DiffTextMode::default(),
-            "test setup: diff_text must start at its unset/syntax default"
-        );
-        let baseline = render_once(&mut app, 60, 20);
-
-        for mode in [DiffTextMode::Tint, DiffTextMode::Edit] {
-            app.set_diff_text(mode);
-            let _ = render_once(&mut app, 60, 20); // render under a tinting mode, then...
-            app.set_diff_text(DiffTextMode::Syntax); // ...switch back before comparing.
-            let restored = render_once(&mut app, 60, 20);
-            assert_eq!(
-                baseline, restored,
-                "Syntax mode must render identically to the pre-CS11 baseline regardless of \
-                 what DiffTextMode {mode:?} was live before it"
-            );
-        }
-    }
-
-    #[test]
     fn footer_shows_hint_string_when_no_notice_is_set() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -4417,14 +4108,16 @@ mod tests {
     }
 
     #[test]
-    fn committed_changeset_combined_view_skips_attribution_and_renders_plain() {
-        // A committed changeset's combined role has no staged/unstaged split to attribute
-        // against (`DiffState::from_committed` leaves both sub-models empty) — without the
-        // `is_committed` skip in `combined_attribution`, `Attribution::build(None, None)` would
-        // still run and its empty `unstaged_adds` set would make EVERY Add cell read as
-        // "already staged" (the dim pair), which is wrong: nothing here was staged from
-        // anything, it's a committed range. Assert the fix: the Add side renders the plain
-        // (bright) pair.
+    fn committed_changeset_combined_view_renders_plain() {
+        // Pre-ADR-038, `Role::Combined` on a committed changeset (no staged/unstaged split to
+        // attribute against — `DiffState::from_committed` leaves both sub-models empty) had a
+        // real failure mode: `Attribution::build(None, None)`'s empty `unstaged_adds` set would
+        // have made EVERY Add cell read as "already staged" (the dim pair) without an explicit
+        // `is_committed` skip. ADR-038 decision 7 deletes `attribute.rs` entirely — `Role::Combined`
+        // now maps straight to `AttributionMode::Plain` (see `attribution_mode`), with no
+        // `Attributed` variant left to build an empty-set lookup from, so that failure mode is
+        // structurally unreachable rather than merely guarded. This test pins the still-real
+        // behavior it protects: the Add side renders the plain (bright) pair.
         use git2::Repository;
         use workon::{Changeset, ChangesetSpan};
 
@@ -6826,11 +6519,7 @@ mod tests {
             .unwrap();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        assert_eq!(
-            app.zoom,
-            crate::app::Zoom::Split,
-            "default requested zoom is Split"
-        );
+        assert!(!app.maximized, "default maximize is off");
         assert_eq!(
             app.effective_zoom_for(app.current),
             EffectiveZoom::Single(Role::Unstaged),

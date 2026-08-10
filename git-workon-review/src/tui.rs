@@ -439,7 +439,7 @@ enum Action {
     NextChangeset,
     PrevChangeset,
     ToggleLayout,
-    CycleZoom,
+    ToggleMaximize,
     ToggleSplitFocus,
     Refresh,
     StageHunk,
@@ -496,7 +496,7 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::ScrollTop => Action::ScrollTop,
         Command::ScrollBottom => Action::ScrollBottom,
         Command::ToggleLayout => Action::ToggleLayout,
-        Command::CycleZoom => Action::CycleZoom,
+        Command::ToggleMaximize => Action::ToggleMaximize,
         Command::ToggleSplitFocus => Action::ToggleSplitFocus,
         Command::Refresh => Action::Refresh,
         Command::StageHunk => Action::StageHunk,
@@ -592,7 +592,7 @@ fn map_key(
 /// have produced — e.g. `j` then immediately `s` must stage the same hunk eager code would have.
 ///
 /// Exempt (returns `false`): every action that ends in its own fresh `open_current` (`NextFile`,
-/// `PrevFile`, `NextChangeset`, `PrevChangeset`, `CycleZoom`, and the outline nav/confirm actions),
+/// `PrevFile`, `NextChangeset`, `PrevChangeset`, `ToggleMaximize`, and the outline nav/confirm actions),
 /// since those simply set a NEW pending open rather than needing the current one force-completed;
 /// plus pure UI toggles/no-ops (`Refresh` rebuilds all views itself; `ToggleHelp`/`Quit`/`None`
 /// touch no view state at all).
@@ -644,7 +644,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::NextChangeset => app.next_changeset(),
         Action::PrevChangeset => app.prev_changeset(),
         Action::ToggleLayout => app.toggle_layout(),
-        Action::CycleZoom => app.cycle_zoom(),
+        Action::ToggleMaximize => app.toggle_maximize(),
         Action::ToggleSplitFocus => app.toggle_split_focus(),
         Action::Refresh => app.coordinated_refresh(),
         Action::StageHunk => app.stage_hunk(),
@@ -1456,12 +1456,10 @@ fn event_loop<W: Write>(
             let view_warnings = app.reload_view_config(&runtime.view_config);
             let mut extra_warnings = runtime.warnings;
             extra_warnings.extend(view_warnings);
-            // `crate::plumb_zoom_hint_and_warnings` re-plumbs the "cycle zoom" refusal hint the
-            // same way `main.rs`'s `seat_app` does at startup — a reload that rebinds
-            // `cycle-zoom` would otherwise leave the hint naming the old key (no binding at all
-            // leaves the previous label in place, same as startup) — and surfaces any warnings.
-            // A reload with nothing to warn about still owes the user a signal that it worked.
-            if !crate::plumb_zoom_hint_and_warnings(app, keymap, extra_warnings) {
+            // `crate::surface_warnings` merges the keymap/view-config/theme-override warnings the
+            // same way `main.rs`'s `seat_app` does at startup and shows them as a notice. A
+            // reload with nothing to warn about still owes the user a signal that it worked.
+            if !crate::surface_warnings(app, keymap, extra_warnings) {
                 app.notify("config reloaded", Severity::Info);
             }
         }
@@ -1806,15 +1804,15 @@ mod tests {
     }
 
     #[test]
-    fn shift_z_and_w_map_to_zoom_and_split_focus() {
-        // diff-fold-keys: `cycle-zoom` moved off bare `z` to `Z` — `z` now anchors the `zM`/`zR`
-        // gap fold-all chords in this view (see `z_m_and_z_r_map_to_reset_and_expand_all_gaps`
+    fn shift_z_and_w_map_to_toggle_maximize_and_split_focus() {
+        // diff-fold-keys: `toggle-maximize` moved off bare `z` to `Z` — `z` now anchors the
+        // `zM`/`zR` gap fold-all chords in this view (see `z_m_and_z_r_map_to_reset_and_expand_all_gaps`
         // below), and a bare-key binding can't coexist with a longer chord sharing its prefix.
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
             map_key(&km, &mut pending, key(KeyCode::Char('Z')), 20, false, false),
-            Action::CycleZoom
+            Action::ToggleMaximize
         );
         assert_eq!(
             map_key(&km, &mut pending, key(KeyCode::Char('w')), 20, false, false),
