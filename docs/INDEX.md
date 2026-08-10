@@ -62,6 +62,7 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 
 - `docs/rfc/workon-review.md`
 - `docs/adr/033-review-crate-workspace-placement.md`
+- `docs/adr/038-review-focus-maximize-replaces-zoom.md` — the diff pane's view state, and why `Role::Combined` survives
 - Key source: `git-workon-review/src/`
 
 ## Cross-cutting Concerns
