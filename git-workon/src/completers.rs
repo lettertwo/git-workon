@@ -43,12 +43,16 @@ pub fn complete_worktree_names(current: &OsStr) -> Vec<CompletionCandidate> {
     };
     let current_dir = std::env::current_dir().unwrap_or_default();
     let prefix = current.to_string_lossy();
+    // Offer the root-relative path rather than the (possibly `~`-encoded) admin name —
+    // it's what a user typed to create the worktree, and `find_worktree` resolves it.
     worktrees
         .iter()
-        .filter(|wt| wt.name().is_some_and(|n| n.starts_with(prefix.as_ref())))
-        .map(|wt| {
-            let name = wt.name().unwrap();
-            CompletionCandidate::new(name).help(worktree_help(wt, root, &current_dir))
+        .filter_map(|wt| {
+            let relative = wt.path().strip_prefix(root).ok()?.to_str()?;
+            if !relative.starts_with(prefix.as_ref()) {
+                return None;
+            }
+            Some(CompletionCandidate::new(relative).help(worktree_help(wt, root, &current_dir)))
         })
         .collect()
 }
