@@ -1,6 +1,6 @@
 # 027 — Path-Encoded Worktree Admin Names
 
-Status: **proposed** — not implemented. The code described under "Decision" does not exist yet.
+Status: **accepted** — implemented.
 
 ## Context
 
