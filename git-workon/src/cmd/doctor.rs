@@ -7,6 +7,7 @@
 //! - Missing worktree directories (in git list but directory deleted) — fixable with --fix
 //! - Broken git links (.git file pointing to non-existent location) — manual fix needed
 //! - Worktrees whose upstream branch is gone — informational
+//! - Worktrees whose admin (metadata) directory name has gone stale — fixable with --fix
 //!
 //! ### Dependency Checks (once):
 //! - Hook commands not found in PATH (from workon.postCreateHook config)
@@ -31,8 +32,9 @@ use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
 use workon::{
-    get_repo, get_worktrees, is_graphite_active, preferred_remote_order, Granularity, StackModel,
-    WorkonConfig, WorktreeDescriptor,
+    encode_worktree_name, get_repo, get_worktrees, is_graphite_active, preferred_remote_order,
+    rename_worktree_metadata, workon_root, Granularity, StackModel, WorkonConfig,
+    WorktreeDescriptor,
 };
 
 use crate::cli::Doctor;
@@ -79,6 +81,9 @@ enum IssueKind {
         branch: String,
     },
     GraphiteNotInitialized,
+    StaleWorktreeName {
+        expected: String,
+    },
 }
 
 struct Issue {
@@ -115,7 +120,9 @@ impl Issue {
     fn fixable(&self) -> bool {
         matches!(
             self.kind,
-            IssueKind::MissingDirectory | IssueKind::RenamedConfigKey { .. }
+            IssueKind::MissingDirectory
+                | IssueKind::RenamedConfigKey { .. }
+                | IssueKind::StaleWorktreeName { .. }
         )
     }
 
@@ -148,6 +155,9 @@ impl Issue {
             }
             IssueKind::GraphiteNotInitialized => {
                 "stackModel=graphite but repo not gt-initialized — run: gt init".to_string()
+            }
+            IssueKind::StaleWorktreeName { expected } => {
+                format!("admin directory name is stale (expected '{expected}')")
             }
             IssueKind::RenamedConfigKey {
                 old_key,
@@ -185,6 +195,7 @@ impl Issue {
             IssueKind::InvalidConfig { .. } => "invalid_config",
             IssueKind::DefaultBranchMissing { .. } => "default_branch_missing",
             IssueKind::GraphiteNotInitialized => "graphite_not_initialized",
+            IssueKind::StaleWorktreeName { .. } => "stale_worktree_name",
         }
     }
 }
@@ -219,12 +230,33 @@ impl Run for Doctor {
                     }
                 } else {
                     debug!("'{}': validate ok, checking upstream", name);
+                    let mut clean = true;
+
                     if wt.has_gone_upstream().unwrap_or(false) {
                         debug!("'{}': upstream is gone", name);
-                        let issue = Issue::worktree(IssueKind::GoneUpstream, name, path);
+                        let issue = Issue::worktree(IssueKind::GoneUpstream, name, path.clone());
                         output::check_warn(name, &issue.message());
                         issues.push(issue);
-                    } else {
+                        clean = false;
+                    }
+
+                    if let Some(expected) = expected_worktree_name(&repo, &path) {
+                        if expected != name {
+                            debug!("'{}': admin name is stale, expected '{}'", name, expected);
+                            let issue = Issue::worktree(
+                                IssueKind::StaleWorktreeName {
+                                    expected: expected.clone(),
+                                },
+                                name,
+                                path.clone(),
+                            );
+                            output::check_warn(name, &issue.message());
+                            issues.push(issue);
+                            clean = false;
+                        }
+                    }
+
+                    if clean {
                         debug!("'{}': ok", name);
                         output::check_pass(name);
                     }
@@ -459,6 +491,9 @@ impl Run for Doctor {
                     if let IssueKind::DefaultBranchMissing { branch } = &issue.kind {
                         obj["branch"] = json!(branch);
                     }
+                    if let IssueKind::StaleWorktreeName { expected } = &issue.kind {
+                        obj["expected"] = json!(expected);
+                    }
                     if let IssueKind::RenamedConfigKey {
                         old_key,
                         new_key,
@@ -535,6 +570,14 @@ impl Run for Doctor {
 
         Ok(None)
     }
+}
+
+/// Compute the admin name a worktree at `path` should have, or `None` if `path` isn't
+/// inside the workon root.
+fn expected_worktree_name(repo: &git2::Repository, path: &Path) -> Option<String> {
+    let root = workon_root(repo).ok()?;
+    let relative = path.strip_prefix(root).ok()?.to_str()?;
+    Some(encode_worktree_name(relative))
 }
 
 /// Abbreviate the home directory as `~` in a path string.
@@ -760,6 +803,13 @@ fn fix_issues(repo: &git2::Repository, issues: &[Issue]) -> Result<Vec<String>> 
                     worktree.prune(Some(&mut opts)).into_diagnostic()?;
                     debug!("pruned worktree '{}'", name);
                     fixed.push(format!("Pruned: {name}"));
+                }
+            }
+            IssueKind::StaleWorktreeName { expected } => {
+                if let (Some(name), Some(path)) = (&issue.name, &issue.path) {
+                    debug!("renaming worktree admin dir '{}' -> '{}'", name, expected);
+                    rename_worktree_metadata(repo, name, expected, path).into_diagnostic()?;
+                    fixed.push(format!("Renamed admin directory: {name} → {expected}"));
                 }
             }
             IssueKind::RenamedConfigKey {

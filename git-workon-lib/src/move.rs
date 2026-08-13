@@ -65,7 +65,7 @@
 //! ```
 
 use git2::BranchType;
-use std::fs;
+use std::{fs, path::Path};
 
 use crate::{
     encode_worktree_name, error::Result, find_worktree, get_worktrees, WorkonConfig, WorkonError,
@@ -146,21 +146,42 @@ pub fn move_worktree(
         return Err(WorkonError::Io(e));
     }
 
-    // Step 3: Rename worktree metadata directory if name changed
-    let old_meta_dir = repo.path().join("worktrees").join(&old_name);
-    let new_meta_dir = repo.path().join("worktrees").join(&new_name);
+    // Step 3: Rename the worktree metadata directory and rewrite the gitdir/.git pointer
+    // pair so the admin directory and the moved worktree stay linked. No rollback here
+    // (see ADR-027) — on failure the caller reports the error and points at
+    // `workon doctor --fix`, which repairs the same pointer pair.
+    rename_worktree_metadata(repo, &old_name, &new_name, &new_path)?;
+
+    WorktreeDescriptor::new(repo, &new_name)
+}
+
+/// Rename a worktree's admin (metadata) directory from `old_name` to `new_name`, and
+/// rewrite the `gitdir` / `.git` pointer pair so `worktree_path` and the admin directory
+/// stay linked.
+///
+/// This is the metadata-only tail of [`move_worktree`]'s three-step move, factored out so
+/// `workon doctor --fix` can repair a stale admin name (one that no longer matches
+/// [`encode_worktree_name`] of the worktree's current path) without moving the worktree
+/// directory itself.
+pub fn rename_worktree_metadata(
+    repo: &git2::Repository,
+    old_name: &str,
+    new_name: &str,
+    worktree_path: &Path,
+) -> Result<()> {
+    let old_meta_dir = repo.path().join("worktrees").join(old_name);
+    let new_meta_dir = repo.path().join("worktrees").join(new_name);
     if old_meta_dir != new_meta_dir && old_meta_dir.exists() {
         fs::rename(&old_meta_dir, &new_meta_dir)?;
     }
     if new_meta_dir.exists() {
         let new_gitdir = new_meta_dir.join("gitdir");
-        let new_git = new_path.join(".git");
+        let new_git = worktree_path.join(".git");
 
         fs::write(&new_gitdir, format!("{}\n", new_git.display()))?;
         fs::write(&new_git, format!("gitdir: {}\n", new_meta_dir.display()))?;
     }
-
-    WorktreeDescriptor::new(repo, &new_name)
+    Ok(())
 }
 
 /// Validate that a move from `source` to `target_name` is safe to perform.
