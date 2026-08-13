@@ -930,9 +930,15 @@ pub fn add_worktree(
         let branch_ref = format!("ref: refs/heads/{}\n", branch_name);
         fs::write(&head_path, branch_ref.as_bytes())?;
 
-        // The branch at refs/heads/<branch_name> is the one we created explicitly above
-        // (see the `reference` match), so there is no stray libgit2-created branch to
-        // clean up here.
+        // The branch at refs/heads/<branch_name> exists only to satisfy
+        // `git_worktree_add`'s reference requirement (see the `reference` match); it
+        // now resolves to a real commit, which would make the parentless commit below
+        // fail with "current tip is not the first parent". Delete it via the filesystem
+        // rather than `Branch::delete`, which refuses a branch checked out in a
+        // worktree — this leaves HEAD unborn, and the orphan commit below recreates the
+        // branch with no parents.
+        let branch_ref_path = common_dir.join("refs/heads").join(branch_name);
+        let _ = fs::remove_file(&branch_ref_path);
 
         // Open the worktree repository
         let worktree_repo = Repository::open(&worktree_path)?;
