@@ -236,6 +236,10 @@ fn new_detached_worktree() -> Result<(), Box<dyn std::error::Error>> {
     let worktree_repo = git2::Repository::open(worktree_path.path())?;
     worktree_repo.assert(predicate::repo::is_head_detached());
 
+    // Regression (ADR-027): the temporary branch libgit2/we create to check out the
+    // detached worktree must not survive as a stray local branch.
+    fixture.assert(predicate::repo::has_branch("detached").not());
+
     Ok(())
 }
 
