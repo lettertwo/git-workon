@@ -66,6 +66,7 @@ mod stack;
 mod stash;
 mod workon_root;
 mod worktree;
+mod worktree_name;
 
 pub use crate::changeset::*;
 pub use crate::checkout::*;
@@ -90,3 +91,4 @@ pub use crate::stack::{
 pub use crate::stash::*;
 pub use crate::workon_root::*;
 pub use crate::worktree::*;
+pub use crate::worktree_name::*;

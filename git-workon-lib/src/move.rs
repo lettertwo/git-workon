@@ -65,11 +65,11 @@
 //! ```
 
 use git2::BranchType;
-use std::{fs, path::Path};
+use std::fs;
 
 use crate::{
-    error::Result, find_worktree, get_worktrees, WorkonConfig, WorkonError, WorktreeDescriptor,
-    WorktreeError,
+    encode_worktree_name, error::Result, find_worktree, get_worktrees, WorkonConfig, WorkonError,
+    WorktreeDescriptor, WorktreeError,
 };
 
 /// Options for moving a worktree
@@ -123,13 +123,12 @@ pub fn move_worktree(
     let old_path = source.path().to_path_buf();
     let new_path = root.join(to);
 
-    // Calculate worktree names (basename of branch names)
+    // `old_name` is read back from git, never recomputed: git worktree move does not
+    // rename the admin directory, so a worktree moved outside this function may already
+    // carry a stale (or legacy basename) name. `new_name` is the one place this move
+    // computes a fresh name, encoding the target's root-relative path (see ADR-027).
     let old_name = source.name().unwrap().to_string();
-    let new_name = Path::new(to)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or(WorktreeError::InvalidName)?
-        .to_string();
+    let new_name = encode_worktree_name(to);
 
     // Create parent directories for namespace changes
     if let Some(parent) = new_path.parent() {
