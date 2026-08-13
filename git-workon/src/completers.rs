@@ -48,7 +48,7 @@ pub fn complete_worktree_names(current: &OsStr) -> Vec<CompletionCandidate> {
     worktrees
         .iter()
         .filter_map(|wt| {
-            let relative = wt.path().strip_prefix(root).ok()?.to_str()?;
+            let relative = workon::relative_worktree_path(&repo, wt.path())?;
             if !relative.starts_with(prefix.as_ref()) {
                 return None;
             }
