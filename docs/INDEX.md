@@ -36,6 +36,7 @@ Maps subsystems and topics to relevant documentation files and source paths. Use
 
 - `docs/diagrams/move-flow.md`
 - `docs/adr/015-atomic-move-with-rollback.md`
+- `docs/adr/027-path-encoded-worktree-names.md` — proposed: admin-name collisions across namespaces
 - Key source: `git-workon/src/cmd/move.rs`
 
 ### doctor
