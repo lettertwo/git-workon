@@ -33,7 +33,7 @@ use miette::{IntoDiagnostic, Result};
 use serde_json::json;
 use workon::{
     encode_worktree_name, get_repo, get_worktrees, is_graphite_active, preferred_remote_order,
-    rename_worktree_metadata, workon_root, Granularity, StackModel, WorkonConfig,
+    relative_worktree_path, rename_worktree_metadata, Granularity, StackModel, WorkonConfig,
     WorktreeDescriptor,
 };
 
@@ -575,9 +575,8 @@ impl Run for Doctor {
 /// Compute the admin name a worktree at `path` should have, or `None` if `path` isn't
 /// inside the workon root.
 fn expected_worktree_name(repo: &git2::Repository, path: &Path) -> Option<String> {
-    let root = workon_root(repo).ok()?;
-    let relative = path.strip_prefix(root).ok()?.to_str()?;
-    Some(encode_worktree_name(relative))
+    let relative = relative_worktree_path(repo, path)?;
+    Some(encode_worktree_name(&relative))
 }
 
 /// Abbreviate the home directory as `~` in a path string.

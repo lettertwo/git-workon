@@ -45,7 +45,7 @@ use log::debug;
 
 use crate::error::{Result, WorktreeError};
 use crate::workon_root;
-use crate::worktree_name::encode_worktree_name;
+use crate::worktree_name::{encode_worktree_name, relative_worktree_path};
 
 /// Type of branch to create for a new worktree
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -635,17 +635,13 @@ pub fn current_worktree(repo: &Repository) -> Result<WorktreeDescriptor> {
 ///
 /// Returns [`WorktreeError::NotFound`] if no matching worktree exists.
 pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor> {
-    let root = workon_root(repo).ok();
     let worktrees = get_worktrees(repo)?;
     worktrees
         .into_iter()
         .find(|wt| {
             wt.name() == Some(name)
                 || wt.branch().ok().flatten().as_deref() == Some(name)
-                || root
-                    .and_then(|root| wt.path().strip_prefix(root).ok())
-                    .and_then(|relative| relative.to_str())
-                    == Some(name)
+                || relative_worktree_path(repo, wt.path()).as_deref() == Some(name)
         })
         .ok_or_else(|| WorktreeError::NotFound(name.to_string()).into())
 }
