@@ -49,6 +49,57 @@ fn move_basic_rename() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[test]
+fn move_archive_and_restart_sequence() -> Result<(), Box<dyn std::error::Error>> {
+    // ADR-027: before path-encoded admin names, this sequence failed on the second
+    // `new` — moving `ee/feature-name` to `archive/feature-name` computed the same
+    // basename admin name twice, so the metadata-directory rename was skipped and the
+    // archived worktree kept the slot `ee/feature-name` needed to be recreated.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .build()?;
+
+    let repo = fixture.repo()?;
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("ee/feature-name")
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .arg("move")
+        .arg("ee/feature-name")
+        .arg("archive/feature-name")
+        .assert()
+        .success();
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .arg("new")
+        .arg("ee/feature-name")
+        .assert()
+        .success();
+
+    repo.assert(predicate::repo::has_worktree("ee~feature-name"));
+    repo.assert(predicate::repo::has_worktree("archive~feature-name"));
+    fixture
+        .root()?
+        .child("ee")
+        .child("feature-name")
+        .assert(predicate::path::is_dir());
+    fixture
+        .root()?
+        .child("archive")
+        .child("feature-name")
+        .assert(predicate::path::is_dir());
+
+    Ok(())
+}
+
+#[test]
 fn move_namespace_change() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)

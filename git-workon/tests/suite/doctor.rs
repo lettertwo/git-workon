@@ -66,6 +66,59 @@ fn doctor_detects_missing_directory() -> Result<(), Box<dyn std::error::Error>> 
 }
 
 #[test]
+fn doctor_detects_and_fixes_stale_worktree_name() -> Result<(), Box<dyn std::error::Error>> {
+    // Simulate what a raw `git worktree move` leaves behind (ADR-027, "Consequences"):
+    // the gitdir/.git pointer pair is rewritten to the new location, but the admin
+    // directory keeps its old name — desyncing it from `encode_worktree_name` of the
+    // worktree's current root-relative path.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feature")
+        .build()?;
+
+    let bare_path = fixture.root()?.join(".bare");
+    let old_path = fixture.root()?.join("feature");
+    let new_path = fixture.root()?.join("ee").join("feature");
+    std::fs::create_dir_all(new_path.parent().unwrap())?;
+    std::fs::rename(&old_path, &new_path)?;
+
+    let meta_dir = bare_path.join("worktrees").join("feature");
+    std::fs::write(
+        meta_dir.join("gitdir"),
+        format!("{}\n", new_path.join(".git").display()),
+    )?;
+    std::fs::write(
+        new_path.join(".git"),
+        format!("gitdir: {}\n", meta_dir.display()),
+    )?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("admin directory name is stale"));
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--fix")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Renamed admin directory"));
+
+    // `git worktree list` (via git2) resolves the worktree under the repaired name.
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    assert!(bare_repo.find_worktree("ee~feature").is_ok());
+    assert!(bare_repo.find_worktree("feature").is_err());
+
+    Ok(())
+}
+
+#[test]
 fn doctor_fix_missing_directory() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)

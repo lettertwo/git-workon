@@ -55,13 +55,119 @@ mod tests {
             false,
         )?;
 
-        // Verify the worktree was created
+        // Verify the worktree was created, with the root-relative path encoded into
+        // the admin name (see ADR-027): every `/` becomes `~`.
         assert!(worktree.path().exists());
-        assert_eq!(worktree.name(), Some("feature-branch"));
+        assert_eq!(worktree.name(), Some("user~feature-branch"));
 
         // Verify the branch was created
         repo.assert(predicate::repo::has_branch("user/feature-branch"));
-        repo.assert(predicate::repo::has_worktree("feature-branch"));
+        repo.assert(predicate::repo::has_worktree("user~feature-branch"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_worktree_same_basename_different_namespace_coexist(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Two worktrees whose paths end in the same component must not collide: each
+        // gets a distinct admin name encoding its own root-relative path (ADR-027).
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        let ee_wt = add_worktree(
+            repo,
+            "ee/feature-name",
+            None,
+            BranchType::Normal,
+            None,
+            false,
+        )?;
+        let archive_wt = add_worktree(
+            repo,
+            "archive/feature-name",
+            None,
+            BranchType::Normal,
+            None,
+            false,
+        )?;
+
+        assert_eq!(ee_wt.name(), Some("ee~feature-name"));
+        assert_eq!(archive_wt.name(), Some("archive~feature-name"));
+        assert!(ee_wt.path().exists());
+        assert!(archive_wt.path().exists());
+        assert_ne!(ee_wt.path(), archive_wt.path());
+
+        repo.assert(predicate::repo::has_worktree("ee~feature-name"));
+        repo.assert(predicate::repo::has_worktree("archive~feature-name"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_worktree_orphan_namespaced_name() -> Result<(), Box<dyn std::error::Error>> {
+        // Regression: before explicit branch creation, an orphan worktree whose path
+        // contained `/` would fail — libgit2 tried to create a branch named after the
+        // `~`-encoded worktree name, which `git_reference_create` rejects.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        let worktree = add_worktree(repo, "docs/guide", None, BranchType::Orphan, None, false)?;
+
+        assert_eq!(worktree.name(), Some("docs~guide"));
+        repo.assert(predicate::repo::has_branch("docs/guide"));
+        repo.assert(predicate::repo::has_worktree("docs~guide"));
+
+        let orphan_repo = Repository::open(worktree.path())?;
+        let head = orphan_repo.head()?;
+        assert_eq!(head.name(), Ok("refs/heads/docs/guide"));
+
+        let head_commit = head.peel_to_commit()?;
+        assert_eq!(
+            head_commit.parent_count(),
+            0,
+            "Orphan branch should have no parent commits"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_worktree_detach_namespaced_name_leaves_no_stray_branch(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Regression: same reasoning as the orphan case above, plus the detached
+        // temporary branch must be cleaned up regardless of namespace depth.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+
+        let repo = fixture.repo()?;
+
+        let worktree = add_worktree(
+            repo,
+            "scratch/detached",
+            None,
+            BranchType::Detached,
+            None,
+            false,
+        )?;
+
+        assert_eq!(worktree.name(), Some("scratch~detached"));
+        repo.assert(predicate::repo::has_worktree("scratch~detached"));
+        assert!(
+            repo.find_branch("scratch/detached", git2::BranchType::Local)
+                .is_err(),
+            "detached worktree must not leave a branch behind"
+        );
 
         Ok(())
     }
@@ -1311,6 +1417,79 @@ mod tests {
             workon::resolve_remote_tracking(repo, "feature"),
             workon::RemoteResolution::None
         ));
+
+        Ok(())
+    }
+
+    // --- find_worktree resolution order (ADR-027) ---
+
+    #[test]
+    fn test_find_worktree_by_admin_name() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+        add_worktree(repo, "feature", None, BranchType::Normal, None, false)?;
+
+        let found = workon::find_worktree(repo, "feature")?;
+        assert_eq!(found.name(), Some("feature"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_worktree_by_branch_name_and_root_relative_path(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+
+        // Explicit alias decouples admin name, branch name, and root-relative path so
+        // each `find_worktree` arm can be exercised independently.
+        let worktree = add_worktree(
+            repo,
+            "ee/feature-branch",
+            Some("ee/alias-name"),
+            BranchType::Normal,
+            None,
+            false,
+        )?;
+        assert_eq!(worktree.name(), Some("ee~alias-name"));
+
+        // Matches via admin name.
+        assert_eq!(
+            workon::find_worktree(repo, "ee~alias-name")?.path(),
+            worktree.path()
+        );
+
+        // Matches via branch name — distinct from both the admin name and the path.
+        assert_eq!(
+            workon::find_worktree(repo, "ee/feature-branch")?.path(),
+            worktree.path()
+        );
+
+        // Matches via root-relative path — distinct from both the admin name and the
+        // branch name, and never decoded from the admin name.
+        assert_eq!(
+            workon::find_worktree(repo, "ee/alias-name")?.path(),
+            worktree.path()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_find_worktree_not_found() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .build()?;
+        let repo = fixture.repo()?;
+
+        assert!(workon::find_worktree(repo, "nonexistent").is_err());
 
         Ok(())
     }
