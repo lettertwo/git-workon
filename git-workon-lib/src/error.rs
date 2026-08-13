@@ -165,6 +165,13 @@ pub enum WorktreeError {
         help("Push commits first, or use --force to override")
     )]
     UnpushedCommits,
+
+    #[error("Worktree admin name '{name}' is already in use by {path}")]
+    #[diagnostic(
+        code(workon::worktree::name_conflict),
+        help("Remove or rename the existing worktree, or run 'git workon doctor' to find a stale admin name")
+    )]
+    WorktreeNameConflict { name: String, path: String },
 }
 
 /// Configuration-related errors

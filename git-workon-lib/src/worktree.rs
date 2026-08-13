@@ -45,6 +45,7 @@ use log::debug;
 
 use crate::error::{Result, WorktreeError};
 use crate::workon_root;
+use crate::worktree_name::encode_worktree_name;
 
 /// Type of branch to create for a new worktree
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -625,16 +626,26 @@ pub fn current_worktree(repo: &Repository) -> Result<WorktreeDescriptor> {
         .ok_or_else(|| WorktreeError::NotInWorktree.into())
 }
 
-/// Find a worktree by its name or by its branch name.
+/// Find a worktree by its admin name, its branch name, or its root-relative path.
+///
+/// The admin name is a creation-time artifact (see [`encode_worktree_name`]) and can go
+/// stale if a worktree is moved outside `move_worktree` (e.g. a raw `git worktree move`);
+/// the root-relative path never does, since git rewrites `gitdir` on every move. Nothing
+/// here decodes an admin name back into a path — a stale name is a label, not a key.
 ///
 /// Returns [`WorktreeError::NotFound`] if no matching worktree exists.
 pub fn find_worktree(repo: &Repository, name: &str) -> Result<WorktreeDescriptor> {
+    let root = workon_root(repo).ok();
     let worktrees = get_worktrees(repo)?;
     worktrees
         .into_iter()
         .find(|wt| {
-            // Match by worktree name or branch name
-            wt.name() == Some(name) || wt.branch().ok().flatten().as_deref() == Some(name)
+            wt.name() == Some(name)
+                || wt.branch().ok().flatten().as_deref() == Some(name)
+                || root
+                    .and_then(|root| wt.path().strip_prefix(root).ok())
+                    .and_then(|relative| relative.to_str())
+                    == Some(name)
         })
         .ok_or_else(|| WorktreeError::NotFound(name.to_string()).into())
 }
@@ -724,7 +735,8 @@ pub fn create_branch_from_remote(repo: &Repository, branch: &str, remote: &str) 
 ///
 /// The worktree directory is placed under the workon root (see [`workon_root`]).
 /// Branch names containing `/` are supported; parent directories are created
-/// automatically and the worktree is named after the final path component.
+/// automatically and the worktree's admin (metadata) directory is named by encoding
+/// the root-relative path (see [`encode_worktree_name`]).
 ///
 /// When `explicit_worktree_name` is `Some`, that value is used as the worktree
 /// directory name and filesystem path instead of deriving it from `branch_name`.
@@ -821,20 +833,12 @@ pub fn add_worktree(
 
     // Determine worktree name and path.
     // When an explicit name is provided, use it directly.
-    // Otherwise, derive from branch_name: git does not support worktree names with
-    // slashes, so take the basename of the branch name as the worktree name.
+    // Otherwise, derive from branch_name. Git does not support worktree admin names with
+    // slashes, so the root-relative path is encoded into an admin name (see ADR-027).
     let (worktree_name, worktree_path) = if let Some(alias) = explicit_worktree_name {
-        let name = match Path::new(alias).file_name() {
-            Some(basename) => basename.to_str().ok_or(WorktreeError::InvalidName)?,
-            None => alias,
-        };
-        (name, root.join(alias))
+        (encode_worktree_name(alias), root.join(alias))
     } else {
-        let name = match Path::new(&branch_name).file_name() {
-            Some(basename) => basename.to_str().ok_or(WorktreeError::InvalidName)?,
-            None => branch_name,
-        };
-        (name, root.join(branch_name))
+        (encode_worktree_name(branch_name), root.join(branch_name))
     };
 
     // Create parent directories if the branch name contains slashes
@@ -850,13 +854,25 @@ pub fn add_worktree(
         opts.lock(true);
     }
 
+    // Backstop: encoding makes an admin-name collision close to unreachable, but a
+    // legacy basename-named worktree can still occupy a top-level slot. Name the
+    // conflict instead of letting libgit2 surface a bare `mkdir` failure.
+    let admin_dir = repo.path().join("worktrees").join(&worktree_name);
+    if admin_dir.exists() {
+        return Err(WorktreeError::WorktreeNameConflict {
+            name: worktree_name.clone(),
+            path: admin_dir.display().to_string(),
+        }
+        .into());
+    }
+
     debug!(
         "adding worktree {} at {}",
         worktree_name,
         worktree_path.display()
     );
 
-    let worktree = repo.worktree(worktree_name, worktree_path.as_path(), Some(&opts))?;
+    let worktree = repo.worktree(&worktree_name, worktree_path.as_path(), Some(&opts))?;
 
     // For detached worktrees, set HEAD to point directly to a commit SHA
     if branch_type == BranchType::Detached {
@@ -869,7 +885,7 @@ pub fn add_worktree(
         let commit_sha = head_commit.id().to_string();
 
         // Write the commit SHA directly to the worktree's HEAD file
-        let git_dir = repo.path().join("worktrees").join(worktree_name);
+        let git_dir = repo.path().join("worktrees").join(&worktree_name);
         let head_path = git_dir.join("HEAD");
         fs::write(&head_path, format!("{}\n", commit_sha).as_bytes())?;
 
@@ -893,7 +909,7 @@ pub fn add_worktree(
 
         // First, manually set HEAD to point to the new branch as a symbolic reference
         // This ensures we're not trying to update an existing branch
-        let git_dir = common_dir.join("worktrees").join(worktree_name);
+        let git_dir = common_dir.join("worktrees").join(&worktree_name);
         let head_path = git_dir.join("HEAD");
         let branch_ref = format!("ref: refs/heads/{}\n", branch_name);
         fs::write(&head_path, branch_ref.as_bytes())?;
