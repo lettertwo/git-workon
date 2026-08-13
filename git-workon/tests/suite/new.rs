@@ -1140,8 +1140,8 @@ fn new_attaching_existing_branch_with_slashes_skips_gt_track(
         std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
     );
 
-    // git-workon uses the basename of the branch as the worktree name
-    bare_repo.assert(predicate::repo::has_worktree("feat-2"));
+    // git-workon encodes the root-relative path into the worktree admin name (ADR-027)
+    bare_repo.assert(predicate::repo::has_worktree("ee~feat-2"));
 
     let stderr = std::str::from_utf8(&output.stderr)?;
     assert!(
