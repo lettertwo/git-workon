@@ -768,13 +768,24 @@ pub fn add_worktree(
     let reference = match branch_type {
         BranchType::Orphan => {
             debug!("creating orphan branch {:?}", branch_name);
-            // For orphan branches, we'll create the branch after the worktree
-            None
+            // When `reference` is `None`, libgit2 creates a branch named after the
+            // *worktree name* to check out — which may be `~`-encoded and which
+            // `git_reference_create` rejects. Create the branch ourselves under
+            // `branch_name` instead; the orphan post-processing below rewrites HEAD
+            // and history onto it.
+            let head_commit = repo.head()?.peel_to_commit()?;
+            let branch = repo.branch(branch_name, &head_commit, false)?;
+            Some(branch.into_reference())
         }
         BranchType::Detached => {
             debug!("creating detached HEAD worktree at {:?}", branch_name);
-            // For detached worktrees, we don't create or use a branch reference
-            None
+            // Same reasoning as the orphan arm: an explicit reference is required to
+            // avoid libgit2 deriving a branch name from the (possibly encoded)
+            // worktree name. This branch is temporary — detached worktrees carry no
+            // branch, so it is deleted once the commit SHA is written to HEAD below.
+            let head_commit = repo.head()?.peel_to_commit()?;
+            let branch = repo.branch(branch_name, &head_commit, false)?;
+            Some(branch.into_reference())
         }
         BranchType::Normal => {
             let branch = match repo.find_branch(branch_name, git2::BranchType::Local) {
@@ -889,6 +900,11 @@ pub fn add_worktree(
         let head_path = git_dir.join("HEAD");
         fs::write(&head_path, format!("{}\n", commit_sha).as_bytes())?;
 
+        // Remove the temporary branch created only to satisfy `git_worktree_add`'s
+        // reference requirement; a detached worktree carries no branch.
+        let mut temp_branch = repo.find_branch(branch_name, git2::BranchType::Local)?;
+        temp_branch.delete()?;
+
         debug!(
             "detached HEAD setup complete for worktree {:?} at {}",
             branch_name, commit_sha
@@ -914,9 +930,9 @@ pub fn add_worktree(
         let branch_ref = format!("ref: refs/heads/{}\n", branch_name);
         fs::write(&head_path, branch_ref.as_bytes())?;
 
-        // Remove any existing branch ref that libgit2 may have created
-        let branch_ref_path = common_dir.join("refs/heads").join(branch_name);
-        let _ = fs::remove_file(&branch_ref_path);
+        // The branch at refs/heads/<branch_name> is the one we created explicitly above
+        // (see the `reference` match), so there is no stray libgit2-created branch to
+        // clean up here.
 
         // Open the worktree repository
         let worktree_repo = Repository::open(&worktree_path)?;
