@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.11.1...git-workon-lib-v0.12.0) - 2026-08-14
+
+### Added
+
+- *(hooks)* add doctor check for stale worktree admin names
+- *(lib)* encode worktree admin names from root-relative path
+
+### Fixed
+
+- *(lib)* canonicalize paths before computing root-relative worktree path
+- *(lib)* keep orphan HEAD unborn after explicit branch creation
+- *(lib)* create orphan/detached branches explicitly, not via worktree name
+
+### Other
+
+- *(lib)* cover path-encoded worktree admin name behavior
+
 ## [0.11.1](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.11.0...git-workon-lib-v0.11.1) - 2026-07-31
 
 ### Fixed
