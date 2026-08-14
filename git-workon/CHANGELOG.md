@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.11.1...git-workon-v0.12.0) - 2026-08-14
+
+### Added
+
+- *(hooks)* add doctor check for stale worktree admin names
+- *(cli)* offer worktree root-relative path in shell completion
+
+### Fixed
+
+- *(lib)* canonicalize paths before computing root-relative worktree path
+
+### Other
+
+- *(cli)* fix stale worktree admin-name assertion for slashed branch
+- *(lib)* cover path-encoded worktree admin name behavior
+
 ## [0.11.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.11.0...git-workon-v0.11.1) - 2026-07-31
 
 ### Fixed
