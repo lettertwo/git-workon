@@ -263,6 +263,10 @@ pub struct TreeNode {
     pub subtree_activity: Option<i64>,
     /// Children (diffs stacked on this branch), in display order.
     pub children: Vec<TreeNode>,
+    /// Provider-assigned stack number, set only on a direct child of a trunk (never on the
+    /// trunk root itself — `build_tree` merges every stack on one trunk into a single root
+    /// node, so the trunk has no single number to show).
+    pub stack_number: Option<u64>,
 }
 
 impl TreeNode {
@@ -301,12 +305,23 @@ pub fn build_tree(
 
     // Per-trunk reverse map: parent_branch → Vec<child_branch>
     let mut per_trunk_reverse: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
+    // Stack number for each direct child of a trunk (branch whose parent == trunk). Never
+    // populated for descendants further down the tree, so a plain lookup at any depth in
+    // `build_children` naturally only matches root children — see `TreeNode::stack_number`.
+    let mut direct_child_numbers: HashMap<String, u64> = HashMap::new();
     for group in groups {
         let rev = per_trunk_reverse
             .entry(group.stack.trunk.clone())
             .or_default();
         for (child, parent) in &group.stack.parents {
             rev.entry(parent.clone()).or_default().push(child.clone());
+        }
+        if let Some(number) = group.stack.number {
+            for (child, parent) in &group.stack.parents {
+                if *parent == group.stack.trunk {
+                    direct_child_numbers.insert(child.clone(), number);
+                }
+            }
         }
     }
     // Sort children for determinism
@@ -348,6 +363,7 @@ pub fn build_tree(
             &branch_to_idx,
             &mut rows,
             &mut visited,
+            &direct_child_numbers,
         );
 
         let subtree_activity = subtree_max(trunk_activity, &children);
@@ -357,6 +373,7 @@ pub fn build_tree(
             row: trunk_row,
             subtree_activity,
             children,
+            stack_number: None, // never on the trunk root — see `TreeNode::stack_number`.
         });
     }
 
@@ -384,6 +401,7 @@ pub fn build_tree(
             subtree_activity: epoch,
             row: Some(row),
             children: vec![],
+            stack_number: None, // ungrouped: not part of a numbered stack.
         });
     }
 
@@ -406,6 +424,7 @@ fn build_children(
     branch_to_idx: &HashMap<String, usize>,
     rows: &mut HashMap<usize, WorktreeDisplayRow>,
     visited: &mut HashSet<String>,
+    direct_child_numbers: &HashMap<String, u64>,
 ) -> Vec<TreeNode> {
     let mut nodes = Vec::new();
     for branch in branch_names {
@@ -417,7 +436,14 @@ fn build_children(
         let epoch = row.as_ref().and_then(|r| r.activity_epoch);
 
         let grandchildren_names = rev_map.get(branch.as_str()).cloned().unwrap_or_default();
-        let children = build_children(&grandchildren_names, rev_map, branch_to_idx, rows, visited);
+        let children = build_children(
+            &grandchildren_names,
+            rev_map,
+            branch_to_idx,
+            rows,
+            visited,
+            direct_child_numbers,
+        );
         let subtree_activity = subtree_max(epoch, &children);
 
         nodes.push(TreeNode {
@@ -425,6 +451,9 @@ fn build_children(
             row,
             subtree_activity,
             children,
+            // Only true direct children of a trunk are keys here (see `build_tree`), so a
+            // plain lookup at any recursion depth naturally yields `None` past the root.
+            stack_number: direct_child_numbers.get(branch).copied(),
         });
     }
     nodes
@@ -479,6 +508,16 @@ fn lane_content_width(own_lane: usize, closing_count: usize, node: &TreeNode) ->
         + 1 // space after glyph/connector
         + node.branch.width()
         + path_extra.unwrap_or(0)
+        + stack_number_suffix(node.stack_number)
+            .map(|s| s.width())
+            .unwrap_or(0)
+}
+
+/// The plain (unstyled) `" #N"` suffix for a stack number, or `None` when there isn't one.
+/// Kept separate from styling so [`lane_content_width`] can measure it without depending on
+/// [`style::dim`]'s color-state side effects.
+fn stack_number_suffix(number: Option<u64>) -> Option<String> {
+    number.map(|n| format!(" #{n}"))
 }
 
 /// Render the gutter string for a lane row.
@@ -704,6 +743,10 @@ pub fn format_tree_lines(
             }
         });
 
+        // Stack number annotation: dim ` #N` (degrades to plain text under NO_COLOR via
+        // `style::dim`), set only on a direct child of a trunk — see `TreeNode::stack_number`.
+        let number_ann = stack_number_suffix(node.stack_number).map(|s| style::dim(&s));
+
         // Padding to align the indicator column.
         let this_content_w = lane_content_width(lr.own_lane, lr.closing_count, node);
         let content_pad = max_content_w.saturating_sub(this_content_w);
@@ -736,14 +779,16 @@ pub fn format_tree_lines(
             String::new()
         };
 
-        // Assemble line: [gutter] [label][path][pad]  [indicators][ind_pad]  [activity][here]
+        // Assemble line: [gutter] [label][path][number][pad]  [indicators][ind_pad]  [activity][here]
         let path_str = path_ann.unwrap_or_default();
+        let number_str = number_ann.unwrap_or_default();
         let line = if node.row.is_some() {
             format!(
-                "{} {}{}{}  {}{}  {}{}",
+                "{} {}{}{}{}  {}{}  {}{}",
                 gutter,
                 label,
                 path_str,
+                number_str,
                 " ".repeat(content_pad),
                 ind_str,
                 " ".repeat(ind_pad),
@@ -751,8 +796,8 @@ pub fn format_tree_lines(
                 here,
             )
         } else {
-            // Metadata-only: gutter + label, no indicator/time columns.
-            format!("{} {}", gutter, label)
+            // Metadata-only: gutter + label + number, no indicator/time columns.
+            format!("{} {}{}", gutter, label, number_str)
         };
 
         lines.push(line);
@@ -1286,6 +1331,7 @@ mod tests {
             }),
             subtree_activity: None,
             children: vec![],
+            stack_number: None,
         }
     }
 
@@ -1295,6 +1341,7 @@ mod tests {
             row: None,
             subtree_activity: None,
             children: vec![],
+            stack_number: None,
         }
     }
 
@@ -1556,6 +1603,7 @@ mod tests {
             }),
             subtree_activity: Some(0),
             children: vec![],
+            stack_number: None,
         }
     }
 
@@ -1588,6 +1636,7 @@ mod tests {
                     .iter()
                     .map(|(c, p)| (c.to_string(), p.to_string()))
                     .collect(),
+                number: None,
             },
             members: vec![],
         }
@@ -1629,6 +1678,61 @@ mod tests {
         assert_eq!(
             branches,
             vec!["base", "ghost-leaf", "ghost-mid", "live-leaf", "main"]
+        );
+    }
+
+    fn numbered_group(number: u64, diffs: &[&str], parents: &[(&str, &str)]) -> workon::StackGroup {
+        let mut group = meta_group(diffs, parents);
+        group.stack.number = Some(number);
+        group
+    }
+
+    fn find_node<'a>(forest: &'a [TreeNode], branch: &str) -> &'a TreeNode {
+        fn find<'a>(nodes: &'a [TreeNode], branch: &str) -> Option<&'a TreeNode> {
+            for node in nodes {
+                if node.branch == branch {
+                    return Some(node);
+                }
+                if let Some(found) = find(&node.children, branch) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        find(forest, branch).unwrap_or_else(|| panic!("{branch} not found in forest"))
+    }
+
+    #[test]
+    fn build_tree_sets_stack_number_only_on_direct_trunk_child() {
+        // "base" is the direct child of trunk "main"; "mid" and "top" are descendants further
+        // down the same stack. Only "base" should carry the stack's number — never the trunk
+        // root ("main" merges every stack on the trunk, so it has no single number) and never
+        // a deeper descendant.
+        let group = numbered_group(
+            12,
+            &["base", "mid", "top"],
+            &[("base", "main"), ("mid", "base"), ("top", "mid")],
+        );
+        let groups = vec![group];
+        let forest = build_tree(&[], &groups, &[], Path::new("/repo"), Path::new("/repo"));
+
+        assert_eq!(find_node(&forest, "main").stack_number, None);
+        assert_eq!(find_node(&forest, "base").stack_number, Some(12));
+        assert_eq!(find_node(&forest, "mid").stack_number, None);
+        assert_eq!(find_node(&forest, "top").stack_number, None);
+    }
+
+    #[test]
+    fn format_tree_lines_renders_dim_stack_number_suffix() {
+        no_color();
+        let mut root = meta("base");
+        root.stack_number = Some(12);
+        let (lines, _) = format_tree_lines(&[root], false);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].ends_with("base #12"),
+            "expected a trailing ' #12' suffix (plain text under NO_COLOR), got: {:?}",
+            lines[0]
         );
     }
 

@@ -15,15 +15,20 @@
 //! `gt track` is invoked only when registering a new branch after `workon new` creates a
 //! worktree forked off an existing stack-worktree branch.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::path::Path;
 
 use git2::Repository;
 use rusqlite::OpenFlags;
 use serde_json::Value;
 
+use super::metadata::{self, StackMetadata};
 use super::Stack;
 use crate::error::StackError;
+
+// Re-exported so `changeset.rs` keeps compiling against `graphite::BranchMetadata` until it is
+// rewritten (in the following commit) to walk `StackMetadata` directly via `metadata::*`.
+pub(crate) use super::metadata::BranchMetadata;
 
 /// Returns `true` if the `gt` binary is on PATH.
 ///
@@ -109,14 +114,6 @@ pub(crate) fn read_trunks(repo: &Repository) -> Vec<String> {
         return vec![trunk.to_string()];
     }
     vec!["main".to_string()]
-}
-
-/// One branch's Graphite metadata: its recorded parent branch and (if known) the parent
-/// revision snapshotted at `gt track`/`gt restack` time.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BranchMetadata {
-    pub parent: String,
-    pub parent_revision: Option<String>,
 }
 
 /// Read per-branch Graphite metadata (parent branch + recorded parent revision).
@@ -236,20 +233,6 @@ fn read_branch_metadata_from_refs(
     Ok(map)
 }
 
-/// Build a `branch → parent_branch` map (thin wrapper over [`read_branch_metadata`] for
-/// callers that only need parent-branch topology, not recorded revisions).
-///
-/// Ghost branches (metadata present, no live ref) are deliberately **retained** here: `list`
-/// prunes them via [`enumerate_stacks`], but `current_stack` must keep them so routing can
-/// distinguish a deleted stack node (`Resolution::DeletedNode`) from a plain typo. The two
-/// consumers filter differently on purpose — see [`enumerate_stacks`].
-fn build_parent_map(repo: &Repository) -> Result<HashMap<String, String>, StackError> {
-    Ok(read_branch_metadata(repo)?
-        .into_iter()
-        .map(|(branch, metadata)| (branch, metadata.parent))
-        .collect())
-}
-
 /// Read PR titles from `<git-common-dir>/.graphite_pr_info`, keyed by branch name
 /// (`prInfos[].headRefName`).
 ///
@@ -278,6 +261,21 @@ pub(crate) fn read_pr_titles(repo: &Repository) -> HashMap<String, String> {
         .collect()
 }
 
+/// Read Graphite's stack metadata into provider-agnostic [`StackMetadata`].
+///
+/// Trunks come from [`read_trunks`]; per-branch parent metadata from [`read_branch_metadata`];
+/// PR titles from [`read_pr_titles`]. Graphite has no stack-numbering concept, so
+/// `stack_numbers` is always empty.
+pub(crate) fn read_metadata(repo: &Repository) -> Result<StackMetadata, StackError> {
+    let parents = read_branch_metadata(repo)?;
+    Ok(StackMetadata {
+        trunks: read_trunks(repo),
+        parents,
+        pr_titles: read_pr_titles(repo),
+        stack_numbers: HashMap::new(),
+    })
+}
+
 /// Return all stacks present in `refs/branch-metadata/*`, one per connected component.
 ///
 /// A "connected component" is the set of all non-trunk branches reachable from a single
@@ -290,172 +288,17 @@ pub(crate) fn read_pr_titles(repo: &Repository) -> HashMap<String, String> {
 ///
 /// Used by the `list` command to surface stacks that have no checked-out worktrees yet.
 pub fn enumerate_stacks(repo: &Repository) -> Result<Vec<Stack>, StackError> {
-    let mut parent_map = build_parent_map(repo)?;
-    if parent_map.is_empty() {
-        return Ok(vec![]);
-    }
-
-    // Drop ghost branches: Graphite leaves metadata rows behind after a branch is merged or
-    // deleted. Filter before the BFS so orphaned subtrees are pruned consistently. Trunks are
-    // not in the parent map (they are values, not keys), so they are always preserved.
-    // (`current_stack` deliberately does NOT prune — routing needs deleted nodes to stay visible.)
-    parent_map.retain(|branch, _| crate::resolve::branch_exists(repo, branch));
-
-    if parent_map.is_empty() {
-        return Ok(vec![]);
-    }
-
-    let trunks: HashSet<String> = read_trunks(repo).into_iter().collect();
-
-    let mut reverse_map: HashMap<String, Vec<String>> = HashMap::new();
-    for (branch, parent) in &parent_map {
-        reverse_map
-            .entry(parent.clone())
-            .or_default()
-            .push(branch.clone());
-    }
-
-    // Root branches are direct children of a trunk.
-    let mut root_branches: Vec<String> = parent_map
-        .iter()
-        .filter(|(_, p)| trunks.contains(*p))
-        .map(|(b, _)| b.clone())
-        .collect();
-    root_branches.sort();
-
-    let mut stacks: Vec<Stack> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-
-    for root in root_branches {
-        if visited.contains(&root) {
-            continue;
-        }
-        let trunk = parent_map.get(&root).cloned().unwrap_or_default();
-
-        let mut diffs: Vec<String> = Vec::new();
-        let mut queue: VecDeque<String> = VecDeque::new();
-        queue.push_back(root);
-        while let Some(branch) = queue.pop_front() {
-            if !visited.insert(branch.clone()) {
-                continue;
-            }
-            if trunks.contains(&branch) {
-                continue;
-            }
-            diffs.push(branch.clone());
-            if let Some(children) = reverse_map.get(&branch) {
-                let mut sorted = children.clone();
-                sorted.sort();
-                for child in sorted {
-                    queue.push_back(child);
-                }
-            }
-        }
-
-        if !diffs.is_empty() {
-            let current = diffs[0].clone();
-            let parents: std::collections::HashMap<String, String> = diffs
-                .iter()
-                .filter_map(|b| parent_map.get(b).map(|p| (b.clone(), p.clone())))
-                .collect();
-            stacks.push(Stack {
-                trunk,
-                diffs,
-                current,
-                parents,
-            });
-        }
-    }
-
-    Ok(stacks)
+    Ok(metadata::enumerate(repo, &read_metadata(repo)?))
 }
 
 /// Get the stack for the worktree whose HEAD is `head_branch`.
 ///
 /// Returns `None` if the branch has no `refs/branch-metadata/` entry (not Graphite-tracked).
 /// The returned stack includes all branches reachable from the same stack root, not just the
-/// path to HEAD, so branching stacks are fully represented.
+/// path to HEAD, so branching stacks are fully represented. Ghost branches are retained (not
+/// pruned) — see [`metadata::current`].
 pub fn current_stack(repo: &Repository, head_branch: &str) -> Result<Option<Stack>, StackError> {
-    let parent_map = build_parent_map(repo)?;
-
-    if !parent_map.contains_key(head_branch) {
-        return Ok(None);
-    }
-
-    let trunks: HashSet<String> = read_trunks(repo).into_iter().collect();
-
-    // Walk upward from head_branch to find the trunk and collect ancestors.
-    let mut walk = head_branch.to_string();
-    let mut ancestors: Vec<String> = Vec::new();
-    let mut upward_seen: HashSet<String> = HashSet::new();
-    upward_seen.insert(walk.clone());
-
-    let trunk = loop {
-        if trunks.contains(&walk) {
-            break walk.clone();
-        }
-        match parent_map.get(&walk) {
-            Some(parent) => {
-                if !upward_seen.insert(parent.clone()) {
-                    // Cycle in branch-metadata: treat current as the implicit root.
-                    break walk.clone();
-                }
-                ancestors.push(walk.clone());
-                walk = parent.clone();
-            }
-            // No metadata — treat this branch as the implicit root.
-            None => break walk.clone(),
-        }
-    };
-
-    // ancestors is [head_branch, ..., bottom]; reverse for bottom → top.
-    ancestors.reverse();
-
-    let stack_root = match ancestors.first() {
-        Some(r) => r.clone(),
-        None => return Ok(None), // head_branch is trunk itself
-    };
-
-    // Build reverse map (parent → children) for BFS downward.
-    let mut reverse_map: HashMap<String, Vec<String>> = HashMap::new();
-    for (branch, parent) in &parent_map {
-        reverse_map
-            .entry(parent.clone())
-            .or_default()
-            .push(branch.clone());
-    }
-
-    // BFS from stack_root to collect all branches in this connected stack.
-    let mut stack_branches: Vec<String> = Vec::new();
-    let mut queue: VecDeque<String> = VecDeque::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    queue.push_back(stack_root);
-
-    while let Some(branch) = queue.pop_front() {
-        if !visited.insert(branch.clone()) {
-            continue;
-        }
-        if trunks.contains(&branch) {
-            continue;
-        }
-        stack_branches.push(branch.clone());
-        if let Some(children) = reverse_map.get(&branch) {
-            for child in children {
-                queue.push_back(child.clone());
-            }
-        }
-    }
-
-    let parents: std::collections::HashMap<String, String> = stack_branches
-        .iter()
-        .filter_map(|b| parent_map.get(b).map(|p| (b.clone(), p.clone())))
-        .collect();
-    Ok(Some(Stack {
-        trunk,
-        diffs: stack_branches,
-        current: head_branch.to_string(),
-        parents,
-    }))
+    Ok(metadata::current(&read_metadata(repo)?, head_branch))
 }
 
 // `read_branch_metadata`'s `parent_revision` field is not (yet) reachable through the public

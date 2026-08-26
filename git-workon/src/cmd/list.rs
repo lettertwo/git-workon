@@ -180,6 +180,7 @@ impl Run for List {
                         "diffs": group.stack.diffs,
                         "parents": parents,
                         "checkouts": checkouts,
+                        "number": group.stack.number,
                     })
                 })
                 .collect();
