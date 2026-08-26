@@ -35,10 +35,6 @@ pub(crate) struct StackMetadata {
     /// Per-branch parent metadata.
     pub parents: HashMap<String, BranchMetadata>,
     /// PR titles, keyed by branch. Empty for gh-stack (title is `None` for gh-stack nodes).
-    ///
-    /// Read by `read_metadata` but not yet consumed here — `changeset.rs`'s assembly wires it
-    /// up in the following commit.
-    #[allow(dead_code)]
     pub pr_titles: HashMap<String, String>,
     /// Provider-assigned stack numbers, keyed by **every** member branch of a stack (not just
     /// the root) — `enumerate` prunes ghosts before BFS, so a ghost root would otherwise take
@@ -239,9 +235,6 @@ pub(crate) fn current(meta: &StackMetadata, head_branch: &str) -> Option<Stack> 
 /// Order branch names bottom→below-head, then `head_branch`, then descendants (depth-first,
 /// siblings sorted lexically), ghost branches RETAINED — the caller skips them from output but
 /// walks through them so live descendants of a ghost still appear.
-///
-/// Not yet called — `changeset.rs`'s assembly is rewired onto this in the following commit.
-#[allow(dead_code)]
 pub(crate) fn changeset_walk(meta: &StackMetadata, head_branch: &str) -> Vec<String> {
     let trunks: HashSet<String> = meta.trunks.iter().cloned().collect();
 

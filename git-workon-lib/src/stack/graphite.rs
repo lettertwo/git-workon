@@ -22,13 +22,9 @@ use git2::Repository;
 use rusqlite::OpenFlags;
 use serde_json::Value;
 
-use super::metadata::{self, StackMetadata};
+use super::metadata::{self, BranchMetadata, StackMetadata};
 use super::Stack;
 use crate::error::StackError;
-
-// Re-exported so `changeset.rs` keeps compiling against `graphite::BranchMetadata` until it is
-// rewritten (in the following commit) to walk `StackMetadata` directly via `metadata::*`.
-pub(crate) use super::metadata::BranchMetadata;
 
 /// Returns `true` if the `gt` binary is on PATH.
 ///
