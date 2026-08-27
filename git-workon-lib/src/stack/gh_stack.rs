@@ -703,16 +703,18 @@ pub enum LinkStatus {
     NotLinked { holds_file: bool },
 }
 
-/// `Linked`/`NotLinked { holds_file }` for a single admin-dir path against `canonical`.
-/// Factored out of [`worktree_link_status`] so it can be applied to both `gh-stack` and
-/// `gh-stack.lock` — a stale `gh-stack.lock` regular file (upstream opens it `O_CREATE` on
-/// every lock attempt, so a worktree that has run `gh stack` almost always has one) is just as
-/// unlinked as a stale `gh-stack` file, and must be equally visible to `doctor`.
-fn link_status_for_path(path: &Path, canonical: &Path) -> LinkStatus {
+/// `Linked`/`NotLinked { holds_file }` for a single admin-dir path against `expected_target`
+/// — the canonical file *that path's own filename* symlinks to (`<common-dir>/gh-stack` for a
+/// `gh-stack` path, `<common-dir>/gh-stack.lock` for a `gh-stack.lock` path). Factored out of
+/// [`worktree_link_status`] so it can be applied to both filenames — a stale `gh-stack.lock`
+/// regular file (upstream opens it `O_CREATE` on every lock attempt, so a worktree that has run
+/// `gh stack` almost always has one) is just as unlinked as a stale `gh-stack` file, and must be
+/// equally visible to `doctor`.
+fn link_status_for_path(path: &Path, expected_target: &Path) -> LinkStatus {
     match std::fs::symlink_metadata(path) {
         Err(_) => LinkStatus::NotLinked { holds_file: false },
         Ok(meta) if meta.file_type().is_symlink() => {
-            if is_symlink_resolving_to(path, canonical) {
+            if is_symlink_resolving_to(path, expected_target) {
                 LinkStatus::Linked
             } else {
                 LinkStatus::NotLinked { holds_file: false }
@@ -728,16 +730,23 @@ fn link_status_for_path(path: &Path, canonical: &Path) -> LinkStatus {
 /// file, whose contents are irrelevant and whose own staleness is fully handled by
 /// [`migrate_worktree`] discarding it before relinking; a stale lock alone must route through
 /// [`link_worktree`], not `migrate_worktree`.
+///
+/// Each path is checked against its own target: `plant_link` symlinks `gh-stack` to
+/// `../../gh-stack` and `gh-stack.lock` to `../../gh-stack.lock`, so comparing both against
+/// `canonical_path` alone would mean the `gh-stack.lock` check can never resolve to it —
+/// `is_symlink_resolving_to` compares the *lock's* resolved target against the *stack file's*
+/// path, which are never equal.
 pub(crate) fn worktree_link_status(repo: &Repository, worktree_name: &str) -> LinkStatus {
     let admin_dir = repo.commondir().join("worktrees").join(worktree_name);
     let canonical = canonical_path(repo);
+    let canonical_lock = repo.commondir().join("gh-stack.lock");
 
     let gh_stack_status = link_status_for_path(&admin_dir.join("gh-stack"), &canonical);
     if matches!(gh_stack_status, LinkStatus::NotLinked { .. }) {
         return gh_stack_status;
     }
 
-    match link_status_for_path(&admin_dir.join("gh-stack.lock"), &canonical) {
+    match link_status_for_path(&admin_dir.join("gh-stack.lock"), &canonical_lock) {
         LinkStatus::Linked => LinkStatus::Linked,
         LinkStatus::NotLinked { .. } => LinkStatus::NotLinked { holds_file: false },
     }
@@ -1255,6 +1264,33 @@ mod tests {
         );
         let lock_target = std::fs::read_link(admin_dir.join("gh-stack.lock")).unwrap();
         assert_eq!(lock_target, Path::new("../../gh-stack.lock"));
+    }
+
+    #[test]
+    fn worktree_link_status_reports_linked_for_a_fully_linked_worktree() {
+        // Regression test: link_status_for_path used to compare BOTH the gh-stack and
+        // gh-stack.lock paths against canonical_path (the gh-stack target), but plant_link
+        // symlinks gh-stack.lock to `../../gh-stack.lock`, which can never resolve to
+        // `../../gh-stack`. A correctly, fully linked worktree reported NotLinked forever, and
+        // no test anywhere asserted LinkStatus::Linked, which is why this regression shipped.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .gh_stack_linked("feat-a")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(worktree_link_status(repo, "feat-a"), LinkStatus::Linked);
+
+        // Healthy-path invariants that also had no coverage: a fully linked worktree leaves
+        // nothing for the degraded union fallback to pick up, and no stack number collides
+        // with itself across sources.
+        assert!(unlinked_files(repo).is_empty());
+        assert!(divergent_stack_numbers(repo).is_empty());
     }
 
     #[test]
