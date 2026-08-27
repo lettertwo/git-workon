@@ -640,20 +640,27 @@ fn gh_stack_linear_order_and_current() -> Result<(), Box<dyn Error>> {
 fn gh_stack_needs_restack_true_when_base_differs_from_parent_live_tip() -> Result<(), Box<dyn Error>>
 {
     let fixture = FixtureBuilder::new()
-        .gh_stack_at(
-            None,
-            1,
-            "main",
-            &[("feat-a", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")],
-        )
+        .worktree("feat-a")
+        .gh_stack(None, 1, "main", &["feat-a", "feat-b"])
         .build()?;
+
+    fixture
+        .commit("feat-a")
+        .file("z.txt", "1")
+        .create("advance feat-a")?;
+
     let repo = fixture.repo()?;
 
-    let changesets = assemble_changesets(repo, "feat-a", StackModel::GhStack)?;
+    let changesets = assemble_changesets(repo, "feat-b", StackModel::GhStack)?;
     let feat_a = changesets.iter().find(|c| c.name == "feat-a").unwrap();
     assert!(
-        feat_a.needs_restack,
-        "recorded base doesn't match main's live tip"
+        !feat_a.needs_restack,
+        "feat-a's own recorded parent (main) hasn't moved"
+    );
+    let feat_b = changesets.iter().find(|c| c.name == "feat-b").unwrap();
+    assert!(
+        feat_b.needs_restack,
+        "feat-b's recorded base no longer matches feat-a's live tip"
     );
     Ok(())
 }
