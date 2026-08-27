@@ -866,14 +866,26 @@ pub fn register_branch(
     let _lock = lock_canonical(repo)?;
 
     let existing = std::fs::read(&canonical).unwrap_or_default();
-    let new_bytes = plan_registered_doc(
+    let new_bytes = match plan_registered_doc(
         &existing,
         branch,
         base_branch,
         &base.to_string(),
         &head.to_string(),
         &canonical,
-    )?;
+    ) {
+        // `read_metadata` (used by `list`/`find`) unions canonical with `unlinked_files`, but
+        // this function reads canonical alone — deliberately, since it must never write
+        // through a worktree symlink (see `write_canonical_atomic`'s docs). So the spec's
+        // accepted chicken-and-egg case (someone runs `gh stack init` inside a worktree before
+        // ever running `doctor --fix`) reads fine everywhere but fails registration here with
+        // a message that looks identical to "no such stack at all". Point at the fix instead.
+        Err(StackError::GhStackNoStackForBase { base }) if !unlinked_files(repo).is_empty() => {
+            return Err(StackError::GhStackStackInUnlinkedWorktree { base });
+        }
+        Err(e) => return Err(e),
+        Ok(bytes) => bytes,
+    };
 
     write_canonical_atomic(&canonical, &new_bytes)
 }
@@ -1724,6 +1736,38 @@ mod tests {
                 assert_eq!(base, "main");
             }
             other => panic!("expected GhStackNoStackForBase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_branch_points_at_doctor_fix_when_stack_is_unlinked_only() {
+        // Finding F: the chicken-and-egg case the spec explicitly accepts — `gh stack init`
+        // run inside a worktree before `doctor --fix` ever migrates it. `read_metadata` unions
+        // in unlinked_files, so `list`/`find` render the stack correctly, but `register_branch`
+        // reads canonical alone (it must never write through a worktree symlink) and would
+        // otherwise report the same generic GhStackNoStackForBase as "no such stack anywhere",
+        // which is indistinguishable from user error. It must instead point at `doctor --fix`.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .branch("feat-b")
+            .gh_stack(Some("feat-a"), 1, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        // Sanity: read_metadata (the list/find path) sees the stack fine via the degraded
+        // union, so the failure below is specific to register_branch's canonical-only read.
+        let meta = read_metadata(repo).unwrap();
+        assert_eq!(meta.parents["feat-a"].parent, "main");
+
+        match register_branch(repo, "feat-b", "feat-a") {
+            Err(StackError::GhStackStackInUnlinkedWorktree { base }) => {
+                assert_eq!(base, "feat-a");
+            }
+            other => panic!("expected GhStackStackInUnlinkedWorktree, got {other:?}"),
         }
     }
 }
