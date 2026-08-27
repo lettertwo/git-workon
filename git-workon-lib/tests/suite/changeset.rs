@@ -637,6 +637,25 @@ fn gh_stack_linear_order_and_current() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn gh_stack_trap7_bogus_parent_revision_errors() -> Result<(), Box<dyn Error>> {
+    let bogus = "deadbeef".repeat(5);
+    let fixture = FixtureBuilder::new()
+        .gh_stack_at(None, 1, "main", &[("feat-a", &bogus)])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let err = assemble_changesets(repo, "feat-a", StackModel::GhStack).unwrap_err();
+    match err {
+        WorkonError::Changeset(ChangesetError::InvalidParentRevision { branch, revision }) => {
+            assert_eq!(branch, "feat-a");
+            assert_eq!(revision, bogus);
+        }
+        other => panic!("expected InvalidParentRevision (not an empty Ok), got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
 fn gh_stack_needs_restack_true_when_base_differs_from_parent_live_tip() -> Result<(), Box<dyn Error>>
 {
     let fixture = FixtureBuilder::new()
