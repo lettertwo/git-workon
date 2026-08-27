@@ -773,27 +773,42 @@ pub(crate) fn readability_errors(repo: &Repository) -> Vec<(PathBuf, StackError)
         .collect()
 }
 
-/// Stack numbers that appear in more than one gh-stack source — only possible when the
-/// degraded union read (see the module docs) actually combines canonical with an unlinked
-/// worktree file. For `doctor`'s `GhStackDivergentStacks` check.
+/// Stack numbers that appear, with genuinely different content, in more than one gh-stack
+/// source — only possible when the degraded union read (see the module docs) actually combines
+/// canonical with an unlinked worktree file. For `doctor`'s `GhStackDivergentStacks` check.
+///
+/// Each number is counted at most once *per source*, so two stacks numbered 1 inside a single
+/// file don't get flagged as spanning "more than one gh-stack source" — that phrase means
+/// files, not array entries. And a number is only reported when its sources disagree: an
+/// unlinked worktree file holding a byte-identical copy of a canonical stack (the common state
+/// right after someone copies a worktree) is compared by content — at minimum its branch list —
+/// so an identical copy is not reported.
 pub(crate) fn divergent_stack_numbers(repo: &Repository) -> Vec<u64> {
     let mut sources = vec![canonical_path(repo)];
     sources.extend(unlinked_files(repo));
 
-    let mut counts: HashMap<u64, usize> = HashMap::new();
+    // number -> one branch-list signature per source that contains it (deduped within that
+    // source, so a file with two same-numbered stacks contributes one signature, not two).
+    let mut signatures_by_number: HashMap<u64, Vec<Vec<String>>> = HashMap::new();
     for path in &sources {
         if let Ok(Some(entries)) = read_doc(path) {
+            let mut numbers_in_this_source: HashSet<u64> = HashSet::new();
             for entry in entries {
-                if entry.number != 0 {
-                    *counts.entry(entry.number).or_insert(0) += 1;
+                if entry.number != 0 && numbers_in_this_source.insert(entry.number) {
+                    let branches: Vec<String> =
+                        entry.branches.iter().map(|b| b.branch.clone()).collect();
+                    signatures_by_number
+                        .entry(entry.number)
+                        .or_default()
+                        .push(branches);
                 }
             }
         }
     }
 
-    let mut divergent: Vec<u64> = counts
+    let mut divergent: Vec<u64> = signatures_by_number
         .into_iter()
-        .filter(|&(_, count)| count > 1)
+        .filter(|(_, signatures)| signatures.iter().any(|s| s != &signatures[0]))
         .map(|(number, _)| number)
         .collect();
     divergent.sort_unstable();
@@ -1003,6 +1018,64 @@ mod tests {
         let meta = read_metadata(repo).unwrap();
         assert!(meta.parents.contains_key("feat-a"));
         assert!(!meta.parents.contains_key("feat-b"));
+    }
+
+    // ── divergent_stack_numbers ─────────────────────────────────────────────────
+
+    #[test]
+    fn two_numbered_stacks_in_one_file_are_not_divergent() {
+        // Regression test for finding H(a): divergent_stack_numbers used to increment a
+        // global per-number counter across all sources, so two *different* stacks both
+        // numbered 1 inside the SAME file tripped count > 1, contradicting the doc comment
+        // "appear in more than one gh-stack source" (source means file, not array entry).
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .branch("other-trunk")
+            .worktree("main")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .gh_stack(None, 1, "other-trunk", &["feat-b"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert!(divergent_stack_numbers(repo).is_empty());
+    }
+
+    #[test]
+    fn identical_copy_across_canonical_and_unlinked_is_not_divergent() {
+        // Regression test for finding H(b): an unlinked worktree file holding a byte-identical
+        // copy of a canonical stack is the common state right after someone copies a
+        // worktree, not a real divergence, so it must not be flagged.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .gh_stack(None, 4, "main", &["feat-a"])
+            .gh_stack(Some("feat-a"), 4, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert!(divergent_stack_numbers(repo).is_empty());
+    }
+
+    #[test]
+    fn genuinely_differing_copy_across_sources_is_divergent() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .branch("feat-b")
+            .gh_stack(None, 4, "main", &["feat-a"])
+            .gh_stack(Some("feat-a"), 4, "main", &["feat-b"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(divergent_stack_numbers(repo), vec![4]);
     }
 
     #[test]
