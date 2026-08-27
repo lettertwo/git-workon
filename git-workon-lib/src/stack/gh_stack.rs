@@ -574,6 +574,7 @@ pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result
         Ok(meta) if !meta.file_type().is_symlink()
     );
     if !is_regular_file {
+        remove_stale_lock_file(&admin_dir)?;
         return link_worktree(repo, worktree_name);
     }
 
@@ -642,7 +643,34 @@ pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result
         message: e.to_string(),
     })?;
 
+    remove_stale_lock_file(&admin_dir)?;
     link_worktree(repo, worktree_name)
+}
+
+/// Remove `admin_dir/gh-stack.lock` if it is a regular file, so the following
+/// [`link_worktree`] call can plant a proper symlink — [`plant_link`] never replaces a regular
+/// file. Its contents are irrelevant (upstream never reads them, it is a pure `flock` target;
+/// see the module docs' shared-canonical-file section), so simply discarding it is safe.
+///
+/// A worktree that has already run `gh stack` almost always has a real `gh-stack.lock`
+/// alongside its real `gh-stack` file (upstream opens it `O_CREATE` on every lock attempt), so
+/// this runs on every path through [`migrate_worktree`], not only the merge path — leaving it
+/// behind would silently keep that worktree flocking a private inode instead of the shared
+/// canonical lock, defeating cross-worktree mutual exclusion without [`worktree_link_status`]
+/// (which now checks both paths) reporting it.
+fn remove_stale_lock_file(admin_dir: &Path) -> Result<(), StackError> {
+    let lock_path = admin_dir.join("gh-stack.lock");
+    let is_regular_file = matches!(
+        std::fs::symlink_metadata(&lock_path),
+        Ok(meta) if !meta.file_type().is_symlink()
+    );
+    if is_regular_file {
+        std::fs::remove_file(&lock_path).map_err(|e| StackError::GhStackWriteFailed {
+            path: lock_path,
+            message: e.to_string(),
+        })?;
+    }
+    Ok(())
 }
 
 /// The first of `gh-stack.bak`, `gh-stack.bak.1`, `gh-stack.bak.2`, ... that doesn't already
@@ -675,23 +703,43 @@ pub enum LinkStatus {
     NotLinked { holds_file: bool },
 }
 
-/// Compute [`LinkStatus`] for `worktree_name`'s `gh-stack` admin-dir path.
-pub(crate) fn worktree_link_status(repo: &Repository, worktree_name: &str) -> LinkStatus {
-    let path = repo
-        .commondir()
-        .join("worktrees")
-        .join(worktree_name)
-        .join("gh-stack");
-    match std::fs::symlink_metadata(&path) {
+/// `Linked`/`NotLinked { holds_file }` for a single admin-dir path against `canonical`.
+/// Factored out of [`worktree_link_status`] so it can be applied to both `gh-stack` and
+/// `gh-stack.lock` — a stale `gh-stack.lock` regular file (upstream opens it `O_CREATE` on
+/// every lock attempt, so a worktree that has run `gh stack` almost always has one) is just as
+/// unlinked as a stale `gh-stack` file, and must be equally visible to `doctor`.
+fn link_status_for_path(path: &Path, canonical: &Path) -> LinkStatus {
+    match std::fs::symlink_metadata(path) {
         Err(_) => LinkStatus::NotLinked { holds_file: false },
         Ok(meta) if meta.file_type().is_symlink() => {
-            if is_symlink_resolving_to(&path, &canonical_path(repo)) {
+            if is_symlink_resolving_to(path, canonical) {
                 LinkStatus::Linked
             } else {
                 LinkStatus::NotLinked { holds_file: false }
             }
         }
         Ok(_) => LinkStatus::NotLinked { holds_file: true },
+    }
+}
+
+/// Compute [`LinkStatus`] for `worktree_name`'s `gh-stack` and `gh-stack.lock` admin-dir
+/// paths, `NotLinked` if either is unlinked. `holds_file` reflects only the `gh-stack` path —
+/// whether there is a real stack file needing [`migrate_worktree`]'s merge — never the lock
+/// file, whose contents are irrelevant and whose own staleness is fully handled by
+/// [`migrate_worktree`] discarding it before relinking; a stale lock alone must route through
+/// [`link_worktree`], not `migrate_worktree`.
+pub(crate) fn worktree_link_status(repo: &Repository, worktree_name: &str) -> LinkStatus {
+    let admin_dir = repo.commondir().join("worktrees").join(worktree_name);
+    let canonical = canonical_path(repo);
+
+    let gh_stack_status = link_status_for_path(&admin_dir.join("gh-stack"), &canonical);
+    if matches!(gh_stack_status, LinkStatus::NotLinked { .. }) {
+        return gh_stack_status;
+    }
+
+    match link_status_for_path(&admin_dir.join("gh-stack.lock"), &canonical) {
+        LinkStatus::Linked => LinkStatus::Linked,
+        LinkStatus::NotLinked { .. } => LinkStatus::NotLinked { holds_file: false },
     }
 }
 
@@ -1173,5 +1221,66 @@ mod tests {
         // ...and the second migration's original landed in a numbered backup instead.
         assert!(admin_dir.join("gh-stack.bak.1").exists());
         repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
+    }
+
+    #[test]
+    fn migrate_worktree_also_migrates_a_stale_lock_file() {
+        // A worktree that has already run `gh stack` almost always has a real `gh-stack.lock`
+        // alongside its real `gh-stack` file (upstream opens it O_CREATE on every lock
+        // attempt). Both must end up symlinked, or this worktree's `gh stack` keeps flocking a
+        // private inode while `register_branch` flocks the shared canonical lock.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .gh_stack(Some("feat-a"), 7, "main", &["feat-a"])
+            .gh_stack_unlinked("feat-a")
+            .gh_stack_lock_unlinked("feat-a")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let admin_dir = repo.commondir().join("worktrees/feat-a");
+        let lock_meta_before = std::fs::symlink_metadata(admin_dir.join("gh-stack.lock")).unwrap();
+        assert!(!lock_meta_before.file_type().is_symlink());
+
+        migrate_worktree(repo, "feat-a").unwrap();
+
+        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
+        let lock_meta_after = std::fs::symlink_metadata(admin_dir.join("gh-stack.lock")).unwrap();
+        assert!(
+            lock_meta_after.file_type().is_symlink(),
+            "gh-stack.lock must be a symlink after migration"
+        );
+        let lock_target = std::fs::read_link(admin_dir.join("gh-stack.lock")).unwrap();
+        assert_eq!(lock_target, Path::new("../../gh-stack.lock"));
+    }
+
+    #[test]
+    fn worktree_link_status_reports_not_linked_when_lock_is_a_regular_file() {
+        // gh-stack itself is correctly linked, but gh-stack.lock reverted to a real file (the
+        // write-in-place risk this module's docs describe). worktree_link_status must catch
+        // this from the gh-stack path alone being insufficient — doctor would otherwise report
+        // `Linked` forever with no way to detect the lost cross-worktree exclusion.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .gh_stack_linked("feat-a")
+            .gh_stack_lock_unlinked("feat-a")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        match worktree_link_status(repo, "feat-a") {
+            LinkStatus::NotLinked { holds_file } => {
+                // holds_file describes the gh-stack path, not the lock, and the gh-stack path
+                // here is correctly linked (not holding a real file).
+                assert!(!holds_file);
+            }
+            LinkStatus::Linked => panic!("expected NotLinked, got Linked"),
+        }
     }
 }
