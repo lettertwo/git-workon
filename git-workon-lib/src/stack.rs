@@ -7,8 +7,8 @@
 //!
 //! Stack awareness is two-dimensional:
 //!
-//! - [`StackModel`] — which tool manages stacks (v1: Graphite, and metadata-less git-inference
-//!   via [`StackModel::Git`]; future: branchless, sapling, spr)
+//! - [`StackModel`] — which tool manages stacks (v1: Graphite and `gh stack`, plus
+//!   metadata-less git-inference via [`StackModel::Git`]; future: branchless, sapling)
 //! - [`Granularity`] — how worktrees map to stacks (v1: [`Granularity::Stack`], one per stack)
 //!
 //! ## Default-on behavior
@@ -24,6 +24,13 @@
 //! JSON written by the `gt` CLI. No `gt` process is needed for detection or visualization.
 //! `gt track` is invoked only when registering a new branch (in `workon new` when creating a
 //! fork off a stack-worktree's branch).
+//!
+//! ## gh-stack (v1)
+//!
+//! Stack metadata is read from the `gh stack` extension's own JSON file — canonical at
+//! `<common-dir>/gh-stack`, with a degraded union fallback for unlinked per-worktree copies.
+//! See `stack/gh_stack.rs`'s module docs for the read order, the dedupe rule, and why a
+//! truncated read is tolerated rather than fatal (the opposite of Graphite's rule below).
 //!
 //! ## Git-inference (v1)
 //!
@@ -41,6 +48,7 @@
 //! set)`, so two worktrees in the same connected stack always collapse into one group regardless
 //! of the [`Stack::diffs`] vector order returned by [`current_stack`].
 
+pub(crate) mod gh_stack;
 pub(crate) mod graphite;
 pub(crate) mod metadata;
 
@@ -57,12 +65,15 @@ pub enum StackModel {
     None,
     /// Graphite (`gt`) manages stacks via `refs/branch-metadata/*`.
     Graphite,
+    /// `gh stack` (the `github/gh-stack` extension) manages stacks via a JSON file. See
+    /// `stack/gh_stack.rs`'s module docs for the canonical-file-plus-symlinks model.
+    GhStack,
     /// No stack-metadata tool; changesets are inferred purely from git, one per commit in
-    /// `upstream..HEAD`. Unlike [`StackModel::Graphite`], this carries no branch-level stack
-    /// topology: [`enumerate_stacks`] and [`current_stack`] treat it as flat (same as
-    /// [`StackModel::None`]), since there is no metadata to enumerate stacks from or to
-    /// group branches into. Only [`crate::assemble_changesets`] (M1 changeset assembly)
-    /// gives this variant meaning, walking `upstream..HEAD` per-commit.
+    /// `upstream..HEAD`. Unlike [`StackModel::Graphite`]/[`StackModel::GhStack`], this carries
+    /// no branch-level stack topology: [`enumerate_stacks`] and [`current_stack`] treat it as
+    /// flat (same as [`StackModel::None`]), since there is no metadata to enumerate stacks
+    /// from or to group branches into. Only [`crate::assemble_changesets`] (M1 changeset
+    /// assembly) gives this variant meaning, walking `upstream..HEAD` per-commit.
     ///
     /// Not reachable via [`StackModel::detect`] — see the module docs' Default-on-behavior
     /// note on why auto-detection never resolves to `Git`.
@@ -89,9 +100,18 @@ impl StackModel {
     /// branch would silently flip that routing for nearly every user. `Git` is reachable via
     /// explicit `workon.stackModel = git` config, or a caller mapping `None` to `Git` before
     /// calling [`crate::assemble_changesets`] (the review crate does this from M3 onward).
+    ///
+    /// **Graphite wins** when both tools' artifacts are present: `.graphite_repo_config`
+    /// comes from an explicit, repo-wide `gt init`, while a `gh-stack` file can appear as a
+    /// side effect of one `gh stack add` run in one worktree. The more deliberate,
+    /// repo-scoped signal wins, so no repo that resolves to `Graphite` today can silently flip
+    /// to `GhStack` just because someone tried the other tool once. The escape hatch is an
+    /// explicit `workon.stackModel = gh-stack`.
     pub fn detect(repo: &Repository) -> Self {
         if graphite::is_graphite_repo(repo) {
             Self::Graphite
+        } else if gh_stack::is_gh_stack_repo(repo) {
+            Self::GhStack
         } else {
             Self::None
         }
@@ -138,6 +158,7 @@ pub fn enumerate_stacks(repo: &Repository, model: StackModel) -> Result<Vec<Stac
     match model {
         StackModel::None => Ok(vec![]),
         StackModel::Graphite => graphite::enumerate_stacks(repo).map_err(Into::into),
+        StackModel::GhStack => gh_stack::enumerate_stacks(repo).map_err(Into::into),
         // Git-inference has no branch-level stack topology to enumerate — flat, like None.
         StackModel::Git => Ok(vec![]),
     }
@@ -156,6 +177,7 @@ pub fn current_stack(
     match model {
         StackModel::None => Ok(None),
         StackModel::Graphite => graphite::current_stack(repo, head_branch).map_err(Into::into),
+        StackModel::GhStack => gh_stack::current_stack(repo, head_branch).map_err(Into::into),
         // Git-inference has no branch-level stack topology — flat, like None.
         StackModel::Git => Ok(None),
     }
@@ -280,6 +302,34 @@ mod tests {
             StackModel::detect(repo),
             StackModel::Graphite,
             "a gt-initialized repo is a Graphite stack regardless of PATH"
+        );
+    }
+
+    #[test]
+    fn detect_resolves_gh_stack_from_canonical_file() {
+        let fixture = FixtureBuilder::new()
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(StackModel::detect(repo), StackModel::GhStack);
+    }
+
+    #[test]
+    fn detect_prefers_graphite_when_both_tools_artifacts_are_present() {
+        let fixture = FixtureBuilder::new()
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(
+            StackModel::detect(repo),
+            StackModel::Graphite,
+            "Graphite's repo-wide gt init must win over a gh-stack file appearing alongside it"
         );
     }
 

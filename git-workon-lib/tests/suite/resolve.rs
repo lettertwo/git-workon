@@ -335,6 +335,28 @@ fn rule3_deepest_ancestor_worktree_is_chosen() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn rule3_fires_under_gh_stack_model() -> Result<(), Box<dyn Error>> {
+    // Same shape as rule3_deepest_ancestor_worktree_is_chosen, but sourced from a gh-stack
+    // file instead of Graphite metadata — proves resolve.rs's model==None gate is the only
+    // thing gating rules 2-3, and any non-None model (including GhStack) passes through.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .gh_stack(None, 1, "main", &["feat-a", "feat-b", "feat-c"])
+        .build()?;
+    let repo = fixture.repo()?;
+    assert_eq!(
+        resolve_action(repo, "feat-c", StackModel::GhStack),
+        Resolution::Checkout {
+            host: "feat-a".to_string()
+        }
+    );
+    Ok(())
+}
+
+#[test]
 fn rule3_nearest_ancestor_wins_when_multiple_have_worktrees() -> Result<(), Box<dyn Error>> {
     // Stack: main → feat-a → feat-b → feat-c. Worktrees: main, feat-a, feat-b.
     // workon("feat-c") → nearest ancestor with worktree is feat-b, not feat-a.

@@ -293,12 +293,17 @@ impl<'repo> WorkonConfig<'repo> {
     ///
     /// Precedence: CLI override > workon.stackModel config > auto-detect.
     ///
-    /// Auto-detection: returns `Graphite` when `gt` is on PATH and the repo has been
-    /// `gt init`-ed (`.graphite_repo_config` exists). Otherwise returns `None`.
+    /// Auto-detection: returns `Graphite` when the repo has been `gt init`-ed
+    /// (`.graphite_repo_config` or `.graphite_metadata.db` exists), else `GhStack` when a
+    /// gh-stack file is present, else `None`. Graphite wins when both are present — see
+    /// [`StackModel::detect`].
     ///
-    /// Accepted config values: `"graphite"`, `"git"`, `"none"`, `"auto"` (re-runs detection).
-    /// `"git"` opts into metadata-less git-inference ([`StackModel::Git`]) explicitly — it is
-    /// never the result of `"auto"`. Anything else returns an error.
+    /// Accepted config values: `"graphite"`, `"gh-stack"`, `"git"`, `"none"`, `"auto"`
+    /// (re-runs detection). `"git"` opts into metadata-less git-inference
+    /// ([`StackModel::Git`]) explicitly — it is never the result of `"auto"`. `"ghstack"`
+    /// (no hyphen) is a *different* tool (Meta's Phabricator-style stacker) and is rejected
+    /// as unsupported rather than treated as a typo for `"gh-stack"`. Anything else returns
+    /// an error.
     pub fn stack_model(&self, cli_override: Option<&str>) -> Result<StackModel> {
         let raw = if let Some(val) = cli_override {
             Some(val.to_string())
@@ -311,8 +316,9 @@ impl<'repo> WorkonConfig<'repo> {
             None | Some("auto") => Ok(StackModel::detect(self.repo)),
             Some("none") => Ok(StackModel::None),
             Some("graphite") => Ok(StackModel::Graphite),
+            Some("gh-stack") => Ok(StackModel::GhStack),
             Some("git") => Ok(StackModel::Git),
-            Some(other) if matches!(other, "branchless" | "sapling" | "spr") => {
+            Some(other) if matches!(other, "branchless" | "sapling" | "spr" | "ghstack") => {
                 Err(StackError::UnsupportedModel {
                     model: other.to_string(),
                 }
