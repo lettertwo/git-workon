@@ -57,7 +57,7 @@ use crate::hooks::execute_post_create_hooks;
 use crate::output;
 use workon::{
     add_worktree, copy_untracked, current_stack, current_worktree, get_repo, get_worktrees,
-    graphite_trunk, resolve_remote_tracking, workon_root, BranchType, CopyOptions,
+    graphite_trunk, link_worktree, resolve_remote_tracking, workon_root, BranchType, CopyOptions,
     RemoteResolution, StackModel, WorkonConfig, WorktreeDescriptor,
 };
 
@@ -361,6 +361,19 @@ impl Run for New {
                 }
                 Err(e) => {
                     output::warn(&format!("gt track unavailable: {}", e));
+                }
+            }
+        }
+
+        // Plant the gh-stack canonical-file symlinks for the new worktree (non-fatal on
+        // failure, matching the `gt track` precedent above — `new` has already created the
+        // worktree). Unlike `gt track`, there's nothing to run inside another process: this is
+        // pure filesystem plumbing that makes gh-stack's own writes visible from every
+        // worktree, so it isn't gated on `branch_pre_existed`.
+        if effective_model == StackModel::GhStack && !self.no_stack {
+            if let Some(name) = worktree.name() {
+                if let Err(e) = link_worktree(&repo, name) {
+                    output::warn(&format!("gh-stack link failed: {}", e));
                 }
             }
         }

@@ -295,6 +295,21 @@ pub enum StackError {
     #[error("Failed to parse gh-stack file '{}': {message}", path.display())]
     #[diagnostic(code(workon::stack::gh_stack_parse_failed))]
     GhStackParseFailed { path: PathBuf, message: String },
+
+    #[error("Timed out waiting for gh-stack lock '{}'", path.display())]
+    #[diagnostic(
+        code(workon::stack::gh_stack_locked),
+        help("Another `gh stack` or `git-workon` process may be mid-write; try again shortly.")
+    )]
+    GhStackLocked { path: PathBuf },
+
+    #[error("Failed to write gh-stack file '{}': {message}", path.display())]
+    #[diagnostic(code(workon::stack::gh_stack_write_failed))]
+    GhStackWriteFailed { path: PathBuf, message: String },
+
+    #[error("Failed to link gh-stack file '{}': {message}", path.display())]
+    #[diagnostic(code(workon::stack::gh_stack_link_failed))]
+    GhStackLinkFailed { path: PathBuf, message: String },
 }
 
 /// Changeset assembly errors

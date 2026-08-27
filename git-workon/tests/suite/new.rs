@@ -1151,3 +1151,56 @@ fn new_attaching_existing_branch_with_slashes_skips_gt_track(
 
     Ok(())
 }
+
+// ── gh-stack link hook ────────────────────────────────────────────────────────
+
+#[test]
+fn new_links_gh_stack_worktree_after_creation() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "gh-stack")
+        .gh_stack(None, 1, "main", &[])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("feat-1")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1"));
+
+    Ok(())
+}
+
+#[test]
+fn new_skips_gh_stack_link_with_no_stack_flag() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "gh-stack")
+        .gh_stack(None, 1, "main", &[])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("--no-stack")
+        .arg("feat-1")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1").not());
+
+    Ok(())
+}
