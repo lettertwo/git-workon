@@ -533,6 +533,64 @@ fn enumerate_stacks_returns_empty_under_git_model_even_with_graphite_metadata(
     Ok(())
 }
 
+// ── StackModel::GhStack — two independent stacks on one trunk ────────────────
+// gh-stack's `stacks[]` holds independent stack objects; two of them sharing a trunk is the
+// shape `git-workon/src/display.rs`'s `build_tree` renders as a fork (ADR-026). Every other
+// gh-stack test in this file (and metadata.rs's generic unit tests) uses a single stack, so
+// `Stack::number` has never been exercised as `Some` alongside a sibling stack here.
+
+#[test]
+fn enumerate_stacks_returns_both_independent_stacks_sharing_a_trunk() -> Result<(), Box<dyn Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .gh_stack(None, 7, "main", &["review-tui"])
+        .gh_stack(None, 0, "main", &["review-scaffold", "gt-support-v1"])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let mut stacks = enumerate_stacks(repo, StackModel::GhStack)?;
+    assert_eq!(stacks.len(), 2);
+    // Order isn't part of the contract; sort by root diff for a stable comparison.
+    stacks.sort_by(|a, b| a.diffs[0].cmp(&b.diffs[0]));
+
+    let numbered = &stacks[1];
+    assert_eq!(numbered.trunk, "main");
+    assert_eq!(numbered.diffs, vec!["review-tui"]);
+    assert_eq!(numbered.number, Some(7));
+
+    let unnumbered = &stacks[0];
+    assert_eq!(unnumbered.trunk, "main");
+    assert_eq!(unnumbered.diffs, vec!["review-scaffold", "gt-support-v1"]);
+    assert_eq!(unnumbered.number, None);
+
+    Ok(())
+}
+
+#[test]
+fn current_stack_returns_only_the_member_stack_when_trunk_is_shared() -> Result<(), Box<dyn Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .gh_stack(None, 7, "main", &["review-tui"])
+        .gh_stack(None, 0, "main", &["review-scaffold", "gt-support-v1"])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let stack = current_stack(repo, "gt-support-v1", StackModel::GhStack)?.unwrap();
+    assert_eq!(stack.trunk, "main");
+    assert_eq!(stack.diffs, vec!["review-scaffold", "gt-support-v1"]);
+    assert_eq!(stack.number, None);
+    assert!(
+        !stack.diffs.contains(&"review-tui".to_string()),
+        "the other stack sharing the same trunk must not leak in"
+    );
+
+    let numbered_stack = current_stack(repo, "review-tui", StackModel::GhStack)?.unwrap();
+    assert_eq!(numbered_stack.diffs, vec!["review-tui"]);
+    assert_eq!(numbered_stack.number, Some(7));
+
+    Ok(())
+}
+
 // ── fixture predicates ────────────────────────────────────────────────────────
 
 #[test]
