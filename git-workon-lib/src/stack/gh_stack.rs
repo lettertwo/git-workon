@@ -636,13 +636,29 @@ pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result
     // is single-attempt and genuinely errors on a parse failure.
     read_raw_stacks(&canonical)?;
 
-    let bak_path = admin_dir.join("gh-stack.bak");
+    let bak_path = next_available_backup_path(&admin_dir);
     std::fs::rename(&worktree_file, &bak_path).map_err(|e| StackError::GhStackWriteFailed {
         path: worktree_file.clone(),
         message: e.to_string(),
     })?;
 
     link_worktree(repo, worktree_name)
+}
+
+/// The first of `gh-stack.bak`, `gh-stack.bak.1`, `gh-stack.bak.2`, ... that doesn't already
+/// exist in `admin_dir`. A worktree can legitimately acquire a real `gh-stack` file again
+/// after a prior migration — the write-in-place risk this crate's module docs describe (a
+/// gh-stack release switching to temp-and-rename would cause exactly this) — so re-migrating
+/// must never clobber the backup a previous migration left behind.
+fn next_available_backup_path(admin_dir: &Path) -> PathBuf {
+    let base = admin_dir.join("gh-stack.bak");
+    if std::fs::symlink_metadata(&base).is_err() {
+        return base;
+    }
+    (1u32..)
+        .map(|n| admin_dir.join(format!("gh-stack.bak.{n}")))
+        .find(|candidate| std::fs::symlink_metadata(candidate).is_err())
+        .expect("u32 backup suffixes are effectively inexhaustible")
 }
 
 // ── `doctor` support ─────────────────────────────────────────────────────────────────────
@@ -1119,5 +1135,43 @@ mod tests {
             .commondir()
             .join("worktrees/feat-a/gh-stack.bak")
             .exists());
+    }
+
+    #[test]
+    fn migrate_worktree_never_clobbers_an_existing_backup() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .gh_stack(Some("feat-a"), 7, "main", &["feat-a"])
+            .gh_stack_unlinked("feat-a")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        migrate_worktree(repo, "feat-a").unwrap();
+
+        let admin_dir = repo.commondir().join("worktrees/feat-a");
+        let first_backup = admin_dir.join("gh-stack.bak");
+        assert!(first_backup.exists());
+        let first_backup_contents = std::fs::read(&first_backup).unwrap();
+
+        // Simulate a gh-stack release switching to temp-and-rename: the symlink this
+        // worktree's `gh-stack` path was left as gets replaced with a real file again.
+        std::fs::remove_file(admin_dir.join("gh-stack")).unwrap();
+        std::fs::write(
+            admin_dir.join("gh-stack"),
+            br#"{"schemaVersion":1,"stacks":[]}"#,
+        )
+        .unwrap();
+
+        migrate_worktree(repo, "feat-a").unwrap();
+
+        // The first backup is untouched...
+        assert_eq!(std::fs::read(&first_backup).unwrap(), first_backup_contents);
+        // ...and the second migration's original landed in a numbered backup instead.
+        assert!(admin_dir.join("gh-stack.bak.1").exists());
+        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
     }
 }
