@@ -847,13 +847,12 @@ fn write_canonical_atomic(canonical: &Path, bytes: &[u8]) -> Result<(), StackErr
 /// and this call. Guarded by [`lock_canonical`], so a concurrent `gh stack` run in any
 /// worktree (every worktree's lock symlinks to the same file) is genuinely excluded.
 ///
-/// A compare-and-swap on raw file bytes (not a checksum — upstream's never crosses a process
-/// boundary, so there is no interop contract, and byte equality on bytes already in hand is
-/// strictly stronger) guards against a writer that doesn't go through [`lock_canonical`] at
-/// all: bytes are read once before the lock is taken, then compared against a fresh read
-/// immediately after. A well-behaved writer never triggers a mismatch, since nothing else can
-/// write while the lock is held; a mismatch triggers one re-plan against the fresher bytes,
-/// then [`StackError::GhStackFileChanged`] if it still disagrees.
+/// The file is read only after the lock is held. No lock-respecting writer (every `gh stack`
+/// invocation, and every other `git-workon` call into this module) can be mid-write once the
+/// lock is ours, so a read-under-lock always sees a complete file — there is nothing to
+/// compare-and-swap against. A pre-lock read would risk observing upstream's non-atomic
+/// `os.WriteFile` mid-truncation and handing a partial prefix to [`plan_registered_doc`],
+/// which is exactly the failure this ordering avoids.
 pub fn register_branch(
     repo: &Repository,
     branch: &str,
@@ -864,32 +863,19 @@ pub fn register_branch(
     let base = repo.merge_base(base_tip, head).unwrap_or(base_tip);
 
     let canonical = canonical_path(repo);
-    let mut snapshot = std::fs::read(&canonical).unwrap_or_default();
-
     let _lock = lock_canonical(repo)?;
 
-    for attempt in 0..2 {
-        let new_bytes = plan_registered_doc(
-            &snapshot,
-            branch,
-            base_branch,
-            &base.to_string(),
-            &head.to_string(),
-            &canonical,
-        )?;
+    let existing = std::fs::read(&canonical).unwrap_or_default();
+    let new_bytes = plan_registered_doc(
+        &existing,
+        branch,
+        base_branch,
+        &base.to_string(),
+        &head.to_string(),
+        &canonical,
+    )?;
 
-        let current = std::fs::read(&canonical).unwrap_or_default();
-        if current == snapshot {
-            return write_canonical_atomic(&canonical, &new_bytes);
-        }
-        if attempt == 0 {
-            snapshot = current;
-            continue;
-        }
-        return Err(StackError::GhStackFileChanged { path: canonical });
-    }
-
-    unreachable!("loop above always returns on its second iteration")
+    write_canonical_atomic(&canonical, &new_bytes)
 }
 
 // ── `doctor` support ─────────────────────────────────────────────────────────────────────
@@ -1691,6 +1677,30 @@ mod tests {
             "/stacks/0/branches/0/pullRequest/number",
             "42",
         ));
+    }
+
+    #[test]
+    fn register_branch_surfaces_parse_failed_for_truncated_canonical() {
+        // A truncated canonical file under an uncontended lock is genuine corruption, not a
+        // mid-write race (a lock-respecting writer can't be mid-write once we hold the lock).
+        // The read-under-lock ordering means this must deterministically surface
+        // GhStackParseFailed rather than a stale pre-lock snapshot masking the truncation.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .branch("feat-b")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .raw_gh_stack(None, b"{\"schemaVersion\": 1, \"stacks\": [".to_vec())
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        match register_branch(repo, "feat-b", "feat-a") {
+            Err(StackError::GhStackParseFailed { .. }) => {}
+            other => panic!("expected GhStackParseFailed, got {other:?}"),
+        }
     }
 
     #[test]
