@@ -196,30 +196,28 @@ problem instead of a transient one.
 cannot fix it, and skipping it would silently render a confidently wrong, outdated stack. Missing
 or `0` is treated as `1`, matching Go's zero-value behavior for an unset int field.
 
-## The register_branch CAS, and the per-worktree-write asymmetry it closes
+## register_branch's read-under-lock, and the per-worktree-write asymmetry it closes
 
 `register_branch` (`gh_stack.rs`) takes `<common-dir>/gh-stack.lock` via `flock(LOCK_EX |
 LOCK_NB)` before writing, retried every 100ms up to 5s. Because every worktree's lock path
 symlinks to the same file (decision 5), this genuinely excludes a concurrent `gh stack` process
 running in any worktree, not just the one `workon new` is writing from.
 
-On top of the lock, `register_branch` also does a compare-and-swap on raw file bytes: it reads
-the canonical file once before taking the lock, then compares that snapshot against a fresh read
-taken immediately after the lock is acquired. Nothing else can write to the file while the lock
-is held, so a well-behaved writer never triggers a mismatch. This path only fires for a writer
-that bypasses `lock_canonical` entirely. On a mismatch it re-plans once against the fresher
-bytes, then returns `StackError::GhStackFileChanged` if it still disagrees. **This CAS path has
-no test coverage.** Nothing in the test suite exercises a writer that skips the lock, since
-constructing one means writing to the canonical file from outside `gh_stack.rs`'s own locked
-functions. It guards against a class of writer the current codebase never produces, not a
-behavior exercised by any of the added tests.
+I first paired the lock with a compare-and-swap on raw file bytes: read the canonical file once
+before taking the lock, compare that snapshot against a fresh read taken right after the lock
+was acquired, re-plan once against the fresher bytes on a mismatch, and return
+`StackError::GhStackFileChanged` if it still disagreed. I removed it in a later commit
+(`8c84c0c`). It existed to guard against a writer that bypasses `lock_canonical` entirely, and
+it didn't actually guard against that writer: such a writer can still write between the compare
+and the rename, so the CAS bought nothing over a plain read-under-lock. What it did buy was a
+new failure mode: an ordinary lock-respecting `gh stack` process that wrote between the pre-lock
+read and the lock acquisition would trip the mismatch and fail an otherwise-correct
+registration.
 
-The CAS is raw byte equality on bytes already in hand, not a hash: upstream's own
-compare-and-swap uses a sha256 checksum, but that checksum never crosses a process boundary (it
-is computed and compared entirely inside one `gh stack` invocation), so there is no interop
-contract to match. Byte equality is strictly stronger and needed no new dependency: `sha2` is
-absent from `Cargo.lock`, and the `flock` call above already relies on `libc`, already a direct
-dependency of `git-workon-lib` and already used with `unsafe` in `copy_untracked.rs:312-344`.
+`register_branch` now reads the canonical file only after the lock is held. No lock-respecting
+writer, every `gh stack` invocation and every other `git-workon` call into this module, can be
+mid-write once the lock is ours, so that read always sees a complete file. There is nothing left
+to compare against.
 
 Decision 5 removes an asymmetry that existed under upstream's own per-worktree layout: `view`,
 `up`, `down`, `top`, `bottom` worked only in the worktree holding the file that happened to have
@@ -235,8 +233,8 @@ sees the same state regardless of which worktree wrote it.
 - `list --json` gains an additive `"number"` field per stack object; `diffs`, `checkouts`, and
   `parents` are unchanged.
 - New `StackError` variants: `GhStackSchemaUnsupported`, `GhStackParseFailed`, `GhStackLocked`,
-  `GhStackWriteFailed`, `GhStackLinkFailed`, `GhStackFileChanged`, `GhStackNoStackForBase`, and
-  `DeletedStackNode` (the provider-neutral twin of `DeletedBranchNode`). `Resolution::DeletedNode`
+  `GhStackWriteFailed`, `GhStackLinkFailed`, `GhStackNoStackForBase`, and `DeletedStackNode`
+  (the provider-neutral twin of `DeletedBranchNode`). `Resolution::DeletedNode`
   carries no model, so `route_branch_to_command` in `git-workon/src/main.rs` now selects between
   the two based on the effective `StackModel` (see ADR-024).
 - New `doctor` checks: `GhStackWorktreeNotLinked` (warn, the `--fix` target),
