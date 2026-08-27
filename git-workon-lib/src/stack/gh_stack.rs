@@ -610,8 +610,11 @@ pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result
     })?;
 
     // Re-read the bytes actually on disk (not just the in-memory copy) before unlinking the
-    // worktree's original file.
-    read_doc(&canonical)?;
+    // worktree's original file. `read_raw_stacks`, not `read_doc`: `read_doc` only ever
+    // returns `Err` for a schema mismatch that can't happen on a doc we just wrote with
+    // `schemaVersion: 1`, so it can never fail here and isn't a real guard. `read_raw_stacks`
+    // is single-attempt and genuinely errors on a parse failure.
+    read_raw_stacks(&canonical)?;
 
     let bak_path = admin_dir.join("gh-stack.bak");
     std::fs::rename(&worktree_file, &bak_path).map_err(|e| StackError::GhStackWriteFailed {
