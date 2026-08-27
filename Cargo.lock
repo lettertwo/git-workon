@@ -594,6 +594,7 @@ dependencies = [
  "env_logger",
  "git-workon-lib",
  "git2",
+ "libc",
  "log",
  "predicates",
  "rusqlite",

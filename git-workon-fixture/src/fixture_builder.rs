@@ -44,6 +44,17 @@ fn isolate_ambient_git_config() {
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Create a symlink at `link` pointing at `target` (may be relative, may be dangling).
+#[cfg(unix)]
+fn symlink(target: &str, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink(target: &str, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(target, link)
+}
+
 /// Which on-disk format Graphite branch-metadata is written in.
 ///
 /// Real `gt` versions before 1.8 wrote `refs/branch-metadata/<branch>` blobs; 1.8+ writes
@@ -88,6 +99,75 @@ struct PrInfoEntry {
     branch: String,
     number: u64,
     title: String,
+}
+
+/// Which gh-stack file a fixture write targets.
+///
+/// `None` is the canonical store at `<common-dir>/gh-stack`; `Some(name)` is the per-worktree
+/// file at `<common-dir>/worktrees/<name>/gh-stack` — mirroring what a real `gh stack`
+/// invocation would write from inside that worktree before workon's symlink plumbing exists.
+type GhStackTarget = Option<String>;
+
+/// How a gh-stack `branchRef.base` is written for one fixtured branch.
+#[derive(Debug, Clone)]
+enum GhStackBase {
+    /// Resolve the parent's live `refs/heads/<name>` tip at `build()` time, mirroring what
+    /// `gh stack add`/`gh stack sync` record.
+    ResolveParentTip,
+    /// Write this string verbatim — stale or bogus `base` values for trap-style tests.
+    Verbatim(String),
+}
+
+/// One `branchRef` entry queued for a [`GhStackStackSpec`].
+#[derive(Debug, Clone)]
+struct GhStackBranchSpec {
+    branch: String,
+    base: GhStackBase,
+    /// Ghost entries simulate a branch gh-stack still tracks but whose git ref was
+    /// deleted/merged — no local branch ref is created for these.
+    ghost: bool,
+}
+
+/// One `stacks[]` entry queued by [`FixtureBuilder::gh_stack`]/[`FixtureBuilder::gh_stack_at`].
+#[derive(Debug, Clone)]
+struct GhStackStackSpec {
+    number: u64,
+    trunk: String,
+    branches: Vec<GhStackBranchSpec>,
+}
+
+/// A queued gh-stack fixture write, replayed in call order at `build()` time (after branch
+/// refs exist, so live-tip `base`/`head` resolution works the same way the Graphite block
+/// resolves `parentBranchRevision`).
+#[derive(Debug, Clone)]
+enum GhStackOp {
+    /// A whole new `stacks[]` entry for `target`.
+    Stack {
+        target: GhStackTarget,
+        spec: GhStackStackSpec,
+    },
+    /// Append a ghost branch onto the `target` file's stack numbered `number` (which must
+    /// already have been queued via a prior [`GhStackOp::Stack`]).
+    GhostBranch {
+        target: GhStackTarget,
+        number: u64,
+        branch: String,
+    },
+    /// Overwrite `target`'s file with raw bytes after all JSON writes — truncated, `v2`, or
+    /// plain garbage content for error-path tests.
+    Raw {
+        target: GhStackTarget,
+        bytes: Vec<u8>,
+    },
+    /// Take and hold `target`'s `gh-stack.lock` (unix only) for the fixture's lifetime, to
+    /// exercise lock-contention handling.
+    LockHeld { target: GhStackTarget },
+    /// Plant `gh-stack`/`gh-stack.lock` in `worktree`'s admin dir as relative symlinks to the
+    /// canonical store.
+    Linked { worktree: String },
+    /// Ensure `worktree`'s admin dir has a real (non-symlink) `gh-stack` file — a stand-in for
+    /// migration-test fixtures when no explicit stack content targets that worktree.
+    Unlinked { worktree: String },
 }
 
 /// Represents a remote URL source
@@ -145,6 +225,7 @@ pub struct FixtureBuilder<'fixture> {
     unstaged_files: Vec<(String, String, String)>, // (path, committed, modified)
     untracked_files: Vec<(String, String)>, // (path, content)
     deleted_files: Vec<(String, String)>, // (path, committed)
+    gh_stack_ops: Vec<GhStackOp>,
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -166,6 +247,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
             unstaged_files: Vec::new(),
             untracked_files: Vec::new(),
             deleted_files: Vec::new(),
+            gh_stack_ops: Vec::new(),
         }
     }
 
@@ -320,6 +402,130 @@ impl<'fixture> FixtureBuilder<'fixture> {
             branch: branch.to_string(),
             number,
             title: title.to_string(),
+        });
+        self
+    }
+
+    /// Queue a `stacks[]` entry for `worktree`'s gh-stack file (`None` = canonical
+    /// `<common-dir>/gh-stack`, `Some(name)` = `<common-dir>/worktrees/<name>/gh-stack`).
+    ///
+    /// `base` for each branch resolves to its parent's live `refs/heads/<name>` tip at
+    /// `build()` time (parent is the previous entry in `branches`, or `trunk` for the first).
+    /// Repeated calls with the same `worktree` accumulate into that file's `stacks` array; a
+    /// local branch ref is created for each entry that doesn't already have one, mirroring
+    /// [`branch_metadata`](Self::branch_metadata). Use [`gh_stack_at`](Self::gh_stack_at) to
+    /// pin verbatim/stale `base` values instead.
+    pub fn gh_stack(
+        mut self,
+        worktree: Option<&str>,
+        number: u64,
+        trunk: &str,
+        branches: &[&str],
+    ) -> Self {
+        let spec = GhStackStackSpec {
+            number,
+            trunk: trunk.to_string(),
+            branches: branches
+                .iter()
+                .map(|branch| GhStackBranchSpec {
+                    branch: branch.to_string(),
+                    base: GhStackBase::ResolveParentTip,
+                    ghost: false,
+                })
+                .collect(),
+        };
+        self.gh_stack_ops.push(GhStackOp::Stack {
+            target: worktree.map(str::to_string),
+            spec,
+        });
+        self
+    }
+
+    /// Same as [`gh_stack`](Self::gh_stack), but `branches` pairs each branch with a verbatim
+    /// `base` string instead of resolving the parent's live tip — for stale/bogus-`base`
+    /// (`needs_restack`) trap tests.
+    pub fn gh_stack_at(
+        mut self,
+        worktree: Option<&str>,
+        number: u64,
+        trunk: &str,
+        branches: &[(&str, &str)],
+    ) -> Self {
+        let spec = GhStackStackSpec {
+            number,
+            trunk: trunk.to_string(),
+            branches: branches
+                .iter()
+                .map(|(branch, base)| GhStackBranchSpec {
+                    branch: branch.to_string(),
+                    base: GhStackBase::Verbatim(base.to_string()),
+                    ghost: false,
+                })
+                .collect(),
+        };
+        self.gh_stack_ops.push(GhStackOp::Stack {
+            target: worktree.map(str::to_string),
+            spec,
+        });
+        self
+    }
+
+    /// Append a ghost branch (no local branch ref) onto `worktree`'s stack numbered `number`.
+    ///
+    /// A [`gh_stack`](Self::gh_stack)/[`gh_stack_at`](Self::gh_stack_at) call for the same
+    /// `(worktree, number)` must be queued first — `build()` panics otherwise, since there is
+    /// no trunk to derive the ghost's position from.
+    pub fn gh_stack_ghost_branch(
+        mut self,
+        worktree: Option<&str>,
+        number: u64,
+        branch: &str,
+    ) -> Self {
+        self.gh_stack_ops.push(GhStackOp::GhostBranch {
+            target: worktree.map(str::to_string),
+            number,
+            branch: branch.to_string(),
+        });
+        self
+    }
+
+    /// Overwrite `worktree`'s gh-stack file with raw `bytes` after all other gh-stack writes —
+    /// for truncated-read, `schemaVersion: 2`, and garbage-content error-path tests.
+    pub fn raw_gh_stack(mut self, worktree: Option<&str>, bytes: Vec<u8>) -> Self {
+        self.gh_stack_ops.push(GhStackOp::Raw {
+            target: worktree.map(str::to_string),
+            bytes,
+        });
+        self
+    }
+
+    /// Take and hold `worktree`'s `gh-stack.lock` (`flock(LOCK_EX)`) for the fixture's
+    /// lifetime, to exercise lock-contention handling in the write path. Unix only.
+    #[cfg(unix)]
+    pub fn gh_stack_lock_held(mut self, worktree: Option<&str>) -> Self {
+        self.gh_stack_ops.push(GhStackOp::LockHeld {
+            target: worktree.map(str::to_string),
+        });
+        self
+    }
+
+    /// Plant `gh-stack`/`gh-stack.lock` in `worktree`'s admin dir as relative symlinks
+    /// (`../../gh-stack`, `../../gh-stack.lock`) resolving to the canonical store — the
+    /// healthy-path layout `link_worktree` produces.
+    pub fn gh_stack_linked(mut self, worktree: &str) -> Self {
+        self.gh_stack_ops.push(GhStackOp::Linked {
+            worktree: worktree.to_string(),
+        });
+        self
+    }
+
+    /// Ensure `worktree`'s admin dir has a real (non-symlink) `gh-stack` file — the
+    /// pre-migration layout `doctor --fix` / `migrate_worktree` targets. A no-op beyond
+    /// ensuring the file exists if [`gh_stack`](Self::gh_stack)/[`gh_stack_at`](Self::gh_stack_at)
+    /// already queued content for this worktree.
+    pub fn gh_stack_unlinked(mut self, worktree: &str) -> Self {
+        self.gh_stack_ops.push(GhStackOp::Unlinked {
+            worktree: worktree.to_string(),
         });
         self
     }
@@ -670,6 +876,220 @@ impl<'fixture> FixtureBuilder<'fixture> {
             let pr_info_json = serde_json::json!({ "prInfos": pr_info_objects });
             let pr_info_path = repo.path().join(".graphite_pr_info");
             std::fs::write(&pr_info_path, pr_info_json.to_string())?;
+        }
+
+        // Write gh-stack files: canonical (`<common-dir>/gh-stack`) and/or per-worktree
+        // (`<common-dir>/worktrees/<name>/gh-stack`), grouped by target and written after
+        // branch refs exist so `resolve_tip` sees live tips. `gh_stack`/`gh_stack_at` calls
+        // accumulate into one `stacks` array per target, in call order; `Raw` overwrites
+        // whatever JSON was written for its target; `Linked`/`Unlinked` run last, after every
+        // file exists, so symlink planting can see (or knowingly precede — dangling is valid)
+        // the canonical file.
+        if !self.gh_stack_ops.is_empty() {
+            fn gh_stack_target_path(repo: &Repository, target: &GhStackTarget) -> PathBuf {
+                match target {
+                    None => repo.commondir().join("gh-stack"),
+                    Some(name) => repo
+                        .commondir()
+                        .join("worktrees")
+                        .join(name)
+                        .join("gh-stack"),
+                }
+            }
+
+            fn branch_ref_json(branch: &str, head: String, base: String) -> serde_json::Value {
+                serde_json::json!({
+                    "branch": branch,
+                    "head": head,
+                    "base": base,
+                    "pullRequest": serde_json::Value::Null,
+                })
+            }
+
+            // Create local branch refs for tracked (non-ghost) gh-stack entries before
+            // resolving live tips, mirroring the Graphite block above. Ghost entries and
+            // trunks are left alone — trunks are expected to already exist from repo/worktree
+            // setup, ghosts intentionally have no ref.
+            for op in &self.gh_stack_ops {
+                if let GhStackOp::Stack { spec, .. } = op {
+                    for b in &spec.branches {
+                        if !b.ghost && repo.find_branch(&b.branch, BranchType::Local).is_err() {
+                            let head = repo.head()?;
+                            let commit = head.peel_to_commit()?;
+                            repo.branch(&b.branch, &commit, false)?;
+                        }
+                    }
+                }
+            }
+
+            // Group queued `Stack` entries by target, preserving call order (dedupe/identity
+            // rules live in the lib, not the fixture — this just replays what was queued).
+            let mut stacks_by_target: Vec<(GhStackTarget, Vec<GhStackStackSpec>)> = Vec::new();
+            let target_index = |stacks_by_target: &[(GhStackTarget, Vec<GhStackStackSpec>)],
+                                target: &GhStackTarget| {
+                stacks_by_target.iter().position(|(t, _)| t == target)
+            };
+
+            for op in &self.gh_stack_ops {
+                match op {
+                    GhStackOp::Stack { target, spec } => {
+                        match target_index(&stacks_by_target, target) {
+                            Some(i) => stacks_by_target[i].1.push(spec.clone()),
+                            None => stacks_by_target.push((target.clone(), vec![spec.clone()])),
+                        }
+                    }
+                    GhStackOp::GhostBranch {
+                        target,
+                        number,
+                        branch,
+                    } => {
+                        let i = target_index(&stacks_by_target, target).unwrap_or_else(|| {
+                            panic!(
+                                "gh_stack_ghost_branch({target:?}, {number}, {branch:?}): \
+                                 no prior gh_stack/gh_stack_at queued a stack numbered {number} \
+                                 for this target"
+                            )
+                        });
+                        let entries = &mut stacks_by_target[i].1;
+                        let spec = entries
+                            .iter_mut()
+                            .find(|s| s.number == *number)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "gh_stack_ghost_branch({target:?}, {number}, {branch:?}): \
+                                     no queued stack numbered {number} for this target"
+                                )
+                            });
+                        spec.branches.push(GhStackBranchSpec {
+                            branch: branch.clone(),
+                            base: GhStackBase::ResolveParentTip,
+                            ghost: true,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+
+            for (target, specs) in &stacks_by_target {
+                let stacks_json: Vec<serde_json::Value> = specs
+                    .iter()
+                    .map(|spec| {
+                        let trunk_tip = resolve_tip(&spec.trunk).unwrap_or_default();
+                        let branches_json: Vec<serde_json::Value> = spec
+                            .branches
+                            .iter()
+                            .enumerate()
+                            .map(|(i, b)| {
+                                let parent = if i == 0 {
+                                    spec.trunk.as_str()
+                                } else {
+                                    spec.branches[i - 1].branch.as_str()
+                                };
+                                let base = match &b.base {
+                                    GhStackBase::Verbatim(s) => s.clone(),
+                                    GhStackBase::ResolveParentTip => {
+                                        resolve_tip(parent).unwrap_or_default()
+                                    }
+                                };
+                                let head = resolve_tip(&b.branch).unwrap_or_default();
+                                branch_ref_json(&b.branch, head, base)
+                            })
+                            .collect();
+                        serde_json::json!({
+                            "id": format!("id-{}", spec.number),
+                            "number": spec.number,
+                            "trunk": branch_ref_json(&spec.trunk, trunk_tip, String::new()),
+                            "branches": branches_json,
+                        })
+                    })
+                    .collect();
+                let doc = serde_json::json!({
+                    "schemaVersion": 1,
+                    "repository": "git-workon-fixture/gh-stack",
+                    "stacks": stacks_json,
+                });
+                let path = gh_stack_target_path(&repo, target);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, doc.to_string())?;
+            }
+
+            // `Unlinked` ensures a real file exists even when no `Stack`/`GhostBranch` op
+            // targeted that worktree — write a minimal valid empty-stacks doc.
+            for op in &self.gh_stack_ops {
+                if let GhStackOp::Unlinked { worktree } = op {
+                    let target = Some(worktree.clone());
+                    let path = gh_stack_target_path(&repo, &target);
+                    if !path.exists() {
+                        if let Some(parent) = path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        let doc = serde_json::json!({
+                            "schemaVersion": 1,
+                            "repository": "git-workon-fixture/gh-stack",
+                            "stacks": [],
+                        });
+                        std::fs::write(&path, doc.to_string())?;
+                    }
+                }
+            }
+
+            // `Raw` overwrites whatever was just written for its target, last write wins.
+            for op in &self.gh_stack_ops {
+                if let GhStackOp::Raw { target, bytes } = op {
+                    let path = gh_stack_target_path(&repo, target);
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, bytes)?;
+                }
+            }
+
+            // `Linked` plants relative symlinks resolving to the canonical store. A dangling
+            // symlink (canonical not yet written) is intentionally valid — see the ADR-028
+            // handoff's "shared canonical file" self-healing note.
+            for op in &self.gh_stack_ops {
+                if let GhStackOp::Linked { worktree } = op {
+                    let admin_dir = repo.commondir().join("worktrees").join(worktree);
+                    std::fs::create_dir_all(&admin_dir)?;
+                    for (name, relative_target) in [
+                        ("gh-stack", "../../gh-stack"),
+                        ("gh-stack.lock", "../../gh-stack.lock"),
+                    ] {
+                        let link_path = admin_dir.join(name);
+                        let _ = std::fs::remove_file(&link_path);
+                        symlink(relative_target, &link_path)?;
+                    }
+                }
+            }
+
+            #[cfg(unix)]
+            for op in &self.gh_stack_ops {
+                if let GhStackOp::LockHeld { target } = op {
+                    let admin_target = match target {
+                        None => repo.commondir().to_path_buf(),
+                        Some(name) => repo.commondir().join("worktrees").join(name),
+                    };
+                    std::fs::create_dir_all(&admin_target)?;
+                    let lock_path = admin_target.join("gh-stack.lock");
+                    let file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&lock_path)?;
+                    // SAFETY: `flock` on a freshly opened fd we own; leaked below so the lock
+                    // is held for the fixture's (process) lifetime, matching a real concurrent
+                    // `gh stack` process for tests exercising lock-contention handling.
+                    let rc = unsafe {
+                        libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX)
+                    };
+                    if rc != 0 {
+                        return Err(std::io::Error::last_os_error().into());
+                    }
+                    std::mem::forget(file);
+                }
+            }
         }
 
         // Index mutations last: staged adds, unstaged working-tree rewrites, untracked
