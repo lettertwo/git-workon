@@ -622,6 +622,88 @@ pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result
     link_worktree(repo, worktree_name)
 }
 
+// ── `doctor` support ─────────────────────────────────────────────────────────────────────
+
+/// Per-worktree link status, for `doctor`'s `GhStackWorktreeNotLinked` check and its `--fix`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkStatus {
+    /// Correctly symlinked to canonical.
+    Linked,
+    /// Not linked. `holds_file` distinguishes the two `--fix` actions: `true` means a real
+    /// file is present and must be merged ([`migrate_worktree`]); `false` means the path is
+    /// simply missing (or a symlink pointing somewhere else) and can be planted directly
+    /// ([`link_worktree`]).
+    NotLinked { holds_file: bool },
+}
+
+/// Compute [`LinkStatus`] for `worktree_name`'s `gh-stack` admin-dir path.
+pub(crate) fn worktree_link_status(repo: &Repository, worktree_name: &str) -> LinkStatus {
+    let path = repo
+        .commondir()
+        .join("worktrees")
+        .join(worktree_name)
+        .join("gh-stack");
+    match std::fs::symlink_metadata(&path) {
+        Err(_) => LinkStatus::NotLinked { holds_file: false },
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if is_symlink_resolving_to(&path, &canonical_path(repo)) {
+                LinkStatus::Linked
+            } else {
+                LinkStatus::NotLinked { holds_file: false }
+            }
+        }
+        Ok(_) => LinkStatus::NotLinked { holds_file: true },
+    }
+}
+
+/// Files (canonical + [`unlinked_files`]) that exist but fail to parse, or whose
+/// `schemaVersion` is unsupported — for `doctor`'s `GhStackFileUnreadable` check.
+///
+/// Unlike [`read_doc`], this is a single-attempt read: `doctor` is a point-in-time health
+/// check, not the hot read path a concurrent `gh stack` write races against, so there is no
+/// truncated-read tolerance to preserve here — a transient mid-write read just gets reported
+/// and re-checked on the next `doctor` run.
+pub(crate) fn readability_errors(repo: &Repository) -> Vec<(PathBuf, StackError)> {
+    let mut sources = vec![canonical_path(repo)];
+    sources.extend(unlinked_files(repo));
+
+    sources
+        .into_iter()
+        .filter(|path| path.exists())
+        .filter_map(|path| match read_raw_stacks(&path) {
+            Ok(_) => None,
+            Err(e) => Some((path, e)),
+        })
+        .collect()
+}
+
+/// Stack numbers that appear in more than one gh-stack source — only possible when the
+/// degraded union read (see the module docs) actually combines canonical with an unlinked
+/// worktree file. For `doctor`'s `GhStackDivergentStacks` check.
+pub(crate) fn divergent_stack_numbers(repo: &Repository) -> Vec<u64> {
+    let mut sources = vec![canonical_path(repo)];
+    sources.extend(unlinked_files(repo));
+
+    let mut counts: HashMap<u64, usize> = HashMap::new();
+    for path in &sources {
+        if let Ok(Some(entries)) = read_doc(path) {
+            for entry in entries {
+                if entry.number != 0 {
+                    *counts.entry(entry.number).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    let mut divergent: Vec<u64> = counts
+        .into_iter()
+        .filter(|&(_, count)| count > 1)
+        .map(|(number, _)| number)
+        .collect();
+    divergent.sort_unstable();
+    divergent
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

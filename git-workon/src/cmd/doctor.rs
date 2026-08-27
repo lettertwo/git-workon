@@ -21,6 +21,11 @@
 //! - Invalid workon.prFormat (missing required `{number}` placeholder)
 //! - workon.defaultBranch set to a branch that does not exist locally
 //! - stackModel=graphite but repo not initialized with `gt init`
+//! - stackModel=gh-stack but no gh-stack file anywhere, or the `gh-stack` extension missing
+//! - Worktrees whose gh-stack admin-dir file isn't linked to the canonical store — fixable
+//!   with --fix (plants the link, or merges a pre-existing real file first)
+//! - gh-stack files that fail to parse, or whose stacks disagree across worktrees
+//! - Both Graphite and gh-stack artifacts present with the model left on `auto`
 //!
 //! ## Flags:
 //! - `--fix` - Automatically repair fixable issues (missing directory entries, renamed keys)
@@ -32,9 +37,11 @@ use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
 use workon::{
-    encode_worktree_name, get_repo, get_worktrees, is_graphite_active, preferred_remote_order,
-    relative_worktree_path, rename_worktree_metadata, Granularity, StackModel, WorkonConfig,
-    WorktreeDescriptor,
+    encode_worktree_name, get_repo, get_worktrees, gh_stack_divergent_stack_numbers,
+    gh_stack_readability_errors, gh_stack_worktree_link_status, is_gh_stack_repo,
+    is_graphite_active, is_graphite_repo, link_worktree, migrate_worktree, preferred_remote_order,
+    relative_worktree_path, rename_worktree_metadata, GhStackLinkStatus, Granularity, StackModel,
+    WorkonConfig, WorktreeDescriptor,
 };
 
 use crate::cli::Doctor;
@@ -84,6 +91,20 @@ enum IssueKind {
     StaleWorktreeName {
         expected: String,
     },
+    GhStackWorktreeNotLinked {
+        worktree: String,
+        holds_file: bool,
+    },
+    GhStackExtensionNotFound,
+    GhStackNotInitialized,
+    GhStackFileUnreadable {
+        path: PathBuf,
+        reason: String,
+    },
+    GhStackDivergentStacks {
+        number: u64,
+    },
+    BothStackToolsDetected,
 }
 
 struct Issue {
@@ -123,6 +144,7 @@ impl Issue {
             IssueKind::MissingDirectory
                 | IssueKind::RenamedConfigKey { .. }
                 | IssueKind::StaleWorktreeName { .. }
+                | IssueKind::GhStackWorktreeNotLinked { .. }
         )
     }
 
@@ -177,6 +199,36 @@ impl Issue {
                     )
                 }
             }
+            IssueKind::GhStackWorktreeNotLinked {
+                worktree,
+                holds_file,
+            } => {
+                if *holds_file {
+                    format!(
+                        "'{worktree}' has its own gh-stack file, not linked to canonical — run --fix to merge it in"
+                    )
+                } else {
+                    format!("'{worktree}' is not linked to the canonical gh-stack file — run --fix to link it")
+                }
+            }
+            IssueKind::GhStackExtensionNotFound => {
+                "gh-stack extension not found (run: gh extension install github/gh-stack)"
+                    .to_string()
+            }
+            IssueKind::GhStackNotInitialized => {
+                "stackModel=gh-stack but no gh-stack file found — run: gh stack init".to_string()
+            }
+            IssueKind::GhStackFileUnreadable { path, reason } => {
+                format!("gh-stack file '{}' is unreadable: {reason}", path.display())
+            }
+            IssueKind::GhStackDivergentStacks { number } => {
+                format!(
+                    "stack #{number} is defined differently in more than one worktree's gh-stack file"
+                )
+            }
+            IssueKind::BothStackToolsDetected => {
+                "both Graphite and gh-stack artifacts are present; set workon.stackModel explicitly to avoid ambiguity".to_string()
+            }
         }
     }
 
@@ -196,6 +248,12 @@ impl Issue {
             IssueKind::DefaultBranchMissing { .. } => "default_branch_missing",
             IssueKind::GraphiteNotInitialized => "graphite_not_initialized",
             IssueKind::StaleWorktreeName { .. } => "stale_worktree_name",
+            IssueKind::GhStackWorktreeNotLinked { .. } => "gh_stack_worktree_not_linked",
+            IssueKind::GhStackExtensionNotFound => "gh_stack_extension_not_found",
+            IssueKind::GhStackNotInitialized => "gh_stack_not_initialized",
+            IssueKind::GhStackFileUnreadable { .. } => "gh_stack_file_unreadable",
+            IssueKind::GhStackDivergentStacks { .. } => "gh_stack_divergent_stacks",
+            IssueKind::BothStackToolsDetected => "both_stack_tools_detected",
         }
     }
 }
@@ -205,6 +263,10 @@ impl Run for Doctor {
         let repo = get_repo(None)?;
         let worktrees = get_worktrees(&repo)?;
         let config = WorkonConfig::new(&repo)?;
+        // Computed once up front: gates the per-worktree link check below and the
+        // dependency-section gh-stack checks further down, mirroring the GraphiteNotInitialized
+        // gate later in this function.
+        let gh_stack_active = matches!(config.stack_model(None), Ok(StackModel::GhStack));
 
         debug!("found {} worktree(s)", worktrees.len());
         output::status(&format!("Checking {} worktree(s)...", worktrees.len()));
@@ -246,6 +308,28 @@ impl Run for Doctor {
                             let issue = Issue::worktree(
                                 IssueKind::StaleWorktreeName {
                                     expected: expected.clone(),
+                                },
+                                name,
+                                path.clone(),
+                            );
+                            output::check_warn(name, &issue.message());
+                            issues.push(issue);
+                            clean = false;
+                        }
+                    }
+
+                    if gh_stack_active {
+                        if let GhStackLinkStatus::NotLinked { holds_file } =
+                            gh_stack_worktree_link_status(&repo, name)
+                        {
+                            debug!(
+                                "'{}': gh-stack not linked (holds_file={})",
+                                name, holds_file
+                            );
+                            let issue = Issue::worktree(
+                                IssueKind::GhStackWorktreeNotLinked {
+                                    worktree: name.to_string(),
+                                    holds_file,
                                 },
                                 name,
                                 path.clone(),
@@ -308,6 +392,49 @@ impl Run for Doctor {
             let issue = Issue::dependency(IssueKind::GtNotFound);
             output::check_warn("gt", "not found in PATH (stack features unavailable)");
             issues.push(issue);
+        }
+
+        // gh-stack checks — gated on the effective model (unlike GtNotFound above) so
+        // Graphite users, who never touch the gh-stack extension, aren't nagged about it.
+        if gh_stack_active {
+            debug!("checking gh-stack extension availability");
+            if gh_stack_extension_available() {
+                debug!("gh-stack extension: ok");
+                output::check_pass("gh-stack");
+            } else {
+                debug!("gh-stack extension not found");
+                let issue = Issue::dependency(IssueKind::GhStackExtensionNotFound);
+                output::check_warn("gh-stack", &issue.message());
+                issues.push(issue);
+            }
+
+            if !is_gh_stack_repo(&repo) {
+                debug!("stackModel=gh-stack but no gh-stack file found anywhere");
+                let issue = Issue::config(IssueKind::GhStackNotInitialized);
+                output::check_warn("gh-stack", &issue.message());
+                issues.push(issue);
+            }
+
+            for (path, reason) in gh_stack_readability_errors(&repo) {
+                debug!("gh-stack file unreadable: {}", path.display());
+                let issue = Issue {
+                    kind: IssueKind::GhStackFileUnreadable {
+                        path: path.clone(),
+                        reason,
+                    },
+                    name: None,
+                    path: Some(path),
+                };
+                output::check_fail("gh-stack", &issue.message());
+                issues.push(issue);
+            }
+
+            for number in gh_stack_divergent_stack_numbers(&repo) {
+                debug!("gh-stack #{} is divergent across worktrees", number);
+                let issue = Issue::config(IssueKind::GhStackDivergentStacks { number });
+                output::check_warn("gh-stack", &issue.message());
+                issues.push(issue);
+            }
         }
 
         let hooks = config.post_create_hooks()?;
@@ -453,6 +580,24 @@ impl Run for Doctor {
             }
         }
 
+        // Both tools' artifacts present, model left on auto/unset: `StackModel::detect` picks
+        // Graphite deterministically (see its docs), but the user tried both tools and might
+        // not know which one workon is actually reading. An explicit `workon.stackModel =
+        // graphite` silences this — it's read as "I know, and I mean it."
+        let stack_model_is_explicit = !matches!(
+            repo.config()
+                .ok()
+                .and_then(|c| c.get_string("workon.stackModel").ok())
+                .as_deref(),
+            None | Some("auto")
+        );
+        if !stack_model_is_explicit && is_graphite_repo(&repo) && is_gh_stack_repo(&repo) {
+            debug!("both graphite and gh-stack artifacts present, model left on auto");
+            let issue = Issue::config(IssueKind::BothStackToolsDetected);
+            output::check_warn("stack", &issue.message());
+            issues.push(issue);
+        }
+
         debug!("found {} issue(s) total", issues.len());
 
         // JSON output: serialize all collected issues
@@ -493,6 +638,15 @@ impl Run for Doctor {
                     }
                     if let IssueKind::StaleWorktreeName { expected } = &issue.kind {
                         obj["expected"] = json!(expected);
+                    }
+                    if let IssueKind::GhStackWorktreeNotLinked { holds_file, .. } = &issue.kind {
+                        obj["holds_file"] = json!(holds_file);
+                    }
+                    if let IssueKind::GhStackFileUnreadable { reason, .. } = &issue.kind {
+                        obj["reason"] = json!(reason);
+                    }
+                    if let IssueKind::GhStackDivergentStacks { number } = &issue.kind {
+                        obj["number"] = json!(number);
                     }
                     if let IssueKind::RenamedConfigKey {
                         old_key,
@@ -815,6 +969,19 @@ fn fix_issues(repo: &git2::Repository, issues: &[Issue]) -> Result<Vec<String>> 
                     fixed.push(format!("Renamed admin directory: {name} → {expected}"));
                 }
             }
+            IssueKind::GhStackWorktreeNotLinked { holds_file, .. } => {
+                if let Some(name) = &issue.name {
+                    if *holds_file {
+                        debug!("migrating gh-stack file for worktree '{}'", name);
+                        migrate_worktree(repo, name).into_diagnostic()?;
+                        fixed.push(format!("Migrated gh-stack file into canonical: {name}"));
+                    } else {
+                        debug!("linking gh-stack for worktree '{}'", name);
+                        link_worktree(repo, name).into_diagnostic()?;
+                        fixed.push(format!("Linked to canonical gh-stack file: {name}"));
+                    }
+                }
+            }
             IssueKind::RenamedConfigKey {
                 old_key,
                 new_key,
@@ -876,4 +1043,19 @@ fn gh_authenticated() -> bool {
 /// Check if the gt CLI (Graphite) is available.
 fn gt_available() -> bool {
     command_in_path("gt")
+}
+
+/// Check if the `gh-stack` `gh` extension is installed (`gh extension list` mentions it).
+///
+/// A subprocess, unlike gh-stack's own stack-state reads elsewhere in this crate — decision 2
+/// of the gh-stack handoff forbids shelling out for *stack state*, not for a doctor probe, and
+/// `gh_authenticated` above already probes `gh auth status` the same way.
+fn gh_stack_extension_available() -> bool {
+    std::process::Command::new("gh")
+        .args(["extension", "list"])
+        .output()
+        .map(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("gh-stack")
+        })
+        .unwrap_or(false)
 }

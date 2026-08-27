@@ -213,6 +213,46 @@ pub fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result<()> {
     gh_stack::migrate_worktree(repo, worktree_name).map_err(Into::into)
 }
 
+/// `true` if the repository has been Graphite-initialized (`.graphite_repo_config` or
+/// `.graphite_metadata.db` exists), independent of whether `gt` is on PATH. Unlike
+/// [`is_graphite_active`], this doesn't gate on `gt`'s presence — `doctor`'s
+/// `BothStackToolsDetected` check needs to know whether the repo's *metadata* says Graphite,
+/// not whether `gt` is currently executable.
+pub fn is_graphite_repo(repo: &Repository) -> bool {
+    graphite::is_graphite_repo(repo)
+}
+
+/// `true` if this repository has a gh-stack file anywhere workon knows to look — canonical
+/// or an unlinked worktree file. Used by `doctor`'s `GhStackNotInitialized` and
+/// `BothStackToolsDetected` checks.
+pub fn is_gh_stack_repo(repo: &Repository) -> bool {
+    gh_stack::is_gh_stack_repo(repo)
+}
+
+/// Per-worktree gh-stack link status, for `doctor`'s `GhStackWorktreeNotLinked` check.
+pub use gh_stack::LinkStatus as GhStackLinkStatus;
+
+/// Compute [`GhStackLinkStatus`] for `worktree_name`'s `gh-stack` admin-dir path.
+pub fn gh_stack_worktree_link_status(repo: &Repository, worktree_name: &str) -> GhStackLinkStatus {
+    gh_stack::worktree_link_status(repo, worktree_name)
+}
+
+/// gh-stack files (canonical + unlinked worktree copies) that exist but fail to parse or use
+/// an unsupported schema version, as `(path, reason)` pairs. For `doctor`'s
+/// `GhStackFileUnreadable` check.
+pub fn gh_stack_readability_errors(repo: &Repository) -> Vec<(std::path::PathBuf, String)> {
+    gh_stack::readability_errors(repo)
+        .into_iter()
+        .map(|(path, err)| (path, err.to_string()))
+        .collect()
+}
+
+/// Stack numbers that appear in more than one gh-stack source, only reachable in degraded
+/// (union-read) mode. For `doctor`'s `GhStackDivergentStacks` check.
+pub fn gh_stack_divergent_stack_numbers(repo: &Repository) -> Vec<u64> {
+    gh_stack::divergent_stack_numbers(repo)
+}
+
 /// One group of worktrees that share a connected stack, identified by trunk + diff set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StackGroup {
