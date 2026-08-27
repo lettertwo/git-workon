@@ -249,10 +249,11 @@ man git-workon
     pruneGone = false            # prune gone-upstream worktrees by default
     pruneFetch = false           # fetch from remotes before evaluating gone status
 
-    # Stacked diffs (Graphite)
-    stackModel = auto            # "auto", "graphite", or "none"
+    # Stacked diffs (Graphite or gh-stack)
+    stackModel = auto            # "auto", "graphite", "gh-stack", "git", or "none"
     stackWorktreeGranularity = stack  # "stack" (one worktree per stack)
-    gtAutoTrack = true           # auto-run 'gt track' after 'workon new'
+    stackAutoTrack = true        # auto-register new branches with the active stack tool after 'workon new'
+    gtAutoTrack = true           # deprecated alias for stackAutoTrack, read only as a fallback
 ```
 
 See `man git-workon` or `git workon --help` for full documentation.

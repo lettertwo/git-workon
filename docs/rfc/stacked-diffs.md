@@ -2,7 +2,7 @@
 
 ## Executive Summary
 
-Stacked diffs is a workflow where large features are broken into a series of small, dependent changesets that build on each other. Tools take different approaches to what a "changeset" is — a branch, a commit, or a logical diff — and different approaches to how dependencies are tracked and submitted for review. This research examines how five stacked diff tools work and what design considerations git-workon should account for to avoid conflicts and enable future stacked diff support. Notably, git-stack bridges the branch-centric and commit-centric models — branches are the unit of work, but stack relationships are inferred purely from the commit graph with zero stored metadata.
+Stacked diffs is a workflow where large features are broken into a series of small, dependent changesets that build on each other. Tools take different approaches to what a "changeset" is — a branch, a commit, or a logical diff — and different approaches to how dependencies are tracked and submitted for review. This research examines how six stacked diff tools work and what design considerations git-workon should account for to avoid conflicts and enable future stacked diff support. Notably, git-stack bridges the branch-centric and commit-centric models — branches are the unit of work, but stack relationships are inferred purely from the commit graph with zero stored metadata.
 
 ## What Are Stacked Diffs?
 
@@ -272,6 +272,48 @@ Sources:
 Sources:
 
 - [git-stack GitHub Repository](https://github.com/gitext-rs/git-stack)
+
+### gh-stack (github/gh-stack)
+
+**Model**: Branch-centric, GitHub CLI extension
+
+- `gh stack` is a `gh` CLI extension (not a standalone binary) for managing linear stacks of
+  branches and their pull requests. Its `branches` array within a stack is strictly linear (no
+  forking), which is a degenerate case of Graphite's fork-capable DAG.
+- Each `branchRef` entry records `branch`, `head`, `base`, and `pullRequest`. `base` is the same
+  concept as Graphite's `parentBranchRevision`: the parent's tip at the time the child was
+  created or last restacked, used to detect when the parent has moved on.
+
+**Metadata storage**:
+
+- One JSON file (`schemaVersion: 1`) per git dir, at `git rev-parse --git-dir` + `/gh-stack`.
+  For the main checkout that is `.git/gh-stack`; for a linked worktree it is
+  `<common-dir>/worktrees/<name>/gh-stack`, meaning the file is **per-worktree by default**, not
+  shared the way Graphite's SQLite database or ref-blobs are.
+- Concurrency is a lock file (`gh-stack.lock`, `flock(LOCK_EX|LOCK_NB)`, 5s timeout with 100ms
+  retry) plus an in-process compare-and-swap keyed on a sha256 checksum of the file's contents.
+  The checksum never crosses a process boundary.
+- Writes go through `os.WriteFile`, which opens with `O_TRUNC` and truncates the target file in
+  place. There is no temp-file-and-rename, and no symlink inspection anywhere in the package, so
+  a reader can observe a partially written file during a concurrent write, and a symlinked path
+  is written through transparently rather than replaced.
+
+**Core commands**:
+
+- `gh stack init`: create a new stack rooted at the current branch
+- `gh stack add`: add a new branch on top of the current stack; refuses unless HEAD is already
+  at the top of the stack, and unconditionally checks out the new branch itself
+- `gh stack view` / `up` / `down` / `top` / `bottom`: inspect and navigate the stack
+- `gh stack link`: upstream's own answer for worktree users, pointing a worktree's local file at
+  another one, since its own docs (`skills/gh-stack/SKILL.md`) note the per-worktree file "would
+  be wrong or absent" without it
+
+**Worktree support**: acknowledged but not automatic. Upstream expects the user to run
+`gh stack link` manually per worktree; there is no built-in shared-store mode.
+
+Sources:
+
+- [github/gh-stack repository](https://github.com/github/gh-stack) (MIT)
 
 ## Stacked Diffs + Worktrees
 
