@@ -923,6 +923,14 @@ fn read_config_entries(
         src,
     ));
 
+    let stack_auto_track = config.stack_auto_track(None)?;
+    let src = scalar_source(repo, &git_config, "workon.stackAutoTrack");
+    entries.push((
+        "workon.stackAutoTrack".to_string(),
+        stack_auto_track.to_string(),
+        src,
+    ));
+
     let gt_auto_track = config.gt_auto_track(None)?;
     let src = scalar_source(repo, &git_config, "workon.gtAutoTrack");
     entries.push((

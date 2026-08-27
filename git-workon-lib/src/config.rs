@@ -31,7 +31,10 @@
 //! - **workon.pruneFetch** - Fetch from tracked remotes before evaluating gone status (bool, default: false)
 //! - **workon.stackModel** - Active stack model: "auto", "graphite", "git", or "none" (string, default: "auto")
 //! - **workon.stackWorktreeGranularity** - Worktree granularity for stacked diffs: "stack" (string, default: "stack")
-//! - **workon.gtAutoTrack** - Auto-run `gt track` after `workon new` (bool, default: true)
+//! - **workon.stackAutoTrack** - Auto-register new branches with the active stack tool after
+//!   `workon new` (bool, default: true)
+//! - **workon.gtAutoTrack** - Deprecated alias for `workon.stackAutoTrack`, read only when the
+//!   latter is unset (bool, default: true)
 //!
 //! ## Example Configuration
 //!
@@ -354,22 +357,33 @@ impl<'repo> WorkonConfig<'repo> {
         }
     }
 
-    /// Get whether to automatically register new branches with Graphite after `workon new`.
+    /// Get whether to automatically register new branches with the active stack tool
+    /// (Graphite's `gt track`, gh-stack's canonical-file append) after `workon new`.
     ///
-    /// Precedence: CLI override > workon.gtAutoTrack config > `true`.
+    /// Precedence: CLI override > `workon.stackAutoTrack` > `workon.gtAutoTrack` (deprecated,
+    /// read only when `stackAutoTrack` is unset) > `true`.
     ///
-    /// When `true` and `stackModel == Graphite`, `workon new` invokes `gt track --parent <base>`
-    /// inside the new worktree so the branch appears in `gt log` / `gt sync`. Failures are
-    /// non-fatal warnings.
-    pub fn gt_auto_track(&self, cli_override: Option<bool>) -> Result<bool> {
+    /// Failures in the registration itself are non-fatal warnings, not errors — see
+    /// `workon new`'s hook.
+    pub fn stack_auto_track(&self, cli_override: Option<bool>) -> Result<bool> {
         if let Some(val) = cli_override {
             return Ok(val);
         }
         let config = self.repo.config()?;
+        if let Ok(val) = config.get_bool("workon.stackAutoTrack") {
+            return Ok(val);
+        }
         match config.get_bool("workon.gtAutoTrack") {
             Ok(val) => Ok(val),
             Err(_) => Ok(true),
         }
+    }
+
+    /// Deprecated alias for [`stack_auto_track`](Self::stack_auto_track), kept for one release
+    /// so existing callers of `workon.gtAutoTrack` don't break. New code should call
+    /// `stack_auto_track` directly; this wrapper carries the same precedence.
+    pub fn gt_auto_track(&self, cli_override: Option<bool>) -> Result<bool> {
+        self.stack_auto_track(cli_override)
     }
 
     /// Helper to read multi-value config entries.
