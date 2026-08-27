@@ -311,6 +311,24 @@ pub enum StackError {
     #[diagnostic(code(workon::stack::gh_stack_link_failed))]
     GhStackLinkFailed { path: PathBuf, message: String },
 
+    #[error("gh-stack file '{}' changed while registering a branch", path.display())]
+    #[diagnostic(
+        code(workon::stack::gh_stack_file_changed),
+        help(
+            "Another `gh stack` or `git-workon` process wrote to the file concurrently; try again."
+        )
+    )]
+    GhStackFileChanged { path: PathBuf },
+
+    #[error("No gh-stack stack ends at branch '{base}'")]
+    #[diagnostic(
+        code(workon::stack::gh_stack_no_stack_for_base),
+        help(
+            "Run `gh stack init` or `gh stack add` for '{base}' first, or check workon.stackModel."
+        )
+    )]
+    GhStackNoStackForBase { base: String },
+
     #[error("Branch '{branch}' exists in stack metadata but its local ref was deleted")]
     #[diagnostic(
         code(workon::stack::deleted_stack_node),
