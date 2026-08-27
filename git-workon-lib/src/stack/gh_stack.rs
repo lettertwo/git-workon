@@ -512,13 +512,14 @@ fn raw_identity(entry: &Value) -> StackIdentity {
     StackIdentity::TrunkAndFirstBranch(trunk, first_branch)
 }
 
-/// Read `path`'s `stacks[]` array as raw `Value`s (no [`GhStackEntry`] parsing, so `id` and
-/// `pullRequest` survive), rejecting `schemaVersion > 1`. Missing file is an empty vec — a
-/// single attempt, no retries: called only under [`lock_canonical`] during `doctor --fix`,
-/// not on the hot read path [`read_doc`] serves.
-fn read_raw_stacks(path: &Path) -> Result<Vec<Value>, StackError> {
+/// Read `path` as a whole raw `Value` (no [`GhStackEntry`] parsing, so every top-level field —
+/// `repository`, `id`, `pullRequest`, anything a future gh-stack adds — survives), rejecting
+/// `schemaVersion > 1`. `Ok(None)` for a missing file. A single attempt, no retries: called
+/// only under [`lock_canonical`] during `doctor --fix` or [`register_branch`], not on the hot
+/// read path [`read_doc`] serves.
+fn read_raw_doc(path: &Path) -> Result<Option<Value>, StackError> {
     match std::fs::read(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(StackError::GhStackParseFailed {
             path: path.to_path_buf(),
             message: e.to_string(),
@@ -540,13 +541,17 @@ fn read_raw_stacks(path: &Path) -> Result<Vec<Value>, StackError> {
                     version,
                 });
             }
-            Ok(value
-                .get("stacks")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default())
+            Ok(Some(value))
         }
     }
+}
+
+/// Read `path`'s `stacks[]` array as raw `Value`s (no [`GhStackEntry`] parsing, so `id` and
+/// `pullRequest` survive). Missing file, or a file with no `stacks` array, is an empty vec.
+fn read_raw_stacks(path: &Path) -> Result<Vec<Value>, StackError> {
+    Ok(read_raw_doc(path)?
+        .and_then(|doc| doc.get("stacks").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default())
 }
 
 /// Merge a worktree's real `gh-stack` file into canonical, then replace it with a symlink.
@@ -575,7 +580,24 @@ pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result
     let _lock = lock_canonical(repo)?;
 
     let canonical = canonical_path(repo);
-    let mut merged = read_raw_stacks(&canonical)?;
+    let canonical_doc = read_raw_doc(&canonical)?;
+
+    // Base the merged document on canonical's whole `Value` when it exists, falling back to
+    // the worktree file's, so every top-level field outside `stacks` — `repository` above
+    // all — round-trips instead of being discarded. Mirrors `plan_registered_doc`, which
+    // round-trips the same way for the same reason.
+    let mut doc = match &canonical_doc {
+        Some(v) => v.clone(),
+        None => read_raw_doc(&worktree_file)?
+            .unwrap_or_else(|| serde_json::json!({ "schemaVersion": 1, "stacks": [] })),
+    };
+
+    let mut merged: Vec<Value> = canonical_doc
+        .as_ref()
+        .and_then(|v| v.get("stacks"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut seen: HashSet<StackIdentity> = merged.iter().map(raw_identity).collect();
     for entry in read_raw_stacks(&worktree_file)? {
         if seen.insert(raw_identity(&entry)) {
@@ -583,10 +605,8 @@ pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result
         }
     }
 
-    let doc = serde_json::json!({
-        "schemaVersion": 1,
-        "stacks": merged,
-    });
+    doc["schemaVersion"] = serde_json::json!(1);
+    doc["stacks"] = serde_json::Value::Array(merged);
 
     // Verify the merged result parses before touching anything on disk or unlinking the
     // worktree's original — never destroy the only copy of data that failed to round-trip.
@@ -1054,6 +1074,31 @@ mod tests {
 
         let meta = read_metadata(repo).unwrap();
         assert_eq!(meta.stack_numbers["feat-a"], 7);
+    }
+
+    #[test]
+    fn migrate_worktree_preserves_top_level_fields_when_canonical_is_absent() {
+        // No `gh_stack`/`gh_stack_at` call targets `None` (canonical), so canonical doesn't
+        // exist before migration and the merged document must be seeded from the worktree
+        // file's whole `Value` — including `repository` — not synthesized from scratch.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .gh_stack(Some("feat-a"), 7, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        migrate_worktree(repo, "feat-a").unwrap();
+
+        repo.assert(predicate::repo::gh_stack_preserves(
+            None,
+            "/repository",
+            "git-workon-fixture/gh-stack",
+        ));
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
     }
 
     #[test]
