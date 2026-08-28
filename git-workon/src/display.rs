@@ -30,20 +30,20 @@
 //!
 //! ### Tree (stack-active) format
 //!
-//! Graphite-style lane graph: each stack is one straight vertical lane; the graph grows
-//! horizontally by one column per concurrent sibling stack. `◉`/`◎`/`◯` glyphs encode
-//! worktree state; converging lanes close on the fork node's own row (no connector-only rows).
-//! Display order is tip-on-top, trunk at the bottom. `← here` marks the current worktree.
+//! Graphite-style lane graph, indented by stack membership rather than gutter-marked: column 0
+//! holds trunks and ungrouped worktrees, both flush left; every stack member that is not the
+//! trunk sits in column 1 or further right. A trunk gathers every stack hanging off it onto its
+//! own row (`◎─┴─┴─╯ main`), tallest stack leftmost. `◉`/`◎`/`◯` glyphs encode worktree state;
+//! converging lanes close on the fork node's own row (no connector-only rows). Display order is
+//! tip-on-top, trunk at the bottom, stacks before ungrouped worktrees. `← here` marks the
+//! current worktree.
 //!
 //! ```text
-//! ◯ api-3
-//! ◎ api-2          ↑   2h ago
-//! ◯ api-1
-//! │ ◯ branch-x
-//! │ │ ◯ branch-y
-//! │ ◎─╯ shared  ./base     5d ago
-//! ◉─╯ main             ↑   2m ago  ← here
-//! ◎ ee/testing           1mo ago
+//!   ◯ app
+//!   ◯ feature
+//!   │ ◎ shared
+//! ◉─┴─╯ main       ← here
+//! ◎ scratch
 //! ```
 //!
 //! Used by `list` for output and `find` for interactive selection.
@@ -251,16 +251,20 @@ pub fn format_aligned_rows_annotated(
 
 /// A single node in the stack display tree.
 ///
-/// Roots are trunks (or standalone untracked worktrees). Children are the diffs
-/// stacked on that trunk (or on another diff), ordered by most-recent activity
-/// descending after the dependency chain is resolved.
+/// Roots are trunks (or standalone untracked worktrees). Children are the diffs stacked on that
+/// trunk (or on another diff), ordered by subtree size descending (tallest stack leftmost) once
+/// the dependency chain is resolved.
 pub struct TreeNode {
     /// The branch/diff name — used as the primary label.
     pub branch: String,
     /// Worktree display data. `None` for metadata-only diffs (no checked-out worktree).
     pub row: Option<WorktreeDisplayRow>,
-    /// Most-recent activity in this node's subtree (epoch seconds), for sort ordering.
+    /// Most-recent activity in this node's subtree (epoch seconds); the tiebreaker once
+    /// `subtree_size` is equal, for both root ordering and lane assignment.
     pub subtree_activity: Option<i64>,
+    /// Node count of this node's own subtree (including itself). Drives lane assignment and
+    /// ordering: the child with the largest `subtree_size` takes the leftmost lane.
+    pub subtree_size: usize,
     /// Children (diffs stacked on this branch), in display order.
     pub children: Vec<TreeNode>,
     /// Provider-assigned stack number, set only on a direct child of a trunk (never on the
@@ -278,9 +282,10 @@ impl TreeNode {
 
 /// Build a forest of [`TreeNode`]s from worktrees, their stacks, and the grouping.
 ///
-/// Each distinct trunk gets one root node; all stacks on that trunk hang underneath.
-/// Untracked worktrees (those in `ungrouped`) become additional root-level leaf nodes,
-/// interleaved with the trunk roots by most-recent activity.
+/// Each distinct trunk gets one root node; all stacks on that trunk hang underneath, ordered
+/// tallest subtree first. Untracked worktrees (those in `ungrouped`) become additional
+/// root-level leaf nodes, sorted after every trunk (never interleaved with them) by
+/// most-recent activity.
 ///
 /// `all_worktrees` is the full filtered slice; `stacks` is parallel to it (one `Option<Stack>`
 /// per worktree). `groups` includes both real and metadata-only stack groups.
@@ -341,7 +346,10 @@ pub fn build_tree(
         .collect();
     trunk_set.sort();
 
-    let mut forest: Vec<TreeNode> = Vec::new();
+    // Trunk roots and ungrouped roots are collected separately and only concatenated at the
+    // end (trunks first): ungrouped worktrees sort after every stack, never interleaved with
+    // them by activity — see `build_tree`'s doc comment.
+    let mut trunk_nodes: Vec<TreeNode> = Vec::new();
     // Forest-global: a branch name is unique across the repo, so it belongs in exactly one place
     // in the tree. Overlapping stack groups merged into `per_trunk_reverse` can list the same
     // branch more than once; `visited` ensures the first placement wins and duplicates are dropped.
@@ -367,11 +375,13 @@ pub fn build_tree(
         );
 
         let subtree_activity = subtree_max(trunk_activity, &children);
+        let subtree_size = subtree_size(&children);
 
-        forest.push(TreeNode {
+        trunk_nodes.push(TreeNode {
             branch: trunk.clone(),
             row: trunk_row,
             subtree_activity,
+            subtree_size,
             children,
             stack_number: None, // never on the trunk root — see `TreeNode::stack_number`.
         });
@@ -380,6 +390,7 @@ pub fn build_tree(
     // Add ungrouped (untracked) worktrees as leaf nodes.
     // If a trunk's worktree is in ungrouped, it was already used above; skip it.
     let trunk_set_ref: std::collections::HashSet<&String> = trunk_set.iter().collect();
+    let mut ungrouped_nodes: Vec<TreeNode> = Vec::new();
     for &idx in ungrouped {
         // Skip if this worktree's branch is a known trunk (already in forest as root).
         let branch = all_worktrees[idx].branch().ok().flatten();
@@ -396,19 +407,35 @@ pub fn build_tree(
         }
         let row = rows.remove(&idx).unwrap();
         let epoch = row.activity_epoch;
-        forest.push(TreeNode {
+        ungrouped_nodes.push(TreeNode {
             branch: branch.clone().unwrap_or_else(|| row.dir_name.clone()),
             subtree_activity: epoch,
+            subtree_size: 1,
             row: Some(row),
             children: vec![],
             stack_number: None, // ungrouped: not part of a numbered stack.
         });
     }
 
-    // Sort roots by most-recent subtree_activity descending (None last).
-    forest.sort_by_key(|n| std::cmp::Reverse(n.subtree_activity));
+    // Trunks sort tallest-subtree-first (mirrors the lane-assignment rule so a trunk's rank
+    // among its peers matches how its own children fan out); ungrouped roots sort by
+    // most-recent activity, as before, and always follow every trunk.
+    trunk_nodes.sort_by(node_order);
+    ungrouped_nodes.sort_by_key(|n| std::cmp::Reverse(n.subtree_activity));
 
+    let mut forest = trunk_nodes;
+    forest.extend(ungrouped_nodes);
     forest
+}
+
+/// Ordering used both for root placement and lane assignment: largest subtree first (rule 4,
+/// "tall stack leftmost"), most-recent activity breaks a size tie, branch name breaks the rest
+/// for determinism.
+fn node_order(a: &TreeNode, b: &TreeNode) -> std::cmp::Ordering {
+    b.subtree_size
+        .cmp(&a.subtree_size)
+        .then_with(|| b.subtree_activity.cmp(&a.subtree_activity))
+        .then_with(|| a.branch.cmp(&b.branch))
 }
 
 /// Recursively build child nodes for a list of branch names.
@@ -445,11 +472,13 @@ fn build_children(
             direct_child_numbers,
         );
         let subtree_activity = subtree_max(epoch, &children);
+        let subtree_size = subtree_size(&children);
 
         nodes.push(TreeNode {
             branch: branch.clone(),
             row,
             subtree_activity,
+            subtree_size,
             children,
             // Only true direct children of a trunk are keys here (see `build_tree`), so a
             // plain lookup at any recursion depth naturally yields `None` past the root.
@@ -468,6 +497,13 @@ fn subtree_max(own: Option<i64>, children: &[TreeNode]) -> Option<i64> {
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+/// Node count of a subtree given its children's own `subtree_size`s, plus 1 for the node itself.
+/// Drives rule 4 ("tall stack leftmost"): the child with the most nodes underneath it (and
+/// itself) takes the leftmost lane.
+fn subtree_size(children: &[TreeNode]) -> usize {
+    1 + children.iter().map(|c| c.subtree_size).sum::<usize>()
 }
 
 // ── Lane graph layout ─────────────────────────────────────────────────────────
@@ -489,7 +525,9 @@ struct LaneRow<'a> {
 
 /// Visual display width of the gutter portion of a lane row.
 ///
-/// = passthrough columns (`own_lane × 2`) + glyph width (1) + closing connector (`closing_count × 2`).
+/// = passthrough columns (`own_lane × 2`) + glyph width (1) + closing connector
+/// (`closing_count × 2`). Lane 0 — trunks and ungrouped worktrees — has no leading columns at
+/// all, so it renders flush left; indentation is the only signal of stack membership.
 fn lane_gutter_width(own_lane: usize, closing_count: usize) -> usize {
     own_lane * 2 + GLYPH_WORKTREE.width() + closing_count * 2
 }
@@ -524,7 +562,8 @@ fn stack_number_suffix(number: Option<u64>) -> Option<String> {
 ///
 /// Produces: `(│ | )* glyph [─╯ | ─┴─╯ | …]`
 /// - Each column before `own_lane` renders as `│ ` (passthrough) or `  ` (empty/closed).
-/// - `own_lane` renders as `glyph`.
+/// - `own_lane` renders as `glyph`. Lane 0 (trunks, ungrouped worktrees) has no columns before
+///   it, so it sits flush left — indentation alone signals stack membership.
 /// - If `closing_count > 0`, appends `─`, then `(closing_count − 1) × ┴─`, then `╯`.
 fn render_gutter(
     own_lane: usize,
@@ -574,7 +613,9 @@ where
     let mut rows = Vec::new();
     for node in forest {
         if include(node) {
-            emit_lane_rows(node, 0, &[], include, &mut rows);
+            // Forest roots are bases (rule 1): a trunk never shares its lane with a child, so
+            // every child of a root opens its own lane instead of one of them inheriting lane 0.
+            emit_lane_rows(node, 0, &[], true, include, &mut rows);
         }
     }
     rows
@@ -584,7 +625,14 @@ where
 ///
 /// - `own_lane`: lane assigned to this node.
 /// - `passthrough_lanes`: lanes open above that pass through this subtree unchanged.
+/// - `is_base`: true for a forest root (trunk or ungrouped worktree). A base's children never
+///   inherit its lane — column 0 is reserved for bases (rule 1), so every child of a base opens
+///   a lane of its own (rule 2). A non-base node still hands its lane down to its tallest child
+///   (rule 2: "the rest stack vertically above it in the same column"), exactly as before.
 /// - `include`: returns true when a node (or its subtree) should appear in output.
+///
+/// Children are ordered by `node_order` (tallest subtree first, rule 4) before lanes are
+/// assigned, so the lane closest to `own_lane` always holds the largest subtree.
 ///
 /// Sibling lanes are assigned relative to `own_lane` (`own_lane + 1`, `+ 2`, …) rather than from a
 /// forest-global counter. A sibling lane is only open between its subtree's first row and this
@@ -595,13 +643,15 @@ fn emit_lane_rows<'a, F>(
     node: &'a TreeNode,
     own_lane: usize,
     passthrough_lanes: &[usize],
+    is_base: bool,
     include: &F,
     rows: &mut Vec<LaneRow<'a>>,
 ) where
     F: Fn(&TreeNode) -> bool,
 {
-    // Visible children only.
-    let visible: Vec<&TreeNode> = node.children.iter().filter(|c| include(c)).collect();
+    // Visible children, tallest subtree first.
+    let mut visible: Vec<&TreeNode> = node.children.iter().filter(|c| include(c)).collect();
+    visible.sort_by(|a, b| node_order(a, b));
 
     if visible.is_empty() {
         rows.push(LaneRow {
@@ -613,40 +663,35 @@ fn emit_lane_rows<'a, F>(
         return;
     }
 
-    // Primary child = highest subtree_activity; earlier index wins ties.
-    let primary_idx: Option<usize> = visible
-        .iter()
-        .enumerate()
-        .max_by_key(|(i, c)| (c.subtree_activity, std::cmp::Reverse(*i)))
-        .map(|(i, _)| i);
+    // A base's children all open new lanes (rule 1); a stack member hands its lane down to its
+    // tallest child (rule 2) and only the rest become siblings.
+    let (primary, siblings): (Option<&TreeNode>, &[&TreeNode]) = if is_base {
+        (None, &visible[..])
+    } else {
+        (Some(visible[0]), &visible[1..])
+    };
 
-    // Non-primary children (siblings) each claim a lane immediately right of this node's.
-    let siblings: Vec<(&TreeNode, usize)> = visible
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| Some(*i) != primary_idx)
-        .enumerate()
-        .map(|(si, (_, &c))| (c, own_lane + 1 + si))
-        .collect();
-
-    // 1. Emit primary subtree (same lane, same passthrough).
-    if let Some(pi) = primary_idx {
-        emit_lane_rows(visible[pi], own_lane, passthrough_lanes, include, rows);
+    // 1. Emit the primary subtree (same lane, same passthrough), if there is one.
+    if let Some(primary) = primary {
+        emit_lane_rows(primary, own_lane, passthrough_lanes, false, include, rows);
     }
 
-    // 2. Emit each sibling's subtree.
-    //    Passthrough for sibling i = passthrough_lanes ∪ {own_lane} ∪ {earlier siblings' lanes}.
-    for (si, &(sib, sib_lane)) in siblings.iter().enumerate() {
+    // 2. Emit each sibling's subtree, in order, claiming lanes immediately right of `own_lane`.
+    //    Passthrough for sibling i = passthrough_lanes ∪ {own_lane, if it's a stack member's own
+    //    lane} ∪ {earlier siblings' lanes}. A base's own lane (0) never passes through its
+    //    children's rows — nothing below a base shares its lane.
+    let mut opened: Vec<usize> = if is_base { Vec::new() } else { vec![own_lane] };
+    for (si, &sib) in siblings.iter().enumerate() {
+        let sib_lane = own_lane + 1 + si;
         let mut sib_pass: Vec<usize> = passthrough_lanes.to_vec();
-        sib_pass.push(own_lane);
-        for &(_, lane) in siblings.iter().take(si) {
-            sib_pass.push(lane);
-        }
+        sib_pass.extend(opened.iter().copied());
         sib_pass.sort_unstable();
-        emit_lane_rows(sib, sib_lane, &sib_pass, include, rows);
+        emit_lane_rows(sib, sib_lane, &sib_pass, false, include, rows);
+        opened.push(sib_lane);
     }
 
-    // 3. Emit this node — sibling lanes converge here.
+    // 3. Emit this node — every child lane converges here (a base) or every sibling lane
+    //    converges here (a stack member; the primary lane continues through unclosed).
     rows.push(LaneRow {
         node,
         own_lane,
@@ -1318,6 +1363,11 @@ mod tests {
         crate::output::set_no_color(true);
     }
 
+    /// A worktree leaf with no children. Whether it ends up flush left (a base: trunk or
+    /// ungrouped worktree) or indented (a stack member) depends entirely on where it's placed in
+    /// the forest — a root is a base, a child is a member — not on any field of the node itself.
+    /// Use [`ungrouped_leaf`] as a readability alias when a leaf plays the "untracked worktree"
+    /// role in a test.
     fn leaf(branch: &str, is_active: bool) -> TreeNode {
         TreeNode {
             branch: branch.to_string(),
@@ -1330,9 +1380,15 @@ mod tests {
                 activity_epoch: None,
             }),
             subtree_activity: None,
+            subtree_size: 1,
             children: vec![],
             stack_number: None,
         }
+    }
+
+    /// Readability alias for [`leaf`]: a root-level leaf standing in for an untracked worktree.
+    fn ungrouped_leaf(branch: &str, is_active: bool) -> TreeNode {
+        leaf(branch, is_active)
     }
 
     fn meta(branch: &str) -> TreeNode {
@@ -1340,9 +1396,20 @@ mod tests {
             branch: branch.to_string(),
             row: None,
             subtree_activity: None,
+            subtree_size: 1,
             children: vec![],
             stack_number: None,
         }
+    }
+
+    /// Attach `children` to `node`, recomputing `subtree_size`/`subtree_activity` the way
+    /// `build_tree` does. Tests build trees top-down (`let mut root = leaf(...); set_children(&mut
+    /// root, vec![...])`), so without this the hand-built `subtree_size` would stay `1` and lane
+    /// assignment (rule 4, tallest subtree leftmost) would silently use the wrong ordering key.
+    fn set_children(node: &mut TreeNode, children: Vec<TreeNode>) {
+        node.subtree_activity = subtree_max(node.subtree_activity, &children);
+        node.subtree_size = subtree_size(&children);
+        node.children = children;
     }
 
     fn flat_row(dir_name: &str, is_active: bool) -> WorktreeDisplayRow {
@@ -1366,7 +1433,7 @@ mod tests {
     fn render_tree_empty_query_shows_all_nodes() {
         // Tip-on-top: child emitted before parent.
         let mut root = leaf("main", false);
-        root.children = vec![leaf("feature", false)];
+        set_children(&mut root, vec![leaf("feature", false)]);
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
         assert_eq!(result.keys, vec!["feature", "main"]);
@@ -1376,7 +1443,7 @@ mod tests {
     fn render_tree_empty_query_cursor_on_active_node() {
         // Active node is "feature"; tip-on-top puts it at index 0.
         let mut root = leaf("main", false);
-        root.children = vec![leaf("feature", true)];
+        set_children(&mut root, vec![leaf("feature", true)]);
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
         assert_eq!(result.cursor, 0);
@@ -1396,7 +1463,7 @@ mod tests {
         // "main" doesn't match "feat", but "feature" (its child) does.
         // Both appear; tip-on-top puts feature first, then main (ancestor).
         let mut root = leaf("main", false);
-        root.children = vec![leaf("feature", false)];
+        set_children(&mut root, vec![leaf("feature", false)]);
         let forest = vec![root];
         let result = render_tree(&forest, "feat", &matcher());
         assert_eq!(result.keys.len(), 2, "ancestor should be retained");
@@ -1412,7 +1479,7 @@ mod tests {
     fn render_tree_query_drops_unrelated_subtree() {
         // "apple" matches "apple"; "zebra" and its child "zoo" do not.
         let mut zebra = leaf("zebra", false);
-        zebra.children = vec![leaf("zoo", false)];
+        set_children(&mut zebra, vec![leaf("zoo", false)]);
         let forest = vec![leaf("apple", false), zebra];
         let result = render_tree(&forest, "apple", &matcher());
         assert_eq!(result.keys, vec!["apple"]);
@@ -1428,38 +1495,46 @@ mod tests {
 
     #[test]
     fn render_tree_lanes_recomputed_for_visible_subset() {
-        // trunk → [child-a, child-b, child-c]; all match "child-".
-        // child-a is primary (index 0), child-b=lane1, child-c=lane2.
+        // trunk (a base) → [child-a, child-b, child-c]; all match "child-".
+        // A base's children never share its lane (rule 1): each opens its own — lane 1, 2, 3.
+        // Equal-size children tie-break alphabetically: child-a, child-b, child-c.
         // Emission order: child-a, child-b, child-c, trunk (trunk last, tip-on-top).
-        // Trunk closes 2 sibling lanes → its line contains "─┴─╯".
+        // Trunk gathers all 3 lanes on its own row → its line contains "─┴─┴─╯".
         let mut root = meta("trunk");
-        root.children = vec![
-            leaf("child-a", false),
-            leaf("child-b", false),
-            leaf("child-c", false),
-        ];
+        set_children(
+            &mut root,
+            vec![
+                leaf("child-a", false),
+                leaf("child-b", false),
+                leaf("child-c", false),
+            ],
+        );
         let forest = vec![root];
         let result = render_tree(&forest, "child-", &matcher());
 
         assert_eq!(result.keys, vec!["child-a", "child-b", "child-c", "trunk"]);
         let trunk_line = result.lines.last().unwrap();
         assert!(
-            trunk_line.contains("─┴─╯"),
-            "trunk with 2 closing sibling lanes should contain ─┴─╯, got: {trunk_line}"
+            trunk_line.contains("─┴─┴─╯"),
+            "trunk gathering 3 stacks should contain ─┴─┴─╯, got: {trunk_line}"
         );
     }
 
     #[test]
     fn render_tree_lanes_correct_when_middle_child_filtered() {
-        // trunk → [child-a, unrelated, child-c]; "child" matches child-a and child-c.
-        // After filtering: primary=child-a (lane 0), sibling=child-c (lane 1).
-        // Emission: child-a, child-c, trunk; trunk closes 1 lane → "─╯".
+        // trunk (a base) → [child-a, unrelated, child-c]; "child" matches child-a and child-c.
+        // After filtering, both are the trunk's children and neither shares its lane (rule 1):
+        // child-a opens lane 1, child-c opens lane 2.
+        // Emission: child-a, child-c, trunk; trunk closes 2 lanes → "─╯".
         let mut root = meta("trunk");
-        root.children = vec![
-            leaf("child-a", false),
-            leaf("unrelated", false), // won't match
-            leaf("child-c", false),
-        ];
+        set_children(
+            &mut root,
+            vec![
+                leaf("child-a", false),
+                leaf("unrelated", false), // won't match
+                leaf("child-c", false),
+            ],
+        );
         let forest = vec![root];
         let result = render_tree(&forest, "child", &matcher());
 
@@ -1480,64 +1555,73 @@ mod tests {
     // ── render_tree: lane graph layout ───────────────────────────────────────
 
     #[test]
-    fn render_tree_linear_stack_is_single_pillar() {
-        // main → s1 → s2: no siblings, so one straight lane (no │, no ─╯).
+    fn render_tree_linear_stack_is_indented_flush_left_trunk() {
+        // main (a base) → s1 → s2: main's one child never shares its lane (rule 1), so s1/s2
+        // sit one column right of it — no fork, so no "│" passthrough anywhere, just indentation.
+        no_color();
         let mut s1 = leaf("s1", false);
-        s1.children = vec![leaf("s2", false)];
+        set_children(&mut s1, vec![leaf("s2", false)]);
         let mut root = leaf("main", false);
-        root.children = vec![s1];
+        set_children(&mut root, vec![s1]);
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
 
         // Tip-on-top: s2, s1, main
         assert_eq!(result.keys, vec!["s2", "s1", "main"]);
-        // No passthrough or closing connectors (single lane throughout).
-        for line in &result.lines {
+        for line in &result.lines[..2] {
             assert!(
-                !line.contains("│ "),
-                "linear stack should have no passthrough │, got: {line}"
+                line.starts_with("  "),
+                "stack members must be indented at least one column, got: {line}"
             );
             assert!(
-                !line.contains("─╯"),
-                "linear stack should have no closing ─╯, got: {line}"
+                !line.contains('│'),
+                "a linear stack has no fork, so no passthrough lane, got: {line}"
             );
         }
+        assert!(
+            result.lines[2].starts_with("◎─╯ main"),
+            "the trunk is a base: flush left, closing the one stack lane, got: {}",
+            result.lines[2]
+        );
     }
 
     #[test]
     fn render_tree_sibling_stack_closes_on_trunk_row() {
-        // main → [s1 (primary), shared (sibling lane 1)].
-        // Emission: s1, shared, main.  main's line closes lane 1 → "─╯".
+        // main (a base) → [s1, shared]: neither shares the trunk's lane (rule 1), both open new
+        // lanes. Equal size ties break alphabetically: s1 (lane 1) before shared (lane 2).
+        // Emission: s1, shared, main. main's line gathers both lanes → "─┴─╯".
         let mut root = leaf("main", false);
-        root.children = vec![leaf("s1", false), leaf("shared", false)];
+        set_children(&mut root, vec![leaf("s1", false), leaf("shared", false)]);
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
 
         assert_eq!(result.keys, vec!["s1", "shared", "main"]);
-        // shared is in lane 1 — its line has "│ " passthrough for lane 0.
+        // shared is in lane 2 — its line has "│ " passthrough for s1's lane.
         assert!(
             result.lines[1].contains("│ "),
-            "shared (sibling lane) should show │ passthrough, got: {}",
+            "shared (later lane) should show │ passthrough, got: {}",
             result.lines[1]
         );
-        // main closes lane 1 on its own row.
+        // main gathers both lanes on its own row.
         let main_line = result.lines.last().unwrap();
         assert!(
-            main_line.contains("─╯"),
-            "main should close sibling lane with ─╯, got: {main_line}"
+            main_line.contains("─┴─╯"),
+            "main should gather both stacks with ─┴─╯, got: {main_line}"
         );
     }
 
     #[test]
     fn render_tree_mid_stack_fork_closes_on_fork_node() {
-        // main → a1 → a2 → [b1 (primary), c1 (sibling)].
-        // Emission: b1, c1, a2, a1, main.  a2 closes lane 1 → "─╯".
+        // main (a base) → a1 → a2 → [b1 (primary), c1 (sibling)].
+        // a1 is main's only child, so it opens lane 1 (rule 1); everything under it stays in
+        // that same column until a2's fork.
+        // Emission: b1, c1, a2, a1, main. a2 closes lane 2 → "─╯".
         let mut a2 = leaf("a2", false);
-        a2.children = vec![leaf("b1", false), leaf("c1", false)];
+        set_children(&mut a2, vec![leaf("b1", false), leaf("c1", false)]);
         let mut a1 = leaf("a1", false);
-        a1.children = vec![a2];
+        set_children(&mut a1, vec![a2]);
         let mut root = leaf("main", false);
-        root.children = vec![a1];
+        set_children(&mut root, vec![a1]);
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
 
@@ -1547,38 +1631,57 @@ mod tests {
             a2_line.contains("─╯"),
             "a2 (fork node) should close sibling lane with ─╯, got: {a2_line}"
         );
-        // a1 and main are back to a single lane — no passthrough or closing.
+        // a1 is back to a single lane, with no fork open above it — no passthrough at all.
         assert!(
-            !result.lines[3].contains("│ "),
-            "a1 after fork should have no passthrough, got: {}",
+            !result.lines[3].contains('│'),
+            "a1 after the fork has closed should show no passthrough, got: {}",
             result.lines[3]
         );
     }
 
     #[test]
     fn render_tree_fork_under_primary_child_reuses_sibling_lane() {
-        // main → [a (primary), z (sibling)]; a → [p (primary), q (sibling)].
-        // z's lane is open only across z's own rows — which come *below* a's subtree — so q may
-        // reuse lane 1. Assigning q a fresh forest-global lane instead over-indents its row and
+        // main (a base) → [a, z]; a → [p (primary), q (sibling)].
+        // a's subtree (3 nodes) is taller than z's (1), so a takes lane 1 and z lane 2 (rule 4).
+        // z's lane is open only across z's own row — which comes *below* a's subtree — so q may
+        // reuse lane 2. Assigning q a fresh forest-global lane instead over-indents its row and
         // leaves a's "─╯" pointing at an empty column.
         no_color();
         let mut a = leaf("a", false);
-        a.children = vec![leaf("p", false), leaf("q", false)];
+        set_children(&mut a, vec![leaf("p", false), leaf("q", false)]);
         let mut root = leaf("main", false);
-        root.children = vec![a, leaf("z", false)];
+        set_children(&mut root, vec![a, leaf("z", false)]);
         let forest = vec![root];
         let result = render_tree(&forest, "", &matcher());
 
         assert_eq!(result.keys, vec!["p", "q", "a", "z", "main"]);
+        // p is a's primary child: same lane as a, one column right of the trunk, no passthrough.
+        let p_line = &result.lines[0];
+        assert!(
+            p_line.starts_with("  ◎ p"),
+            "p should sit in a's lane with no passthrough, got: {p_line}"
+        );
+        // q is a's sibling: one lane further right, with a's lane passing through.
         let q_line = &result.lines[1];
         assert!(
-            q_line.starts_with("│ ◎ q"),
-            "q should sit in lane 1 directly right of a's lane, got: {q_line}"
+            q_line.starts_with("  │ ◎ q"),
+            "q should sit one lane right of a, with a's lane passing through, got: {q_line}"
         );
         let a_line = &result.lines[2];
         assert!(
-            a_line.starts_with("◎─╯ a"),
-            "a's connector should close onto lane 1, got: {a_line}"
+            a_line.starts_with("  ◎─╯ a"),
+            "a's connector should close onto q's lane, got: {a_line}"
+        );
+        // z reuses q's lane index once q's subtree has closed — same column, no over-indent.
+        let z_line = &result.lines[3];
+        assert!(
+            z_line.starts_with("  │ ◎ z"),
+            "z should sit in the same lane column q used, with a's lane passing through, got: {z_line}"
+        );
+        let main_line = &result.lines[4];
+        assert!(
+            main_line.starts_with("◎─┴─╯ main"),
+            "main should gather both a's and z's lanes, got: {main_line}"
         );
     }
 
@@ -1602,6 +1705,7 @@ mod tests {
                 activity_epoch: Some(0),
             }),
             subtree_activity: Some(0),
+            subtree_size: 1,
             children: vec![],
             stack_number: None,
         }
@@ -1737,12 +1841,44 @@ mod tests {
     }
 
     #[test]
+    fn format_tree_lines_stack_member_indented_trunk_and_ungrouped_flush_left() {
+        // Column 0 is reserved for bases (rule 1): the trunk and an ungrouped worktree both
+        // render flush left; "feature", a stack member that isn't the trunk, is indented at
+        // least one column (rule 2) — indentation alone signals stack membership now, not a
+        // gutter marker.
+        no_color();
+        let mut trunk = leaf("main", false);
+        set_children(&mut trunk, vec![leaf("feature", false)]);
+        let forest = vec![trunk, ungrouped_leaf("scratch", false)];
+        let (lines, selection) = format_tree_lines(&forest, false);
+
+        assert_eq!(selection, vec!["feature", "main", "scratch"]);
+        let feature_line = &lines[0];
+        let main_line = &lines[1];
+        let scratch_line = &lines[2];
+
+        assert!(
+            feature_line.starts_with("  "),
+            "stack member should be indented at least one column, got: {feature_line}"
+        );
+        assert!(
+            main_line.starts_with("◎─╯ main") || main_line.starts_with("◉─╯ main"),
+            "the trunk is a base: flush left, closing its one stack lane, got: {main_line}"
+        );
+        assert!(
+            !scratch_line.starts_with(' ') && !scratch_line.starts_with('│'),
+            "ungrouped worktree is also a base: flush left, no indent, got: {scratch_line}"
+        );
+    }
+
+    #[test]
     fn format_tree_lines_indicator_column_aligned_across_lanes() {
-        // Forest: main → [s1 (primary, lane 0), shared (sibling, lane 1)]
+        // Forest: main (a base) → [s1, shared], neither sharing main's lane (rule 1); equal size
+        // ties break alphabetically, so s1 opens lane 1 and shared lane 2.
         // Emission order (tip-on-top): s1, shared, main
         //
-        // s1 gutter  = "◎"     (width 1) → narrow
-        // main gutter = "◉─╯"  (width 3) → wide (closes sibling lane)
+        // s1 gutter   = "  ◎"     (width 3) → narrow
+        // main gutter = "◉─┴─╯"  (width 5) → wide (gathers both lanes)
         // shared has no indicators; s1 has "*", main has "↑".
         //
         // Despite the different gutter widths, the indicator column must start at
@@ -1751,7 +1887,7 @@ mod tests {
         let s1 = leaf_with_data("s1", false, &["*"], "2h ago");
         let shared = leaf_with_data("shared", false, &[], "3d ago");
         let mut root = leaf_with_data("main", true, &["↑"], "1d ago");
-        root.children = vec![s1, shared];
+        set_children(&mut root, vec![s1, shared]);
         let forest = vec![root];
 
         let (lines, _) = format_tree_lines(&forest, true);
@@ -1774,7 +1910,7 @@ mod tests {
         let s1 = leaf_with_data("s1", false, &["*"], "2h ago");
         let shared = leaf_with_data("shared", false, &[], "3d ago");
         let mut root = leaf_with_data("main", true, &["↑"], "1d ago");
-        root.children = vec![s1, shared];
+        set_children(&mut root, vec![s1, shared]);
         let forest = vec![root];
 
         let (lines, _) = format_tree_lines(&forest, true);
@@ -1794,6 +1930,174 @@ mod tests {
             "activity column must align between s1 and main:\ns1:   {:?}\nmain: {:?}",
             lines[0], lines[2]
         );
+    }
+
+    // ── target renders (indentation-as-membership) ───────────────────────────
+
+    #[test]
+    fn format_tree_lines_matches_three_stack_target_render() {
+        // main gathers 3 stacks: a 3-branch chain (tallest, lane 1), and two single-branch
+        // stacks (lanes 2 and 3, ordered by activity since their subtree sizes tie), plus two
+        // ungrouped worktrees that must sort after every stack, not interleaved by activity.
+        no_color();
+
+        let mut m11_view_state = leaf("m11-view-state", true);
+        m11_view_state.row = Some(WorktreeDisplayRow {
+            is_active: true,
+            dir_name: "git-workon-review".to_string(),
+            branch_annotation: None,
+            indicators: vec![],
+            last_activity: String::new(),
+            activity_epoch: None,
+        });
+        let mut m11_yank_split = meta("m11-yank-split");
+        set_children(&mut m11_yank_split, vec![m11_view_state]);
+        let mut review_scaffold = meta("review-scaffold");
+        set_children(&mut review_scaffold, vec![m11_yank_split]);
+
+        let mut gt_support_v1 = meta("gt-support-v1");
+        gt_support_v1.subtree_activity = Some(2); // more recently active than gh-stack-support
+        let mut gh_stack_support = leaf("gh-stack-support", false);
+        gh_stack_support.subtree_activity = Some(1);
+
+        let mut main = leaf("main", false);
+        set_children(
+            &mut main,
+            vec![review_scaffold, gt_support_v1, gh_stack_support],
+        );
+
+        let mut acceptance_probe = leaf("acceptance-probe", false);
+        acceptance_probe.subtree_activity = Some(20);
+        let mut review_tui = leaf("review-tui", false);
+        review_tui.subtree_activity = Some(10);
+
+        let forest = vec![main, acceptance_probe, review_tui];
+        let (lines, selection) = format_tree_lines(&forest, true);
+
+        assert_eq!(
+            selection,
+            vec![
+                "m11-view-state",
+                "m11-yank-split",
+                "review-scaffold",
+                "gt-support-v1",
+                "gh-stack-support",
+                "main",
+                "acceptance-probe",
+                "review-tui",
+            ]
+        );
+
+        // Metadata-only rows render without column padding, so an exact match is safe.
+        assert_eq!(lines[1], "  ◯ m11-yank-split");
+        assert_eq!(lines[2], "  ◯ review-scaffold");
+        assert_eq!(lines[3], "  │ ◯ gt-support-v1");
+        // Worktree rows carry trailing column padding (indicator/activity columns); only the
+        // load-bearing gutter/label prefix is pinned.
+        assert!(
+            lines[0].starts_with("  ◉ m11-view-state  ./git-workon-review"),
+            "got: {}",
+            lines[0]
+        );
+        assert!(lines[0].ends_with("← here"), "got: {}", lines[0]);
+        assert!(
+            lines[4].starts_with("  │ │ ◎ gh-stack-support"),
+            "got: {}",
+            lines[4]
+        );
+        assert!(lines[5].starts_with("◎─┴─┴─╯ main"), "got: {}", lines[5]);
+        assert!(
+            lines[6].starts_with("◎ acceptance-probe"),
+            "got: {}",
+            lines[6]
+        );
+        assert!(lines[7].starts_with("◎ review-tui"), "got: {}", lines[7]);
+    }
+
+    #[test]
+    fn format_tree_lines_matches_single_stack_target_render() {
+        // The common case: one stack on main, no forks, so no "│" anywhere in the stack itself —
+        // just indentation. Ungrouped worktrees follow, sorted by activity, including the
+        // active one (no "◎"/"◯" distinction from being in a stack; only column 0 vs. indented
+        // signals membership).
+        no_color();
+
+        let mut m11_view_state = leaf("m11-view-state", false);
+        m11_view_state.row = Some(WorktreeDisplayRow {
+            is_active: false,
+            dir_name: "git-workon-review".to_string(),
+            branch_annotation: None,
+            indicators: vec![],
+            last_activity: String::new(),
+            activity_epoch: None,
+        });
+        let mut m11_yank_split = meta("m11-yank-split");
+        set_children(&mut m11_yank_split, vec![m11_view_state]);
+        let mut review_scaffold = meta("review-scaffold");
+        set_children(&mut review_scaffold, vec![m11_yank_split]);
+
+        let mut main = leaf("main", false);
+        set_children(&mut main, vec![review_scaffold]);
+
+        let mut gh_stack_support = leaf("gh-stack-support", true);
+        gh_stack_support.subtree_activity = Some(30);
+        let mut review_tui = leaf("review-tui", false);
+        review_tui.subtree_activity = Some(20);
+        let mut gt_support_v1 = leaf("gt-support-v1", false);
+        gt_support_v1.subtree_activity = Some(10);
+
+        let forest = vec![main, gh_stack_support, review_tui, gt_support_v1];
+        let (lines, selection) = format_tree_lines(&forest, true);
+
+        assert_eq!(
+            selection,
+            vec![
+                "m11-view-state",
+                "m11-yank-split",
+                "review-scaffold",
+                "main",
+                "gh-stack-support",
+                "review-tui",
+                "gt-support-v1",
+            ]
+        );
+
+        assert!(
+            lines[0].starts_with("  ◎ m11-view-state  ./git-workon-review"),
+            "got: {}",
+            lines[0]
+        );
+        assert_eq!(lines[1], "  ◯ m11-yank-split");
+        assert_eq!(lines[2], "  ◯ review-scaffold");
+        assert!(lines[3].starts_with("◎─╯ main"), "got: {}", lines[3]);
+        assert!(
+            lines[4].starts_with("◉ gh-stack-support"),
+            "got: {}",
+            lines[4]
+        );
+        assert!(lines[4].ends_with("← here"), "got: {}", lines[4]);
+        assert!(lines[5].starts_with("◎ review-tui"), "got: {}", lines[5]);
+        assert!(lines[6].starts_with("◎ gt-support-v1"), "got: {}", lines[6]);
+    }
+
+    #[test]
+    fn format_tree_lines_matches_mid_stack_fork_target_render() {
+        // main → a → [b (primary), c (sibling)]: a is main's only child (rule 1, opens lane 1);
+        // b and c fork under a exactly as any non-base fork does. c's lane passes through on the
+        // row below it (rule 5) so the "┴"-less "─╯" on a's own row has a line to trace up to.
+        no_color();
+        let mut a = meta("a");
+        set_children(&mut a, vec![meta("b"), meta("c")]);
+        let mut main = leaf("main", false);
+        set_children(&mut main, vec![a]);
+        let forest = vec![main];
+        let (lines, selection) = format_tree_lines(&forest, false);
+
+        assert_eq!(selection, vec!["b", "c", "a", "main"]);
+        assert_eq!(lines[0], "  ◯ b");
+        assert_eq!(lines[1], "  │ ◯ c");
+        assert_eq!(lines[2], "  ◯─╯ a");
+        assert!(lines[3].starts_with("◎─╯ main"), "got: {}", lines[3]);
     }
 
     // ── render_flat ────────────────────────────────────────────────────────────

@@ -970,7 +970,7 @@ fn list_json_stack_includes_parents_map() -> Result<(), Box<dyn std::error::Erro
 fn list_tree_linear_chain_uses_pipe_continuation_not_fork_chars(
 ) -> Result<(), Box<dyn std::error::Error>> {
     // main → step-1 → step-2 → step-3  (no forks)
-    // Linear chains must show │ continuation but NOT ├─ or └─.
+    // A linear chain has nothing to fork, so no ├─/└─ (nor any Graphite-style connector at all).
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
