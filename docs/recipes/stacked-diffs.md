@@ -128,24 +128,30 @@ Stack-active output shows a Graphite-style lane graph with three glyphs:
 
 Display order is **tip-on-top**: the tip of each stack appears at the top, the
 trunk at the bottom. Each stack is one straight vertical lane; sibling stacks fan
-out to the right and converge back on the fork node's own row (no extra connector
+out to the right and converge back on the trunk's own row (no extra connector
 lines).
 
-```
-◯ auth-step-3
-◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
-◯ auth-step-1
-◎ main                        1 day ago
-```
-
-With a sibling stack branching off `main`:
+Indentation, not a gutter marker, signals stack membership. Column 0 is reserved
+for bases: the trunk and any worktree with no stack at all both render flush
+left. Every stack member that is not the trunk sits at least one column in, and
+the trunk gathers every stack hanging off it onto its own row.
 
 ```
-◯ auth-step-3
-◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
-◯ auth-step-1
-│ ◎ other-feature              3 days ago
-◎─╯ main                       1 day ago
+  ◯ auth-step-3
+  ◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
+  ◯ auth-step-1
+◎─╯ main                        1 day ago
+```
+
+With a sibling stack branching off `main`, the taller stack takes the column
+closer to the trunk:
+
+```
+  ◯ auth-step-3
+  ◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
+  ◯ auth-step-1
+  │ ◎ other-feature              3 days ago
+◎─┴─╯ main                       1 day ago
 ```
 
 `← here` marks the worktree that contains the current directory. When the worktree
@@ -156,10 +162,10 @@ Under gh-stack, a branch that is the direct child of a trunk also shows a dim ` 
 naming its `stacks[].number`:
 
 ```
-◯ auth-step-3
-◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
-◯ auth-step-1 #7
-◎ main                        1 day ago
+  ◯ auth-step-3
+  ◉ auth-step-2  ./auth   ↑     2 hours ago  ← here
+  ◯ auth-step-1 #7
+◎─╯ main                        1 day ago
 ```
 
 Status filters (`--dirty`, `--clean`, `--ahead`, `--behind`, `--gone`) suppress the tree
