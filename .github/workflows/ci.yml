@@ -7,7 +7,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    types: [opened, synchronize, reopened, edited]
 
 env:
   CARGO_TERM_COLOR: always
@@ -82,7 +82,7 @@ jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
+    if: github.event.action != 'edited' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-'))
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -92,7 +92,7 @@ jobs:
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
+    if: github.event.action != 'edited' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-'))
     steps:
       - uses: actions/checkout@v7
       - run: rustup toolchain install
@@ -103,7 +103,7 @@ jobs:
   test:
     name: Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-')
+    if: github.event.action != 'edited' && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'release-plz-'))
     strategy:
       fail-fast: false
       matrix:
