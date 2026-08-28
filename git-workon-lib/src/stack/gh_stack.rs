@@ -318,15 +318,19 @@ pub(crate) fn read_metadata(repo: &Repository) -> Result<StackMetadata, StackErr
             } else {
                 Some(branch_ref.base.clone())
             };
-            parents.insert(
-                branch_ref.branch.clone(),
-                BranchMetadata {
+            // First-wins wholesale, matching `trunks` above: if a branch appears in two
+            // stacks, the earliest source's parent and stack number stick and `doctor` flags
+            // the divergence, rather than the last-seen source silently overwriting them.
+            parents
+                .entry(branch_ref.branch.clone())
+                .or_insert(BranchMetadata {
                     parent: parent.clone(),
                     parent_revision,
-                },
-            );
+                });
             if entry.number != 0 {
-                stack_numbers.insert(branch_ref.branch.clone(), entry.number);
+                stack_numbers
+                    .entry(branch_ref.branch.clone())
+                    .or_insert(entry.number);
             }
             parent = branch_ref.branch.clone();
         }
@@ -557,5 +561,29 @@ mod tests {
         let meta = read_metadata(repo).unwrap();
         assert!(meta.parents.contains_key("feat-a"));
         assert!(!meta.parents.contains_key("feat-b"));
+    }
+
+    #[test]
+    fn branch_spanning_two_stacks_keeps_the_first_stacks_parent_and_number() {
+        // Regression test for finding E: read_metadata's flattening loop deduped `trunks`
+        // first-wins but wrote `parents`/`stack_numbers` last-wins, contradicting the module
+        // doc's "first wins wholesale" and the spec's "first-seen wins, doctor flags it". Two
+        // canonical stacks, both listing "shared" — stack 1 comes first in file order, so its
+        // parent ("main") and number (1) must stick even though stack 2 ("other-trunk", 2) is
+        // read afterward.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .branch("other-trunk")
+            .worktree("main")
+            .gh_stack(None, 1, "main", &["shared"])
+            .gh_stack(None, 2, "other-trunk", &["shared"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = read_metadata(repo).unwrap();
+        assert_eq!(meta.parents["shared"].parent, "main");
+        assert_eq!(meta.stack_numbers["shared"], 1);
     }
 }
