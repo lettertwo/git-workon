@@ -977,6 +977,28 @@ mod tests {
     }
 
     #[test]
+    fn link_worktree_replaces_a_symlink_pointing_somewhere_wrong() {
+        // plant_link has three arms: already-correct (link_worktree_is_idempotent), missing
+        // (link_worktree_plants_relative_symlinks), and remove-and-recreate for a symlink that
+        // exists but resolves elsewhere. Only the first two had coverage.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let admin_dir = repo.commondir().join("worktrees").join("feat-a");
+
+        create_symlink(Path::new("../../nonsense"), &admin_dir.join("gh-stack")).unwrap();
+
+        link_worktree(repo, "feat-a").unwrap();
+
+        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
+    }
+
+    #[test]
     fn link_worktree_never_replaces_a_real_file() {
         let fixture = FixtureBuilder::new()
             .bare(true)
