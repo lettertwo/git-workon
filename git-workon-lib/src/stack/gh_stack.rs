@@ -442,6 +442,51 @@ mod tests {
     }
 
     #[test]
+    fn missing_schema_version_defaults_to_1() {
+        // The module doc claims a missing `schemaVersion` is treated as `1`, matching Go's
+        // zero-value behavior for an unset int field. No prior test omitted the field.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .raw_gh_stack(
+                None,
+                br#"{"stacks": [{"number": 1, "trunk": {"branch": "main", "head": "", "base": ""}, "branches": [{"branch": "feat-a", "head": "", "base": ""}]}]}"#.to_vec(),
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = read_metadata(repo).unwrap();
+        assert_eq!(meta.parents["feat-a"].parent, "main");
+        assert_eq!(meta.stack_numbers["feat-a"], 1);
+    }
+
+    #[test]
+    fn schema_version_0_defaults_to_1() {
+        // Same claim, explicit `schemaVersion: 0` — Go's own zero value for the field, and
+        // distinct from "the field is absent" (missing_schema_version_defaults_to_1 above),
+        // since the two arrive through different branches of `.filter(|&v| v != 0)`.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .raw_gh_stack(
+                None,
+                br#"{"schemaVersion": 0, "stacks": [{"number": 1, "trunk": {"branch": "main", "head": "", "base": ""}, "branches": [{"branch": "feat-a", "head": "", "base": ""}]}]}"#.to_vec(),
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = read_metadata(repo).unwrap();
+        assert_eq!(meta.parents["feat-a"].parent, "main");
+        assert_eq!(meta.stack_numbers["feat-a"], 1);
+    }
+
+    #[test]
     fn needs_restack_true_when_base_differs_from_parent_live_tip() {
         let fixture = FixtureBuilder::new()
             .bare(true)
