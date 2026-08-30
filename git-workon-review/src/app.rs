@@ -593,10 +593,22 @@ fn read_head_blob(repo: &Repository, tree: &git2::Tree<'_>, path: &str) -> Strin
 /// (index ↔ worktree) view and the "new" side of a staged (`HEAD` ↔ index) view. Reads stage-0
 /// (the ordinary, non-conflict entry); a path absent from the index (or with no stage-0 entry)
 /// reads as empty, same graceful-default posture as [`read_head_blob`].
+///
+/// Reloads the index from disk first. libgit2 caches a repository's index in memory and never
+/// re-reads it on its own, and ADR-037's loader thread holds ONE `Repository` for the whole
+/// session (`tui.rs`'s `spawn_loader_thread`) — so once any load has primed that handle's cache,
+/// every later read on it returns the index as it stood BEFORE the main thread's staging write.
+/// A staged view built that way gets a short new side, and each row past the stale blob's last
+/// line renders its gutter with no text. `read(false)` reloads only when the on-disk index
+/// actually changed, so the unchanged case costs a stat; a failed reload falls through to
+/// whatever is cached rather than reading nothing at all.
 fn read_index_blob(repo: &Repository, path: &str) -> String {
     repo.index()
         .ok()
-        .and_then(|index| index.get_path(Path::new(path), 0))
+        .and_then(|mut index| {
+            let _ = index.read(false);
+            index.get_path(Path::new(path), 0)
+        })
         .and_then(|entry| repo.find_blob(entry.id).ok())
         .map(|blob| String::from_utf8_lossy(blob.content()).into_owned())
         .unwrap_or_default()
@@ -8349,6 +8361,55 @@ mod tests {
 
         let repo = fixture.repo().unwrap();
         repo.assert(predicate::repo::has_staged_file("a.txt"));
+    }
+
+    /// The ADR-037 loader thread holds ONE `Repository` for the whole session
+    /// (`tui.rs`'s `spawn_loader_thread`), and libgit2 caches a repository's index in memory
+    /// without ever re-reading it from disk. So once any load has primed that handle's index,
+    /// every later `read_index_blob` on it returns the index as it was BEFORE the main thread's
+    /// staging op — the staged view's new side comes back short, and every row past the stale
+    /// blob's last line renders its gutter with no text.
+    ///
+    /// Drives the real sequence synchronously: defer, dispatch, `build_file_views` on a SECOND
+    /// handle, seat the result — the shape `tui.rs`'s event loop runs (see its own
+    /// `run_load_job` tests), with one persistent loader handle across both loads.
+    #[test]
+    fn a_deferred_load_on_a_reused_loader_handle_sees_the_staged_index() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "a\nb\nc\n", "a\nb\nc\nd\ne\n")
+            .build()
+            .unwrap();
+        let workdir = fixture.repo().unwrap().workdir().unwrap().to_path_buf();
+
+        // The loader thread's single, long-lived handle.
+        let loader_repo = Repository::open(&workdir).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let mut pump = |app: &mut App| {
+            if let Some((gen, cs_idx, file_idx, spec)) = app.take_pending_load_spec() {
+                let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+                app.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+            }
+        };
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        pump(&mut app); // primes the loader handle's index cache (unstaged old side)
+
+        app.focus_outline();
+        app.outline_stage(); // whole-file stage from the outline: no sync force-completion
+        pump(&mut app);
+
+        let view = app
+            .role_view_ref(0, Role::Staged)
+            .expect("the staged view must be seated");
+        assert_eq!(
+            view.new_text(),
+            "a\nb\nc\nd\ne\n",
+            "the staged view's new side must read the POST-stage index, not the loader \
+             handle's cached pre-stage copy"
+        );
     }
 
     #[test]
