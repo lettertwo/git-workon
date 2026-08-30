@@ -3,11 +3,12 @@
 //! ## Model
 //!
 //! Analysis always runs in full: every worktree in scope is evaluated for **all**
-//! prunability signals (branch deleted, remote gone, merged into target) plus safety
-//! state (dirty, unmerged, locked, protected). Nothing is hidden from the analysis;
-//! `--gone` and `--merged` only control which signals count as "active" for
+//! prunability signals (branch deleted, remote gone, merged into target, PR merged)
+//! plus safety state (dirty, unmerged, locked, protected). Nothing is hidden from the
+//! analysis; `--gone` and `--merged` only control which signals count as "active" for
 //! pre-checking (interactive) and auto-pruning (non-interactive) — they never gate
-//! visibility. `BranchDeleted` is always an active criterion.
+//! visibility. `BranchDeleted` and `PrMerged` are always active criteria: a merged PR
+//! is unambiguous evidence the work landed, so it needs no opt-in flag.
 //!
 //! - **Bare `prune`**: scope is every worktree except the default one. Only rows
 //!   carrying at least one signal are shown/considered.
@@ -36,6 +37,12 @@
 //! branch as gone). In named mode, the prune-fetch narrows to remotes tracked by the
 //! named worktrees only.
 //!
+//! The `PrMerged` signal runs unconditionally, gated only on `gh` being usable (a
+//! single `check_gh_available()` call, not one per row). Rows that already carry a
+//! signal skip the lookup entirely. Any failure — `gh` missing, unauthenticated,
+//! offline, or a non-zero exit for one branch — degrades that row to no signal, with
+//! no warning: same under-report-only guarantee as the fetch above.
+//!
 //! ## Protected Branch Matching
 //!
 //! Patterns use standard glob syntax (`*`, `?`, `[...]`) via the [`glob`] crate, with
@@ -49,9 +56,10 @@
 //!
 //! A row whose only signal is `RemoteGone` uses `has_tracked_changes()` instead of
 //! `is_dirty()` for the dirty check, so untracked files (build artifacts, IDE dirs)
-//! don't block pruning. The unmerged check is skipped entirely for any row carrying a
-//! signal (`BranchDeleted`, `RemoteGone`, or `Merged`) — the signal already implies the
-//! work was handled.
+//! don't block pruning. `PrMerged` rows keep `is_dirty()`, same as any other signal.
+//! The unmerged check is skipped entirely for any row carrying a signal
+//! (`BranchDeleted`, `RemoteGone`, `Merged`, or `PrMerged`) — the signal already
+//! implies the work was handled.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -60,8 +68,9 @@ use dialoguer::Confirm;
 use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use serde_json::json;
 use workon::{
-    get_default_branch, get_repo, get_worktrees, prune_fetch as remote_prune_fetch,
-    remotes_tracked_by_worktrees, PruneError, WorktreeDescriptor,
+    check_gh_available, find_merged_pr, get_default_branch, get_repo, get_worktrees,
+    prune_fetch as remote_prune_fetch, remotes_tracked_by_worktrees, PruneError,
+    WorktreeDescriptor,
 };
 
 use crate::cli::Prune;
@@ -157,7 +166,7 @@ impl Run for Prune {
         };
         let merged_active = self.merged.is_some();
 
-        let rows: Vec<PruneRow> = scope
+        let mut rows: Vec<PruneRow> = scope
             .iter()
             .map(|wt| {
                 build_row(
@@ -169,6 +178,16 @@ impl Run for Prune {
                 )
             })
             .collect();
+
+        // Second pass: PR-merged status only comes from a network call, so it can't
+        // live in build_row alongside the offline signals. Gate the whole pass on
+        // `gh` being usable at all, so a missing/unauthenticated `gh` costs one check
+        // instead of one per row; a per-row failure still degrades that row alone.
+        if check_gh_available().is_ok() {
+            for row in rows.iter_mut() {
+                fill_pr_merged(row);
+            }
+        }
         pb.finish_and_clear();
 
         // Bare mode only ever shows rows carrying a signal; named mode shows exactly
@@ -279,6 +298,7 @@ enum Signal {
     BranchDeleted,
     RemoteGone,
     Merged(String),
+    PrMerged(u32),
 }
 
 impl std::fmt::Display for Signal {
@@ -287,6 +307,7 @@ impl std::fmt::Display for Signal {
             Signal::BranchDeleted => write!(f, "branch deleted"),
             Signal::RemoteGone => write!(f, "remote gone"),
             Signal::Merged(target) => write!(f, "merged into {}", target),
+            Signal::PrMerged(number) => write!(f, "PR #{} merged", number),
         }
     }
 }
@@ -397,6 +418,22 @@ fn build_row<'a>(
     }
 }
 
+/// Raise `Signal::PrMerged` for a row with no other signal, if `gh` reports a merged
+/// PR for its branch. Skips rows that already carry a signal (no local branch to look
+/// up, or the network call would just be redundant), and any `gh` failure for this
+/// branch degrades silently, matching the rest of prune's under-report-only contract.
+fn fill_pr_merged(row: &mut PruneRow) {
+    if !row.signals.is_empty() || row.branch.starts_with('(') {
+        return;
+    }
+    if let Ok(Some(number)) = find_merged_pr(&row.branch) {
+        row.signals.push(Signal::PrMerged(number));
+        // A merged PR is unambiguous evidence the work landed, so the unmerged
+        // check (only meaningful for signal-less rows) no longer applies.
+        row.unmerged = false;
+    }
+}
+
 /// True if at least one of the row's signals is currently "active" per the
 /// `--gone`/`--merged` flags. `BranchDeleted` is always active.
 fn is_active(row: &PruneRow, active: ActiveCriteria) -> bool {
@@ -404,6 +441,7 @@ fn is_active(row: &PruneRow, active: ActiveCriteria) -> bool {
         Signal::BranchDeleted => true,
         Signal::RemoteGone => active.gone,
         Signal::Merged(_) => active.merged,
+        Signal::PrMerged(_) => true,
     })
 }
 
