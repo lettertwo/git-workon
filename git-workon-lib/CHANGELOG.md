@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.12.0...git-workon-lib-v0.13.0) - 2026-08-30
+
+### Added
+
+- *(cli)* register new branches in the canonical gh-stack file ([#68](https://github.com/lettertwo/git-workon/pull/68))
+- *(cli)* link gh-stack worktrees and check them in doctor ([#67](https://github.com/lettertwo/git-workon/pull/67))
+- *(lib)* add gh-stack as a stack provider ([#66](https://github.com/lettertwo/git-workon/pull/66))
+
+### Other
+
+- *(lib)* [**breaking**] lift stack graph algorithms onto StackMetadata ([#65](https://github.com/lettertwo/git-workon/pull/65))
+
 ## [0.12.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.11.1...git-workon-lib-v0.12.0) - 2026-08-14
 
 ### Added
