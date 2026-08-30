@@ -143,3 +143,14 @@ stay untouched (defer off, slots constructed `Ready`).
   a corrupt changeset in a stack degrades to a `Failed` row instead of killing the launch.
 - `App` and the loader each hold a `TsHighlighter`; grammar caches are duplicated
   per-instance (modest, accepted for the sync-fallback guarantee).
+- The loader thread's `Repository` is long-lived, and libgit2 caches a repository's index
+  in memory without ever re-reading it from disk. So index state a loader job reads goes
+  stale the moment the main thread stages: the handle keeps serving the index as it stood
+  when some earlier job on it first looked. Found in practice after this ADR landed, as a
+  staged file rendering its gutter with no text (`read_index_blob` returned the pre-stage
+  blob, so the staged view's new side came back shorter than its own hunks). It reproduced
+  only for a stage started from the outline, since the diff pane's own staging verbs run
+  the force-completion fallback above and rebuild on `App`'s handle, which just did the
+  write. `read_index_blob` now calls `git_index_read(force = false)` before every read.
+  Any future loader-side read of index state needs the same treatment: the force-completion
+  fallback covers correctness only for what the main thread actually re-reads.
