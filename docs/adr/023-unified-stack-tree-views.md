@@ -43,6 +43,17 @@ Both `graphite::enumerate_stacks` and `graphite::current_stack` populate it. Thi
 transient per-call parent map that was previously discarded. `list --json` gains an additive
 `parents` object in each stack entry (backward-compatible; `diffs`/`checkouts` unchanged).
 
+### `Stack.number` and the ` #N` tree label (ADR-028)
+
+ADR-028 gives `Stack` a `number: Option<u64>` field, a provider-assigned stack number
+(gh-stack's `stacks[].number`; always `None` under Graphite and Git) that is display metadata
+only, never part of `group_by_stack`'s `(trunk, sorted diff set)` identity key.
+`display.rs`'s `TreeNode` carries a matching `stack_number: Option<u64>`, set only on a direct
+child of a trunk, since `build_tree` merges every stack on a trunk into a single root node with
+no single number of its own. The tree renders it as a dim `" #N"` suffix after the branch name,
+degrading to plain text under `NO_COLOR`. `list --json` gains an additive `"number"` field per
+stack entry alongside `parents`, `null` under Graphite.
+
 ### Shared renderer
 
 `build_tree` + `format_tree_lines` in `display.rs` build and render the forest for both commands.

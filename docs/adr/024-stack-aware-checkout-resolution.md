@@ -110,6 +110,14 @@ A `◯` stack node whose local branch ref was deleted (metadata remains in gt's 
 **errors with guidance pointing at gt** — workon does not reach into gt's metadata to
 resurrect branch refs. workon orchestrates worktrees; gt owns stack metadata.
 
+**Update (ADR-028):** this errors as `StackError::DeletedBranchNode` (remedy text mentions `gt
+branch checkout`/`gt branch delete`) under `StackModel::Graphite`, and the provider-neutral
+`StackError::DeletedStackNode` (remedy text says "recreate the branch, or remove it from the
+stack metadata," naming no specific tool) under `StackModel::GhStack`.
+`Resolution::DeletedNode` itself carries no model, so `route_branch_to_command`
+(`git-workon/src/main.rs`) selects between the two variants from the effective `StackModel` at
+the point it turns the resolution into an error.
+
 ## Non-stack degradation
 
 Under `--no-stack` or `StackModel::None`, every branch is a stack-of-one: rules 2–3 never
