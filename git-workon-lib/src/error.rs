@@ -221,8 +221,9 @@ pub enum StackError {
     #[diagnostic(
         code(workon::stack::unsupported_model),
         help(
-            "Only 'graphite' is implemented in this version. \
-             Support for branchless, sapling, and spr is planned."
+            "'graphite' and 'gh-stack' are implemented in this version. \
+             Support for branchless and sapling is planned. 'ghstack' (Meta's \
+             Phabricator-style stacker) is a different tool and is not planned."
         )
     )]
     UnsupportedModel { model: String },
@@ -230,7 +231,7 @@ pub enum StackError {
     #[error("Unknown stack model '{value}'")]
     #[diagnostic(
         code(workon::stack::unknown_model),
-        help("Valid values: graphite, git, none, auto")
+        help("Valid values: graphite, gh-stack, git, none, auto")
     )]
     UnknownModel { value: String },
 
@@ -283,6 +284,17 @@ pub enum StackError {
         )
     )]
     DeletedBranchNode { branch: String },
+
+    #[error("gh-stack file '{}' uses schema version {version}, which this version of git-workon does not support", path.display())]
+    #[diagnostic(
+        code(workon::stack::gh_stack_schema_unsupported),
+        help("Upgrade git-workon, or downgrade the gh-stack extension that wrote this file.")
+    )]
+    GhStackSchemaUnsupported { path: PathBuf, version: u64 },
+
+    #[error("Failed to parse gh-stack file '{}': {message}", path.display())]
+    #[diagnostic(code(workon::stack::gh_stack_parse_failed))]
+    GhStackParseFailed { path: PathBuf, message: String },
 }
 
 /// Changeset assembly errors

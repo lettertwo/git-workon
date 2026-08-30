@@ -14,6 +14,7 @@ assert_fs.workspace = true
 env_logger.workspace = true
 git-workon-lib.workspace = true
 git2.workspace = true
+libc.workspace = true
 log.workspace = true
 predicates.workspace = true
 rusqlite.workspace = true

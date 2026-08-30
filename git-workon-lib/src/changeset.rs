@@ -9,12 +9,14 @@
 //! ## Assembly per [`StackModel`]
 //!
 //! - [`StackModel::None`] → always `Ok(vec![])`.
-//! - [`StackModel::Graphite`] → walks recorded stack metadata: ancestors of `head_branch`
-//!   (bottom → just-below-head), then `head_branch` itself, then descendants (depth-first,
-//!   siblings sorted lexically). Ghost nodes (a metadata row with no resolvable branch ref)
-//!   are skipped from the output but still walked through, so live descendants of a ghost
-//!   still appear. Falls back to the `Git` arm when `head_branch` is a trunk branch or has no
-//!   metadata row at all (mirrors the nvim prototype's factory behavior).
+//! - [`StackModel::Graphite`] and [`StackModel::GhStack`] → both reduce to [`StackMetadata`]
+//!   (via `graphite::read_metadata`/`gh_stack::read_metadata`) and share one walk through
+//!   [`assemble_from_metadata`]: ancestors of `head_branch` (bottom → just-below-head), then
+//!   `head_branch` itself, then descendants (depth-first, siblings sorted lexically). Ghost
+//!   nodes (a metadata row with no resolvable branch ref) are skipped from the output but
+//!   still walked through, so live descendants of a ghost still appear. Falls back to the
+//!   `Git` arm when `head_branch` is a trunk branch or has no metadata row at all (mirrors
+//!   the nvim prototype's factory behavior).
 //! - [`StackModel::Git`] → no metadata; walks `upstream..head_branch` commit-by-commit
 //!   (oldest first), one [`Changeset`] per commit.
 //!
@@ -28,7 +30,7 @@ use git2::{BranchType, Oid, Repository, StatusOptions};
 
 use crate::error::{ChangesetError, Result};
 use crate::stack::metadata::{self, StackMetadata};
-use crate::stack::{graphite, StackModel};
+use crate::stack::{gh_stack, graphite, StackModel};
 
 /// What a [`Changeset`] spans: a resolved commit range, or the working tree + index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +78,9 @@ pub fn assemble_changesets(
         StackModel::Git => assemble_git(repo, head_branch),
         StackModel::Graphite => {
             assemble_from_metadata(repo, head_branch, &graphite::read_metadata(repo)?)
+        }
+        StackModel::GhStack => {
+            assemble_from_metadata(repo, head_branch, &gh_stack::read_metadata(repo)?)
         }
     }
 }

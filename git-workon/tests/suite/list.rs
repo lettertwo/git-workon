@@ -1264,3 +1264,142 @@ fn list_json_dirty_filter_excludes_metadata_only_stacks() -> Result<(), Box<dyn 
 
     Ok(())
 }
+
+// ── gh-stack: two independent stacks sharing a trunk (fork, not a schema-level parent) ──
+// gh-stack's `stacks[]` holds independent stack objects, each rooted on its own trunk; nothing
+// in the schema links them. `build_tree` merges every stack sharing a trunk into one root node,
+// so two gh-stack stacks on the same trunk render as a fork with a lane column and a `─╯`
+// convergence connector (ADR-026), and the numbered stack's direct trunk child gets a `#N`
+// label that the unnumbered stack's branches (and the trunk row itself) never get.
+
+#[test]
+fn list_tree_gh_stack_two_stacks_on_shared_trunk_forks_with_number_label(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // main → review-tui (stack #7, numbered)
+    // main → review-scaffold → gt-support-v1 (unnumbered)
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.stackModel", "gh-stack")
+        .worktree("main")
+        .worktree("review-tui")
+        .gh_stack(None, 7, "main", &["review-tui"])
+        .gh_stack(None, 0, "main", &["review-scaffold", "gt-support-v1"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .env("NO_COLOR", "1")
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    // The two stacks fork off the shared trunk: one lane column (│ passthrough) and a
+    // convergence connector (─╯) drawn on the trunk's own row, not a flat list.
+    assert!(
+        stdout.contains("│ "),
+        "sibling-lane row must show │ passthrough: {stdout}"
+    );
+    assert!(
+        stdout.contains("─╯"),
+        "trunk row must close the sibling lane with ─╯: {stdout}"
+    );
+
+    let lines: Vec<&str> = stdout.lines().collect();
+    let line_for = |needle: &str| -> &str {
+        lines
+            .iter()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line containing {needle:?} in: {stdout}"))
+    };
+
+    // review-tui is stack #7's direct trunk child: it alone carries the " #7" label.
+    assert!(
+        line_for("review-tui").contains(" #7"),
+        "review-tui (direct trunk child of numbered stack #7) must carry the #7 label: {stdout}"
+    );
+    // The unnumbered stack's branches carry no label at all.
+    assert!(
+        !line_for("review-scaffold").contains('#'),
+        "review-scaffold (unnumbered stack) must not carry a # label: {stdout}"
+    );
+    assert!(
+        !line_for("gt-support-v1").contains('#'),
+        "gt-support-v1 (unnumbered stack) must not carry a # label: {stdout}"
+    );
+    // The trunk row itself never carries a number (it merges every stack on the trunk).
+    let main_line = lines
+        .iter()
+        .find(|l| l.contains("main") && !l.contains("review") && !l.contains("gt-support"))
+        .unwrap_or_else(|| panic!("no trunk row for main in: {stdout}"));
+    assert!(
+        !main_line.contains('#'),
+        "trunk row must not carry a # label: {main_line}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_json_gh_stack_two_stacks_on_shared_trunk_include_respective_numbers(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.stackModel", "gh-stack")
+        .worktree("main")
+        .worktree("review-tui")
+        .gh_stack(None, 7, "main", &["review-tui"])
+        .gh_stack(None, 0, "main", &["review-scaffold", "gt-support-v1"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("list")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+
+    let stacks = parsed["stacks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected stacks array in: {stdout}"));
+    assert_eq!(stacks.len(), 2, "both stacks must appear: {stdout}");
+
+    let numbered = stacks
+        .iter()
+        .find(|g| {
+            g["diffs"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|v| v == "review-tui"))
+        })
+        .unwrap_or_else(|| panic!("no stack group containing review-tui in: {stdout}"));
+    assert_eq!(
+        numbered["number"],
+        serde_json::json!(7),
+        "review-tui's stack must carry number 7: {stdout}"
+    );
+
+    let unnumbered = stacks
+        .iter()
+        .find(|g| {
+            g["diffs"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|v| v == "gt-support-v1"))
+        })
+        .unwrap_or_else(|| panic!("no stack group containing gt-support-v1 in: {stdout}"));
+    assert_eq!(
+        unnumbered["number"],
+        serde_json::Value::Null,
+        "review-scaffold's stack must carry no number: {stdout}"
+    );
+
+    Ok(())
+}

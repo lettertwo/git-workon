@@ -235,6 +235,34 @@ fn stack_model_cli_override_wins_over_config() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn stack_model_gh_stack_returns_gh_stack_variant() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "gh-stack")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(cfg.stack_model(None)?, StackModel::GhStack);
+    Ok(())
+}
+
+#[test]
+fn stack_model_bare_ghstack_is_rejected_as_a_different_tool() -> Result<(), Box<dyn Error>> {
+    // "ghstack" (no hyphen) is Meta's Phabricator-style stacker, a different tool from
+    // "gh-stack" (github/gh-stack) — it must not be silently treated as a typo.
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "ghstack")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    let err = cfg.stack_model(None).unwrap_err();
+    assert!(
+        err.to_string().contains("not yet supported"),
+        "expected 'not yet supported' for 'ghstack', got: {err}"
+    );
+    Ok(())
+}
+
+#[test]
 fn stack_model_unsupported_values_return_error() -> Result<(), Box<dyn Error>> {
     for unsupported in &["branchless", "sapling", "spr"] {
         let fixture = FixtureBuilder::new()

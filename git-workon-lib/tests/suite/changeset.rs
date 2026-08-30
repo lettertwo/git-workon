@@ -610,3 +610,76 @@ fn none_model_always_returns_empty() -> Result<(), Box<dyn Error>> {
     assert_eq!(assemble_changesets(repo, "c", StackModel::None)?, vec![]);
     Ok(())
 }
+
+// ── StackModel::GhStack ──────────────────────────────────────────────────────────
+// Thin wiring check: GhStack shares assemble_from_metadata with Graphite (see stack/gh_stack.rs
+// for the provider-specific parsing tests), so this only proves changeset.rs's match arm calls
+// gh_stack::read_metadata and gets a properly ordered walk out of it.
+
+#[test]
+fn gh_stack_linear_order_and_current() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .gh_stack(None, 1, "main", &["a", "b", "c"])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let changesets = assemble_changesets(repo, "b", StackModel::GhStack)?;
+    let names: Vec<&str> = changesets.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b", "c"]);
+
+    let current: Vec<&str> = changesets
+        .iter()
+        .filter(|c| c.current)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(current, vec!["b"]);
+    Ok(())
+}
+
+#[test]
+fn gh_stack_trap7_bogus_parent_revision_errors() -> Result<(), Box<dyn Error>> {
+    let bogus = "deadbeef".repeat(5);
+    let fixture = FixtureBuilder::new()
+        .gh_stack_at(None, 1, "main", &[("feat-a", &bogus)])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let err = assemble_changesets(repo, "feat-a", StackModel::GhStack).unwrap_err();
+    match err {
+        WorkonError::Changeset(ChangesetError::InvalidParentRevision { branch, revision }) => {
+            assert_eq!(branch, "feat-a");
+            assert_eq!(revision, bogus);
+        }
+        other => panic!("expected InvalidParentRevision (not an empty Ok), got {other:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn gh_stack_needs_restack_true_when_base_differs_from_parent_live_tip() -> Result<(), Box<dyn Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .worktree("feat-a")
+        .gh_stack(None, 1, "main", &["feat-a", "feat-b"])
+        .build()?;
+
+    fixture
+        .commit("feat-a")
+        .file("z.txt", "1")
+        .create("advance feat-a")?;
+
+    let repo = fixture.repo()?;
+
+    let changesets = assemble_changesets(repo, "feat-b", StackModel::GhStack)?;
+    let feat_a = changesets.iter().find(|c| c.name == "feat-a").unwrap();
+    assert!(
+        !feat_a.needs_restack,
+        "feat-a's own recorded parent (main) hasn't moved"
+    );
+    let feat_b = changesets.iter().find(|c| c.name == "feat-b").unwrap();
+    assert!(
+        feat_b.needs_restack,
+        "feat-b's recorded base no longer matches feat-a's live tip"
+    );
+    Ok(())
+}
