@@ -2453,6 +2453,54 @@ fn prune_degrades_quietly_when_gh_pr_list_fails() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
+/// A failing `gh` is repo-level (no GitHub remote, unauthenticated, offline), so the
+/// pass stops after the first failure rather than paying a failing subprocess for every
+/// remaining worktree.
+#[test]
+fn prune_stops_pr_lookups_after_the_first_gh_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature-one")
+        .worktree("feature-two")
+        .worktree("feature-three")
+        .build()?;
+
+    for branch in ["feature-one", "feature-two", "feature-three"] {
+        fixture
+            .commit(branch)
+            .file(&format!("{branch}.txt"), branch)
+            .create("Feature commit")?;
+    }
+
+    let stub = PathStub::new()?.binary("gh", &gh_stub_pr_list_fails())?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No worktrees to prune"));
+
+    // One `--version` from check_gh_available, then exactly one `pr list` before the
+    // pass gives up. Without the early stop this would be three `pr list` calls.
+    let pr_list_calls = stub
+        .invocations("gh")
+        .into_iter()
+        .filter(|line| line.starts_with("pr list"))
+        .count();
+    assert_eq!(
+        pr_list_calls, 1,
+        "expected the pass to stop after the first failure, got {pr_list_calls} pr list calls"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn prune_skips_pr_lookup_for_branch_already_deleted() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()

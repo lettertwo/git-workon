@@ -40,8 +40,11 @@
 //! The `PrMerged` signal runs unconditionally, gated only on `gh` being usable (a
 //! single `check_gh_available()` call, not one per row). Rows that already carry a
 //! signal skip the lookup entirely. Any failure — `gh` missing, unauthenticated,
-//! offline, or a non-zero exit for one branch — degrades that row to no signal, with
-//! no warning: same under-report-only guarantee as the fetch above.
+//! offline, or no GitHub remote — degrades to no signal, with no warning: same
+//! under-report-only guarantee as the fetch above. A branch with no PR comes back as
+//! an empty list rather than an error, so a failed lookup is repo-level and the first
+//! one stops the pass; otherwise an unauthenticated `gh` would cost one failing
+//! subprocess per worktree.
 //!
 //! ## Protected Branch Matching
 //!
@@ -185,7 +188,9 @@ impl Run for Prune {
         // instead of one per row; a per-row failure still degrades that row alone.
         if check_gh_available().is_ok() {
             for row in rows.iter_mut() {
-                fill_pr_merged(row);
+                if !fill_pr_merged(row) {
+                    break;
+                }
             }
         }
         pb.finish_and_clear();
@@ -421,17 +426,27 @@ fn build_row<'a>(
 
 /// Raise `Signal::PrMerged` for a row with no other signal, if `gh` reports a merged
 /// PR for its branch. Skips rows that already carry a signal (no local branch to look
-/// up, or the network call would just be redundant), and any `gh` failure for this
-/// branch degrades silently, matching the rest of prune's under-report-only contract.
-fn fill_pr_merged(row: &mut PruneRow) {
+/// up, or the network call would just be redundant), and any `gh` failure degrades
+/// silently, matching the rest of prune's under-report-only contract.
+///
+/// Returns false when the `gh` call itself failed. A branch with no PR is `Ok(None)`,
+/// not an error, so a failure here is repo-level (no GitHub remote, unauthenticated,
+/// offline) and every later row would fail the same way. The caller stops instead of
+/// paying one failing subprocess per worktree.
+fn fill_pr_merged(row: &mut PruneRow) -> bool {
     if !row.signals.is_empty() || row.branch.starts_with('(') {
-        return;
+        return true;
     }
-    if let Ok(Some(number)) = find_merged_pr(&row.branch) {
-        row.signals.push(Signal::PrMerged(number));
-        // A merged PR is unambiguous evidence the work landed, so the unmerged
-        // check (only meaningful for signal-less rows) no longer applies.
-        row.unmerged = false;
+    match find_merged_pr(&row.branch) {
+        Ok(Some(number)) => {
+            row.signals.push(Signal::PrMerged(number));
+            // A merged PR is unambiguous evidence the work landed, so the unmerged
+            // check (only meaningful for signal-less rows) no longer applies.
+            row.unmerged = false;
+            true
+        }
+        Ok(None) => true,
+        Err(_) => false,
     }
 }
 
