@@ -313,7 +313,8 @@ impl std::fmt::Display for Signal {
 }
 
 /// Which signals currently count as "active" (pre-checked / auto-pruned), per the
-/// `--gone`/`--merged` flags. `BranchDeleted` is always active, so it has no field.
+/// `--gone`/`--merged` flags. `BranchDeleted` and `PrMerged` are always active, so
+/// neither has a field.
 #[derive(Debug, Clone, Copy)]
 struct ActiveCriteria {
     gone: bool,
@@ -435,7 +436,7 @@ fn fill_pr_merged(row: &mut PruneRow) {
 }
 
 /// True if at least one of the row's signals is currently "active" per the
-/// `--gone`/`--merged` flags. `BranchDeleted` is always active.
+/// `--gone`/`--merged` flags. `BranchDeleted` and `PrMerged` are always active.
 fn is_active(row: &PruneRow, active: ActiveCriteria) -> bool {
     row.signals.iter().any(|s| match s {
         Signal::BranchDeleted => true,
