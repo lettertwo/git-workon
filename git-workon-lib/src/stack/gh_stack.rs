@@ -689,6 +689,207 @@ fn next_available_backup_path(admin_dir: &Path) -> PathBuf {
         .expect("u32 backup suffixes are effectively inexhaustible")
 }
 
+// ── Registering new branches (write path) ───────────────────────────────────────────────
+
+/// Resolve `name`'s local branch tip. `workon new` has already created both `branch` and
+/// (normally) `base_branch` by the time [`register_branch`] runs, so failure here means
+/// something is badly wrong rather than an expected condition — reported as
+/// [`StackError::GhStackWriteFailed`] since there's no more specific variant for "the thing
+/// we were asked to register doesn't resolve to a commit".
+fn branch_tip(repo: &Repository, name: &str) -> Result<git2::Oid, StackError> {
+    let branch = repo
+        .find_branch(name, git2::BranchType::Local)
+        .map_err(|e| StackError::GhStackWriteFailed {
+            path: canonical_path(repo),
+            message: format!("branch '{name}' not found: {e}"),
+        })?;
+    branch
+        .get()
+        .target()
+        .ok_or_else(|| StackError::GhStackWriteFailed {
+            path: canonical_path(repo),
+            message: format!("branch '{name}' has no target (unborn?)"),
+        })
+}
+
+/// Find the index in `stacks` (a `stacks[]` array of raw `Value`s) whose stack currently ends
+/// at `base_branch`: either its last `branches` element is `base_branch`, or it has no
+/// `branches` yet and its `trunk.branch` is `base_branch`. First match wins when more than
+/// one qualifies — `doctor`'s `GhStackDivergentStacks` check is what flags that situation,
+/// not this function.
+fn select_target_index(stacks: &[Value], base_branch: &str) -> Option<usize> {
+    stacks
+        .iter()
+        .position(|stack| {
+            stack
+                .get("branches")
+                .and_then(|b| b.as_array())
+                .and_then(|arr| arr.last())
+                .and_then(|b| b.get("branch"))
+                .and_then(|v| v.as_str())
+                == Some(base_branch)
+        })
+        .or_else(|| {
+            stacks.iter().position(|stack| {
+                let branches_empty = stack
+                    .get("branches")
+                    .and_then(|b| b.as_array())
+                    .map(|arr| arr.is_empty())
+                    .unwrap_or(true);
+                branches_empty
+                    && stack
+                        .get("trunk")
+                        .and_then(|t| t.get("branch"))
+                        .and_then(|v| v.as_str())
+                        == Some(base_branch)
+            })
+        })
+}
+
+/// Build the full replacement document (as pretty-printed bytes) for `register_branch`,
+/// given the raw bytes currently on disk (`existing`, possibly empty for "file doesn't exist
+/// yet"). Round-trips through `serde_json::Value` rather than a typed struct so `id`,
+/// `pullRequest`, and any other field on untouched `stacks[]` entries survive unchanged —
+/// only the target stack's `branches` array gains one new, minimal entry.
+fn plan_registered_doc(
+    existing: &[u8],
+    branch: &str,
+    base_branch: &str,
+    base: &str,
+    head: &str,
+    canonical: &Path,
+) -> Result<Vec<u8>, StackError> {
+    let mut doc: Value = if existing.is_empty() {
+        serde_json::json!({ "schemaVersion": 1, "stacks": [] })
+    } else {
+        serde_json::from_slice(existing).map_err(|e| StackError::GhStackParseFailed {
+            path: canonical.to_path_buf(),
+            message: e.to_string(),
+        })?
+    };
+
+    let version = doc
+        .get("schemaVersion")
+        .and_then(|v| v.as_u64())
+        .filter(|&v| v != 0)
+        .unwrap_or(1);
+    if version > 1 {
+        return Err(StackError::GhStackSchemaUnsupported {
+            path: canonical.to_path_buf(),
+            version,
+        });
+    }
+
+    let stacks = doc
+        .get_mut("stacks")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| StackError::GhStackNoStackForBase {
+            base: base_branch.to_string(),
+        })?;
+
+    let idx = select_target_index(stacks, base_branch).ok_or_else(|| {
+        StackError::GhStackNoStackForBase {
+            base: base_branch.to_string(),
+        }
+    })?;
+
+    // `pullRequest` is deliberately omitted, matching upstream's `omitempty` on a fresh entry.
+    let new_entry = serde_json::json!({ "branch": branch, "head": head, "base": base });
+    match stacks[idx]
+        .get_mut("branches")
+        .and_then(|v| v.as_array_mut())
+    {
+        Some(arr) => arr.push(new_entry),
+        None => stacks[idx]["branches"] = serde_json::json!([new_entry]),
+    }
+
+    serde_json::to_vec_pretty(&doc).map_err(|e| StackError::GhStackWriteFailed {
+        path: canonical.to_path_buf(),
+        message: e.to_string(),
+    })
+}
+
+/// Write `bytes` to `canonical` via `<common-dir>/gh-stack.tmp` then `fs::rename`, mode 0644.
+/// Atomic, unlike upstream's `os.WriteFile` — always call this with `canonical` itself
+/// ([`canonical_path`]'s return value), never a worktree's symlinked admin-dir path: renaming
+/// onto a symlink replaces the link with a real file instead of updating what it points to,
+/// silently detaching that worktree from the shared store.
+fn write_canonical_atomic(canonical: &Path, bytes: &[u8]) -> Result<(), StackError> {
+    let tmp_path = canonical.with_extension("tmp");
+    std::fs::write(&tmp_path, bytes).map_err(|e| StackError::GhStackWriteFailed {
+        path: tmp_path.clone(),
+        message: e.to_string(),
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o644)).map_err(
+            |e| StackError::GhStackWriteFailed {
+                path: tmp_path.clone(),
+                message: e.to_string(),
+            },
+        )?;
+    }
+
+    std::fs::rename(&tmp_path, canonical).map_err(|e| StackError::GhStackWriteFailed {
+        path: canonical.to_path_buf(),
+        message: e.to_string(),
+    })
+}
+
+/// Append `branch` to the canonical file's stack that currently ends at `base_branch`.
+/// Round-trips through `serde_json::Value` — a typed struct would silently drop `id`,
+/// `pullRequest`, and any field a future gh-stack adds.
+///
+/// `base` is `repo.merge_base(base_branch's tip, branch's tip)` — equal to `base_branch`'s
+/// tip in the normal case, but still correct if `base_branch` moved between worktree creation
+/// and this call. Guarded by [`lock_canonical`], so a concurrent `gh stack` run in any
+/// worktree (every worktree's lock symlinks to the same file) is genuinely excluded.
+///
+/// The file is read only after the lock is held. No lock-respecting writer (every `gh stack`
+/// invocation, and every other `git-workon` call into this module) can be mid-write once the
+/// lock is ours, so a read-under-lock always sees a complete file — there is nothing to
+/// compare-and-swap against. A pre-lock read would risk observing upstream's non-atomic
+/// `os.WriteFile` mid-truncation and handing a partial prefix to [`plan_registered_doc`],
+/// which is exactly the failure this ordering avoids.
+pub fn register_branch(
+    repo: &Repository,
+    branch: &str,
+    base_branch: &str,
+) -> Result<(), StackError> {
+    let head = branch_tip(repo, branch)?;
+    let base_tip = branch_tip(repo, base_branch)?;
+    let base = repo.merge_base(base_tip, head).unwrap_or(base_tip);
+
+    let canonical = canonical_path(repo);
+    let _lock = lock_canonical(repo)?;
+
+    let existing = std::fs::read(&canonical).unwrap_or_default();
+    let new_bytes = match plan_registered_doc(
+        &existing,
+        branch,
+        base_branch,
+        &base.to_string(),
+        &head.to_string(),
+        &canonical,
+    ) {
+        // `read_metadata` (used by `list`/`find`) unions canonical with `unlinked_files`, but
+        // this function reads canonical alone — deliberately, since it must never write
+        // through a worktree symlink (see `write_canonical_atomic`'s docs). So the spec's
+        // accepted chicken-and-egg case (someone runs `gh stack init` inside a worktree before
+        // ever running `doctor --fix`) reads fine everywhere but fails registration here with
+        // a message that looks identical to "no such stack at all". Point at the fix instead.
+        Err(StackError::GhStackNoStackForBase { base }) if !unlinked_files(repo).is_empty() => {
+            return Err(StackError::GhStackStackInUnlinkedWorktree { base });
+        }
+        Err(e) => return Err(e),
+        Ok(bytes) => bytes,
+    };
+
+    write_canonical_atomic(&canonical, &new_bytes)
+}
+
 // ── `doctor` support ─────────────────────────────────────────────────────────────────────
 
 /// Per-worktree link status, for `doctor`'s `GhStackWorktreeNotLinked` check and its `--fix`.
@@ -1390,6 +1591,183 @@ mod tests {
                 assert!(!holds_file);
             }
             LinkStatus::Linked => panic!("expected NotLinked, got Linked"),
+        }
+    }
+
+    // ── register_branch ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn register_branch_appends_onto_a_trunk_with_no_branches_yet() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .gh_stack(None, 1, "main", &[])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        register_branch(repo, "feat-a", "main").unwrap();
+
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
+        let head_oid = repo
+            .find_branch("feat-a", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        repo.assert(predicate::repo::gh_stack_branch_base(
+            None,
+            "feat-a",
+            head_oid.to_string(),
+        ));
+    }
+
+    #[test]
+    fn register_branch_appends_onto_the_top_of_an_existing_stack() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .branch("feat-b")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        register_branch(repo, "feat-b", "feat-a").unwrap();
+
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-b", 1));
+    }
+
+    #[test]
+    fn register_branch_preserves_id_and_pull_request_on_untouched_entries() {
+        // The existing entry's `id` and its branch's `pullRequest` are fields workon never
+        // reads. A typed struct would silently drop them on write; the raw-Value round-trip
+        // must not.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .branch("feat-b")
+            .raw_gh_stack(
+                None,
+                br#"{
+                    "schemaVersion": 1,
+                    "stacks": [{
+                        "id": "stack-abc",
+                        "number": 3,
+                        "trunk": { "branch": "main", "head": "", "base": "" },
+                        "branches": [{
+                            "branch": "feat-a",
+                            "head": "0000000000000000000000000000000000000a",
+                            "base": "0000000000000000000000000000000000000b",
+                            "pullRequest": { "number": 42, "id": "PR_1", "merged": false }
+                        }]
+                    }]
+                }"#
+                .to_vec(),
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        register_branch(repo, "feat-b", "feat-a").unwrap();
+
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-b", 1));
+        repo.assert(predicate::repo::gh_stack_preserves(
+            None,
+            "/stacks/0/id",
+            "stack-abc",
+        ));
+        repo.assert(predicate::repo::gh_stack_preserves(
+            None,
+            "/stacks/0/branches/0/pullRequest/number",
+            "42",
+        ));
+    }
+
+    #[test]
+    fn register_branch_surfaces_parse_failed_for_truncated_canonical() {
+        // A truncated canonical file under an uncontended lock is genuine corruption, not a
+        // mid-write race (a lock-respecting writer can't be mid-write once we hold the lock).
+        // The read-under-lock ordering means this must deterministically surface
+        // GhStackParseFailed rather than a stale pre-lock snapshot masking the truncation.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .branch("feat-b")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .raw_gh_stack(None, b"{\"schemaVersion\": 1, \"stacks\": [".to_vec())
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        match register_branch(repo, "feat-b", "feat-a") {
+            Err(StackError::GhStackParseFailed { .. }) => {}
+            other => panic!("expected GhStackParseFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_branch_errors_when_no_stack_ends_at_base() {
+        // "main" is a real branch, but the only stack's last branch is "feat-a", not "main",
+        // and its `branches` isn't empty, so "main" doesn't match either target-selection
+        // rule.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .branch("feat-b")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        match register_branch(repo, "feat-b", "main") {
+            Err(StackError::GhStackNoStackForBase { base }) => {
+                assert_eq!(base, "main");
+            }
+            other => panic!("expected GhStackNoStackForBase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn register_branch_points_at_doctor_fix_when_stack_is_unlinked_only() {
+        // Finding F: the chicken-and-egg case the spec explicitly accepts — `gh stack init`
+        // run inside a worktree before `doctor --fix` ever migrates it. `read_metadata` unions
+        // in unlinked_files, so `list`/`find` render the stack correctly, but `register_branch`
+        // reads canonical alone (it must never write through a worktree symlink) and would
+        // otherwise report the same generic GhStackNoStackForBase as "no such stack anywhere",
+        // which is indistinguishable from user error. It must instead point at `doctor --fix`.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-a")
+            .branch("feat-b")
+            .gh_stack(Some("feat-a"), 1, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        // Sanity: read_metadata (the list/find path) sees the stack fine via the degraded
+        // union, so the failure below is specific to register_branch's canonical-only read.
+        let meta = read_metadata(repo).unwrap();
+        assert_eq!(meta.parents["feat-a"].parent, "main");
+
+        match register_branch(repo, "feat-b", "feat-a") {
+            Err(StackError::GhStackStackInUnlinkedWorktree { base }) => {
+                assert_eq!(base, "feat-a");
+            }
+            other => panic!("expected GhStackStackInUnlinkedWorktree, got {other:?}"),
         }
     }
 }

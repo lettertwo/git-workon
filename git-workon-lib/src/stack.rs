@@ -206,6 +206,14 @@ pub fn link_worktree(repo: &Repository, worktree_name: &str) -> Result<()> {
     gh_stack::link_worktree(repo, worktree_name).map_err(Into::into)
 }
 
+/// Append `branch` to the canonical gh-stack file's stack that currently ends at
+/// `base_branch`. Callers gate this on `StackModel::GhStack` themselves (see `workon new`'s
+/// hook), matching [`link_worktree`]. See `stack/gh_stack.rs`'s `register_branch` for the
+/// locking, CAS, and target-selection rules.
+pub fn register_branch(repo: &Repository, branch: &str, base_branch: &str) -> Result<()> {
+    gh_stack::register_branch(repo, branch, base_branch).map_err(Into::into)
+}
+
 /// Merge `worktree_name`'s real `gh-stack` file into canonical, then replace it with a
 /// symlink, leaving `gh-stack.bak` behind. Reachable only from `doctor --fix` — never
 /// automatically. See `stack/gh_stack.rs`'s module docs for the shared-canonical-file model.

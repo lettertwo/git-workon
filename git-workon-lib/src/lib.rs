@@ -87,8 +87,8 @@ pub use crate::resolve::*;
 pub use crate::stack::{
     current_stack, enumerate_stacks, gh_stack_divergent_stack_numbers, gh_stack_readability_errors,
     gh_stack_worktree_link_status, graphite_trunk, group_by_stack, is_gh_stack_repo,
-    is_graphite_active, is_graphite_repo, link_worktree, migrate_worktree, GhStackLinkStatus,
-    Granularity, Stack, StackGroup, StackGrouping, StackModel,
+    is_graphite_active, is_graphite_repo, link_worktree, migrate_worktree, register_branch,
+    GhStackLinkStatus, Granularity, Stack, StackGroup, StackGrouping, StackModel,
 };
 pub use crate::stash::*;
 pub use crate::workon_root::*;

@@ -383,3 +383,60 @@ fn gt_auto_track_cli_override_wins() -> Result<(), Box<dyn Error>> {
     assert!(!cfg.gt_auto_track(Some(false))?);
     Ok(())
 }
+
+// ── stack_auto_track ──────────────────────────────────────────────────────────
+
+#[test]
+fn stack_auto_track_defaults_to_true() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new().build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(cfg.stack_auto_track(None)?);
+    Ok(())
+}
+
+#[test]
+fn stack_auto_track_reads_false_from_config() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackAutoTrack", "false")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(!cfg.stack_auto_track(None)?);
+    Ok(())
+}
+
+#[test]
+fn stack_auto_track_cli_override_wins() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackAutoTrack", "true")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(!cfg.stack_auto_track(Some(false))?);
+    Ok(())
+}
+
+#[test]
+fn stack_auto_track_falls_back_to_deprecated_gt_auto_track() -> Result<(), Box<dyn Error>> {
+    // workon.stackAutoTrack unset, workon.gtAutoTrack set — the deprecated key still governs.
+    let fixture = FixtureBuilder::new()
+        .config("workon.gtAutoTrack", "false")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(!cfg.stack_auto_track(None)?);
+    Ok(())
+}
+
+#[test]
+fn stack_auto_track_takes_precedence_over_deprecated_gt_auto_track() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackAutoTrack", "true")
+        .config("workon.gtAutoTrack", "false")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert!(cfg.stack_auto_track(None)?);
+    Ok(())
+}

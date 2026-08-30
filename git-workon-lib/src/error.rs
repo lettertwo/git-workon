@@ -311,6 +311,25 @@ pub enum StackError {
     #[diagnostic(code(workon::stack::gh_stack_link_failed))]
     GhStackLinkFailed { path: PathBuf, message: String },
 
+    #[error("No gh-stack stack ends at branch '{base}'")]
+    #[diagnostic(
+        code(workon::stack::gh_stack_no_stack_for_base),
+        help(
+            "Run `gh stack init` or `gh stack add` for '{base}' first, or check workon.stackModel."
+        )
+    )]
+    GhStackNoStackForBase { base: String },
+
+    #[error("No gh-stack stack ends at branch '{base}' in the canonical store")]
+    #[diagnostic(
+        code(workon::stack::gh_stack_stack_in_unlinked_worktree),
+        help(
+            "'{base}' may be tracked in an unlinked worktree's gh-stack file. \
+             Run `workon doctor --fix` to migrate it into the canonical store, then retry."
+        )
+    )]
+    GhStackStackInUnlinkedWorktree { base: String },
+
     #[error("Branch '{branch}' exists in stack metadata but its local ref was deleted")]
     #[diagnostic(
         code(workon::stack::deleted_stack_node),

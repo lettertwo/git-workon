@@ -1204,3 +1204,193 @@ fn new_skips_gh_stack_link_with_no_stack_flag() -> Result<(), Box<dyn std::error
 
     Ok(())
 }
+
+// ── gh-stack register hook ───────────────────────────────────────────────────
+
+#[test]
+fn new_registers_branch_with_gh_stack() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "gh-stack")
+        .gh_stack(None, 1, "main", &[])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("feat-1")
+        .arg("--base")
+        .arg("main")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1"));
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0));
+
+    Ok(())
+}
+
+#[test]
+fn new_skips_gh_stack_register_with_no_stack_flag() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "gh-stack")
+        .gh_stack(None, 1, "main", &[])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("--no-stack")
+        .arg("feat-1")
+        .arg("--base")
+        .arg("main")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0).not());
+
+    Ok(())
+}
+
+#[test]
+fn new_attaching_existing_branch_skips_gh_stack_register() -> Result<(), Box<dyn std::error::Error>>
+{
+    // feat-1 already exists as a local branch (no worktree yet); attaching it must not
+    // register it with gh-stack — there's no "new branch" being created.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .branch("feat-1")
+        .config("workon.stackModel", "gh-stack")
+        .gh_stack(None, 1, "main", &[])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("feat-1")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0).not());
+
+    Ok(())
+}
+
+#[test]
+fn new_skips_gh_stack_register_when_stack_auto_track_false(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "gh-stack")
+        .config("workon.stackAutoTrack", "false")
+        .gh_stack(None, 1, "main", &[])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("feat-1")
+        .arg("--base")
+        .arg("main")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    // The link still gets planted — only registration is gated on stackAutoTrack.
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1"));
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0).not());
+
+    Ok(())
+}
+
+#[test]
+fn new_skips_gh_stack_register_when_gt_auto_track_false_via_deprecation_fallback(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // workon.stackAutoTrack is unset; the deprecated workon.gtAutoTrack=false must still
+    // disable gh-stack registration through Config::stack_auto_track's fallback.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "gh-stack")
+        .config("workon.gtAutoTrack", "false")
+        .gh_stack(None, 1, "main", &[])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("feat-1")
+        .arg("--base")
+        .arg("main")
+        .assert()
+        .success();
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0).not());
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn new_gh_stack_register_lock_contention_warns_and_exits_zero(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "gh-stack")
+        .gh_stack(None, 1, "main", &[])
+        .gh_stack_lock_held(None)
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("new")
+        .arg("feat-1")
+        .arg("--base")
+        .arg("main")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "new must succeed even when the gh-stack lock is held; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("gh-stack register failed"),
+        "expected a gh-stack register warning in stderr: {stderr}"
+    );
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0).not());
+
+    Ok(())
+}
