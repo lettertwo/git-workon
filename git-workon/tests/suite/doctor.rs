@@ -589,3 +589,233 @@ fn doctor_json_configuration_includes_stack_keys() -> Result<(), Box<dyn std::er
 
     Ok(())
 }
+
+// ── gh-stack checks ───────────────────────────────────────────────────────────
+
+/// Builds a PATH that excludes any directory containing a `gh` binary.
+fn path_without_gh() -> String {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|dir| !std::path::Path::new(dir).join("gh").exists())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+#[test]
+fn doctor_detects_unlinked_gh_stack_worktree_and_fixes_with_link(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .gh_stack(None, 1, "main", &["feat-a"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "is not linked to the canonical gh-stack file",
+        ));
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .arg("--fix")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Linked to canonical gh-stack file",
+        ));
+
+    let bare_repo = git2::Repository::open_bare(fixture.root()?.join(".bare"))?;
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
+
+    Ok(())
+}
+
+#[test]
+fn doctor_migrates_worktree_holding_a_real_gh_stack_file() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .gh_stack(Some("feat-a"), 2, "main", &["feat-a"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("has its own gh-stack file"));
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .arg("--fix")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Migrated gh-stack file into canonical",
+        ));
+
+    let bare_repo = git2::Repository::open_bare(fixture.root()?.join(".bare"))?;
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
+    assert!(fixture
+        .root()?
+        .join(".bare/worktrees/feat-a/gh-stack.bak")
+        .exists());
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_gh_stack_extension_not_found_emits_kind() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .gh_stack(None, 1, "main", &["feat-a"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("PATH", path_without_gh())
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let issues = parsed["issues"].as_array().expect("issues must be array");
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["kind"] == "gh_stack_extension_not_found"),
+        "expected gh_stack_extension_not_found issue in: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn doctor_warns_both_stack_tools_detected_when_model_is_auto(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .gh_stack(None, 1, "main", &["feat-b"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "both Graphite and gh-stack artifacts are present",
+        ));
+
+    Ok(())
+}
+
+#[test]
+fn doctor_does_not_warn_both_stack_tools_when_model_is_explicit(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .gh_stack(None, 1, "main", &["feat-b"])
+        .config("workon.stackModel", "graphite")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("both Graphite and gh-stack artifacts are present").not());
+
+    Ok(())
+}
+
+#[test]
+fn doctor_warns_gh_stack_divergent_stacks_in_degraded_mode(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .worktree("feat-b")
+        .gh_stack(Some("feat-a"), 1, "main", &["feat-a"])
+        .gh_stack(Some("feat-b"), 1, "main", &["feat-b"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "is defined differently in more than one worktree",
+        ));
+
+    Ok(())
+}
+
+#[test]
+fn doctor_flags_unreadable_gh_stack_file_for_unsupported_schema(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .raw_gh_stack(None, br#"{"schemaVersion": 2, "stacks": []}"#.to_vec())
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stderr = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .env("NO_COLOR", "1")
+            .arg("doctor")
+            .output()?
+            .stderr,
+    )?;
+
+    assert!(
+        stderr.contains("is unreadable"),
+        "expected gh-stack unreadable message in stderr: {stderr}"
+    );
+
+    Ok(())
+}

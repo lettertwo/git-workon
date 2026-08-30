@@ -295,6 +295,31 @@ pub enum StackError {
     #[error("Failed to parse gh-stack file '{}': {message}", path.display())]
     #[diagnostic(code(workon::stack::gh_stack_parse_failed))]
     GhStackParseFailed { path: PathBuf, message: String },
+
+    #[error("Timed out waiting for gh-stack lock '{}'", path.display())]
+    #[diagnostic(
+        code(workon::stack::gh_stack_locked),
+        help("Another `gh stack` or `git-workon` process may be mid-write; try again shortly.")
+    )]
+    GhStackLocked { path: PathBuf },
+
+    #[error("Failed to write gh-stack file '{}': {message}", path.display())]
+    #[diagnostic(code(workon::stack::gh_stack_write_failed))]
+    GhStackWriteFailed { path: PathBuf, message: String },
+
+    #[error("Failed to link gh-stack file '{}': {message}", path.display())]
+    #[diagnostic(code(workon::stack::gh_stack_link_failed))]
+    GhStackLinkFailed { path: PathBuf, message: String },
+
+    #[error("Branch '{branch}' exists in stack metadata but its local ref was deleted")]
+    #[diagnostic(
+        code(workon::stack::deleted_stack_node),
+        help(
+            "The branch was tracked by your stack tool but its local ref no longer exists. \
+             Recreate the branch, or remove it from the stack metadata."
+        )
+    )]
+    DeletedStackNode { branch: String },
 }
 
 /// Changeset assembly errors
@@ -303,7 +328,7 @@ pub enum ChangesetError {
     #[error("Branch '{branch}' has no resolvable local ref")]
     #[diagnostic(
         code(workon::changeset::unresolvable_branch),
-        help("The branch may have been deleted while stack metadata lingered; run 'gt sync' or re-create the branch")
+        help("The branch may have been deleted while stack metadata lingered; sync your stack tool (e.g. `gt sync`) or re-create the branch")
     )]
     UnresolvableBranch { branch: String },
 
@@ -312,7 +337,7 @@ pub enum ChangesetError {
     )]
     #[diagnostic(
         code(workon::changeset::invalid_parent_revision),
-        help("Stack metadata may be corrupt or copied from another clone; run 'gt restack' to rewrite it")
+        help("Stack metadata may be corrupt or copied from another clone; resync your stack tool (e.g. `gt restack`) to rewrite it")
     )]
     InvalidParentRevision { branch: String, revision: String },
 

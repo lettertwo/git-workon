@@ -165,7 +165,9 @@ fn emit_json_error(e: &miette::Report) -> ! {
 /// - [`Navigate`] / [`NotFound`] → `None` (falls through to `Cmd::Find`)
 /// - [`Materialize`] → `Some(Cmd::New)`
 /// - [`Checkout`] → `Some(Cmd::Checkout)` *(added in PR-2)*
-/// - [`DeletedNode`] → structured error (`StackError::DeletedBranchNode`)
+/// - [`DeletedNode`] → structured error (`StackError::DeletedBranchNode`, or
+///   `StackError::DeletedStackNode` under `StackModel::GhStack` — `Resolution::DeletedNode`
+///   itself carries no model, so the choice is made here from `model`)
 ///
 /// [`Navigate`]: workon::Resolution::Navigate
 /// [`NotFound`]: workon::Resolution::NotFound
@@ -189,9 +191,12 @@ fn route_branch_to_command(
             no_stack: false,
             no_interactive: false,
         }))),
-        workon::Resolution::DeletedNode { branch } => {
-            miette::bail!(workon::StackError::DeletedBranchNode { branch })
-        }
+        workon::Resolution::DeletedNode { branch } => match model {
+            workon::StackModel::GhStack => {
+                miette::bail!(workon::StackError::DeletedStackNode { branch })
+            }
+            _ => miette::bail!(workon::StackError::DeletedBranchNode { branch }),
+        },
         // Navigate → Find handles the cd; NotFound → Find shows the error.
         _ => Ok(None),
     }
