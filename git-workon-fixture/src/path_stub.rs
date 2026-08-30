@@ -35,6 +35,34 @@ impl PathStub {
         Ok(self)
     }
 
+    /// Write an executable `<name>` stub with a custom script `body`, for faking an
+    /// arbitrary external binary (e.g. `gh`) rather than the `git-workon-<name>`
+    /// dispatch convention `command` targets. Every invocation is logged (its
+    /// space-joined arguments, one per line) before `body` runs, so tests can assert
+    /// whether — and how many times — the stub was called via [`Self::invocations`].
+    pub fn binary(self, name: &str, body: &str) -> Result<Self> {
+        let path = self.dir.path().join(name);
+        let log = self.invocation_log(name);
+        let script = format!("#!/bin/sh\necho \"$*\" >> {}\n{}\n", log.display(), body);
+        std::fs::write(&path, script)?;
+        set_executable(&path)?;
+        Ok(self)
+    }
+
+    /// Recorded invocation lines for a `binary` stub named `name` (empty if it was
+    /// never called, or was created with `command` instead of `binary`).
+    pub fn invocations(&self, name: &str) -> Vec<String> {
+        std::fs::read_to_string(self.invocation_log(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn invocation_log(&self, name: &str) -> PathBuf {
+        self.dir.path().join(format!("{name}.invocations.log"))
+    }
+
     /// `PATH` value with the stub directory prepended to the current process's `PATH`, so a
     /// stub shadows nothing else already on `PATH` unless intended (see built-in precedence).
     pub fn path(&self) -> String {
