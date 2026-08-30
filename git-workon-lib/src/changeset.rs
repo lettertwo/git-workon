@@ -22,11 +22,12 @@
 //! [`ChangesetSource::Uncommitted`] entry immediately after the current node, taking over
 //! `current`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use git2::{BranchType, Oid, Repository, StatusOptions};
 
 use crate::error::{ChangesetError, Result};
+use crate::stack::metadata::{self, StackMetadata};
 use crate::stack::{graphite, StackModel};
 
 /// What a [`Changeset`] spans: a resolved commit range, or the working tree + index.
@@ -73,17 +74,23 @@ pub fn assemble_changesets(
     match model {
         StackModel::None => Ok(vec![]),
         StackModel::Git => assemble_git(repo, head_branch),
-        StackModel::Graphite => assemble_graphite(repo, head_branch),
+        StackModel::Graphite => {
+            assemble_from_metadata(repo, head_branch, &graphite::read_metadata(repo)?)
+        }
     }
 }
 
-/// Graphite-metadata-driven assembly (see module docs for the walk).
-fn assemble_graphite(repo: &Repository, head_branch: &str) -> Result<Vec<Changeset>> {
-    let metadata = graphite::read_branch_metadata(repo)?;
-    let trunks: HashSet<String> = graphite::read_trunks(repo).into_iter().collect();
+/// Provider-agnostic metadata-driven assembly (see module docs for the walk). Shared by every
+/// stack provider that reduces to [`StackMetadata`] — only the parse step differs between them.
+fn assemble_from_metadata(
+    repo: &Repository,
+    head_branch: &str,
+    meta: &StackMetadata,
+) -> Result<Vec<Changeset>> {
+    let trunks: HashSet<String> = meta.trunks.iter().cloned().collect();
 
     // Trunk or untracked head_branch: no stack metadata to walk, fall back to git-inference.
-    if trunks.contains(head_branch) || !metadata.contains_key(head_branch) {
+    if trunks.contains(head_branch) || !meta.parents.contains_key(head_branch) {
         return assemble_git(repo, head_branch);
     }
 
@@ -96,86 +103,13 @@ fn assemble_graphite(repo: &Repository, head_branch: &str) -> Result<Vec<Changes
         .into());
     }
 
-    // Ancestors bottom → just-below-head, following recorded parent links. Stops at a trunk
-    // parent or a branch absent from the metadata map; cycle-guarded (an `a` <-> `b` cycle in
-    // metadata must terminate, not hang).
-    let mut ancestors_desc: Vec<String> = Vec::new();
-    {
-        let mut walk = head_branch.to_string();
-        let mut seen: HashSet<String> = HashSet::new();
-        seen.insert(walk.clone());
-        loop {
-            if trunks.contains(&walk) {
-                break;
-            }
-            let Some(entry) = metadata.get(&walk) else {
-                break;
-            };
-            let parent = entry.parent.clone();
-            if trunks.contains(&parent) {
-                break;
-            }
-            // An untracked parent (no metadata row) is outside the stack: stop without
-            // emitting it, matching the prototype walk. Every walked name therefore has a
-            // metadata row.
-            if !metadata.contains_key(&parent) {
-                break;
-            }
-            if !seen.insert(parent.clone()) {
-                break; // cycle guard
-            }
-            ancestors_desc.push(parent.clone());
-            walk = parent;
-        }
-    }
-    ancestors_desc.reverse();
-
-    // Descendants: depth-first from head_branch, siblings sorted lexically, cycle-guarded.
-    let mut reverse_map: HashMap<String, Vec<String>> = HashMap::new();
-    for (branch, entry) in &metadata {
-        reverse_map
-            .entry(entry.parent.clone())
-            .or_default()
-            .push(branch.clone());
-    }
-    for children in reverse_map.values_mut() {
-        children.sort();
-    }
-
-    fn visit_descendants(
-        branch: &str,
-        reverse_map: &HashMap<String, Vec<String>>,
-        visited: &mut HashSet<String>,
-        out: &mut Vec<String>,
-    ) {
-        if let Some(children) = reverse_map.get(branch) {
-            for child in children {
-                if visited.insert(child.clone()) {
-                    out.push(child.clone());
-                    visit_descendants(child, reverse_map, visited, out);
-                }
-            }
-        }
-    }
-
-    let mut descendants: Vec<String> = Vec::new();
-    let mut visited: HashSet<String> = HashSet::new();
-    visited.insert(head_branch.to_string());
-    visit_descendants(head_branch, &reverse_map, &mut visited, &mut descendants);
-
-    let titles = graphite::read_pr_titles(repo);
-
-    let ordered_names: Vec<String> = ancestors_desc
-        .into_iter()
-        .chain(std::iter::once(head_branch.to_string()))
-        .chain(descendants)
-        .collect();
+    let ordered_names = metadata::changeset_walk(meta, head_branch);
 
     let mut changesets: Vec<Changeset> = Vec::new();
     let mut current_index: Option<usize> = None;
     for name in ordered_names {
         // Ghost node: metadata row lingers, no branch exists anywhere. Skip from output —
-        // its children were already reached by visit_descendants regardless.
+        // its children were already reached by the walk regardless.
         if !crate::resolve::branch_exists(repo, &name) {
             continue;
         }
@@ -196,11 +130,10 @@ fn assemble_graphite(repo: &Repository, head_branch: &str) -> Result<Vec<Changes
 
         // Every walked name has a metadata row: the ancestors walk stops at untracked
         // parents, head_branch was checked on entry, and descendants come from the map.
-        let entry = &metadata[&name];
-        let (base_oid, needs_restack) = resolve_graphite_base(
+        let entry = &meta.parents[&name];
+        let (base_oid, needs_restack) = resolve_recorded_base(
             repo,
-            &metadata,
-            &trunks,
+            meta,
             &entry.parent,
             entry.parent_revision.as_deref(),
             head_oid,
@@ -212,7 +145,7 @@ fn assemble_graphite(repo: &Repository, head_branch: &str) -> Result<Vec<Changes
             current_index = Some(changesets.len());
         }
         changesets.push(Changeset {
-            title: titles.get(&name).cloned(),
+            title: meta.pr_titles.get(&name).cloned(),
             source: ChangesetSource::Committed {
                 base: base_oid,
                 head: head_oid,
@@ -228,7 +161,7 @@ fn assemble_graphite(repo: &Repository, head_branch: &str) -> Result<Vec<Changes
     Ok(changesets)
 }
 
-/// Resolve `(base, needs_restack)` for one Graphite stack node.
+/// Resolve `(base, needs_restack)` for one stack node.
 ///
 /// `parent_revision`, when present, is the recorded snapshot — verified against the odb and
 /// used as `base` directly (no need to resolve the parent's live ref: this keeps a stale
@@ -238,14 +171,13 @@ fn assemble_graphite(repo: &Repository, head_branch: &str) -> Result<Vec<Changes
 ///
 /// When `parent_revision` is missing, `base` falls back to `merge_base(ancestor_tip, head)`,
 /// where `ancestor_tip` is the nearest *live* branch (or trunk) reached by walking through
-/// `metadata` past any ghost parents — a live node hanging off a ghost whose own recorded
+/// `meta.parents` past any ghost parents — a live node hanging off a ghost whose own recorded
 /// parent revision never resolved (because the ghost's branch ref never existed to resolve a
 /// tip from) still needs a computable base. Only when that walk finds nothing resolvable at
 /// all is it a genuine error.
-fn resolve_graphite_base(
+fn resolve_recorded_base(
     repo: &Repository,
-    metadata: &HashMap<String, graphite::BranchMetadata>,
-    trunks: &HashSet<String>,
+    meta: &StackMetadata,
     parent: &str,
     parent_revision: Option<&str>,
     head: Oid,
@@ -271,27 +203,21 @@ fn resolve_graphite_base(
             Ok((oid, needs_restack))
         }
         None => {
-            let tip =
-                resolve_live_ancestor_tip(repo, metadata, trunks, parent).ok_or_else(|| {
-                    ChangesetError::UnresolvableBranch {
-                        branch: parent.to_string(),
-                    }
-                })?;
+            let tip = resolve_live_ancestor_tip(repo, meta, parent).ok_or_else(|| {
+                ChangesetError::UnresolvableBranch {
+                    branch: parent.to_string(),
+                }
+            })?;
             let base = repo.merge_base(tip, head)?;
             Ok((base, false))
         }
     }
 }
 
-/// Walk from `start` through `metadata`'s parent links (cycle-guarded) until a branch that
+/// Walk from `start` through `meta.parents`' parent links (cycle-guarded) until a branch that
 /// resolves to a live ref is found, returning its tip. `start` itself is checked first, so a
 /// live `start` resolves immediately; a ghost `start` walks to its recorded parent, and so on.
-fn resolve_live_ancestor_tip(
-    repo: &Repository,
-    metadata: &HashMap<String, graphite::BranchMetadata>,
-    trunks: &HashSet<String>,
-    start: &str,
-) -> Option<Oid> {
+fn resolve_live_ancestor_tip(repo: &Repository, meta: &StackMetadata, start: &str) -> Option<Oid> {
     let mut walk = start.to_string();
     let mut seen: HashSet<String> = HashSet::new();
     seen.insert(walk.clone());
@@ -303,10 +229,10 @@ fn resolve_live_ancestor_tip(
         {
             return Some(tip);
         }
-        if trunks.contains(&walk) {
+        if meta.trunks.iter().any(|t| t == &walk) {
             return None;
         }
-        match metadata.get(&walk) {
+        match meta.parents.get(&walk) {
             Some(entry) if seen.insert(entry.parent.clone()) => walk = entry.parent.clone(),
             _ => return None, // no metadata entry, or cycle
         }

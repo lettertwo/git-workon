@@ -42,6 +42,7 @@
 //! of the [`Stack::diffs`] vector order returned by [`current_stack`].
 
 pub(crate) mod graphite;
+pub(crate) mod metadata;
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -120,6 +121,12 @@ pub struct Stack {
     /// [`Stack::diffs`]; the trunk's own parent is not recorded. Used to reconstruct
     /// the branching tree structure (a flat [`diffs`] list cannot represent forks).
     pub parents: HashMap<String, String>,
+    /// Provider-assigned stack number (e.g. gh-stack's `stacks[].number`), for display only.
+    ///
+    /// This is **display metadata, never an identity key** — [`group_by_stack`] keys on
+    /// `(trunk, sorted diff set)` and does not consult this field. Always `None` for
+    /// [`StackModel::Graphite`] and [`StackModel::Git`], which have no numbering concept.
+    pub number: Option<u64>,
 }
 
 /// Return all stacks present in metadata, one per connected component.
@@ -282,6 +289,7 @@ mod tests {
             diffs: diffs.iter().map(|s| s.to_string()).collect(),
             current: current.to_string(),
             parents: HashMap::new(),
+            number: None,
         }
     }
 
