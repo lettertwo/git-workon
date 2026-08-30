@@ -1583,11 +1583,45 @@ fn changeset_prefix_spans(
 /// focus AND the effective zoom is [`EffectiveZoom::Single`] — under [`EffectiveZoom::Split`] a
 /// caption is the lit label instead, so this stays dim, EXCEPT when `render_body_split`'s own
 /// short-area fallback drops both captions, in which case this label lights up instead).
+/// The role word the diff header carries when the current file renders as a SINGLE staged or
+/// unstaged pane, or `None` when the header needs no such word.
+///
+/// The split already answers "which role am I reading" with its two captions
+/// ([`render_caption`]), and a single pane used to answer it with nothing at all — the same file
+/// looks the same whether its one pane is the staged or the unstaged side. This closes that gap
+/// for the three ways a single role happens: a file that is only staged, one that is only
+/// unstaged, and a split maximized (`Z`) onto one of its halves.
+///
+/// [`Role::Combined`] gets no word deliberately. It is reachable only for a binary file (which
+/// renders a placeholder, not a diff) and for a committed changeset's files, where there is no
+/// staged/unstaged distinction for a badge to disambiguate — see [`crate::app::effective_zoom`].
+/// The same uppercase wording as the split's captions, so `Z` reads as the caption moving into
+/// the header rather than as a different label appearing.
+///
+/// `split_collapsed` is [`render_body_split`]'s short-area fallback: under 4 body rows it drops
+/// both captions and renders the focused half alone over the whole area, which is the one way a
+/// `Split` zoom still puts a single role on screen with nothing naming it. The caller resolves
+/// that (it owns the rect the fallback gates on) and this names the focused role for it — the
+/// same division of labor as `focused`, whose own `area.height < 4` exception sits beside it.
+fn single_role_badge(app: &App, split_collapsed: bool) -> Option<&'static str> {
+    let role = match app.effective_zoom_for(app.current) {
+        EffectiveZoom::Single(role) => role,
+        EffectiveZoom::Split if split_collapsed => app.split_focus_role(),
+        EffectiveZoom::Split => return None,
+    };
+    match role {
+        Role::Unstaged => Some("UNSTAGED"),
+        Role::Staged => Some("STAGED"),
+        Role::Combined => None,
+    }
+}
+
 fn file_segment_spans(
     app: &App,
     theme: &Palette,
     icons: IconMode,
     focused: bool,
+    role_badge: Option<&'static str>,
 ) -> Vec<TSpan<'static>> {
     let idx = app.current + 1;
     let n = app.files().len();
@@ -1595,6 +1629,12 @@ fn file_segment_spans(
         format!("[{idx}/{n}] "),
         pane_header_label_style(theme, focused),
     )];
+    if let Some(label) = role_badge {
+        spans.push(TSpan::styled(
+            format!("{label} "),
+            pane_header_label_style(theme, focused),
+        ));
+    }
     if icons == IconMode::Nerd {
         if let Some(f) = app.files().get(app.current) {
             let (icon, color) = crate::icons::icon_for_path(
@@ -1652,7 +1692,13 @@ fn file_segment_spans(
 /// ([`render_body`]) resolves this from the diff's focus state AND [`EffectiveZoom`] (locked
 /// decision #5): a Split zoom lights a caption instead (see [`render_body_split`]), so this stays
 /// dim even while the diff has focus in that case.
-fn diff_header_line(app: &App, theme: &Palette, icons: IconMode, focused: bool) -> Line<'static> {
+fn diff_header_line(
+    app: &App,
+    theme: &Palette,
+    icons: IconMode,
+    focused: bool,
+    role_badge: Option<&'static str>,
+) -> Line<'static> {
     let show_prefix = app.changeset_count() > 1 && !app.outline_open();
 
     if app.current_failure().is_some() || app.is_current_pending() || app.files().is_empty() {
@@ -1676,7 +1722,7 @@ fn diff_header_line(app: &App, theme: &Palette, icons: IconMode, focused: bool) 
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    spans.extend(file_segment_spans(app, theme, icons, focused));
+    spans.extend(file_segment_spans(app, theme, icons, focused, role_badge));
     Line::from(spans)
 }
 
@@ -2060,12 +2106,19 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
         // gates on (both derive from the header carve-out above), so this branch mirrors that
         // check and lights the diff header instead, preserving the exactly-one-lit-label
         // invariant.
+        let split_collapsed = matches!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Split if area.height < 4
+        );
         let diff_header_focused = !app.outline_focused()
             && match app.effective_zoom_for(app.current) {
                 EffectiveZoom::Single(_) => true,
                 EffectiveZoom::Split => area.height < 4,
             };
-        let line = diff_header_line(app, theme, icons, diff_header_focused);
+        // Same rect, same `< 4` question as `diff_header_focused` above — see
+        // `single_role_badge`.
+        let role_badge = single_role_badge(app, split_collapsed);
+        let line = diff_header_line(app, theme, icons, diff_header_focused, role_badge);
         frame
             .buffer_mut()
             .set_line(header_area.x, header_area.y, &line, header_area.width);
@@ -6505,6 +6558,149 @@ mod tests {
         check(&mut app, "STAGED", "UNSTAGED");
     }
 
+    // ---- the single-role header badge -------------------------------------------------------
+
+    /// The header row's text for a freshly opened `app`, at a size roomy enough that nothing
+    /// wraps or truncates.
+    fn header_row(app: &mut App) -> String {
+        let buf = render_once(app, OUTLINE_TEST_WIDTH, 24);
+        buf_lines(&buf)[0].clone()
+    }
+
+    #[test]
+    fn a_single_unstaged_pane_names_its_role_in_the_header() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("only.txt", "l1\nl2\nl3\n", "l1\nCHANGED\nl3\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Unstaged)
+        );
+
+        let header = header_row(&mut app);
+        assert!(
+            header.contains("UNSTAGED"),
+            "an unstaged-only file's header must name the role, got: {header:?}"
+        );
+        assert!(
+            !header.contains("[1/1] STAGED"),
+            "and must not name the other one, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_staged_pane_names_its_role_in_the_header() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("new.txt", "hello\nthere\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Staged)
+        );
+
+        let header = header_row(&mut app);
+        assert!(
+            header.contains("STAGED"),
+            "a staged-only file's header must name the role, got: {header:?}"
+        );
+    }
+
+    /// The split already names both roles in its captions, so the header adds nothing — and
+    /// maximizing onto one half takes the badge back over, which is the `Z` continuity the badge
+    /// exists for.
+    #[test]
+    fn a_split_carries_no_header_badge_until_it_is_maximized() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+
+        let header = header_row(&mut app);
+        assert!(
+            !header.contains("UNSTAGED") && !header.contains("STAGED"),
+            "the split's captions already name both roles, got: {header:?}"
+        );
+
+        app.toggle_split_focus(); // -> Staged
+        app.toggle_maximize();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Staged)
+        );
+        let header = header_row(&mut app);
+        assert!(
+            header.contains("STAGED"),
+            "maximizing onto the staged half must carry its caption into the header, got: \
+             {header:?}"
+        );
+    }
+
+    /// A committed changeset has no staged/unstaged split for a badge to disambiguate — see
+    /// `single_role_badge`.
+    #[test]
+    fn a_committed_changesets_combined_pane_carries_no_header_badge() {
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        use crate::app::ChangesetView;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("f.txt", "l1\nold\nl3\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("f.txt", "l1\nnew\nl3\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: "main".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Combined)
+        );
+
+        let header = header_row(&mut app);
+        assert!(
+            !header.contains("UNSTAGED") && !header.contains("STAGED"),
+            "a committed changeset has no role to disambiguate, got: {header:?}"
+        );
+    }
+
     #[test]
     fn zoom_collapse_to_single_lights_the_diff_header_not_a_caption() {
         // Gotcha: a requested `Split` collapses to `EffectiveZoom::Single` for a file lacking one
@@ -6529,9 +6725,13 @@ mod tests {
         let theme = Palette::dark();
         let buf = render_once(&mut app, 60, 20);
         let content = buf_lines(&buf);
+        // Matched on the caption's `\u{2500}\u{2500} ` rule prefix, not the bare role word: the
+        // header's own single-role badge (`single_role_badge`) legitimately carries "UNSTAGED"
+        // here, so the word alone no longer distinguishes a caption from a badge.
         for line in &content {
             assert!(
-                !line.contains("UNSTAGED") && !line.contains("STAGED"),
+                !line.contains("\u{2500}\u{2500} UNSTAGED")
+                    && !line.contains("\u{2500}\u{2500} STAGED"),
                 "a collapsed Single zoom must not render split captions, got: {line:?}"
             );
         }
@@ -6570,9 +6770,11 @@ mod tests {
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 5);
         let content = buf_lines(&buf);
 
+        // The caption rule prefix, not the bare word — see the sibling collapse test.
         for line in &content {
             assert!(
-                !line.contains("UNSTAGED") && !line.contains("STAGED"),
+                !line.contains("\u{2500}\u{2500} UNSTAGED")
+                    && !line.contains("\u{2500}\u{2500} STAGED"),
                 "the short-area fallback must not render split captions, got: {line:?}"
             );
         }
