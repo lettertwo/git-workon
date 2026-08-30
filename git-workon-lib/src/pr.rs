@@ -335,6 +335,59 @@ pub fn fetch_pr_metadata(pr_number: u32) -> Result<PrMetadata> {
     })
 }
 
+/// Look up the merged PR for `branch`, if any, using the `gh` CLI.
+///
+/// Runs `gh pr list --head <branch> --state merged --json number,mergedAt --limit 1`.
+/// Matching is by branch name only, so a same-named branch from a fork is a
+/// false match; callers that care about this should already have ruled out
+/// forks another way.
+///
+/// Returns `Ok(None)` if the branch never had a PR merged under that name.
+/// Does not call [`check_gh_available`] itself — callers that intend to
+/// silently degrade when `gh` is unavailable should check once up front
+/// rather than pay for it on every branch.
+pub fn find_merged_pr(branch: &str) -> Result<Option<u32>> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "merged",
+            "--json",
+            "number,mergedAt",
+            "--limit",
+            "1",
+        ])
+        .output()
+        .map_err(|e| PrError::GhFetchFailed {
+            message: e.to_string(),
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(PrError::GhFetchFailed {
+            message: stderr.to_string(),
+        }
+        .into());
+    }
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| PrError::GhJsonParseFailed {
+            message: e.to_string(),
+        })?;
+
+    let number = json
+        .as_array()
+        .and_then(|prs| prs.first())
+        .and_then(|pr| pr["number"].as_u64())
+        .map(|n| n as u32);
+
+    Ok(number)
+}
+
 /// Sanitize a string for use in branch/worktree names
 fn sanitize_for_branch_name(s: &str) -> String {
     let sanitized = s
