@@ -2315,3 +2315,207 @@ fn prune_keeps_namespace_dir_with_stray_file() -> Result<(), Box<dyn std::error:
 
     Ok(())
 }
+
+// ── PR-merged signal ──────────────────────────────────────────────────────────
+
+/// Builds a PATH that excludes any directory containing a `gh` binary.
+/// (copied from `doctor.rs`'s `path_without_gh`, one per test module by convention)
+fn path_without_gh() -> String {
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|dir| !std::path::Path::new(dir).join("gh").exists())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// A `gh` stub that answers `--version` with success and `pr list` with a merged PR
+/// for any branch, recording every invocation the fixture builder logs.
+fn gh_stub_reports_merged_pr(pr_number: u32) -> String {
+    format!(
+        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\necho '[{{\"number\":{pr_number},\"mergedAt\":\"2024-01-01T00:00:00Z\"}}]'\n"
+    )
+}
+
+/// A `gh` stub whose `--version` succeeds (so the availability gate passes) but
+/// whose `pr list` always fails, for exercising per-row lookup degradation.
+fn gh_stub_pr_list_fails() -> String {
+    "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nexit 1\n".to_string()
+}
+
+/// A worktree whose branch is diverged from `main` (so `Merged` doesn't fire) with a
+/// local branch and no upstream (so neither `BranchDeleted` nor `RemoteGone` fires),
+/// leaving the PR-merged lookup as the only possible signal.
+fn build_signal_less_diverged_worktree() -> Result<Fixture, Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    fixture
+        .commit("feature")
+        .file("feature.txt", "feature")
+        .create("Feature commit")?;
+
+    Ok(fixture)
+}
+
+#[test]
+fn prune_dry_run_reports_merged_pr_signal() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_signal_less_diverged_worktree()?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PR #66 merged"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_yes_prunes_merged_pr_worktree_and_deletes_branch() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = build_signal_less_diverged_worktree()?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+
+    let feature_dir = fixture.cwd()?;
+    feature_dir.assert(predicate::path::is_dir());
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Pruned 1 worktree"));
+
+    feature_dir.assert(predicate::path::missing());
+    assert!(
+        fixture
+            .repo()?
+            .find_branch("feature", git2::BranchType::Local)
+            .is_err(),
+        "branch should have been deleted"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn prune_degrades_quietly_when_gh_missing() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_signal_less_diverged_worktree()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    let output = prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", path_without_gh())
+        .arg("prune")
+        .arg("--dry-run")
+        .output()?;
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("No worktrees to prune"), "stderr: {stderr}");
+    assert!(!stderr.to_lowercase().contains("warn"), "stderr: {stderr}");
+
+    Ok(())
+}
+
+#[test]
+fn prune_degrades_quietly_when_gh_pr_list_fails() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_signal_less_diverged_worktree()?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_pr_list_fails())?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    let output = prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .arg("prune")
+        .arg("--dry-run")
+        .output()?;
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("No worktrees to prune"), "stderr: {stderr}");
+    assert!(!stderr.to_lowercase().contains("warn"), "stderr: {stderr}");
+
+    Ok(())
+}
+
+#[test]
+fn prune_skips_pr_lookup_for_branch_already_deleted() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/heads/feature")?
+        .delete()?;
+
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("branch deleted"));
+
+    let invocations = stub.invocations("gh");
+    assert!(
+        invocations.iter().all(|line| !line.starts_with("pr")),
+        "gh pr list should not have been invoked for a signal-less-free row: {invocations:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn prune_json_includes_pr_merged_signal() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_signal_less_diverged_worktree()?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    let output = prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .arg("prune")
+        .arg("--dry-run")
+        .arg("--json")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
+    let pruned = json["pruned"].as_array().expect("pruned should be array");
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0]["reason"], serde_json::json!("PR #66 merged"));
+    let signals = pruned[0]["signals"]
+        .as_array()
+        .expect("signals should be array");
+    assert!(signals.iter().any(|s| s.as_str() == Some("PR #66 merged")));
+
+    Ok(())
+}
