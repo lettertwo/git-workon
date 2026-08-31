@@ -37,14 +37,15 @@
 //! branch as gone). In named mode, the prune-fetch narrows to remotes tracked by the
 //! named worktrees only.
 //!
-//! The `PrMerged` signal runs unconditionally, gated only on `gh` being usable (a
-//! single `check_gh_available()` call, not one per row). Rows that already carry a
-//! signal skip the lookup entirely. Any failure — `gh` missing, unauthenticated,
-//! offline, or no GitHub remote — degrades to no signal, with no warning: same
-//! under-report-only guarantee as the fetch above. A branch with no PR comes back as
-//! an empty list rather than an error, so a failed lookup is repo-level and the first
-//! one stops the pass; otherwise an unauthenticated `gh` would cost one failing
-//! subprocess per worktree.
+//! The `PrMerged` signal runs unconditionally, gated on the repo having a GitHub
+//! remote and `gh` being usable (a single `check_gh_available()` call, not one per
+//! row) — `gh` cannot resolve a PR without either. Rows that already carry a signal
+//! skip the lookup entirely. Any failure — `gh` missing, unauthenticated, or offline —
+//! degrades to no signal, with no warning: same under-report-only guarantee as the
+//! fetch above. A per-row failure alone doesn't stop the pass (a rate limit or DNS
+//! blip on one worktree shouldn't blank the signal for the rest); the pass gives up
+//! only after 3 consecutive failures, which bounds the cost of a repo-level failure
+//! (unauthenticated `gh`) without paying one failing subprocess per worktree.
 //!
 //! ## Protected Branch Matching
 //!
@@ -72,7 +73,7 @@ use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use serde_json::json;
 use workon::{
     check_gh_available, find_merged_pr, get_default_branch, get_repo, get_worktrees,
-    prune_fetch as remote_prune_fetch, remotes_tracked_by_worktrees, PruneError,
+    has_github_remote, prune_fetch as remote_prune_fetch, remotes_tracked_by_worktrees, PruneError,
     WorktreeDescriptor,
 };
 
@@ -183,13 +184,24 @@ impl Run for Prune {
             .collect();
 
         // Second pass: PR-merged status only comes from a network call, so it can't
-        // live in build_row alongside the offline signals. Gate the whole pass on
-        // `gh` being usable at all, so a missing/unauthenticated `gh` costs one check
-        // instead of one per row; a per-row failure still degrades that row alone.
-        if check_gh_available().is_ok() {
+        // live in build_row alongside the offline signals. `gh` can't resolve a PR
+        // without a GitHub remote, so skip the pass entirely when there isn't one —
+        // this also keeps every pre-existing prune test hermetic, since fixture repos
+        // have no GitHub remote. Otherwise gate on `gh` being usable at all, so a
+        // missing/unauthenticated `gh` costs one check instead of one per row. A
+        // bounded run of consecutive per-row failures then stops the pass (see
+        // `fill_pr_merged`'s doc comment), rather than one flaky row blanking the
+        // signal for every row after it.
+        if has_github_remote(&repo) && check_gh_available().is_ok() {
+            let mut consecutive_failures = 0;
             for row in rows.iter_mut() {
-                if !fill_pr_merged(row) {
-                    break;
+                if fill_pr_merged(row) {
+                    consecutive_failures = 0;
+                } else {
+                    consecutive_failures += 1;
+                    if consecutive_failures >= 3 {
+                        break;
+                    }
                 }
             }
         }
@@ -430,9 +442,11 @@ fn build_row<'a>(
 /// silently, matching the rest of prune's under-report-only contract.
 ///
 /// Returns false when the `gh` call itself failed. A branch with no PR is `Ok(None)`,
-/// not an error, so a failure here is repo-level (no GitHub remote, unauthenticated,
-/// offline) and every later row would fail the same way. The caller stops instead of
-/// paying one failing subprocess per worktree.
+/// not an error, so a failure here means something is wrong with the lookup itself
+/// (rate limit, DNS blip, revoked auth mid-run) rather than "this branch has no PR".
+/// The caller tracks consecutive failures and gives up after enough of them in a row
+/// that `gh` is probably unusable here, rather than aborting on the first one and
+/// blanking the signal for every row after it.
 fn fill_pr_merged(row: &mut PruneRow) -> bool {
     if !row.signals.is_empty() || row.branch.starts_with('(') {
         return true;
