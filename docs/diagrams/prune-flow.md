@@ -90,7 +90,9 @@ flowchart TD
 | `BranchDeleted` | local branch ref no longer exists | always |
 | `RemoteGone` | upstream tracking ref is gone (`has_gone_upstream()`) | `--gone` / `workon.pruneGone` |
 | `Merged(target)` | `is_merged_into(target)` — target is `--merged=BRANCH` or the default branch | `--merged` passed (with or without a value) |
-| `PrMerged(number)` | `gh pr list --head <branch> --state merged` found a merged PR (only checked for otherwise signal-less rows, gated on a GitHub remote + `gh` being usable) | always |
+| `PrMerged(number)` | `gh pr list --head <branch> --state merged` found a merged PR whose `headRefOid` is at or behind the branch's current tip (equal, or the tip is an ancestor of it) — only checked for otherwise signal-less rows, gated on a GitHub remote + `gh` being usable | always |
+
+`PrMerged`'s SHA comparison guards against a stale match: a long-lived branch that was once a PR's head (gitflow's `develop`/`production`, a `release/*` line) stays a merged PR's head forever, even after moving on with commits the PR never saw. Without the comparison, the signal would fire permanently on such a branch. Known gap: a branch rewritten locally after its PR merged (restack, amend) no longer matches its old merged head, so it loses the signal too — it still surfaces via `--gone` after a fetch, or by naming the worktree.
 
 A row can carry more than one signal (e.g. a fresh worktree off the default branch is always trivially `Merged(default)`). `reason_display()`/`annotate()` join every signal present, not just the active ones.
 
