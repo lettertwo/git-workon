@@ -374,18 +374,22 @@ pub fn find_merged_pr(branch: &str) -> Result<Option<u32>> {
     }
 
     let json_str = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&json_str).map_err(|e| PrError::GhJsonParseFailed {
-            message: e.to_string(),
-        })?;
+    Ok(parse_merged_pr(&json_str))
+}
 
-    let number = json
-        .as_array()
-        .and_then(|prs| prs.first())
-        .and_then(|pr| pr["number"].as_u64())
-        .map(|n| n as u32);
-
-    Ok(number)
+/// Extract a merged PR number from `gh pr list --json number,mergedAt`'s output.
+///
+/// Treats any shape mismatch as "no merged PR" rather than an error: an empty array
+/// (never had a PR), missing/non-numeric `number`, a non-array payload, or malformed
+/// JSON. [`find_merged_pr`] already treats a `None` here as a degrade-quietly case, so
+/// there is no separate error path to preserve for these.
+fn parse_merged_pr(json: &str) -> Option<u32> {
+    let json: serde_json::Value = serde_json::from_str(json).ok()?;
+    json.as_array()?
+        .first()?
+        .get("number")?
+        .as_u64()
+        .map(|n| n as u32)
 }
 
 /// Sanitize a string for use in branch/worktree names
@@ -465,6 +469,25 @@ pub fn preferred_remote_order(repo: &Repository) -> Vec<String> {
         .collect();
     all.sort_by_key(|r| remote_priority(r));
     all
+}
+
+/// True if any of the repository's remotes point at `github.com`.
+///
+/// `gh` can only resolve a PR against a GitHub remote, so callers use this to skip a
+/// lookup that is guaranteed to fail (e.g. prune's PR-merged signal). Handles both URL
+/// forms (`https://github.com/...` and `git@github.com:...`); a remote whose URL fails
+/// to parse is treated as non-GitHub rather than an error.
+pub fn has_github_remote(repo: &Repository) -> bool {
+    let Ok(remotes) = repo.remotes() else {
+        return false;
+    };
+    remotes.iter().flatten().flatten().any(|name| {
+        repo.find_remote(name)
+            .ok()
+            .and_then(|r| r.url().ok().map(str::to_string))
+            .and_then(|url| crate::ssh_config::extract_host_from_url(&url))
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+    })
 }
 
 /// Select which remote to use for fetching PR refs.
@@ -735,6 +758,39 @@ mod tests {
             format_pr_name_with_metadata("{branch}-{number}", &metadata),
             "feature-fix-auth-123"
         );
+    }
+
+    #[test]
+    fn test_parse_merged_pr_empty_array() {
+        assert_eq!(parse_merged_pr("[]"), None);
+    }
+
+    #[test]
+    fn test_parse_merged_pr_populated_array() {
+        let json = r#"[{"number":66,"mergedAt":"2024-01-01T00:00:00Z"}]"#;
+        assert_eq!(parse_merged_pr(json), Some(66));
+    }
+
+    #[test]
+    fn test_parse_merged_pr_number_missing() {
+        let json = r#"[{"mergedAt":"2024-01-01T00:00:00Z"}]"#;
+        assert_eq!(parse_merged_pr(json), None);
+    }
+
+    #[test]
+    fn test_parse_merged_pr_number_non_numeric() {
+        let json = r#"[{"number":"not-a-number","mergedAt":"2024-01-01T00:00:00Z"}]"#;
+        assert_eq!(parse_merged_pr(json), None);
+    }
+
+    #[test]
+    fn test_parse_merged_pr_non_array_payload() {
+        assert_eq!(parse_merged_pr(r#"{"number":66}"#), None);
+    }
+
+    #[test]
+    fn test_parse_merged_pr_malformed_json() {
+        assert_eq!(parse_merged_pr("not json"), None);
     }
 
     // Integration tests requiring gh CLI (marked with #[ignore])
