@@ -5008,6 +5008,18 @@ impl App {
         }
     }
 
+    /// Whether a staging verb would act on the current file rather than refuse — the same
+    /// [`Self::staging_role`] gate `stage_file`/`stage_hunk`/`start_selection` check before they
+    /// call [`Self::notify_combined_refusal`], read here by the renderer so the footer stops
+    /// advertising `stage`/`discard` where they can only refuse (`render::render_footer`).
+    ///
+    /// Deliberately the SAME predicate rather than a second one that reconstructs the conditions
+    /// (committed changeset, binary file, empty file list): a separate copy would drift, and the
+    /// footer would then either hide a key that works or advertise one that doesn't.
+    pub fn can_stage_current(&self) -> bool {
+        !self.cur().diff.files.is_empty() && self.staging_role().is_some()
+    }
+
     /// The role a staging verb acts in for the current file: the single effective role, or the
     /// focused split pane's role. `None` for [`Role::Combined`] — the combined view fuses both
     /// sub-diffs, so staging there has no unambiguous direction and the verbs refuse (locked

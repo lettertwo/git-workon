@@ -1791,7 +1791,7 @@ fn render_footer_notice_or_hint(
             } else {
                 View::Diff
             };
-            let text = footer_hint(keymap, focused, app.outline_mode());
+            let text = footer_hint(keymap, focused, app.outline_mode(), app.can_stage_current());
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(theme.dim)),
                 area,
@@ -3717,11 +3717,17 @@ mod tests {
         use crate::config::View as CfgView;
         use crate::keymap::Keymap;
 
+        // A stageable file, not the empty fixture this used to build: the footer only carries a
+        // stage entry where staging can actually act (`App::can_stage_current`), and an empty
+        // changeset has nothing to stage. The rebinding under test is unrelated to that gate.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "l1\nl2\nl3\n", "l1\nCHANGED\nl3\n")
             .build()
             .unwrap();
         let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(app.can_stage_current());
         assert!(app.notice.is_none());
 
         let keymap = Keymap::from_bindings(&[RawBinding {
@@ -6556,6 +6562,78 @@ mod tests {
         app.toggle_split_focus();
         assert_eq!(app.split_focus_role(), Role::Staged);
         check(&mut app, "STAGED", "UNSTAGED");
+    }
+
+    /// CS: the footer stops advertising `s stage` / `d discard` where a staging verb can only
+    /// refuse. A committed changeset is the common case (every file of a stack, PR, or ref
+    /// review); the keys stay bound and still explain themselves when pressed.
+    #[test]
+    fn a_committed_changesets_footer_does_not_advertise_the_staging_verbs() {
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        use crate::app::ChangesetView;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("f.txt", "l1\nold\nl3\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("f.txt", "l1\nnew\nl3\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: "main".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        assert!(!app.can_stage_current());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let footer = buf_lines(&buf).last().unwrap().clone();
+        assert!(
+            !footer.contains("stage") && !footer.contains("discard"),
+            "a committed changeset's footer must not advertise staging, got: {footer:?}"
+        );
+        assert!(
+            footer.contains("help"),
+            "the rest of the hint must survive, got: {footer:?}"
+        );
+    }
+
+    /// The mirror: an ordinary dirty file still advertises both.
+    #[test]
+    fn a_stageable_files_footer_still_advertises_the_staging_verbs() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", "l1\nl2\nl3\n", "l1\nCHANGED\nl3\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(app.can_stage_current());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let footer = buf_lines(&buf).last().unwrap().clone();
+        assert!(
+            footer.contains("stage") && footer.contains("discard"),
+            "got: {footer:?}"
+        );
     }
 
     // ---- the single-role header badge -------------------------------------------------------

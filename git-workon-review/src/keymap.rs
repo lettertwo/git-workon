@@ -979,6 +979,33 @@ enum HintItem {
     Pair(Command, Command, &'static str),
 }
 
+impl HintItem {
+    /// Whether this entry advertises a staging verb, and so drops out of the hint where
+    /// `App::can_stage_current` is false — see [`footer_hint`].
+    ///
+    /// Matched on the COMMAND, not on the entry's position in `DIFF_HINTS`, so a staging verb
+    /// added to a curated set later is covered without a second edit here. A `Pair` counts when
+    /// either half does; no staging command is half of a pair today, and one that were would
+    /// still be a staging entry.
+    fn is_staging(&self) -> bool {
+        fn staging(command: Command) -> bool {
+            matches!(
+                command,
+                Command::StageHunk
+                    | Command::StageFile
+                    | Command::DiscardHunk
+                    | Command::DiscardFile
+                    | Command::OutlineStage
+                    | Command::OutlineDiscard
+            )
+        }
+        match self {
+            HintItem::One(command, _) => staging(*command),
+            HintItem::Pair(a, b, _) => staging(*a) || staging(*b),
+        }
+    }
+}
+
 /// CS4 (`outline-mode-cycle`): most hint labels are the static string baked into the `HintItem`,
 /// but `OutlineCycleMode`'s label shows the mode `i` would switch TO instead — computed from
 /// `outline_mode` (the outline's CURRENT mode, so this is `outline_mode.cycle()`'s label).
@@ -1034,7 +1061,18 @@ const OUTLINE_HINTS: &[HintItem] = &[
 /// string, so a rebind shows here too. A notice temporarily replaces this in the footer (the
 /// caller's job, see `render::render_footer`); an unbound curated action is simply dropped from
 /// the string rather than leaving a stale/wrong key visible.
-pub fn footer_hint(keymap: &Keymap, focused: View, outline_mode: OutlineMode) -> String {
+///
+/// `can_stage` is `App::can_stage_current` — false where a staging verb can only refuse (a
+/// committed changeset, a binary file, an empty file list). The staging entries drop out of the
+/// string entirely there, the same way an unbound action does, so the hint never advertises a
+/// key that will answer with a refusal notice. The keys stay BOUND and still explain themselves
+/// when pressed: this hides the advertisement, not the behavior.
+pub fn footer_hint(
+    keymap: &Keymap,
+    focused: View,
+    outline_mode: OutlineMode,
+    can_stage: bool,
+) -> String {
     let items: &[HintItem] = match focused {
         View::Diff => DIFF_HINTS,
         View::Outline => OUTLINE_HINTS,
@@ -1042,6 +1080,7 @@ pub fn footer_hint(keymap: &Keymap, focused: View, outline_mode: OutlineMode) ->
     };
     items
         .iter()
+        .filter(|item| can_stage || !item.is_staging())
         .filter_map(|item| render_hint_item(keymap, item, outline_mode))
         .collect::<Vec<_>>()
         .join("  \u{b7}  ")
@@ -1695,7 +1734,7 @@ mod tests {
     #[test]
     fn footer_hint_renders_the_curated_diff_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), true);
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("s stage"), "got: {hint:?}");
         assert!(hint.contains("d discard"), "got: {hint:?}");
@@ -1705,9 +1744,36 @@ mod tests {
     }
 
     #[test]
+    fn footer_hint_drops_the_staging_entries_where_staging_can_only_refuse() {
+        let km = Keymap::defaults();
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), false);
+        assert!(
+            !hint.contains("stage") && !hint.contains("discard"),
+            "a non-stageable file must not advertise the staging verbs, got: {hint:?}"
+        );
+        // The rest of the curated set is untouched — this hides two entries, not the footer.
+        assert!(hint.contains("j/k move"), "got: {hint:?}");
+        assert!(hint.contains("o outline"), "got: {hint:?}");
+        assert!(hint.contains("? help"), "got: {hint:?}");
+        assert!(hint.contains("q quit"), "got: {hint:?}");
+    }
+
+    /// The outline's curated set carries no staging entry to begin with (it was trimmed to fit
+    /// 80 columns), so the flag changes nothing there. Pinned so a later addition to
+    /// `OUTLINE_HINTS` has to decide about `can_stage` rather than inherit an accident.
+    #[test]
+    fn footer_hint_outline_entries_are_unaffected_by_the_staging_flag() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            footer_hint(&km, View::Outline, OutlineMode::Stack, true),
+            footer_hint(&km, View::Outline, OutlineMode::Stack, false),
+        );
+    }
+
+    #[test]
     fn footer_hint_renders_the_curated_outline_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Outline, OutlineMode::Stack);
+        let hint = footer_hint(&km, View::Outline, OutlineMode::Stack, true);
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("enter open"), "got: {hint:?}");
         assert!(hint.contains("n/p changeset"), "got: {hint:?}");
@@ -1733,7 +1799,7 @@ mod tests {
             (OutlineMode::Flat, "tree"),
             (OutlineMode::Tree, "stack"),
         ] {
-            let hint = footer_hint(&km, View::Outline, mode);
+            let hint = footer_hint(&km, View::Outline, mode, true);
             let want = format!("i \u{2192}{next}");
             assert!(
                 hint.contains(&want),
@@ -1749,7 +1815,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: "x".to_string(),
         }]);
-        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), true);
         assert!(hint.contains("x stage"), "got: {hint:?}");
         assert!(!hint.contains("s stage"), "got: {hint:?}");
     }
@@ -1761,7 +1827,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: String::new(),
         }]);
-        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), true);
         assert!(!hint.contains("stage"), "got: {hint:?}");
         // The rest of the curated set is unaffected.
         assert!(hint.contains("d discard"), "got: {hint:?}");
