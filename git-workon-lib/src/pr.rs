@@ -335,18 +335,27 @@ pub fn fetch_pr_metadata(pr_number: u32) -> Result<PrMetadata> {
     })
 }
 
+/// A merged PR's number and the commit its head branch pointed to when it merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedPr {
+    pub number: u32,
+    pub head_oid: String,
+}
+
 /// Look up the merged PR for `branch`, if any, using the `gh` CLI.
 ///
-/// Runs `gh pr list --head <branch> --state merged --json number,mergedAt --limit 1`.
-/// Matching is by branch name only, so a same-named branch from a fork is a
-/// false match; callers that care about this should already have ruled out
-/// forks another way.
+/// Runs `gh pr list --head <branch> --state merged --json number,mergedAt,headRefOid
+/// --limit 1`. Matching is by branch name only, so a same-named branch from a fork is
+/// a false match; callers that care about this should already have ruled out forks
+/// another way.
 ///
-/// Returns `Ok(None)` if the branch never had a PR merged under that name.
+/// Returns `Ok(None)` if the branch never had a PR merged under that name, or if the
+/// merged PR's `headRefOid` is missing or unparseable (callers can't compare against
+/// the branch tip without it, so this degrades the same as "no merged PR").
 /// Does not call [`check_gh_available`] itself — callers that intend to
 /// silently degrade when `gh` is unavailable should check once up front
 /// rather than pay for it on every branch.
-pub fn find_merged_pr(branch: &str) -> Result<Option<u32>> {
+pub fn find_merged_pr(branch: &str) -> Result<Option<MergedPr>> {
     let output = std::process::Command::new("gh")
         .args([
             "pr",
@@ -356,7 +365,7 @@ pub fn find_merged_pr(branch: &str) -> Result<Option<u32>> {
             "--state",
             "merged",
             "--json",
-            "number,mergedAt",
+            "number,mergedAt,headRefOid",
             "--limit",
             "1",
         ])
@@ -377,19 +386,20 @@ pub fn find_merged_pr(branch: &str) -> Result<Option<u32>> {
     Ok(parse_merged_pr(&json_str))
 }
 
-/// Extract a merged PR number from `gh pr list --json number,mergedAt`'s output.
+/// Extract a merged PR's number and head OID from
+/// `gh pr list --json number,mergedAt,headRefOid`'s output.
 ///
 /// Treats any shape mismatch as "no merged PR" rather than an error: an empty array
-/// (never had a PR), missing/non-numeric `number`, a non-array payload, or malformed
-/// JSON. [`find_merged_pr`] already treats a `None` here as a degrade-quietly case, so
-/// there is no separate error path to preserve for these.
-fn parse_merged_pr(json: &str) -> Option<u32> {
+/// (never had a PR), missing/non-numeric `number`, missing/non-string `headRefOid`,
+/// a non-array payload, or malformed JSON. [`find_merged_pr`] already treats a `None`
+/// here as a degrade-quietly case, so there is no separate error path to preserve for
+/// these.
+fn parse_merged_pr(json: &str) -> Option<MergedPr> {
     let json: serde_json::Value = serde_json::from_str(json).ok()?;
-    json.as_array()?
-        .first()?
-        .get("number")?
-        .as_u64()
-        .map(|n| n as u32)
+    let entry = json.as_array()?.first()?;
+    let number = entry.get("number")?.as_u64()? as u32;
+    let head_oid = entry.get("headRefOid")?.as_str()?.to_string();
+    Some(MergedPr { number, head_oid })
 }
 
 /// Sanitize a string for use in branch/worktree names
@@ -767,19 +777,31 @@ mod tests {
 
     #[test]
     fn test_parse_merged_pr_populated_array() {
-        let json = r#"[{"number":66,"mergedAt":"2024-01-01T00:00:00Z"}]"#;
-        assert_eq!(parse_merged_pr(json), Some(66));
+        let json = r#"[{"number":66,"mergedAt":"2024-01-01T00:00:00Z","headRefOid":"abc123"}]"#;
+        assert_eq!(
+            parse_merged_pr(json),
+            Some(MergedPr {
+                number: 66,
+                head_oid: "abc123".to_string()
+            })
+        );
     }
 
     #[test]
     fn test_parse_merged_pr_number_missing() {
-        let json = r#"[{"mergedAt":"2024-01-01T00:00:00Z"}]"#;
+        let json = r#"[{"mergedAt":"2024-01-01T00:00:00Z","headRefOid":"abc123"}]"#;
         assert_eq!(parse_merged_pr(json), None);
     }
 
     #[test]
     fn test_parse_merged_pr_number_non_numeric() {
-        let json = r#"[{"number":"not-a-number","mergedAt":"2024-01-01T00:00:00Z"}]"#;
+        let json = r#"[{"number":"not-a-number","mergedAt":"2024-01-01T00:00:00Z","headRefOid":"abc123"}]"#;
+        assert_eq!(parse_merged_pr(json), None);
+    }
+
+    #[test]
+    fn test_parse_merged_pr_head_oid_missing() {
+        let json = r#"[{"number":66,"mergedAt":"2024-01-01T00:00:00Z"}]"#;
         assert_eq!(parse_merged_pr(json), None);
     }
 
