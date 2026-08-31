@@ -2482,9 +2482,17 @@ fn prune_stops_pr_lookups_after_3_consecutive_gh_failures() -> Result<(), Box<dy
         .worktree("feature-one")
         .worktree("feature-two")
         .worktree("feature-three")
+        .worktree("feature-four")
+        .worktree("feature-five")
         .build()?;
 
-    for branch in ["feature-one", "feature-two", "feature-three"] {
+    for branch in [
+        "feature-one",
+        "feature-two",
+        "feature-three",
+        "feature-four",
+        "feature-five",
+    ] {
         fixture
             .commit(branch)
             .file(&format!("{branch}.txt"), branch)
@@ -2504,11 +2512,9 @@ fn prune_stops_pr_lookups_after_3_consecutive_gh_failures() -> Result<(), Box<dy
         .success()
         .stderr(predicate::str::contains("No worktrees to prune"));
 
-    // Three worktrees, three consecutive failures: the bound is hit exactly as the
-    // rows run out. Without the bound this would still be three calls (nothing to
-    // distinguish it from "no bound at all" here); `prune_does_not_stop_pass_after_a_single_gh_failure`
-    // and `prune_gh_empty_list_for_one_branch_does_not_stop_pass` below cover that a
-    // single failure or an empty result doesn't trip it early.
+    // Five worktrees against a stub that always fails, so the bound has to stop the
+    // pass two rows early. Three worktrees wouldn't prove anything here: the count
+    // would be 3 whether the bound existed or not.
     let pr_list_calls = stub
         .invocations("gh")
         .into_iter()
