@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.13.0...git-workon-lib-v0.13.1) - 2026-08-31
+
+### Added
+
+- *(lib)* split merged-PR JSON parsing and add remote host check
+- *(lib)* add per-branch merged-PR lookup via gh
+
 ## [0.13.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.12.0...git-workon-lib-v0.13.0) - 2026-08-30
 
 ### Added

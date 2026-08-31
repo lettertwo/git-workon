@@ -10,7 +10,7 @@ name = "git-workon-lib"
 readme = "README.md"
 repository.workspace = true
 rust-version.workspace = true
-version = "0.13.0"
+version = "0.13.1"
 include = [
   "src/**/*",
   "Cargo.toml",
