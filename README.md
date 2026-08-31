@@ -110,7 +110,7 @@ git workon list --dirty --ahead  # filters combine with AND logic
 
 ### Prune stale worktrees
 
-`prune` always analyzes every worktree in scope for every signal (branch deleted, remote gone, merged into target) — `--gone`/`--merged` don't hide anything, they just decide what counts as an *active* criterion for pre-checking and auto-pruning. A branch-deleted worktree is always active. By default, pruning deletes the local branch ref along with the worktree; use `--keep-branch` to preserve it.
+`prune` always analyzes every worktree in scope for every signal (branch deleted, remote gone, merged into target, PR merged) — `--gone`/`--merged` don't hide anything, they just decide what counts as an *active* criterion for pre-checking and auto-pruning. A branch-deleted worktree and a worktree with a merged PR are always active. By default, pruning deletes the local branch ref along with the worktree; use `--keep-branch` to preserve it.
 
 ```sh
 git workon prune                 # interactive: multi-select picker, pre-checked with the safe default

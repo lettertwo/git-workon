@@ -25,7 +25,7 @@ flowchart TD
     end
 
     subgraph ANALYSIS["Analysis — every row in scope, always"]
-        ANALYZE["build_row() per worktree:\nsignals: BranchDeleted | RemoteGone | Merged(target)\n+ protected / locked / dirty / unmerged"]
+        ANALYZE["build_row() per worktree:\nsignals: BranchDeleted | RemoteGone | Merged(target) | PrMerged(number)\n+ protected / locked / dirty / unmerged"]
         ANALYZE --> VISIBLE{bare mode?}
         VISIBLE -->|yes| FILTERSIG["keep only rows with >=1 signal"]
         VISIBLE -->|no named| KEEPALL["keep every named row\n(signal or not)"]
@@ -51,7 +51,7 @@ flowchart TD
 
     subgraph CLASSIFY_BLOCK["classify(): to_prune vs skipped"]
         CLASSIFY{named?}
-        CLASSIFY -->|no| ACTIVE{signal active?\nBranchDeleted always;\nRemoteGone iff --gone;\nMerged iff --merged}
+        CLASSIFY -->|no| ACTIVE{signal active?\nBranchDeleted always;\nPrMerged always;\nRemoteGone iff --gone;\nMerged iff --merged}
         ACTIVE -->|no| DROP["not a candidate\n(not shown, not skipped)"]
         ACTIVE -->|yes| SAFETY
         CLASSIFY -->|yes| HEALTHY{healthy?\nno signal AND !dirty AND !unmerged}
@@ -90,6 +90,7 @@ flowchart TD
 | `BranchDeleted` | local branch ref no longer exists | always |
 | `RemoteGone` | upstream tracking ref is gone (`has_gone_upstream()`) | `--gone` / `workon.pruneGone` |
 | `Merged(target)` | `is_merged_into(target)` — target is `--merged=BRANCH` or the default branch | `--merged` passed (with or without a value) |
+| `PrMerged(number)` | `gh pr list --head <branch> --state merged` found a merged PR (only checked for otherwise signal-less rows, gated on a GitHub remote + `gh` being usable) | always |
 
 A row can carry more than one signal (e.g. a fresh worktree off the default branch is always trivially `Merged(default)`). `reason_display()`/`annotate()` join every signal present, not just the active ones.
 
