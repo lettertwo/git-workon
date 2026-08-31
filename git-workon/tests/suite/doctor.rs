@@ -592,16 +592,6 @@ fn doctor_json_configuration_includes_stack_keys() -> Result<(), Box<dyn std::er
 
 // ── gh-stack checks ───────────────────────────────────────────────────────────
 
-/// Builds a PATH that excludes any directory containing a `gh` binary.
-fn path_without_gh() -> String {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|dir| !std::path::Path::new(dir).join("gh").exists())
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 #[test]
 fn doctor_detects_unlinked_gh_stack_worktree_and_fixes_with_link(
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -695,7 +685,7 @@ fn doctor_json_gh_stack_extension_not_found_emits_kind() -> Result<(), Box<dyn s
     let main_path = fixture.root()?.join("main");
     let output = cargo_bin_cmd!("git-workon")
         .current_dir(&main_path)
-        .env("PATH", path_without_gh())
+        .env("PATH", PathStub::path_without("gh"))
         .arg("doctor")
         .arg("--json")
         .output()?;

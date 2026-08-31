@@ -2318,17 +2318,6 @@ fn prune_keeps_namespace_dir_with_stray_file() -> Result<(), Box<dyn std::error:
 
 // ── PR-merged signal ──────────────────────────────────────────────────────────
 
-/// Builds a PATH that excludes any directory containing a `gh` binary.
-/// (copied from `doctor.rs`'s `path_without_gh`, one per test module by convention)
-fn path_without_gh() -> String {
-    std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .filter(|dir| !std::path::Path::new(dir).join("gh").exists())
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 /// A `gh` stub that answers `--version` with success and `pr list` with a merged PR
 /// for any branch, recording every invocation the fixture builder logs.
 fn gh_stub_reports_merged_pr(pr_number: u32) -> String {
@@ -2343,13 +2332,47 @@ fn gh_stub_pr_list_fails() -> String {
     "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nexit 1\n".to_string()
 }
 
+/// What a stubbed `gh pr list` should do for a given branch, keyed by `--head`'s
+/// value (`gh pr list --head <branch> ...`, so the branch lands in `$4`).
+enum GhOutcome {
+    /// Exit non-zero, as if the lookup itself failed (rate limit, DNS blip, ...).
+    Fail,
+    /// Print an empty array, as if the branch never had a PR.
+    Empty,
+    /// Print a single merged PR with the given number.
+    Merged(u32),
+}
+
+/// A `gh` stub whose `--version` succeeds and whose `pr list --head <branch>`
+/// response varies per branch, per `mapping`. Lets a single test exercise multiple
+/// rows hitting different outcomes in one pass.
+fn gh_stub_pr_outcomes(mapping: &[(&str, GhOutcome)]) -> String {
+    let mut script = String::from(
+        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nbranch=\"$4\"\ncase \"$branch\" in\n",
+    );
+    for (branch, outcome) in mapping {
+        let body = match outcome {
+            GhOutcome::Fail => "    exit 1\n".to_string(),
+            GhOutcome::Empty => "    echo '[]'\n".to_string(),
+            GhOutcome::Merged(number) => format!(
+                "    echo '[{{\"number\":{number},\"mergedAt\":\"2024-01-01T00:00:00Z\"}}]'\n"
+            ),
+        };
+        script.push_str(&format!("  {branch})\n{body}    ;;\n"));
+    }
+    script.push_str("esac\n");
+    script
+}
+
 /// A worktree whose branch is diverged from `main` (so `Merged` doesn't fire) with a
 /// local branch and no upstream (so neither `BranchDeleted` nor `RemoteGone` fires),
-/// leaving the PR-merged lookup as the only possible signal.
+/// leaving the PR-merged lookup as the only possible signal. Carries a GitHub remote
+/// so the PR pass actually runs (it's skipped entirely without one).
 fn build_signal_less_diverged_worktree() -> Result<Fixture, Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
+        .remote("origin", "https://github.com/test/test.git")
         .worktree("feature")
         .build()?;
 
@@ -2401,13 +2424,7 @@ fn prune_yes_prunes_merged_pr_worktree_and_deletes_branch() -> Result<(), Box<dy
         .stderr(predicate::str::contains("Pruned 1 worktree"));
 
     feature_dir.assert(predicate::path::missing());
-    assert!(
-        fixture
-            .repo()?
-            .find_branch("feature", git2::BranchType::Local)
-            .is_err(),
-        "branch should have been deleted"
-    );
+    fixture.assert(predicate::repo::has_branch("feature").not());
 
     Ok(())
 }
@@ -2419,7 +2436,7 @@ fn prune_degrades_quietly_when_gh_missing() -> Result<(), Box<dyn std::error::Er
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     let output = prune_cmd
         .current_dir(&fixture)
-        .env("PATH", path_without_gh())
+        .env("PATH", PathStub::path_without("gh"))
         .arg("prune")
         .arg("--dry-run")
         .output()?;
@@ -2453,14 +2470,15 @@ fn prune_degrades_quietly_when_gh_pr_list_fails() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// A failing `gh` is repo-level (no GitHub remote, unauthenticated, offline), so the
-/// pass stops after the first failure rather than paying a failing subprocess for every
-/// remaining worktree.
+/// A `gh` that fails on every call still costs at most 3 subprocesses (the
+/// consecutive-failure bound), rather than one per worktree.
 #[test]
-fn prune_stops_pr_lookups_after_the_first_gh_failure() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_stops_pr_lookups_after_3_consecutive_gh_failures() -> Result<(), Box<dyn std::error::Error>>
+{
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
+        .remote("origin", "https://github.com/test/test.git")
         .worktree("feature-one")
         .worktree("feature-two")
         .worktree("feature-three")
@@ -2486,16 +2504,125 @@ fn prune_stops_pr_lookups_after_the_first_gh_failure() -> Result<(), Box<dyn std
         .success()
         .stderr(predicate::str::contains("No worktrees to prune"));
 
-    // One `--version` from check_gh_available, then exactly one `pr list` before the
-    // pass gives up. Without the early stop this would be three `pr list` calls.
+    // Three worktrees, three consecutive failures: the bound is hit exactly as the
+    // rows run out. Without the bound this would still be three calls (nothing to
+    // distinguish it from "no bound at all" here); `prune_does_not_stop_pass_after_a_single_gh_failure`
+    // and `prune_gh_empty_list_for_one_branch_does_not_stop_pass` below cover that a
+    // single failure or an empty result doesn't trip it early.
     let pr_list_calls = stub
         .invocations("gh")
         .into_iter()
         .filter(|line| line.starts_with("pr list"))
         .count();
     assert_eq!(
-        pr_list_calls, 1,
-        "expected the pass to stop after the first failure, got {pr_list_calls} pr list calls"
+        pr_list_calls, 3,
+        "expected exactly 3 pr list calls at the consecutive-failure bound, got {pr_list_calls}"
+    );
+
+    Ok(())
+}
+
+/// A single `gh` failure degrades that one row but doesn't stop the pass: it's below
+/// the consecutive-failure bound, so later rows still get looked up.
+#[test]
+fn prune_does_not_stop_pass_after_a_single_gh_failure() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "https://github.com/test/test.git")
+        .worktree("feature-one")
+        .worktree("feature-two")
+        .worktree("feature-three")
+        .build()?;
+
+    for branch in ["feature-one", "feature-two", "feature-three"] {
+        fixture
+            .commit(branch)
+            .file(&format!("{branch}.txt"), branch)
+            .create("Feature commit")?;
+    }
+
+    let stub = PathStub::new()?.binary(
+        "gh",
+        &gh_stub_pr_outcomes(&[
+            ("feature-one", GhOutcome::Fail),
+            ("feature-two", GhOutcome::Empty),
+            ("feature-three", GhOutcome::Merged(66)),
+        ]),
+    )?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PR #66 merged"));
+
+    let pr_list_calls = stub
+        .invocations("gh")
+        .into_iter()
+        .filter(|line| line.starts_with("pr list"))
+        .count();
+    assert_eq!(
+        pr_list_calls, 3,
+        "a single failure should not stop the pass, got {pr_list_calls} pr list calls"
+    );
+
+    Ok(())
+}
+
+/// An empty result for one branch (the common real case — a branch that never had a
+/// PR) doesn't stop the pass, and `find_merged_pr`'s array extraction handles it.
+#[test]
+fn prune_gh_empty_list_for_one_branch_does_not_stop_pass() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "https://github.com/test/test.git")
+        .worktree("no-pr")
+        .worktree("merged")
+        .build()?;
+
+    for branch in ["no-pr", "merged"] {
+        fixture
+            .commit(branch)
+            .file(&format!("{branch}.txt"), branch)
+            .create("Feature commit")?;
+    }
+
+    let stub = PathStub::new()?.binary(
+        "gh",
+        &gh_stub_pr_outcomes(&[
+            ("no-pr", GhOutcome::Empty),
+            ("merged", GhOutcome::Merged(66)),
+        ]),
+    )?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PR #66 merged"))
+        .stderr(predicate::str::contains("no-pr").not());
+
+    let pr_list_calls = stub
+        .invocations("gh")
+        .into_iter()
+        .filter(|line| line.starts_with("pr list"))
+        .count();
+    assert_eq!(
+        pr_list_calls, 2,
+        "expected both branches to be looked up, got {pr_list_calls} pr list calls"
     );
 
     Ok(())
@@ -2506,6 +2633,7 @@ fn prune_skips_pr_lookup_for_branch_already_deleted() -> Result<(), Box<dyn std:
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
+        .remote("origin", "https://github.com/test/test.git")
         .worktree("feature")
         .build()?;
 
