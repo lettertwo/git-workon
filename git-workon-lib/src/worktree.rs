@@ -10,7 +10,7 @@
 //! - **State detection**: `is_detached()`, `is_dirty()`, `is_valid()`, `is_locked()`
 //! - **Remote tracking**: `remote()`, `remote_branch()`, `remote_url()`, `remote_fetch_url()`, `remote_push_url()`
 //! - **Commit info**: `head_commit()`
-//! - **Status checks**: `has_unpushed_commits()`, `is_behind_upstream()`, `has_gone_upstream()`, `is_merged_into()`
+//! - **Status checks**: `has_unpushed_commits()`, `is_behind_upstream()`, `has_gone_upstream()`, `is_merged_into()`, `is_at_or_behind()`
 //!
 //! These methods enable status filtering (`--dirty`, `--ahead`, `--behind`, `--gone`) and
 //! interactive display with status indicators.
@@ -390,6 +390,52 @@ impl WorktreeDescriptor {
         // Check if current branch's commit is reachable from target
         // This means target is a descendant of (or equal to) current
         Ok(repo.graph_descendant_of(target_oid, current_oid)?)
+    }
+
+    /// Returns true if the worktree's HEAD is at or behind `oid`.
+    ///
+    /// "At or behind" means `oid` equals HEAD, or `oid` is a descendant of HEAD (HEAD's
+    /// commit is reachable from `oid`, i.e. `oid` carries everything HEAD has plus
+    /// possibly more). Used to confirm a merged PR's head actually covers the worktree's
+    /// current tip, rather than being a stale match from an earlier point in the
+    /// branch's history.
+    ///
+    /// Returns false if:
+    /// - HEAD cannot be resolved (e.g. unborn branch)
+    /// - `oid` does not parse as a commit hash
+    /// - `oid` does not resolve to a commit in this repository (it may only exist under
+    ///   `refs/remotes/` on the remote that reported it, which is fine — the commondir
+    ///   repo still has the object once fetched)
+    pub fn is_at_or_behind(&self, oid: &str) -> Result<bool> {
+        let head_oid_str = match self.head_commit()? {
+            Some(h) => h,
+            None => return Ok(false),
+        };
+
+        if head_oid_str == oid {
+            return Ok(true);
+        }
+
+        let target_oid = match git2::Oid::from_str(oid) {
+            Ok(o) => o,
+            Err(_) => return Ok(false),
+        };
+        let head_oid = match git2::Oid::from_str(&head_oid_str) {
+            Ok(o) => o,
+            Err(_) => return Ok(false),
+        };
+
+        // Open the bare repository (not the worktree) to check the target OID; it may
+        // only exist under refs/remotes/ there, the same as is_merged_into does.
+        let worktree_repo = Repository::open(self.path())?;
+        let commondir = worktree_repo.commondir();
+        let repo = Repository::open(commondir)?;
+
+        if repo.find_commit(target_oid).is_err() {
+            return Ok(false);
+        }
+
+        Ok(repo.graph_descendant_of(target_oid, head_oid)?)
     }
 
     /// Returns the commit hash (SHA) of the worktree's current HEAD.

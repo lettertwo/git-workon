@@ -40,12 +40,18 @@
 //! The `PrMerged` signal runs unconditionally, gated on the repo having a GitHub
 //! remote and `gh` being usable (a single `check_gh_available()` call, not one per
 //! row) — `gh` cannot resolve a PR without either. Rows that already carry a signal
-//! skip the lookup entirely. Any failure — `gh` missing, unauthenticated, or offline —
-//! degrades to no signal, with no warning: same under-report-only guarantee as the
-//! fetch above. A per-row failure alone doesn't stop the pass (a rate limit or DNS
-//! blip on one worktree shouldn't blank the signal for the rest); the pass gives up
-//! only after 3 consecutive failures, which bounds the cost of a repo-level failure
-//! (unauthenticated `gh`) without paying one failing subprocess per worktree.
+//! skip the lookup entirely. A merged PR only counts if its head OID actually covers
+//! the branch's current tip (equal, or the tip is an ancestor of it); otherwise a
+//! long-lived branch that was once a PR head (gitflow's `develop`/`production`, a
+//! `release/*` line) would read as permanently merged even after it moved on. A
+//! branch rewritten locally after its PR merged (restack, amend) loses the signal —
+//! it still surfaces via `--gone` after a fetch, or by naming the worktree. Any
+//! failure — `gh` missing, unauthenticated, or offline — degrades to no signal, with
+//! no warning: same under-report-only guarantee as the fetch above. A per-row failure
+//! alone doesn't stop the pass (a rate limit or DNS blip on one worktree shouldn't
+//! blank the signal for the rest); the pass gives up only after 3 consecutive
+//! failures, which bounds the cost of a repo-level failure (unauthenticated `gh`)
+//! without paying one failing subprocess per worktree.
 //!
 //! ## Protected Branch Matching
 //!
@@ -437,26 +443,37 @@ fn build_row<'a>(
 }
 
 /// Raise `Signal::PrMerged` for a row with no other signal, if `gh` reports a merged
-/// PR for its branch. Skips rows that already carry a signal (no local branch to look
-/// up, or the network call would just be redundant), and any `gh` failure degrades
-/// silently, matching the rest of prune's under-report-only contract.
+/// PR for its branch whose head covers the worktree's current tip. Skips rows that
+/// already carry a signal (no local branch to look up, or the network call would just
+/// be redundant), and any `gh` failure degrades silently, matching the rest of
+/// prune's under-report-only contract.
 ///
-/// Returns false when the `gh` call itself failed. A branch with no PR is `Ok(None)`,
-/// not an error, so a failure here means something is wrong with the lookup itself
-/// (rate limit, DNS blip, revoked auth mid-run) rather than "this branch has no PR".
-/// The caller tracks consecutive failures and gives up after enough of them in a row
-/// that `gh` is probably unusable here, rather than aborting on the first one and
-/// blanking the signal for every row after it.
+/// A merged PR alone isn't enough: gitflow-style long-lived branches (`develop`,
+/// `production`) are repeatedly a PR's head and never stop being one, so a bare
+/// "was this branch ever a merged PR's head" check fires forever on branches that
+/// have long since moved on. `is_at_or_behind` confirms the merged PR's head OID
+/// actually covers the branch's current tip (equal, or the tip is an ancestor of it)
+/// before treating it as evidence the work landed. A branch rewritten locally after
+/// its PR merged (restack, amend) loses this signal — it still surfaces via `--gone`
+/// after a fetch, or by naming the worktree.
+///
+/// Returns false when the `gh` call itself failed. A branch with no PR, or a merged
+/// PR whose head doesn't cover the tip, is not a failure — only the `gh` lookup
+/// itself failing is. The caller tracks consecutive failures and gives up after
+/// enough of them in a row that `gh` is probably unusable here, rather than aborting
+/// on the first one and blanking the signal for every row after it.
 fn fill_pr_merged(row: &mut PruneRow) -> bool {
     if !row.signals.is_empty() || row.branch.starts_with('(') {
         return true;
     }
     match find_merged_pr(&row.branch) {
-        Ok(Some(number)) => {
-            row.signals.push(Signal::PrMerged(number));
-            // A merged PR is unambiguous evidence the work landed, so the unmerged
-            // check (only meaningful for signal-less rows) no longer applies.
-            row.unmerged = false;
+        Ok(Some(merged)) => {
+            if row.wt.is_at_or_behind(&merged.head_oid).unwrap_or(false) {
+                row.signals.push(Signal::PrMerged(merged.number));
+                // A merged PR is unambiguous evidence the work landed, so the unmerged
+                // check (only meaningful for signal-less rows) no longer applies.
+                row.unmerged = false;
+            }
             true
         }
         Ok(None) => true,
