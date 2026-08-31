@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1](https://github.com/lettertwo/git-workon/compare/git-workon-v0.13.0...git-workon-v0.13.1) - 2026-08-31
+
+### Added
+
+- *(cli)* raise a PR-merged prune signal
+
+### Fixed
+
+- *(cli)* bound consecutive gh failures and require a github remote
+
+### Other
+
+- *(cli)* prove the gh failure bound with five worktrees
+- *(cli)* cover gh empty-list and bounded-failure prune cases
+- *(cli)* stop PR lookups after the first gh failure
+- *(cli)* note PrMerged in the active-criteria comments
+- *(cli)* cover prune's PR-merged signal and gh fallback
+
 ## [0.13.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.12.0...git-workon-v0.13.0) - 2026-08-30
 
 ### Added
