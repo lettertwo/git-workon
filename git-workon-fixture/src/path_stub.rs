@@ -43,7 +43,10 @@ impl PathStub {
     pub fn binary(self, name: &str, body: &str) -> Result<Self> {
         let path = self.dir.path().join(name);
         let log = self.invocation_log(name);
-        let script = format!("#!/bin/sh\necho \"$*\" >> {}\n{}\n", log.display(), body);
+        // Quote the log path: an unquoted path containing a space (e.g. a TMPDIR
+        // under a space-containing directory) would split the redirect target and
+        // break every stub invocation.
+        let script = format!("#!/bin/sh\necho \"$*\" >> '{}'\n{}\n", log.display(), body);
         std::fs::write(&path, script)?;
         set_executable(&path)?;
         Ok(self)
@@ -73,6 +76,19 @@ impl PathStub {
     /// The stub directory's path, for tests that need it directly.
     pub fn dir(&self) -> &std::path::Path {
         self.dir.path()
+    }
+
+    /// Builds a `PATH` value that excludes any directory containing a `name` binary,
+    /// for testing degradation when an external tool (e.g. `gh`) is absent. Doesn't
+    /// need a `PathStub` instance — it strips from the current process's `PATH`
+    /// rather than adding a stub directory to it.
+    pub fn path_without(name: &str) -> String {
+        std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .filter(|dir| !std::path::Path::new(dir).join(name).exists())
+            .collect::<Vec<_>>()
+            .join(":")
     }
 }
 
