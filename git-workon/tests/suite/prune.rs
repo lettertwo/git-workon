@@ -2318,11 +2318,24 @@ fn prune_keeps_namespace_dir_with_stray_file() -> Result<(), Box<dyn std::error:
 
 // ── PR-merged signal ──────────────────────────────────────────────────────────
 
+/// The current tip of `branch` in `fixture`'s repo, as a hex string, for stubbing a
+/// `gh` `headRefOid` that actually matches (or deliberately doesn't match) the
+/// worktree's real tip.
+fn branch_tip(fixture: &Fixture, branch: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let repo = fixture.repo()?;
+    let oid = repo
+        .find_branch(branch, git2::BranchType::Local)?
+        .get()
+        .target()
+        .ok_or("branch has no target")?;
+    Ok(oid.to_string())
+}
+
 /// A `gh` stub that answers `--version` with success and `pr list` with a merged PR
 /// for any branch, recording every invocation the fixture builder logs.
-fn gh_stub_reports_merged_pr(pr_number: u32) -> String {
+fn gh_stub_reports_merged_pr(pr_number: u32, head_oid: &str) -> String {
     format!(
-        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\necho '[{{\"number\":{pr_number},\"mergedAt\":\"2024-01-01T00:00:00Z\"}}]'\n"
+        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\necho '[{{\"number\":{pr_number},\"mergedAt\":\"2024-01-01T00:00:00Z\",\"headRefOid\":\"{head_oid}\"}}]'\n"
     )
 }
 
@@ -2339,8 +2352,8 @@ enum GhOutcome {
     Fail,
     /// Print an empty array, as if the branch never had a PR.
     Empty,
-    /// Print a single merged PR with the given number.
-    Merged(u32),
+    /// Print a single merged PR with the given number and `headRefOid`.
+    Merged(u32, String),
 }
 
 /// A `gh` stub whose `--version` succeeds and whose `pr list --head <branch>`
@@ -2354,8 +2367,8 @@ fn gh_stub_pr_outcomes(mapping: &[(&str, GhOutcome)]) -> String {
         let body = match outcome {
             GhOutcome::Fail => "    exit 1\n".to_string(),
             GhOutcome::Empty => "    echo '[]'\n".to_string(),
-            GhOutcome::Merged(number) => format!(
-                "    echo '[{{\"number\":{number},\"mergedAt\":\"2024-01-01T00:00:00Z\"}}]'\n"
+            GhOutcome::Merged(number, head_oid) => format!(
+                "    echo '[{{\"number\":{number},\"mergedAt\":\"2024-01-01T00:00:00Z\",\"headRefOid\":\"{head_oid}\"}}]'\n"
             ),
         };
         script.push_str(&format!("  {branch})\n{body}    ;;\n"));
@@ -2387,7 +2400,8 @@ fn build_signal_less_diverged_worktree() -> Result<Fixture, Box<dyn std::error::
 #[test]
 fn prune_dry_run_reports_merged_pr_signal() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_signal_less_diverged_worktree()?;
-    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+    let tip = branch_tip(&fixture, "feature")?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66, &tip))?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
@@ -2407,7 +2421,8 @@ fn prune_dry_run_reports_merged_pr_signal() -> Result<(), Box<dyn std::error::Er
 fn prune_yes_prunes_merged_pr_worktree_and_deletes_branch() -> Result<(), Box<dyn std::error::Error>>
 {
     let fixture = build_signal_less_diverged_worktree()?;
-    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+    let tip = branch_tip(&fixture, "feature")?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66, &tip))?;
 
     let feature_dir = fixture.cwd()?;
     feature_dir.assert(predicate::path::is_dir());
@@ -2548,12 +2563,13 @@ fn prune_does_not_stop_pass_after_a_single_gh_failure() -> Result<(), Box<dyn st
             .create("Feature commit")?;
     }
 
+    let feature_three_tip = branch_tip(&fixture, "feature-three")?;
     let stub = PathStub::new()?.binary(
         "gh",
         &gh_stub_pr_outcomes(&[
             ("feature-one", GhOutcome::Fail),
             ("feature-two", GhOutcome::Empty),
-            ("feature-three", GhOutcome::Merged(66)),
+            ("feature-three", GhOutcome::Merged(66, feature_three_tip)),
         ]),
     )?;
 
@@ -2601,11 +2617,12 @@ fn prune_gh_empty_list_for_one_branch_does_not_stop_pass() -> Result<(), Box<dyn
             .create("Feature commit")?;
     }
 
+    let merged_tip = branch_tip(&fixture, "merged")?;
     let stub = PathStub::new()?.binary(
         "gh",
         &gh_stub_pr_outcomes(&[
             ("no-pr", GhOutcome::Empty),
-            ("merged", GhOutcome::Merged(66)),
+            ("merged", GhOutcome::Merged(66, merged_tip)),
         ]),
     )?;
 
@@ -2648,7 +2665,12 @@ fn prune_skips_pr_lookup_for_branch_already_deleted() -> Result<(), Box<dyn std:
         .find_reference("refs/heads/feature")?
         .delete()?;
 
-    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+    // The branch is already deleted, so `fill_pr_merged` never calls `gh` for this
+    // row; the head oid here is never read.
+    let stub = PathStub::new()?.binary(
+        "gh",
+        &gh_stub_reports_merged_pr(66, "0000000000000000000000000000000000000000"),
+    )?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
@@ -2673,7 +2695,8 @@ fn prune_skips_pr_lookup_for_branch_already_deleted() -> Result<(), Box<dyn std:
 #[test]
 fn prune_json_includes_pr_merged_signal() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_signal_less_diverged_worktree()?;
-    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66))?;
+    let tip = branch_tip(&fixture, "feature")?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66, &tip))?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     let output = prune_cmd
@@ -2698,6 +2721,146 @@ fn prune_json_includes_pr_merged_signal() -> Result<(), Box<dyn std::error::Erro
         .as_array()
         .expect("signals should be array");
     assert!(signals.iter().any(|s| s.as_str() == Some("PR #66 merged")));
+
+    Ok(())
+}
+
+/// A gitflow-style branch that was once a PR's head but has since moved on (its tip
+/// now has commits past the merged PR's `headRefOid`) gets no `PrMerged` signal: the
+/// SHA comparison catches the stale match, and the ordinary `unmerged` check applies
+/// again instead.
+#[test]
+fn prune_dry_run_ignores_merged_pr_when_branch_moved_on() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = build_signal_less_diverged_worktree()?;
+    // Capture the tip as it stands (as if this were the commit the PR merged at),
+    // then move `feature` past it, the way a gitflow release/hotfix branch keeps
+    // advancing after each PR into it merges.
+    let merged_head_oid = branch_tip(&fixture, "feature")?;
+    fixture
+        .commit("feature")
+        .file("more.txt", "more")
+        .create("Commit after the PR merged")?;
+
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66, &merged_head_oid))?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PR #66 merged").not())
+        // Bare dry-run only shows rows carrying a signal; a signal-less row (the
+        // stale match produced no signal) doesn't appear at all.
+        .stderr(predicate::str::contains("feature").not());
+
+    Ok(())
+}
+
+/// The same stale-head scenario as above, but naming the worktree so it appears
+/// despite carrying no signal — proving `unmerged` was never cleared, since the row
+/// still gets blocked as unmerged rather than treated as safe to prune.
+#[test]
+fn prune_named_merged_pr_stale_head_is_blocked_as_unmerged(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_signal_less_diverged_worktree()?;
+    let merged_head_oid = branch_tip(&fixture, "feature")?;
+    fixture
+        .commit("feature")
+        .file("more.txt", "more")
+        .create("Commit after the PR merged")?;
+
+    let stub = PathStub::new()?.binary("gh", &gh_stub_reports_merged_pr(66, &merged_head_oid))?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("feature")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "has unmerged commits, use --allow-unmerged to override",
+        ));
+
+    fixture.assert(predicate::repo::has_branch("feature"));
+
+    Ok(())
+}
+
+/// A merged PR whose `headRefOid` is a local descendant of the branch's current tip —
+/// the PR was pushed from elsewhere and carries everything local plus more — still
+/// fires `PrMerged`, since the branch tip is fully covered by the merged head.
+#[test]
+fn prune_dry_run_reports_merged_pr_when_tip_is_ancestor_of_head(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_signal_less_diverged_worktree()?;
+    let repo = fixture.repo()?;
+    let tip_oid = git2::Oid::from_str(&branch_tip(&fixture, "feature")?)?;
+    let tip_commit = repo.find_commit(tip_oid)?;
+
+    // Build a descendant commit object without moving `feature` itself, and park it
+    // under a remote-tracking ref — the same place a real merged head can live when
+    // it was pushed from elsewhere and never fetched as a local branch.
+    let sig = git2::Signature::now("test", "test@test.com")?;
+    let descendant_oid = repo.commit(
+        None,
+        &sig,
+        &sig,
+        "Descendant of the local tip",
+        &tip_commit.tree()?,
+        &[&tip_commit],
+    )?;
+    fixture.create_remote_ref("origin/feature", descendant_oid)?;
+
+    let stub = PathStub::new()?.binary(
+        "gh",
+        &gh_stub_reports_merged_pr(66, &descendant_oid.to_string()),
+    )?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PR #66 merged"));
+
+    Ok(())
+}
+
+/// A merged PR payload missing `headRefOid` entirely produces no signal — there's
+/// nothing to compare the branch tip against, and the standing contract is to
+/// under-report rather than guess.
+#[test]
+fn prune_dry_run_ignores_merged_pr_without_head_oid() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = build_signal_less_diverged_worktree()?;
+    let stub = PathStub::new()?.binary(
+        "gh",
+        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\necho '[{\"number\":66,\"mergedAt\":\"2024-01-01T00:00:00Z\"}]'\n",
+    )?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("PR #66 merged").not())
+        .stderr(predicate::str::contains("feature").not());
 
     Ok(())
 }
