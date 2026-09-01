@@ -132,7 +132,8 @@ fn review_binary_path() -> std::path::PathBuf {
         .join("git-workon-review")
 }
 
-/// ADR-036 CS5 / M6 CS3's deferred seam: `git workon review <TAB>` shells out to the review
+/// ADR-036's source completion and sub-delegation / the external-subcommand-completion-
+/// enumeration-deferred seam: `git workon review <TAB>` shells out to the review
 /// binary's own `COMPLETE=` responder rather than completing against review's argument-less stub
 /// `Command` (`augment_external_subcommands`). Uses the *real* compiled `git-workon-review`
 /// (via `PathStub::command_exe`, not the canned `arg:`/`cwd:` script `command` writes) so the

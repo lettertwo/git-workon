@@ -122,7 +122,8 @@ fn external_shadows_same_named_branch_but_find_still_reaches_it(
         .build()?;
 
     // `git workon review` dispatches to the external even though a branch named `review`
-    // exists — installing the tool must guarantee this reaches it (locked decision 2).
+    // exists — installing the tool must guarantee this reaches it (locked decision: an
+    // installed external must be reachable even when a same-named branch exists).
     let output = cargo_bin_cmd!("git-workon")
         .current_dir(&fixture)
         .env("PATH", stub.path())
