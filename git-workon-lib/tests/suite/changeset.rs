@@ -208,9 +208,7 @@ both_formats!(graphite_current_branch_missing_ref_errors);
 
 // ── Stale-metadata head ───────────────────────────────────────────────────────
 
-fn trap7_spans_stale_branch_revision_to_live_head(
-    format: MetadataFormat,
-) -> Result<(), Box<dyn Error>> {
+fn stale_branch_revision_spans_to_live_head(format: MetadataFormat) -> Result<(), Box<dyn Error>> {
     let fixture = FixtureBuilder::new()
         .metadata_format(format)
         .graphite_config(&["main"])
@@ -251,9 +249,9 @@ fn trap7_spans_stale_branch_revision_to_live_head(
     }
     Ok(())
 }
-both_formats!(trap7_spans_stale_branch_revision_to_live_head);
+both_formats!(stale_branch_revision_spans_to_live_head);
 
-fn trap7_bogus_parent_revision_errors(format: MetadataFormat) -> Result<(), Box<dyn Error>> {
+fn bogus_parent_revision_errors(format: MetadataFormat) -> Result<(), Box<dyn Error>> {
     let bogus = "deadbeef".repeat(5);
     let fixture = FixtureBuilder::new()
         .metadata_format(format)
@@ -278,10 +276,10 @@ fn trap7_bogus_parent_revision_errors(format: MetadataFormat) -> Result<(), Box<
     }
     Ok(())
 }
-both_formats!(trap7_bogus_parent_revision_errors);
+both_formats!(bogus_parent_revision_errors);
 
 #[test]
-fn trap7_corrupt_sqlite_db_errors() -> Result<(), Box<dyn Error>> {
+fn corrupt_sqlite_db_errors() -> Result<(), Box<dyn Error>> {
     // Refs-format fixture with valid metadata, then garbage bytes at the sqlite db path —
     // proves the error isn't masked by a silent fallback to (valid!) refs metadata.
     let fixture = FixtureBuilder::new()
