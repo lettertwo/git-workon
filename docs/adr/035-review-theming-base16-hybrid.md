@@ -2,9 +2,9 @@
 
 ## Context
 
-The review TUI's colors were hardcoded during M3–M5: a `const … Color::Rgb(…)` block
+The review TUI's colors were hardcoded during the initial-renderer-through-stack-and-outline work: a `const … Color::Rgb(…)` block
 atop `render.rs` (dark-only) and a parallel `HIGHLIGHT_NAMES`/`HIGHLIGHT_COLORS` pair in
-`highlight.rs`. The everyday-usability pass (ahead of M7, see [ADR-034](034-review-git-native-config-schema.md))
+`highlight.rs`. The everyday-usability pass (ahead of the source-selector work, see [ADR-034](034-review-git-native-config-schema.md))
 adds built-in light/dark theming and terminal adaptivity. Four things had to be resolved:
 the color *philosophy* (respect the terminal's 16 ANSI colors vs. ship tuned truecolor),
 the theme *primitive*, the *mechanism* by which a theme reaches syntax highlighting, and
@@ -30,7 +30,7 @@ is spec-conformant.
   variants, cursor, selection, and **syntax**. Contrast is guaranteed because foreground and
   background come from the *same* scheme.
 - **Chrome (default text, dim labels, gutter/dividers) + the canvas background →
-  base16-ramp-controlled (revised post-CS6):** originally these were ANSI-named
+  base16-ramp-controlled (revised after the terminal-derivation-probe work):** originally these were ANSI-named
   (`Color::Gray`/`DarkGray`) and the canvas was never painted, on the theory that inheriting
   the terminal's own bg/fg would self-adapt for free. In practice this broke explicit
   `light`/`dark` selections outright — the terminal's own (often dark) bg/fg bled straight
@@ -51,17 +51,20 @@ capture→slot template.
 
 Diff-bg tints ideally come from base08 (red / spec "Diff Deleted") and base0B (green / spec
 "Diff Inserted") and the scheme background, so syntax and tints stay coordinated. **But the
-derivation is luminance-dependent, not a single "blend toward base00" (corrected in CS4):**
-- **Dark (base00 dark):** the shipped M3–M5 tints are more saturated/darker than *any* convex
+derivation is luminance-dependent, not a single "blend toward base00" (corrected in the
+base16-palette-primitive work):**
+- **Dark (base00 dark):** the shipped initial-renderer-through-stack-and-outline tints are more saturated/darker than *any* convex
   blend of an accent toward a dark base00 can produce (their green/blue channels sit *below*
   base00's). A blend toward a dark base00 also yields muddy mid-tones, not punchy washes. So
-  the **dark tints are held explicit** in `Palette::dark()` (byte-identical to M3–M5, per the
+  the **dark tints are held explicit** in `Palette::dark()` (byte-identical to the
+  initial-renderer-through-stack-and-outline values, per the
   pixel-identity gate). Deriving them would require scaling the accent toward *black* plus a
   desaturation step, not a base00 blend — not worth reverse-engineering the hand-tuned values.
 - **Light (base00 light) and terminal-derived:** blending an accent toward a *light* base00
-  gives the correct pale tint, so the `tint_toward` derivation applies there (CS5/CS6). A
+  gives the correct pale tint, so the `tint_toward` derivation applies there (the
+  curated-light-scheme and terminal-derivation-probe work). A
   terminal-derived theme on a *dark* background hits the same problem as dark and needs the
-  toward-black+desaturate construction — a CS6 concern.
+  toward-black+desaturate construction — a terminal-derivation-probe concern.
 
 Net: the scheme-coordinated derivation is real but must branch on background luminance; dark
 stays authored.
@@ -100,7 +103,7 @@ stays authored.
   the curated scheme chosen by background luminance if `OSC 11` answered, else `dark`.
   tmux/screen/ssh non-response is handled by the timeout, never a hang.
 
-**CS6 refinement — the diff-bg tints stay curated, only the scheme is derived.** In
+**Terminal-derivation-probe refinement — the diff-bg tints stay curated, only the scheme is derived.** In
 implementation, `auto` derives the base16 **scheme** (the 16 slots → syntax + monochrome ramp)
 from the terminal, but the **diff/cursor/selection tints stay curated by luminance** rather than
 derived from the probed accents (`Palette::from_terminal`: syntax = `SYNTAX_SLOTS` over the probed
@@ -117,7 +120,7 @@ ANSI-less slots are still synthesized as above; `parse` → `build_base16` → `
 read left untested (see `terminal_query.rs`).
 
 **Derived-washes addendum (2026-07-20) — `auto`'s diff washes derive from the probed accents
-after all; cursor/selection washes stay curated.** The CS6 refinement above is partially
+after all; cursor/selection washes stay curated.** The terminal-derivation-probe refinement above is partially
 reversed. Its objection (1) — "a convex blend toward a dark base00 can't reproduce the
 hand-tuned washes" — turned out to answer the wrong question: the goal isn't to reproduce the
 curated washes from probed inputs, it's to produce the washes the terminal's *theme author*
@@ -127,7 +130,7 @@ computes its editor diff backgrounds as `accent:mix(bg, 90)` — exactly the
 `tint_toward(accent, bg, k)` shape. `Palette::from_terminal` now derives del washes from probed
 base08 and add washes from probed base0B toward the probed base00: a dark probed background uses
 the dogfood-validated ratios (subtle 0.90, strong 0.75, staged 0.94/0.85 — staged still reads
-dimmer, locked decision #7), a light one reuses `Palette::light`'s hand-tuned ratio set.
+dimmer, per the staging-verbs staged-attribution decision), a light one reuses `Palette::light`'s hand-tuned ratio set.
 Objection (2) — arbitrary-palette unpredictability — is accepted residual risk, bounded by the
 `workon.review.theme.*` override tier (a wash that derives badly on some exotic palette is
 pinnable per-user). Cursor/selection/unfocused washes keep borrowing the curated set: they have
@@ -150,7 +153,7 @@ surprises (a teal cursor row on an aqua-leaning theme), so that judgment stays c
   to render; `FgSpan` loses its `Color` field in favor of a capture index. Existing render
   tests that assert concrete colors must resolve through a fixed test `Palette`.
 
-## Revised (CS2, visual-polish pass)
+## Revised (promoting semantic foregrounds to palette knobs, visual-polish pass)
 
 The "chrome that is never a theme knob (error/warn/current-marker) stays ANSI/const in
 `render.rs`" clause above is superseded. Those three colors are now `Palette` fields
@@ -162,7 +165,7 @@ precedent the diff/cursor tints follow); `light()` takes `ONE_LIGHT`'s base08/ba
 the syntax slots (matching the terminal, not curated-tint-borrowing). No other part of the
 hybrid boundary changes: this only moves three named colors from `const` to palette fields.
 
-## Revised (CS1, user-configurable colors tier)
+## Revised (user-configurable color-override keys)
 
 The "user-supplied base16 scheme … the deferred 'user-configurable colors' tier" noted in
 Consequences above lands, narrower than originally sketched: **per-slot and per-tint git-config
@@ -191,7 +194,7 @@ resolved — the mechanism is base-agnostic, so an override key works identicall
 role-mapped field(s) even when the current base hand-authored that field explicitly (e.g.
 `base08` under `theme = dark` replaces `dark()`'s hand-tuned `error_fg`) — the alternative
 (silently ignoring slot overrides for authored fields) is a UX trap: a user who sets `base08`
-expects red to change. Slot overrides do NOT re-derive the diff/cursor tints; that stays the 11
+expects red to change. Slot overrides do NOT re-derive the diff/cursor tints; that stays the 12
 tint keys' job, applied last and verbatim, so a slot override can't reshape a hand-tuned wash it
 wasn't asked to touch. An invalid value or an unrecognized key under `workon.review.theme.*` is
 ignored with a startup warning (the same posture as ADR-034's keybinding validation) — not a
@@ -203,7 +206,7 @@ to vendor) was considered and set aside — the override-key tier covers the imm
 named schemes slot in additively later (a `Theme::Named` variant + a `schemes.rs` of vendored
 constants) without touching this work if demand appears.
 
-**NO_COLOR (CS2).** The other extra this tier's Context section named — `NO_COLOR`, no CLI flag,
+**NO_COLOR (monochrome rendering).** The other extra this tier's Context section named — `NO_COLOR`, no CLI flag,
 no color-depth downgrade — lands as `Palette::mono(light: bool)`: every fg field, every syntax
 entry, and the canvas background collapse to `Color::Reset` (`paint_canvas: false`), while the
 11 diff/cursor washes become achromatic grayscale `Rgb` ladders (dark-terminal vs light-terminal
@@ -225,9 +228,9 @@ a palette-EXTERNAL color source `mono()`'s own `Color::Reset` fields can't reach
 carries a `colorless` flag (`false` on every curated/probed constructor, `true` only on `mono`)
 and `render.rs`'s icon paint sites collapse to `foreground` themselves whenever it's set.
 
-## Revised (CS11, diff foreground/background split)
+## Revised (diff foreground/background split)
 
-CS1's override table above named the diff washes `subtle`/`strong`. That naming is retired: it
+The user-configurable-color-override-keys work's override table above named the diff washes `subtle`/`strong`. That naming is retired: it
 described *intensity*, and intensity names invite reuse wherever something should look emphatic.
 `render.rs`'s outline status column duly reached for `add_strong`/`del_strong` as **foregrounds**
 for the X/Y letters — a background wash used as text color. On a theme whose washes are dark (the
@@ -277,7 +280,7 @@ then has no background signal, and the foreground is dimming against a full-stre
 derivation dims by up to the nominal ratio and stops early at a relative-luminance floor against
 that state's own edit wash. This is the first real contrast math in `theme.rs`, whose only prior
 arithmetic was `tint_toward`'s per-channel lerp; it is worth the ~25 lines because the failure it
-prevents is silent and theme-dependent. Note this is *not* the CS1 blend trap — that was about a
+prevents is silent and theme-dependent. Note this is *not* the user-configurable-color-override-keys blend trap — that was about a
 convex blend being unable to *reproduce* `dark()`'s hand-tuned washes (channels below base00);
 blending an accent toward base00 for a foreground is well-defined, and `light()` already does it.
 
@@ -288,7 +291,7 @@ text also retints the status column. Accepted; a theme wanting them apart can be
 appears.
 
 **`workon.review.diff.text` selects the foreground source on changed lines** — `syntax` (default,
-pixel-identical to CS1 behavior), `tint` (changed lines take the tint foreground), `edit` (syntax
+pixel-identical to the user-configurable-color-override-keys behavior), `tint` (changed lines take the tint foreground), `edit` (syntax
 stays on the line; only edits take the tint foreground). Context lines always keep syntax
 highlighting in every mode; `NO_COLOR`/`mono` still wins over all of it, unchanged. In `edit` mode
 an unpaired line takes the tint foreground across its full width, preserving the invariant
@@ -308,7 +311,7 @@ nothing, now documented rather than surprising.
 existing unknown-key startup warning. Pre-1.0, and a dual vocabulary would keep the retired model
 discoverable — which is the thing this revision exists to undo.
 
-**Corrections to CS1's table above:** it says "the 11 tint keys" while listing 12, and omits
+**Corrections to the user-configurable-color-override-keys table above:** it said "the 11 tint keys" while listing 12 (fixed above to 12), and omits
 `filler-fg` entirely (added later, when the filler hatch was screened back to its own base01
 foreground). The table in this revision supersedes it for the diff keys; `cursor-bg`,
 `selection-bg`, `cursor-unfocused-bg`, `pane-header-focused-fg`, and `filler-fg` are unchanged and

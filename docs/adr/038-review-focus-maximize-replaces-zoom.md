@@ -1,6 +1,6 @@
 # 038 — Review TUI: Replace the Zoom Enum with Focus + Maximize
 
-Status: accepted (2026-08-09, pre-merge review of the M3–M11 tower)
+Status: accepted (2026-08-09, pre-merge review of the initial-renderer-through-in-diff-navigation tower)
 
 ## Context
 
@@ -13,7 +13,7 @@ file actually has.
 Alongside it, and independent of it, `split_focus` tracks which half of a split has focus, toggled
 with `w`.
 
-Three findings from dogfooding through M11 and from reading the state space:
+Three findings from dogfooding through the in-diff navigation work and from reading the state space:
 
 **`Zoom::Combined` earns nothing.** Staging verbs refuse there — every verb writes the index, and
 the index is on neither side of HEAD ↔ worktree — so the state is read-only by construction, and
@@ -155,7 +155,7 @@ history at this ADR's commit, and the asymmetry rationale is preserved in its mo
 - **`cycle_zoom_walks_the_four_states_and_persists_across_file_nav` splits in two.** The cycle half
   goes; the persistence half becomes a `maximized` test. Add a case the old test could not express:
   maximized on the staged pane, navigate to another file, assert focus and maximize both survive
-  (decision 5).
+  (the `reset_panes` focus-preservation decision above).
 - **The attribution render test guards a real bug.** One test pins that
   `Attribution::build(None, None)` would otherwise miscolor every Add cell as already-staged. Read
   it before deleting and confirm the failure mode cannot reappear through `AttributionMode::Plain`.

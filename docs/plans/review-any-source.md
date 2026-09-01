@@ -1,4 +1,4 @@
-# Plan — Review Any Source (M7)
+# Plan — Review Any Source
 
 Design locked 2026-07-09. Decisions live in **[ADR-036](../adr/036-review-source-grammar.md)**
 (source grammar, per-shape resolution, error posture, completion scope, the
@@ -8,7 +8,7 @@ rationale. Glossary terms ("Review source", "Changeset span", "Uncommitted layer
 [CONTEXT.md](../../CONTEXT.md).
 
 Goal: `git workon review [<source>]` reviews *anything* — stack, uncommitted, ref, range,
-PR — not just the auto-detected state. Read-only for committed sources (M5 semantics);
+PR — not just the auto-detected state. Read-only for committed sources (stack-and-outline semantics);
 no-arg auto-detect behavior is byte-identical to today.
 
 ## Scope (five tracks)
@@ -27,44 +27,45 @@ no-arg auto-detect behavior is byte-identical to today.
    PR title carried through. No worktree is created.
 5. **Completion** — review-binary completer offers keywords + local branches + tags
    (and the RHS after `..`/`...`); git-workon's completer sub-delegates post-subcommand
-   words to `COMPLETE=<shell> git-workon-review` (the M6-deferred shell-out).
+   words to `COMPLETE=<shell> git-workon-review` (the CLI-integration-deferred shell-out).
 
 ## Changeset partition (Graphite stack)
 
 Linear stack — each unit extends the classifier the previous one introduced. Base:
-the current M3–M6.5 tower tip (`uc-roadmap-reprioritize`/`uc-pty-smoke`), or `main` once
+the current initial-renderer-through-usability-pass tower tip (`uc-roadmap-reprioritize`/`uc-pty-smoke`), or `main` once
 the tower lands. Each unit is land-alone (green + valuable by itself) and
 standalone-review (~≤400 non-mechanical lines).
 
 ```
 <tower tip>
- └─ m7-span-rename        CS1 ── ChangesetSource → ChangesetSpan (mechanical)
-     └─ m7-source-keywords CS2 ── Source enum, positional arg, stack/uncommitted keywords
-         └─ m7-source-revs  CS3 ── <ref> dispatch + ranges (grammar complete)
-             └─ m7-source-pr CS4 ── PR references via pr.rs
-                 └─ m7-complete CS5 ── source completion + git-workon sub-delegation
+ └─ m7-span-rename        ── ChangesetSource → ChangesetSpan (mechanical)
+     └─ m7-source-keywords ── Source enum, positional arg, stack/uncommitted keywords
+         └─ m7-source-revs  ── <ref> dispatch + ranges (grammar complete)
+             └─ m7-source-pr ── PR references via pr.rs
+                 └─ m7-complete ── source completion + git-workon sub-delegation
 ```
 
-Interim behavior is honest at every cut: before CS3, a ref/range argument fails the
-keyword match and errors pre-TUI as an unresolvable source; before CS4, `pr-123` falls
+Interim behavior is honest at every cut: before the `<ref>`-and-range-resolution
+changeset lands, a ref/range argument fails the keyword match and errors pre-TUI as an
+unresolvable source; before the PR-reference-resolution changeset lands, `pr-123` falls
 through to the ref arm and errors the same way (named, hinted).
 
 ## Per-changeset detail
 
-### CS1 — `m7-span-rename` (refactor, lib + review)
+### The ChangesetSource→ChangesetSpan rename (`m7-span-rename`, refactor, lib + review)
 
 - `refactor(lib): rename ChangesetSource to ChangesetSpan`. Type, `Changeset.source`
   field → `Changeset.span`, doc comments, all use sites in `acquire.rs`/`app.rs`/tests.
 - Purely mechanical; no behavior change. Verify: full workspace green, `grep -rn
   ChangesetSource` returns nothing.
 
-### CS2 — `m7-source-keywords` (review crate + one lib seam)
+### The stack/uncommitted source keywords (`m7-source-keywords`, review crate + one lib seam)
 
 - New `source.rs` in the review lib: `Source` enum
   (`Auto | Stack | Uncommitted | Ref(String) | Range{..} | Pr(PullRequest)`) with
-  `Source::classify(&str)` implementing the ADR precedence. In CS2 the classifier ships
-  with keyword + fallback-to-`Ref` arms only; `Ref` resolution errors as unresolvable
-  (real resolution is CS3). Classification is pure → unit-test exhaustively (keyword
+  `Source::classify(&str)` implementing the ADR precedence. In this changeset the classifier
+  ships with keyword + fallback-to-`Ref` arms only; `Ref` resolution errors as unresolvable
+  (real resolution is the `<ref>`-and-range-resolution changeset). Classification is pure → unit-test exhaustively (keyword
   exactness: `Stack` ≠ `stack` keyword? No — exact bare match is case-sensitive `stack`;
   `refs/heads/stack` classifies as `Ref`).
 - `Cli` gains `Option<String>` positional `[SOURCE]`; `main.rs` routes
@@ -77,17 +78,18 @@ through to the ref arm and errors the same way (named, hinted).
 - **Lib seam**: `assemble_changesets` must be able to omit the uncommitted layer
   (ADR-036: layer only when focused on real HEAD). Prefer an explicit parameter over a
   post-filter — a post-filter must also repair the `current` flag, which is subtle.
-  CS2 introduces the seam (keywords always run with the layer *on*, since `stack`
-  reviews HEAD's stack); CS3 is the first caller that turns it off.
+  This changeset introduces the seam (keywords always run with the layer *on*, since `stack`
+  reviews HEAD's stack); the `<ref>`-and-range-resolution changeset is the first caller that
+  turns it off.
 - New error variants in review `error.rs` per ADR-008 — **load `/docs errors` first**.
 - Verify: fixture tests for both keyword resolutions in Graphite and plain-git repos
   (sqlite + legacy metadata modes), error cases asserted with `NO_COLOR=1`.
 
-### CS3 — `m7-source-revs` (review crate + acquire)
+### `<ref>` and range resolution (`m7-source-revs`, review crate + acquire)
 
 - `Ref` resolution, dispatched on shape (ADR-036): Graphite-tracked branch →
   `assemble_changesets` focused there, uncommitted layer ON iff the ref is the actual
-  `HEAD` branch (first user of the CS2 lib seam); untracked branch → one committed
+  `HEAD` branch (first user of the stack/uncommitted-source-keywords lib seam); untracked branch → one committed
   changeset, base = merge-base(upstream, else trunk, else error); commit-ish →
   `parent..ref` (root commit: empty-tree base).
 - `Range` resolution: split on `...` first, then `..`; empty side → `HEAD`; rev-parse
@@ -98,7 +100,7 @@ through to the ref arm and errors the same way (named, hinted).
   `review <current-branch>` == auto-detect output (layer present); reviewing a non-HEAD
   tracked branch on a dirty tree asserts NO uncommitted layer and correct `current`.
 
-### CS4 — `m7-source-pr` (review crate, reuses lib `pr.rs`)
+### PR-reference resolution (`m7-source-pr`, review crate, reuses lib `pr.rs`)
 
 - Classifier gains the PR arm at top precedence (`parse_pr_reference`; also accept
   `pr-123` if the lib parser doesn't already — check first, extend the *lib parser*
@@ -111,15 +113,16 @@ through to the ref arm and errors the same way (named, hinted).
   the gh-network path itself is exercised manually — record the manual check in the
   changeset description).
 
-### CS5 — `m7-complete` (review crate + git-workon completer)
+### Source completion and sub-delegation (`m7-complete`, review crate + git-workon completer)
 
 - Review-binary completer: keywords + local branch names + tag names via git2 ref
   enumeration; when the current word contains `..`/`...`, complete the RHS ref the
   same way. Offline only; no PR numbers.
 - git-workon side: the dynamic completer's external-subcommand arm shells out
   `COMPLETE=<shell> git-workon-review -- <partial>` for post-subcommand words
-  (M6 CS3 left this seam documented; remember `_CLAP_COMPLETE_INDEX`).
-- Verify: completion integration tests per M6's pattern (`COMPLETE=` env protocol),
+  (the CLI-integration work's external-subcommand-completion-enumeration changeset left
+  this seam documented; remember `_CLAP_COMPLETE_INDEX`).
+- Verify: completion integration tests per the CLI-integration work's pattern (`COMPLETE=` env protocol),
   asserting keyword + ref candidates and the delegation path.
 
 ## Traps / notes for the implementer
@@ -127,8 +130,8 @@ through to the ref arm and errors the same way (named, hinted).
 - **Load `/docs testing` before any tests; `/docs errors` before error variants.**
 - `FORCE_COLOR=3` is set in this environment — output-asserting tests pin `NO_COLOR=1`.
 - Verify TUI behavior by instrumenting, never by grepping ratatui frames.
-- The Git-inference arm (`assemble_git`) is lib-complete and lib-tested; CS2 only wires
-  it. Don't reimplement.
+- The Git-inference arm (`assemble_git`) is lib-complete and lib-tested; the
+  stack/uncommitted-source-keywords changeset only wires it. Don't reimplement.
 - `resolve_changesets`'s doc comment explains why auto-detect must NOT route plain-git
   repos to `StackModel::Git` — that reasoning stays true; only the explicit `stack`
   keyword takes the Git arm.
@@ -146,7 +149,7 @@ cargo fmt --all -- --check
 cargo run -p git-workon-review -- <source>   # manual: each source shape renders
 ```
 
-## Acceptance (RFC M7)
+## Acceptance (RFC source-selector work)
 
 `git workon review <ref>` / `<a..b>` / `pr-123` renders the right changeset(s);
 `git workon review <TAB>` completes sources.

@@ -1,11 +1,11 @@
 # 036 — Review Source: One Sniffed Positional, Shape-Aware Resolution
 
-Status: accepted (2026-07-09, M7 design session)
+Status: accepted (2026-07-09, source-selector design session)
 
 ## Context
 
-Through M6.5 the review binary's `Cli` is empty: it reviews only what auto-detect finds
-(the Graphite stack when one is active, else a single uncommitted changeset). M7 makes it
+Through the usability pass the review binary's `Cli` is empty: it reviews only what auto-detect finds
+(the Graphite stack when one is active, else a single uncommitted changeset). The source-selector work makes it
 review *anything* — the RFC's "review any source" — which forces three intertwined
 decisions: how a source is spelled on the command line, what changeset(s) each spelling
 resolves to, and what happens when resolution fails. This is the binary's entire
@@ -34,10 +34,11 @@ only the exact bare word matches the keyword.
 **`stack` keyword** — "give me the real stack": Graphite metadata when active, otherwise
 git-inference (the lib's already-built `StackModel::Git` arm: one changeset per commit in
 `upstream..HEAD`). No metadata and no upstream is a real error, never a silent fall-through
-to uncommitted — an explicit ask deserves an explicit failure. This ships the M5-deferred
-`StackModel::Git` wiring, scoped to the one keyword that means it.
+to uncommitted — an explicit ask deserves an explicit failure. This ships the
+stack-and-outline-deferred `StackModel::Git` wiring, scoped to the one keyword that means it.
 
-**`uncommitted` keyword** — always the single uncommitted changeset (M2–M4 behavior),
+**`uncommitted` keyword** — always the single uncommitted changeset (the
+diff-model-and-patch-synthesis-through-staging-verbs behavior),
 even in a Graphite repo.
 
 **`<ref>` — shape-aware dispatch.** Match what a person most plausibly means per shape:
@@ -76,13 +77,13 @@ to name the source.
 
 **Completion — keywords + local branches + tags.** Offline git2 ref enumeration only;
 after a `..`/`...` prefix, complete the right-hand ref the same way. No PR-number
-completion (network in the TAB hot path). This is M6's deferred sub-delegation trigger:
+completion (network in the TAB hot path). This is the CLI-integration work's deferred sub-delegation trigger:
 git-workon's dynamic completer now shells out to `COMPLETE=<shell> git-workon-review` for
 post-subcommand words.
 
 **Rename `ChangesetSource` → `ChangesetSpan`.** Its doc comment already says "what a
 Changeset spans"; the rename frees "source" for the user-facing concept every roadmap
-document already uses. Safe while the M1–M6.5 tower is unmerged.
+document already uses. Safe while the lib-changeset-assembly-through-usability-pass tower is unmerged.
 
 ## Consequences
 
@@ -90,7 +91,7 @@ document already uses. Safe while the M1–M6.5 tower is unmerged.
   (Auto | Stack | Uncommitted | Ref | Range | Pr) becomes the seam between CLI parse and
   changeset resolution.
 - Stack assembly for a non-HEAD tracked branch must suppress the uncommitted layer — a
-  lib-side knob or an acquire-side filter (execution detail, see the M7 plan).
+  lib-side knob or an acquire-side filter (execution detail, see the source-selector plan).
 - `review <trunk>` resolves through the untracked-branch arm via its upstream (unpushed
   commits) — an acceptable edge, not a special case.
 - Git-inference changesets become reachable from the binary for the first time; its

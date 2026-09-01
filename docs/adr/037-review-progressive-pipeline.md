@@ -4,12 +4,12 @@ Status: accepted (2026-07-10, progressive-pipeline design session)
 
 ## Context
 
-The M7 performance pass (perf-gt-detect … perf-pty-responsiveness) removed the worst
+The source-selector performance pass (perf-gt-detect … perf-pty-responsiveness) removed the worst
 launch and navigation stalls, but two synchronous gaps remain: the idle-deferred file load
 runs on the event-loop thread (a huge file holds input hostage for its own load once the
 80ms debounce fires), and startup diffs complete in full — behind the splash, but not
 streamed — before the outline appears. Closing them means work moves off the event-loop
-thread, which **supersedes M4's locked decision #4** ("a synchronous poll on the existing
+thread, which **supersedes the staging-verbs work's sync-runtime decision** ("a synchronous poll on the existing
 `Tick`… No threads, no `mpsc`, no new deps" — recorded in `tui.rs`'s module doc, not an
 ADR). This ADR retires the "no threads" letter of that decision while keeping its "no new
 deps" spirit: everything below is `std::sync::mpsc` + `std::thread`. Zero new dependencies.
@@ -72,7 +72,7 @@ chokepoint keeps its meaning: an action that reads the view (`s`, cursor moves, 
 finds the cache warm or loads *synchronously right there* — `App` keeps its own
 `Repository` + `TsHighlighter` for exactly this and for staging. The in-flight loader
 result later hits "already cached" and is discarded. The loader is thereby a **pure
-cache-warmer: correctness never depends on it**, and the CS4 invariant (deferred-then-
+cache-warmer: correctness never depends on it**, and the idle-deferred-file-loads invariant (deferred-then-
 completed open ≡ eager open, byte-identical) survives trivially. Accepted cost: `s` on a
 just-reached huge file can still block for that file's load — the price of byte-identical
 action semantics without action-replay machinery (queueing actions until `FileReady` was
@@ -130,10 +130,10 @@ stay untouched (defer off, slots constructed `Ready`).
 
 ## Consequences
 
-- `tui.rs`'s module doc note pinning M4 locked decision #4 must be rewritten to point
-  here; the M4 index-watcher *semantics* (signature compare on the tick beat, echo
-  suppression) are unchanged — only the beat's mechanism moves from `event::poll` timeout
-  to `recv_timeout`.
+- The sync-poll comments in `app.rs` and `tui.rs` pinning the staging-verbs work's
+  sync-runtime decision must be rewritten to point here; that work's index-watcher
+  *semantics* (signature compare on the tick beat, echo suppression) are unchanged — only
+  the beat's mechanism moves from `event::poll` timeout to `recv_timeout`.
 - `AppEvent` stops being `Copy`; `drain_pending`/`next_event` reshape around the inbox;
   the input thread becomes the only code that touches crossterm's event API.
 - The splash survives only on the lone-changeset path; for stacks the first frame is the
