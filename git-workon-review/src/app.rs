@@ -2,7 +2,7 @@
 //! highlight cache + word-diff cache), and navigation/scroll state.
 //!
 //! Ported from the `review-tui-spike` prototype's `model.rs` — renamed here because `model`
-//! already means the diff model in this crate (see the M3 plan's naming rule).
+//! already means the diff model in this crate (see the initial-renderer plan's naming rule).
 //!
 //! Renders the staged/unstaged split when both sides have content, and the **whole** (`HEAD`
 //! ↔ worktree, or `base` ↔ `head` for a committed changeset) diff otherwise — see
@@ -61,12 +61,13 @@ const HSCROLL_STEP: usize = 8;
 /// | Modified / Unmerged    | `HEAD` blob at `path`                | worktree file at `path`     |
 ///
 /// The new side reads from the **worktree file on disk**, not the index blob — unstaged
-/// content isn't in the object database; reading the staged (index) blob is an M4 concern (the
-/// staged/unstaged split zoom).
+/// content isn't in the object database; reading the staged (index) blob is a
+/// staging-verbs concern (the staged/unstaged split zoom).
 #[derive(Debug)]
 pub struct FileView {
-    /// The pre-collapse row list [`Self::display`]/[`Self::inline`] derive from — retained (CS8)
-    /// so a gap can be re-collapsed with a wider [`GapExpansion`] window without re-diffing the
+    /// The pre-collapse row list [`Self::display`]/[`Self::inline`] derive from — retained
+    /// (progressive gap expansion) so a gap can be re-collapsed with a wider [`GapExpansion`]
+    /// window without re-diffing the
     /// file. `AlignedRow` is small/`Copy`, so cloning the whole vector per expansion is cheap
     /// relative to re-running `align_file`.
     aligned: Vec<AlignedRow>,
@@ -75,7 +76,8 @@ pub struct FileView {
     /// [`Self::load`] — expansions are NOT preserved across a refresh; the view rebuilds from
     /// scratch and every gap re-collapses to its base window. See [`Self::expand_gap`].
     expansions: HashMap<usize, GapExpansion>,
-    /// The file's hunks, retained (CS8) alongside [`Self::aligned`] so [`Self::rebuild_rows`] can
+    /// The file's hunks, retained (progressive gap expansion) alongside [`Self::aligned`] so
+    /// [`Self::rebuild_rows`] can
     /// recompute [`Self::display_hunk`]/[`Self::inline_hunk`] after an expansion without needing
     /// the original [`FileChange`] back.
     hunks: Vec<Hunk>,
@@ -246,7 +248,7 @@ impl FileView {
         self.inline_word_spans.clear();
     }
 
-    /// Accumulate an expansion request for the gap keyed `key` (CS8's progressive reveal) and
+    /// Accumulate an expansion request for the gap keyed `key` (progressive gap expansion) and
     /// rebuild the derived rows. `more_before`/`more_after` ADD to whatever was already revealed
     /// at that edge (repeated `Enter` presses widen further); `full` is sticky — once set for this
     /// gap it stays set. A `key` with no matching gap in the current `display` is harmless: the
@@ -303,7 +305,7 @@ impl FileView {
         changed
     }
 
-    /// CS9's scope-reveal: widen the gap keyed `key` to uncover a tree-sitter scope range
+    /// The tree-sitter scope reveal: widen the gap keyed `key` to uncover a tree-sitter scope range
     /// `[scope_start, scope_end]` (1-based, inclusive — as returned by
     /// [`crate::scope::enclosing_scope_lines`]) that encloses the gap's anchor line, in
     /// `anchor_prefers_new`'s frame (new-side lineno when `true`, old-side when `false` — see
@@ -471,7 +473,7 @@ impl FileView {
             .unwrap_or_default()
     }
 
-    /// M11 CS3 (search): literal, smartcase matches of `query` against this file's PRE-collapse
+    /// The in-diff search: literal, smartcase matches of `query` against this file's PRE-collapse
     /// row space — see [`crate::search::compute_matches`]'s doc comment for why that space (not
     /// [`Self::display`]/[`Self::inline`]) is what's scanned.
     pub(crate) fn search_matches(&self, query: &str) -> Vec<crate::search::SearchMatch> {
@@ -486,7 +488,8 @@ impl FileView {
 
 /// The tree a WHOLE-role [`FileView`]'s old side reads from (see [`FileView::load`]'s role
 /// table): the changeset's `base` commit for a committed changeset, or the live `HEAD` for the
-/// uncommitted layer — the only case M2–M4 ever had, and what [`App::base_label`] already
+/// uncommitted layer — the only case the crate ever had before the staging-verbs work, and
+/// what [`App::base_label`] already
 /// names. A committed changeset's whole role is `base..head` (there is no staged/unstaged
 /// split to disagree with it — see [`DiffState::from_committed`]), so the old side must read
 /// `base`'s blob, not whatever `HEAD` happens to be right now.
@@ -512,7 +515,8 @@ fn old_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tre
 
 /// The tree a WHOLE-role [`FileView`]'s NEW side reads from (see [`FileView::load`]'s role
 /// table): the changeset's `head` commit for a committed changeset, or `None` for the uncommitted
-/// layer — where `None` means "read the worktree", the only new-side source M2–M4 ever had. A
+/// layer — where `None` means "read the worktree", the only new-side source the crate ever
+/// had before the staging-verbs work. A
 /// committed changeset's whole role is `base..head`, so its new side must read `head`'s blob,
 /// not the current worktree (which for an OLDER committed changeset differs from `head` and would
 /// break the align invariant against the `base..head` hunks). The mirror of [`old_side_tree_for`].
@@ -619,14 +623,17 @@ fn read_workdir_file(repo: &Repository, path: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Default outline pane width (locked design: "~35 cols") — the CS7
+/// Default outline pane width (locked design: "~35 cols") — the view-config settings'
 /// (`workon.review.outline.width`) fallback when the setting is unset, out of range, or the
-/// config read fails. Was a `render.rs`-local const before CS7; now App-owned state since it's
+/// config read fails. Was a `render.rs`-local const before the view-config settings; now
+/// App-owned state since it's
 /// configurable per session (see [`OutlineState::width`]).
 pub const DEFAULT_OUTLINE_WIDTH: u16 = 35;
-/// Sane clamp bounds for `workon.review.outline.width` (CS7). Below `MIN_OUTLINE_WIDTH` the
+/// Sane clamp bounds for `workon.review.outline.width` (the view-config settings). Below
+/// `MIN_OUTLINE_WIDTH` the
 /// pane can't show a useful path fragment; above `MAX_OUTLINE_WIDTH` it would swallow the diff
-/// pane on any reasonable terminal. Also addresses M5's deferred narrow-terminal papercut: a
+/// pane on any reasonable terminal. Also addresses the stack-and-outline work's deferred
+/// narrow-terminal papercut: a
 /// user on a narrow terminal can now set a smaller width instead of losing the diff pane
 /// entirely to a fixed 35-col outline.
 pub const MIN_OUTLINE_WIDTH: u16 = 10;
@@ -655,7 +662,7 @@ pub enum Role {
     Staged,
 }
 
-/// `workon.review.diff.text` (see ADR-035's "Revised (CS11, diff foreground/background split)"
+/// `workon.review.diff.text` (see ADR-035's "Revised (diff foreground/background split)"
 /// section): which foreground source changed lines render with. A **behavior selector, not a
 /// color** — it lives on `App` rather than [`crate::theme::Palette`] because it decides which
 /// already-resolved palette color a segment picks, not what a color IS. Context lines always keep
@@ -688,9 +695,11 @@ pub enum EffectiveZoom {
 /// Resolve the diff pane's requested state — the focused split pane's role and whether it's
 /// [`App::maximized`] — to the [`EffectiveZoom`] a file can actually show, given which of its
 /// sub-diffs exist (`has_unstaged`/`has_staged` = the file's path appears in that role's
-/// `DiffModel`) and whether it's stageable at all (`can_stage` = non-binary in M4).
+/// `DiffModel`) and whether it's stageable at all (`can_stage` = non-binary, per the staging-
+/// verbs work).
 ///
-/// Rules (a pure gate, unit-tested against the full truth table — ADR-038 decision 3):
+/// Rules (a pure gate, unit-tested against the full truth table — ADR-038, "`effective_zoom`
+/// takes the new inputs and narrows"):
 /// - not stageable → [`Role::Whole`] (binary files render the placeholder; no attribution);
 /// - both sub-diffs, maximized → `Single(focus_role)`;
 /// - both sub-diffs, not maximized → `Split`;
@@ -725,9 +734,10 @@ pub fn effective_zoom(
     }
 }
 
-/// The valid config strings for one of the CS7 view-config enums, in declaration order — the
-/// single source both the `parse_*` functions below and their warning messages
-/// (`App::apply_view_config`, config-validation-completeness Decision 5) read from, so the
+/// The valid config strings for one of the view-config settings' enums, in declaration order
+/// — the single source both the `parse_*` functions below and their warning messages
+/// (`App::apply_view_config`, invalid-value warnings name the allowed set and the fallback)
+/// read from, so the
 /// "valid: …" list in a warning can never list a name the parser doesn't actually accept (or
 /// omit one it does).
 fn valid_options_list<T: Copy>(options: &[(&str, T)]) -> String {
@@ -751,8 +761,9 @@ fn default_option_name<T: Copy + PartialEq + Default>(
         .expect("T::default() has a canonical name listed in `options`")
 }
 
-/// Look up `raw` in one of the CS7 `*_OPTIONS` tables below — `None` on anything not in
-/// `options`, the "unrecognized" signal [`resolve_option`] falls back to a default and warns on.
+/// Look up `raw` in one of the view-config settings' `*_OPTIONS` tables below — `None` on
+/// anything not in `options`, the "unrecognized" signal [`resolve_option`] falls back to a
+/// default and warns on.
 fn parse_option<T: Copy>(options: &[(&str, T)], raw: &str) -> Option<T> {
     options
         .iter()
@@ -781,7 +792,8 @@ fn resolve_option<T: Copy + PartialEq + Default>(
     })
 }
 
-/// `workon.review.outline.mode` (CS7)'s valid config strings, kebab-cased mirrors of the
+/// `workon.review.outline.mode` (the view-config settings)'s valid config strings, kebab-cased
+/// mirrors of the
 /// [`OutlineMode`] variant names, in [`App::apply_view_config`]'s warning order. Resolved via
 /// [`resolve_option`] — [`App::apply_view_config`] falls back to [`OutlineMode::default`] and
 /// warns on anything not listed here.
@@ -792,7 +804,8 @@ const OUTLINE_MODE_OPTIONS: &[(&str, OutlineMode)] = &[
     ("stack-tree", OutlineMode::StackTree),
 ];
 
-/// `workon.review.outline.order` (CS3)'s valid config strings, kebab-cased mirrors of the
+/// `workon.review.outline.order` (the outline side pane's stack-and-outline work)'s valid config
+/// strings, kebab-cased mirrors of the
 /// [`OutlineOrder`] variant names. Resolved via [`resolve_option`] — [`App::apply_view_config`]
 /// falls back to [`OutlineOrder::default`] and warns on anything not listed here.
 const OUTLINE_ORDER_OPTIONS: &[(&str, OutlineOrder)] = &[
@@ -800,21 +813,24 @@ const OUTLINE_ORDER_OPTIONS: &[(&str, OutlineOrder)] = &[
     ("base-first", OutlineOrder::BaseFirst),
 ];
 
-/// `workon.review.icons` (CS5)'s valid config strings, kebab-cased mirrors of the [`IconMode`]
-/// variant names. Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to
-/// [`IconMode::default`] (also `none` — CS5's no-auto-detection default) and warns on anything
+/// `workon.review.icons` (file-status letters and opt-in nerd icons)'s valid config strings,
+/// kebab-cased mirrors of the [`IconMode`] variant names. Resolved via [`resolve_option`] —
+/// [`App::apply_view_config`] falls back to [`IconMode::default`] (also `none` — its
+/// no-auto-detection default) and warns on anything
 /// not listed here.
 const ICON_MODE_OPTIONS: &[(&str, IconMode)] =
     &[("none", IconMode::None), ("nerd", IconMode::Nerd)];
 
-/// `workon.review.diff.layout` (CS7)'s valid config strings, mirroring the [`Layout`] variant
+/// `workon.review.diff.layout` (the view-config settings)'s valid config strings, mirroring the
+/// [`Layout`] variant
 /// names. Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to
 /// [`Layout::default`] and warns on anything not listed here.
 const DIFF_LAYOUT_OPTIONS: &[(&str, Layout)] = &[("sbs", Layout::Sbs), ("inline", Layout::Inline)];
 
-/// `workon.review.diff.text` (CS11)'s valid config strings, mirroring the [`DiffTextMode`]
-/// variant names — see [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s
-/// "Revised (CS11, diff foreground/background split)" section. Resolved via [`resolve_option`]
+/// `workon.review.diff.text` (the diff foreground/background split)'s valid config strings,
+/// mirroring the [`DiffTextMode`] variant names — see
+/// [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s
+/// "Revised (diff foreground/background split)" section. Resolved via [`resolve_option`]
 /// — [`App::apply_view_config`] falls back to [`DiffTextMode::default`] and warns on anything
 /// not listed here.
 const DIFF_TEXT_OPTIONS: &[(&str, DiffTextMode)] = &[
@@ -823,7 +839,8 @@ const DIFF_TEXT_OPTIONS: &[(&str, DiffTextMode)] = &[
     ("edit", DiffTextMode::Edit),
 ];
 
-/// CS4: which outline row a Header/Dir cursor selection resolves to — [`App::summary_target`]'s
+/// The summary panel: which outline row a Header/Dir cursor selection resolves to —
+/// [`App::summary_target`]'s
 /// return type, and the input [`App::summary_for`] consumes to build the renderable summary.
 /// `render.rs`'s `render_summary` never matches on this directly — it only calls
 /// `App::summary_for`/renders the [`Summary`] that comes back.
@@ -838,16 +855,17 @@ pub enum SummaryTarget {
     Dir { cs_idx: Option<usize>, path: String },
 }
 
-/// CS4: the renderable summary [`App::summary_for`] builds for a [`SummaryTarget`] — a thin
-/// wrapper so `render.rs` has one return type to match on regardless of which kind of row was
-/// selected.
+/// The summary panel: the renderable summary [`App::summary_for`] builds for a
+/// [`SummaryTarget`] — a thin wrapper so `render.rs` has one return type to match on regardless
+/// of which kind of row was selected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Summary {
     Changeset(summary::ChangesetSummary),
     Dir(summary::DirSummary),
 }
 
-/// CS7: a stable identity for an outline File/Dir row, captured BEFORE a staging/discard op's
+/// The outline staging verbs: a stable identity for an outline File/Dir row, captured BEFORE a
+/// staging/discard op's
 /// `coordinated_refresh` rebuilds [`App::outline_items`]'s row list, so the row can be re-found
 /// (or gracefully lost, e.g. a fully-discarded file) afterward — see
 /// [`App::restore_outline_position`]. `cs_idx`/`path` mirror the row's own fields, EXCEPT a
@@ -932,15 +950,17 @@ pub struct OutlineState {
     pub focused: bool,
     pub cursor: usize,
     pub mode: OutlineMode,
-    /// The outline pane's column width — `workon.review.outline.width` (CS7), defaulting to
-    /// [`DEFAULT_OUTLINE_WIDTH`]. Read by `render.rs` in place of the old fixed const.
+    /// The outline pane's column width — `workon.review.outline.width` (the view-config
+    /// settings), defaulting to [`DEFAULT_OUTLINE_WIDTH`]. Read by `render.rs` in place of the
+    /// old fixed const.
     pub width: u16,
     /// Top-of-viewport row index into [`App::outline_items`]'s row list, derived from `cursor`
     /// via the same scrolloff discipline as [`App::scroll`] (see [`App::derive_outline_scroll`]) —
     /// never written directly.
     pub scroll: usize,
     /// Which end of the stack the stack-shaped modes display first — `workon.review.outline.order`
-    /// (CS3), defaulting to [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
+    /// (the outline side pane's stack-and-outline work), defaulting to
+    /// [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
     pub order: OutlineOrder,
     /// Column pan offset (display columns) for the outline pane — the outline's own analog of
     /// [`App::hscroll`], since a long path is hard-clipped at the outline's fixed width just like
@@ -950,7 +970,7 @@ pub struct OutlineState {
     /// here. Reset to `0` by [`App::outline_cycle_mode`] — the row list (and therefore the set of
     /// paths on screen) changes shape there, the same reason that resyncs the cursor.
     pub hscroll: usize,
-    /// CS5 (`outline-fold`): per-[`OutlineMode`] sets of collapsed [`FoldKey`]s — a Header row's
+    /// `outline-fold`: per-[`OutlineMode`] sets of collapsed [`FoldKey`]s — a Header row's
     /// changeset label PLUS its `cs_idx`, or a Dir row's full path (+ owning changeset `cs_idx` in
     /// `StackTree`) — see [`FoldKey`]'s own doc comment for why `cs_idx` is load-bearing there,
     /// not decorative (a changeset's `label` alone can collide with its own uncommitted layer's).
@@ -961,7 +981,8 @@ pub struct OutlineState {
     /// outlives its own toggling row's disappearance and reappearance (e.g. a discard-then-recreate
     /// of the same path) for as long as the session runs.
     pub folds: HashMap<OutlineMode, HashSet<FoldKey>>,
-    /// CS2 (`outline-filter`, M11): the fuzzy-filter query, `/` while the outline has focus opens.
+    /// The outline fuzzy filter (`outline-filter`): the fuzzy-filter query, `/` while the outline
+    /// has focus opens.
     /// Read fresh every [`App::outline_items`] call (via [`outline::fold_outline_filtered`])
     /// rather than
     /// cached — persistence across a rebuild (staging op, mode cycle, refresh) is therefore free:
@@ -970,7 +991,8 @@ pub struct OutlineState {
     /// [`Self::filter_focused`] for the two-focus model this pairs with.
     pub filter: PromptState,
     /// Whether the one-row filter input (not the outline row list) currently has keyboard capture
-    /// — the prototype's two-focus model (locked design #2 in the M11 plan): `/` sets this `true`;
+    /// — the prototype's two-focus model (locked design: two-focus input model, in the
+    /// in-diff navigation plan): `/` sets this `true`;
     /// `Enter`/`Esc` set it back to `false` while KEEPING [`Self::filter`]'s query; `Ctrl-c` clears
     /// the query AND sets this `false`. Meaningless unless [`OutlineState::focused`] is also
     /// `true` — the filter input can't have keyboard capture while the diff pane does.
@@ -1007,7 +1029,8 @@ struct PaneState {
     scroll: usize,
 }
 
-/// CS6: a staging op's pre-op position, captured by [`App::capture_position`] before
+/// Staging preserves the diff position: a staging op's pre-op position, captured by
+/// [`App::capture_position`] before
 /// `coordinated_refresh` and restored by [`App::restore_position`] after — so a staging op keeps
 /// the reviewer's place instead of `reset_panes`' first-hunk reseat (that reseat still runs for
 /// every MANUAL nav: file/changeset switches, maximize toggles). `path` + `role` say WHERE (the same
@@ -1098,14 +1121,16 @@ fn derive_scroll_value(
 
 /// One changeset's diff state: its [`workon::Changeset`] descriptor (name, source, restack
 /// status), the [`DiffState`] acquired for it, and its own per-file, per-role lazily built
-/// [`FileView`] caches — the same three `views_*` vectors [`App`] held directly through M4,
-/// now scoped per changeset since M5 reviews more than one at a time.
+/// [`FileView`] caches — the same three `views_*` vectors [`App`] held directly through the
+/// staging-verbs work, now scoped per changeset since the stack-and-outline work reviews more
+/// than one at a time.
 ///
 /// A committed changeset's [`Self::diff`] has empty staged/unstaged sub-models (see
 /// [`DiffState::from_committed`]), which is enough on its own to render it read-only: the
 /// existing [`effective_zoom`] gate collapses `Split`/`Unstaged`/`Staged` to
 /// [`EffectiveZoom::Single(Role::Whole)`] whenever both sub-diffs are absent — no
-/// committed-specific rendering code needed for M5's spine (the mode-aware staging refusal and
+/// committed-specific rendering code needed for the stack-and-outline work's spine (the
+/// mode-aware staging refusal and
 /// zoom lock riding this natural collapse are [`App::is_committed`]'s targeted guards).
 pub struct ChangesetView {
     pub cs: Changeset,
@@ -1235,7 +1260,8 @@ impl ChangesetView {
     }
 }
 
-/// One content region the renderer painted this frame, in terminal cell coordinates (CS10). A
+/// One content region the renderer painted this frame, in terminal cell coordinates (mouse
+/// support). A
 /// deliberately tiny local shape rather than `ratatui::layout::Rect`: `app.rs` has no ratatui
 /// dependency today, and this keeps it that way — `render.rs` (which already depends on
 /// ratatui) converts a `Rect`'s content area into this when it writes [`App::hit_regions`].
@@ -1253,7 +1279,8 @@ impl Region {
     }
 }
 
-/// The content regions the last frame painted (CS10), written by `render::render` (which clears
+/// The content regions the last frame painted (mouse support), written by `render::render` (which
+/// clears
 /// this to `Default` at the top of every frame first) and read by [`App::handle_click`]/
 /// [`App::handle_wheel`] to hit-test a mouse event's `(col, row)` against the region under the
 /// pointer. A `None` field simply wasn't painted this frame — the outline is closed, or the
@@ -1267,7 +1294,8 @@ pub struct HitRegions {
     pub staged: Option<Region>,
 }
 
-/// Which content region a mouse event hit-tested into (CS10's `App::hit_test`) — the outline,
+/// Which content region a mouse event hit-tested into (mouse support's `App::hit_test`) — the
+/// outline,
 /// the single-zoom diff pane, or one half of a split, tagged with which [`SplitPane`] so the
 /// click/wheel handlers know whether to `toggle_split_focus` first.
 enum HitPane {
@@ -1296,7 +1324,8 @@ pub struct App {
     current_cs: usize,
     pub current: usize,
     /// Row index, in the ACTIVE layout's coordinate space, of the highlighted navigation
-    /// anchor — THE nav state (locked decision #2 in the M4 plan). In a split this is the
+    /// anchor — THE nav state (the staging-verbs plan's locked decision that navigation is
+    /// cursor-primary, scroll derived). In a split this is the
     /// FOCUSED pane's cursor; the unfocused pane's lives in [`Self::alt`]. `scroll` is derived
     /// from this every time it moves, via [`Self::derive_scroll`].
     pub cursor: usize,
@@ -1324,41 +1353,47 @@ pub struct App {
     /// Content height of the outline pane, written by the renderer each frame — same discipline
     /// as [`Self::pane_height`]. Read by [`Self::derive_outline_scroll`].
     pub outline_height: usize,
-    /// The content regions the last frame painted (CS10 mouse support) — see [`HitRegions`]'s
+    /// The content regions the last frame painted (mouse support) — see [`HitRegions`]'s
     /// doc comment. Cleared and re-written by `render::render` every frame; read by
     /// [`Self::handle_click`]/[`Self::handle_wheel`].
     pub hit_regions: HitRegions,
     /// Label for the old side of the diff, shown next to a rename's `old_path` in the header.
-    /// M4 only reviews the uncommitted (`HEAD` ↔ worktree) diffs, so this is always `"HEAD"`
-    /// today; M5's committed-changeset zoom will want the changeset's actual base rev.
+    /// The staging-verbs work only reviews the uncommitted (`HEAD` ↔ worktree) diffs, so this
+    /// is always `"HEAD"` today; the stack-and-outline work's committed-changeset zoom will
+    /// want the changeset's actual base rev.
     pub base_label: String,
     highlighter: TsHighlighter,
     /// Current render layout; see [`Layout`]'s doc comment for the persistence contract.
     pub layout: Layout,
     /// Whether the focused split pane requests the whole body (toggled by `Z`); the effective
     /// per-file resolution is [`effective_zoom`]. Persists across file navigation, like
-    /// [`Self::layout`] — see ADR-038 decision 6. Applies only where the gate would otherwise
-    /// return `Split`; inert everywhere else (decision 3).
+    /// [`Self::layout`] — see ADR-038, "`maximized` persists across file navigation and
+    /// refresh". Applies only where the gate would otherwise return `Split`; inert everywhere
+    /// else (ADR-038, "`effective_zoom` takes the new inputs and narrows").
     pub maximized: bool,
-    /// `workon.review.diff.text` (CS11) — which foreground source changed lines render with.
+    /// `workon.review.diff.text` (the diff foreground/background split) — which foreground source
+    /// changed lines render with.
     /// Read directly by `render.rs`, same as [`Self::layout`]/[`Self::maximized`]; see
     /// [`DiffTextMode`]'s doc comment.
     pub diff_text: DiffTextMode,
     /// Which split pane has focus. Only meaningful under [`EffectiveZoom::Split`] or
     /// [`Self::maximized`]; reset to `Unstaged` (the top pane) whenever a file opens, UNLESS
-    /// [`Self::maximized`] is set — see [`Self::reset_panes`] (ADR-038 decision 5).
+    /// [`Self::maximized`] is set — see [`Self::reset_panes`] (ADR-038, "`reset_panes`
+    /// preserves `split_focus` when `maximized` is set").
     split_focus: SplitPane,
     /// A transient, footer-rendered message — set by [`Self::notify`], cleared by
     /// [`Self::clear_notice`] (the latter called by the event loop on the next keypress, so a
     /// notice stays visible until the user acts). `None` renders the footer's normal hint string
     /// instead (see `render::render_footer`).
     pub notice: Option<Notice>,
-    /// FIFO queue every staging verb enqueues through, then drains on the same beat (locked
-    /// decision #5). Going through the queue (rather than calling `ops::apply_*` directly) buys
+    /// FIFO queue every staging verb enqueues through, then drains on the same beat (the
+    /// staging-verbs work's locked decision: the queue enqueues and drains in the same beat).
+    /// Going through the queue (rather than calling `ops::apply_*` directly) buys
     /// the queue's lock-retry and panic isolation for free; because the drain is synchronous and
     /// a refresh follows before the next keystroke, only ever one op is in flight.
     queue: StagingQueue,
-    /// The default write path (M2 verdict): libgit2's `Repository::apply`. Held as the concrete
+    /// The default write path (the git2-vs-CLI round-trip verdict): libgit2's `Repository::apply`.
+    /// Held as the concrete
     /// type — [`crate::apply::Applier`] stays a trait for the CLI escape hatch, but the field is
     /// the default.
     applier: Git2Applier,
@@ -1375,13 +1410,15 @@ pub struct App {
     /// maximize toggle, file switch, split-focus swap — since a raw row index carries no meaning
     /// across a reshape.
     pub selection_anchor: Option<usize>,
-    /// Trap-4/5 livelock/interlock state for the M4 index watcher (locked decision #4: a
-    /// synchronous poll-on-`Tick`, no threads). See [`Self::on_tick`] and
+    /// Live-index-staging-queue/refresh-echo-suppression livelock/interlock state for the
+    /// staging-verbs work's index watcher (locked decision: the runtime stays sync, polling the
+    /// index signature on Tick). See [`Self::on_tick`] and
     /// [`Self::coordinated_refresh`].
     refresh_coordinator: RefreshCoordinator,
     /// The outline side pane's state — see [`OutlineState`]'s doc comment. Initialized by
     /// [`Self::from_changesets`] to open-when-`len() > 1`/unfocused/[`OutlineMode::default`]
-    /// (the "decided without interview" default in the M5 plan), and repositioned (never
+    /// (the "decided without interview" default in the stack-and-outline plan), and
+    /// repositioned (never
     /// rebuilt-from-scratch — `open`/`focused`/`mode` persist, like [`Self::layout`]/
     /// [`Self::maximized`]) by every diff-initiated nav and by [`Self::refresh`].
     outline: OutlineState,
@@ -1390,19 +1427,23 @@ pub struct App {
     /// appearance mode like the theme, not an outline view setting: it gates the outline's
     /// file/dir icons AND the summary panel's and winbar's glyphs (see `render.rs`).
     icon_mode: IconMode,
-    /// Whether the `?` help overlay is showing (CS3). While `true`, `tui::update` intercepts
+    /// Whether the `?` help overlay is showing (the help footer and `?` overlay). While `true`,
+    /// `tui::update` intercepts
     /// every key as a modal (mirroring [`Self::pending_confirm`]'s capture) — see its doc comment
     /// for the precedence between the two modals.
     pub help_visible: bool,
     /// The `git workon review [<source>]` argument the session was launched with, set via
-    /// [`Self::set_review_source`] (M7 CS2 fix). `None` means the session was launched via
+    /// [`Self::set_review_source`] (a stack/uncommitted-source-keywords fix). `None` means the
+    /// session was launched via
     /// no-argument auto-detect (`crate::acquire::resolve_changesets`); `Some(source)` means an
-    /// explicit ask (`stack`, `uncommitted`, and later CS3/CS4's ref/range/PR variants) that
+    /// explicit ask (`stack`, `uncommitted`, or the `<ref>`-and-range-resolution and
+    /// PR-reference-resolution work's ref/range/PR variants) that
     /// [`Self::refresh`] must re-resolve on every refresh, NEVER downgrade to auto-detect — a
     /// setter (rather than a constructor parameter) so `App::from_changesets`'s signature, and
     /// every existing test building through it, stays untouched.
     review_source: Option<Source>,
-    /// CS4's idle-deferred load switch. `false` (the default) keeps every pre-CS4
+    /// Idle-deferred file loads' load switch. `false` (the default) keeps every pre-idle-
+    /// deferred-file-loads
     /// `open_current`/render-path behavior byte-identical, so the ~80 existing tests asserting
     /// eager loads keep passing unchanged. `main.rs` turns this on via [`Self::set_defer_loads`]
     /// right after construction; the event loop is what actually defers (see `tui.rs`'s
@@ -1447,7 +1488,8 @@ pub struct App {
     /// the reload swaps in (they're threaded through `tui.rs`/`main.rs`), so it only raises the
     /// flag here and the event loop — which DOES hold those — does the actual reload.
     config_reload_requested: bool,
-    /// M11 CS3 (`diff-search`): the ACCEPTED search query, `/` in the diff view opens the prompt
+    /// The in-diff search (`diff-search`): the ACCEPTED search query, `/` in the diff view opens
+    /// the prompt
     /// to edit. Survives file/changeset switches (vim-register semantics — see
     /// [`Self::recompute_search`]'s doc comment for what recomputes it on which trigger). `None`
     /// while no search has ever been
@@ -1465,7 +1507,7 @@ pub struct App {
     /// The CURRENT search text's matches (the live prompt buffer's while [`Self::search_focused`],
     /// else [`Self::search_query`]'s) against the focused pane's file, in file order — recomputed
     /// by [`Self::recompute_search`]/[`Self::recompute_search_keep_current`] on every trigger the
-    /// M11 CS3 plan names: prompt edits, accept, abort, file/changeset switch, refresh, zoom
+    /// in-diff-search plan names: prompt edits, accept, abort, file/changeset switch, refresh, zoom
     /// change, layout change.
     search_matches: Vec<crate::search::SearchMatch>,
     /// Index into [`Self::search_matches`] of the match the cursor is currently parked on —
@@ -1505,8 +1547,9 @@ pub enum PendingOp {
         file_idx: usize,
         selections: Vec<(usize, LineSelection)>,
     },
-    /// CS7: discard every file in `files` — `(changeset identity, file path)` pairs — from the
-    /// worktree: an outline File row's single target, or a Dir row's every file under its path.
+    /// The outline staging verbs: discard every file in `files` — `(changeset identity, file
+    /// path)` pairs — from the worktree: an outline File row's single target, or a Dir row's
+    /// every file under its path.
     /// Stored by [`ChangesetIdentity`] + PATH rather than raw `(cs_idx, file_idx)` indices
     /// because the confirm modal doesn't stop the tick beat: an external index change (e.g.
     /// `git add` from another terminal) can run a full refresh between `d` and `y`, rebuilding
@@ -1560,10 +1603,11 @@ pub(crate) fn display_label(cs: &Changeset) -> String {
 }
 
 impl App {
-    /// Build an [`App`] reviewing a single uncommitted changeset — the M2–M4 shape, and still
-    /// what a non-Graphite (or clean-Graphite-tip) repo degrades to under M5's auto-detect
-    /// (locked decision #7): a one-element [`Self::changesets`], `current_cs = 0`,
-    /// `base_label = "HEAD"`. `test_support::app_from_fixture` and every existing M2–M4 test
+    /// Build an [`App`] reviewing a single uncommitted changeset — the original shape, and
+    /// still what a non-Graphite (or clean-Graphite-tip) repo degrades to under the stack-and-
+    /// outline work's auto-detect (locked decision: auto-detect Graphite, else a single
+    /// uncommitted changeset): a one-element [`Self::changesets`], `current_cs = 0`,
+    /// `base_label = "HEAD"`. `test_support::app_from_fixture` and every existing early test
     /// build through this constructor unchanged.
     pub fn new(repo: Repository, diffs: WorktreeDiffs) -> Self {
         let name = repo
@@ -1585,7 +1629,8 @@ impl App {
     /// Build an [`App`] over an already-diffed changeset stack — `main.rs`'s entry point for
     /// both the Graphite-stack and single-uncommitted-changeset cases (the latter goes through
     /// [`Self::new`] instead, which is the same thing for a one-element stack). Opens on
-    /// whichever changeset the lib marked `current` (locked decision #6: "honor lib `current`,
+    /// whichever changeset the lib marked `current` (locked decision: open on whichever
+    /// changeset the lib marks current — "honor lib `current`,
     /// first file"), falling back to index `0` if none is marked. An empty `changesets` panics —
     /// `main.rs` and [`Self::new`] never call this with one.
     pub fn from_changesets(repo: Repository, changesets: Vec<ChangesetView>) -> Self {
@@ -1595,10 +1640,11 @@ impl App {
         );
         let current_cs = current_cs_index(&changesets);
         let base_label = base_label_for(&changesets[current_cs].cs);
-        // Default-open when the stack has more than one changeset (the M5 plan's
-        // "decided without interview" default — preserves the M4 full-width look for a lone
-        // uncommitted changeset), unfocused (the diff keeps initial keyboard focus so the user
-        // can start reading immediately), Stack mode (shows the structure M5 exists to surface).
+        // Default-open when the stack has more than one changeset (the stack-and-outline
+        // plan's "decided without interview" default — preserves the original full-width look
+        // for a lone uncommitted changeset), unfocused (the diff keeps initial keyboard focus so
+        // the user can start reading immediately), Stack mode (shows the structure the
+        // stack-and-outline work exists to surface).
         // Under the pure open/closed toggle (`o`) this is now a consistent split: `o` controls
         // visibility, `h`/[`App::focus_outline`] controls focus — so seeding open+unfocused here
         // doesn't fight the toggle the way it did under the old three-state cycle.
@@ -1681,7 +1727,8 @@ impl App {
 
     /// Record the `[SOURCE]` argument the review session was launched with, so
     /// [`Self::refresh`] re-resolves that same ask instead of silently falling back to
-    /// no-argument auto-detect (M7 CS2 fix). `main.rs` calls this right after
+    /// no-argument auto-detect (a stack/uncommitted-source-keywords fix). `main.rs` calls this
+    /// right after
     /// [`Self::from_changesets`] whenever a `[SOURCE]` argument was given; a no-argument launch
     /// never calls it, leaving [`Self::review_source`] at its `None` default.
     pub fn set_review_source(&mut self, source: Source) {
@@ -1699,7 +1746,7 @@ impl App {
     /// Refresh wrapped with [`RefreshCoordinator`] bookkeeping — the entry point every refresh
     /// trigger (manual `r`, and the post-staging-op drain) must go through instead of calling
     /// [`Self::refresh`] directly, so `last_signature` stays current and a `Tick` right after
-    /// doesn't mistake our own write for an external one (trap 5's echo-suppression).
+    /// doesn't mistake our own write for an external one (refresh echo suppression).
     ///
     /// The signature is read AFTER `self.refresh()` runs, not before: `refresh`'s own diffing can
     /// itself touch the index's stat cache (see [`RefreshCoordinator::complete`]'s doc comment for
@@ -1715,7 +1762,10 @@ impl App {
         }
     }
 
-    /// The periodic `Tick` hook (locked decision #4: sync poll, no threads/channels). Reads the
+    /// The periodic `Tick` hook (the staging-verbs work's locked decision that the runtime
+    /// stays sync, polling the index signature on Tick — since retired by ADR-037: the crate
+    /// now runs an input thread and a loader thread, but this poll itself is still a plain
+    /// synchronous call on every `Tick`). Reads the
     /// current index signature and, if [`RefreshCoordinator::note_index_event`] says it's a
     /// genuinely new, unseen state with no staging op in flight, runs a [`Self::coordinated_refresh`].
     /// A failed signature read is a silent no-op (tolerated, see [`Self::index_signature`]) — the
@@ -1784,14 +1834,16 @@ impl App {
     }
 
     /// Number of changesets in the reviewed stack — `1` for a non-Graphite (or
-    /// clean-Graphite-tip) repo, per locked decision #7.
+    /// clean-Graphite-tip) repo, per the locked decision that Graphite auto-detects, else a
+    /// single uncommitted changeset.
     pub fn changeset_count(&self) -> usize {
         self.changesets.len()
     }
 
     /// Whether the ACTIVE changeset is a committed range (`base..head`) rather than the
     /// uncommitted worktree layer — derived from [`workon::ChangesetSpan`] on every call rather
-    /// than cached (locked decision #2's "derive, don't store" mode gate). Drives every
+    /// than cached (the staging-verbs work's locked decision that the mode gate is derived,
+    /// never cached). Drives every
     /// committed-mode guard: the mode-aware staging refusal, skipping whole-role attribution (no
     /// staged/unstaged sets exist to color by), and locking zoom to whole.
     pub fn is_committed(&self) -> bool {
@@ -1857,7 +1909,8 @@ impl App {
     /// above), leaves the rest of `Self::changesets` untouched and sets an error [`Notice`]
     /// instead (via [`Self::notify`]) — a failed refresh must never blank the review.
     ///
-    /// Dispatches on [`Self::review_source`] (M7 CS2 fix): a no-argument launch (`None`) re-runs
+    /// Dispatches on [`Self::review_source`] (a stack/uncommitted-source-keywords fix): a
+    /// no-argument launch (`None`) re-runs
     /// today's auto-detect ([`crate::acquire::resolve_changesets`]); an explicit-source launch
     /// (`Some`) re-runs [`crate::source::resolve_source`] against THAT source, never auto-detect
     /// — every ref-shaped source variant (`Stack`, `Uncommitted`, `Ref`, `Range`) is offline,
@@ -1988,8 +2041,8 @@ impl App {
 
     /// Resolve the [`EffectiveZoom`] for file `idx` this frame: [`Self::split_focus`]/
     /// [`Self::maximized`] gated against that file's available sub-diffs and stageability. Cheap
-    /// (three lookups + the pure [`effective_zoom`]) — re-evaluated per file per frame, no caching
-    /// (locked decision #3).
+    /// (three lookups + the pure [`effective_zoom`]) — re-evaluated per file per frame, no
+    /// caching (the per-file zoom gate is derived, never cached).
     pub(crate) fn effective_zoom_for(&self, idx: usize) -> EffectiveZoom {
         let (can_stage, has_unstaged, has_staged) = self.stage_shape(idx);
         effective_zoom(
@@ -2070,8 +2123,9 @@ impl App {
     /// Read-only access to file `idx`'s already-loaded [`FileView`] for `role` (`None` if the role
     /// has no change for the file, or it isn't loaded yet). `pub` (not `pub(crate)`) so the
     /// separate `git-workon-review` bin crate's `tui.rs` tests can assert a file was — or, more
-    /// importantly, was NOT — loaded without visiting it (CS2's event-coalescing regression
-    /// test); read-only and does not touch `open_current`/`ensure_loaded`/`outline_move_by`'s
+    /// importantly, was NOT — loaded without visiting it (a coalescing-buffered-navigation-
+    /// input regression test); read-only and does not touch
+    /// `open_current`/`ensure_loaded`/`outline_move_by`'s
     /// eager-load semantics.
     pub fn role_view_ref(&self, idx: usize, role: Role) -> Option<&FileView> {
         self.views_for(role).get(idx).and_then(|v| v.as_ref())
@@ -2230,14 +2284,16 @@ impl App {
     /// a raw cursor index across a role switch would be meaningless; jumping to the role's own
     /// first hunk (the same position a fresh file open lands on) is always valid and predictable.
     ///
-    /// [`Self::split_focus`] is the one exception (ADR-038 decision 5): while [`Self::maximized`]
+    /// [`Self::split_focus`] is the one exception (ADR-038, "`reset_panes` preserves
+    /// `split_focus` when `maximized` is set"): while [`Self::maximized`]
     /// is set, focus IS the view, so resetting it here would silently switch which role the
     /// reviewer is reading on every file open. Preserved rather than reset in that case; reset to
     /// `Unstaged` otherwise, same as before maximize existed.
     ///
     /// This is also what `coordinated_refresh` leaves behind after a staging op (via
-    /// `open_current`), since a refresh is itself a file "open" of the post-op state — CS6's
-    /// `App::restore_position` runs immediately after, overwriting this first-hunk reseat with
+    /// `open_current`), since a refresh is itself a file "open" of the post-op state — staging
+    /// preserves the diff position: `App::restore_position` runs immediately after, overwriting
+    /// this first-hunk reseat with
     /// the reviewer's pre-op position when it can. Every OTHER caller (manual file/changeset
     /// nav, maximize toggles) has no such follow-up, so first-hunk-on-open is still what they see.
     fn reset_panes(&mut self) {
@@ -2259,7 +2315,8 @@ impl App {
         }
         self.derive_scroll();
         // The unfocused pane's scroll is derived at render time, once its height is known.
-        // M11 CS3: `reset_panes` is the one chokepoint every file/changeset switch, refresh, and
+        // The in-diff search: `reset_panes` is the one chokepoint every file/changeset switch,
+        // refresh, and
         // maximize toggle already funnels through (`open_current`/`complete_pending_open` both end
         // here) — see [`Self::recompute_search`]'s doc comment for the full trigger list.
         self.recompute_search();
@@ -2272,7 +2329,8 @@ impl App {
         self.derive_scroll();
     }
 
-    /// Turn CS4's idle-deferred load mode on/off. `main.rs` calls this with `true` right after
+    /// Turn idle-deferred file loads' idle-deferred load mode on/off. `main.rs` calls this with
+    /// `true` right after
     /// [`Self::from_changesets`], before the first [`Self::open_current`] — see the field's doc
     /// comment. Exposed as a setter (rather than folded into construction) so every existing test
     /// building through `from_changesets`/`App::new` keeps today's eager behavior untouched.
@@ -2280,7 +2338,8 @@ impl App {
         self.defer_loads = on;
     }
 
-    /// Whether CS4's idle-deferred load mode is on — see [`Self::set_defer_loads`].
+    /// Whether idle-deferred file loads' idle-deferred load mode is on — see
+    /// [`Self::set_defer_loads`].
     pub fn defer_loads(&self) -> bool {
         self.defer_loads
     }
@@ -2541,7 +2600,8 @@ impl App {
     /// When `idx` IS the active changeset (the outline cursor already sits there — either it was
     /// the lib-marked `current` changeset at launch, or the user navigated onto its still-`Pending`
     /// placeholder), it's seated exactly as a fresh open would be: `current` resets to its first
-    /// file and [`Self::open_current`] runs (deferred-open semantics — CS4's placeholder shows
+    /// file and [`Self::open_current`] runs (deferred-open semantics — idle-deferred file
+    /// loads' placeholder shows
     /// until the file itself loads), then the outline cursor resyncs. Nothing here requires the
     /// user to navigate away and back for a just-readied active changeset to become interactive.
     pub fn apply_changeset_ready(
@@ -2771,12 +2831,13 @@ impl App {
         self.sync_outline_to_current();
     }
 
-    // ── Outline side pane (CS3) ─────────────────────────────────────────────────
+    // ── The outline side pane (flat and stack modes) ──────────────────────────────
 
-    // ── Summary panel (CS4) ─────────────────────────────────────────────────────
+    // ── The summary panel ─────────────────────────────────────────────────────────
 
     /// Snapshot every reviewed changeset into [`OutlineChangeset`]/[`OutlineFile`] — the input
-    /// [`Self::outline_items`] feeds `outline::build_items`, and CS4's [`Self::summary_for`]
+    /// [`Self::outline_items`] feeds `outline::build_items`, and the summary panel's
+    /// [`Self::summary_for`]
     /// feeds `outline::latest_by_path` for a [`OutlineMode::Tree`] directory's cross-stack
     /// aggregate. Rebuilt fresh on every call, same posture as [`Self::outline_items`] itself.
     fn outline_snapshot(&self) -> Vec<OutlineChangeset> {
@@ -2803,7 +2864,8 @@ impl App {
     }
 
     /// The current [`OutlineMode`]'s FOLD-FILTERED row list — [`Self::outline_items`]'s FOLD-ONLY
-    /// input, before CS2's fuzzy filter (if any) is layered on top. `render.rs`'s marker needs the
+    /// input, before the outline fuzzy filter (if any) is layered on top. `render.rs`'s marker
+    /// needs the
     /// per-row hidden-file counts this alone carries — see [`Self::outline_items_with_hidden_counts`].
     /// Rebuilt fresh on every call (cheap: a small stack times a handful of files each, no
     /// caching, same posture as [`Self::effective_zoom_for`]) rather than cached on `App`, so it's
@@ -2816,7 +2878,8 @@ impl App {
         })
     }
 
-    /// CS2's fuzzy filter, REVISED 2026-07-24: filter-then-rebuild — the outline cursor's SINGLE
+    /// The outline fuzzy filter, REVISED 2026-07-24: filter-then-rebuild — the outline cursor's
+    /// SINGLE
     /// index space, and the source of truth every other outline consumer reads: `render.rs`,
     /// [`Self::outline_move_by`]/[`Self::outline_move_to`], [`Self::outline_confirm`],
     /// [`Self::summary_target`], and the staging-verb resolution in [`Self::outline_row_targets`]
@@ -2854,8 +2917,9 @@ impl App {
         self.outline_filtered().items
     }
 
-    /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count
-    /// and CS2's fuzzy-match char indices (empty when no filter is active, or for a row that
+    /// [`Self::outline_items`], plus (aligned by index) each row's `outline-fold` hidden-file
+    /// marker count and the outline fuzzy filter's fuzzy-match char indices (empty when no filter
+    /// is active, or for a row that
     /// isn't itself a match — see [`outline::FilterMarks`]'s doc comment) — `render_outline`'s
     /// data source.
     pub fn outline_items_with_hidden_counts(
@@ -2868,14 +2932,16 @@ impl App {
     /// Resolve a target row matched against the FULL (unfiltered, unfolded) row list to its
     /// position in [`Self::outline_items`]'s row list.
     ///
-    /// With NO CS2 fuzzy filter active: its own index if it's visible, or its nearest visible
-    /// (collapsed) ancestor's if a fold hides it (CS5's "`sync_outline_to_current` targeting a
+    /// With NO outline fuzzy filter active: its own index if it's visible, or its nearest visible
+    /// (collapsed) ancestor's if a fold hides it (`outline-fold`'s "`sync_outline_to_current`
+    /// targeting a
     /// file hidden under a collapsed node lands on the collapsed ancestor WITHOUT auto-expanding"
     /// rule — see [`outline::FoldedOutline::visible_index`]'s doc comment). `find` matches against
     /// the full build (via `outline::build_items` directly, not [`Self::outline_items`]) since a
     /// fold-hidden target has no index in the fold-filtered list at all to match against.
     ///
-    /// With a CS2 fuzzy filter active: `None` when the target row's own text didn't survive the
+    /// With the outline fuzzy filter active: `None` when the target row's own text didn't survive
+    /// the
     /// filter — REVISED 2026-07-24's rebuild DOES preserve ancestor Header/Dir rows, but `find`
     /// here always matches a specific `File` row's true `cs_idx`/`file_idx` (see
     /// [`Self::sync_outline_to_current`]'s call site), and a `File` row that didn't itself survive
@@ -2883,8 +2949,9 @@ impl App {
     /// ancestor" fallback for a FILTERED-out file the way a FOLDED-hidden one gets, since the
     /// filter's ancestor rows carry no notion of "the file that would have been here." Callers
     /// (currently only [`Self::sync_outline_to_current`]) already treat `None` as "leave the
-    /// cursor where it is, clamped" — precisely the CS2 gotcha's "no-op instead of clearing the
-    /// filter" requirement, since neither branch here ever touches [`OutlineState::filter`] itself.
+    /// cursor where it is, clamped" — precisely the outline-fuzzy-filter gotcha's "no-op
+    /// instead of clearing the filter" requirement, since neither branch here ever touches
+    /// [`OutlineState::filter`] itself.
     fn outline_target_index(&self, find: impl Fn(&OutlineItem) -> bool) -> Option<usize> {
         if !self.outline.filter.is_empty() {
             return self.outline_items().iter().position(find);
@@ -2895,7 +2962,8 @@ impl App {
         self.outline_folded().visible_index.get(full_idx).copied()
     }
 
-    /// CS4: the outline row a Header/Dir cursor selection resolves to — `None` when the outline
+    /// The summary panel: the outline row a Header/Dir cursor selection resolves to — `None` when
+    /// the outline
     /// isn't in a state where the diff area shows a summary instead of a file's diff (closed,
     /// merely open-but-unfocused, or the cursor is on a File row). `render_body` branches on this
     /// before any of its usual diff-body gates (pending/failed/binary/deferred-load).
@@ -2977,12 +3045,13 @@ impl App {
         self.outline.cursor
     }
 
-    /// CS2 (`outline-filter`): the current filter query, for `render.rs`'s input-row line.
+    /// The outline fuzzy filter (`outline-filter`): the current filter query, for `render.rs`'s
+    /// input-row line.
     pub fn outline_filter_query(&self) -> &str {
         self.outline.filter.buffer()
     }
 
-    /// CS2: the filter input's own [`PromptState`] — `render.rs` calls
+    /// The outline fuzzy filter: the filter input's own [`PromptState`] — `render.rs` calls
     /// [`PromptState::render_line`] on it directly rather than `app.rs` doing so itself, keeping
     /// this module free of a `ratatui` dependency (see [`Region`]'s doc comment for the same
     /// discipline elsewhere in this file).
@@ -2990,15 +3059,17 @@ impl App {
         &self.outline.filter
     }
 
-    /// CS2: whether the filter INPUT ROW (not the outline row list) currently has keyboard
+    /// The outline fuzzy filter: whether the filter INPUT ROW (not the outline row list) currently
+    /// has keyboard
     /// capture — see [`OutlineState::filter_focused`]'s doc comment for the two-focus model.
     pub fn outline_filter_focused(&self) -> bool {
         self.outline.filter_focused
     }
 
-    /// CS2: whether `render_outline` should paint the filter input row at all — non-empty query
-    /// OR input-focused (locked design: typing shows the row; leaving it focused with an empty
-    /// query still shows it, so the cursor has somewhere to render). `false` (the pre-CS2 default)
+    /// The outline fuzzy filter: whether `render_outline` should paint the filter input row at
+    /// all — non-empty query OR input-focused (locked design: typing shows the row; leaving it
+    /// focused with an empty query still shows it, so the cursor has somewhere to render).
+    /// `false` (the pre-outline-fuzzy-filter default)
     /// renders the outline exactly as before this changeset.
     pub fn outline_filter_active(&self) -> bool {
         self.outline.filter_focused || !self.outline.filter.is_empty()
@@ -3018,9 +3089,9 @@ impl App {
         self.outline.hscroll
     }
 
-    /// The outline pane's column width — `workon.review.outline.width` (CS7), or
-    /// [`DEFAULT_OUTLINE_WIDTH`] if never set. Read by `render.rs` in place of the old fixed
-    /// const.
+    /// The outline pane's column width — `workon.review.outline.width` (the view-config
+    /// settings), or [`DEFAULT_OUTLINE_WIDTH`] if never set. Read by `render.rs` in place of
+    /// the old fixed const.
     pub fn outline_width(&self) -> u16 {
         self.outline.width
     }
@@ -3029,7 +3100,8 @@ impl App {
         self.outline.mode
     }
 
-    /// Which end of the stack the outline displays first — `workon.review.outline.order` (CS3),
+    /// Which end of the stack the outline displays first — `workon.review.outline.order` (the
+    /// outline side pane's stack-and-outline work),
     /// or [`OutlineOrder::default`] if never set.
     pub fn outline_order(&self) -> OutlineOrder {
         self.outline.order
@@ -3073,7 +3145,7 @@ impl App {
         self.outline.focused = false;
     }
 
-    // ── Mouse (CS10) ─────────────────────────────────────────────────────────────
+    // ── Mouse support ────────────────────────────────────────────────────────────
 
     /// Hit-test `(col, row)` against [`Self::hit_regions`] — outline first, then the single diff
     /// pane, then the split's two halves — returning the matched region tagged with which
@@ -3132,13 +3204,15 @@ impl App {
         self.derive_scroll();
     }
 
-    /// Left-click at terminal `(col, row)` (CS10): focus + select whatever content region the
+    /// Left-click at terminal `(col, row)` (mouse support): focus + select whatever content region
+    /// the
     /// click landed in, matching the keyboard-driven equivalent for that region. Outline: focuses
     /// the outline and jumps the cursor to the clicked row via [`Self::outline_move_to`] — a File
     /// row jumps the diff there (same single-jump semantics `g`/`G` use), a Header/Dir row just
     /// selects (the summary panel follows via [`Self::summary_target`]) WITHOUT toggling its fold
-    /// (CS5, `outline-fold`) — a click has always been "move the cursor here", a strictly weaker
-    /// action than `Enter`'s "act on this row" even before folding existed (pre-CS5, `Enter` on a
+    /// (`outline-fold`) — a click has always been "move the cursor here", a strictly weaker
+    /// action than `Enter`'s "act on this row" even before folding existed (pre-`outline-fold`,
+    /// `Enter` on a
     /// Header jumped to its first file; a click on the same row never did), so a click staying
     /// select-only here keeps that existing asymmetry rather than inventing a new "click mirrors
     /// Enter" rule this pane never had. Diff pane (single or split): focuses that pane (flipping
@@ -3263,7 +3337,8 @@ impl App {
             (self.outline.scroll as i64 + delta).clamp(0, max_scroll.max(0)) as usize;
     }
 
-    /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
+    /// `?`: toggle the help overlay (the help footer and `?` overlay). A plain flip — the overlay
+    /// always renders whatever
     /// view currently has keyboard focus (see `render::render_help_overlay`), so there is no
     /// extra state to reposition here, unlike [`Self::toggle_outline`].
     pub fn toggle_help(&mut self) {
@@ -3281,7 +3356,8 @@ impl App {
         self.sync_outline_to_current();
     }
 
-    /// Set the outline pane width directly (CS7: `workon.review.outline.width`, applied by
+    /// Set the outline pane width directly (the view-config settings:
+    /// `workon.review.outline.width`, applied by
     /// [`Self::apply_view_config`] at startup — there's no interactive key for this today). The
     /// caller is responsible for clamping into `[MIN_OUTLINE_WIDTH, MAX_OUTLINE_WIDTH]`
     /// (`apply_view_config` does); this setter trusts its input.
@@ -3289,7 +3365,7 @@ impl App {
         self.outline.width = width;
     }
 
-    /// Set the outline mode directly — the config-startup (CS7) counterpart to
+    /// Set the outline mode directly — the config-startup (view-config settings) counterpart to
     /// [`Self::outline_cycle_mode`]. Unlike the interactive cycle, this does NOT call
     /// [`Self::sync_outline_to_current`]: [`Self::apply_view_config`] runs before the first
     /// [`Self::open_current`], matching how [`Self::from_changesets`] seeds
@@ -3298,7 +3374,8 @@ impl App {
         self.outline.mode = mode;
     }
 
-    /// Set the outline stack order directly — the config-startup (CS3) counterpart there is no
+    /// Set the outline stack order directly — the config-startup (outline side pane's
+    /// stack-and-outline work) counterpart there is no
     /// interactive key for today. Same non-resync posture as [`Self::set_outline_mode`]: called
     /// before the first [`Self::open_current`], so no [`Self::sync_outline_to_current`] call is
     /// needed here either.
@@ -3430,12 +3507,14 @@ impl App {
     }
 
     /// `Enter` while the outline has focus: a FILE row jumps the diff straight there and returns
-    /// focus to the diff (unchanged since CS3). A HEADER or DIR row instead TOGGLES that row's
-    /// fold state (CS5, `outline-fold`) and deliberately does NOT return focus — you're
+    /// focus to the diff (unchanged since the outline side pane's stack-and-outline work). A
+    /// HEADER or DIR row instead TOGGLES that row's fold state (`outline-fold`) and
+    /// deliberately does NOT return focus — you're
     /// manipulating the outline's own structure, not confirming a jump, so there's nothing to
-    /// hand focus back to yet. This REMOVES Enter's pre-CS5 jump-to-changeset-first-file behavior
-    /// on a Header row (still reachable via Enter on any of that changeset's own file rows, or
-    /// `[c`/`]c`) and Dir's pre-CS5 no-op (CS4 shipped Dir rows before any fold state existed to
+    /// hand focus back to yet. This REMOVES Enter's pre-`outline-fold`
+    /// jump-to-changeset-first-file behavior on a Header row (still reachable via Enter on any of
+    /// that changeset's own file rows, or `[c`/`]c`) and Dir's pre-`outline-fold` no-op (the
+    /// outline's path-trie tree modes shipped Dir rows before any fold state existed to
     /// toggle).
     pub fn outline_confirm(&mut self) {
         let items = self.outline_items();
@@ -3453,7 +3532,7 @@ impl App {
         }
     }
 
-    /// `Enter` on a Header/Dir row (CS5, `outline-fold`): flip that row's collapsed state in the
+    /// `Enter` on a Header/Dir row (`outline-fold`): flip that row's collapsed state in the
     /// CURRENT [`OutlineMode`]'s fold set (see [`OutlineState::folds`]), then re-derive the
     /// outline scroll — the row list's length just changed shape (more/fewer rows), the same
     /// reason every other row-count-changing op does. The cursor's own INDEX never needs
@@ -3510,7 +3589,7 @@ impl App {
         self.sync_outline_to_current();
     }
 
-    // ── Outline fuzzy filter (CS2 `outline-filter`, M11) ─────────────────────────
+    // ── Outline fuzzy filter (`outline-filter`) ──────────────────────────────────
 
     /// `/` while the outline has focus: give the filter input row keyboard capture. The keymap
     /// only ever dispatches this while [`OutlineState::focused`] is already `true` (it's a
@@ -3613,7 +3692,7 @@ impl App {
         self.outline_filter_reflow();
     }
 
-    // ── Diff search (CS3 `diff-search`, M11) ─────────────────────────────────────
+    // ── Diff search (`diff-search`) ───────────────────────────────────────────────
 
     /// Whether the search prompt currently has keyboard capture (`/` opened it, `Enter`/`Esc`
     /// haven't closed it yet) — `tui.rs`'s modal-capture cascade arm and mouse-swallow guard, and
@@ -3669,7 +3748,8 @@ impl App {
     }
 
     /// Recompute [`Self::search_matches`] from [`Self::active_search_text`] against the FOCUSED
-    /// pane's current file view — called on every trigger the M11 CS3 plan names: every prompt
+    /// pane's current file view — called on every trigger the in-diff-search plan names: every
+    /// prompt
     /// edit (live preview), accept/abort, file/changeset switch and refresh (both funnel through
     /// [`Self::reset_panes`]), and a layout change (harmless to re-run even when the match content
     /// can't have changed — matches address the layout-agnostic `AlignedRow` space).
@@ -3891,8 +3971,9 @@ impl App {
         self.search_step(false);
     }
 
-    /// Which side (old or new) each row the active yank range covers resolves to — the rule M11's
-    /// yank-split handoff locks as decision 4, shared by [`Self::resolve_copy_lines`] and
+    /// Which side (old or new) each row the active yank range covers resolves to — the rule the
+    /// yank-split handoff locks as "which side a row contributes (new side, old on pure
+    /// deletions)", shared by [`Self::resolve_copy_lines`] and
     /// [`Self::resolve_copy_location`] so the two verbs cannot drift on side selection or gap
     /// handling. Walks [`Self::selection_range`] (or the bare cursor row when no selection is
     /// active) in the FOCUSED pane's ACTIVE layout coordinate space — the same space
@@ -3902,13 +3983,15 @@ impl App {
     ///   carries no new side (the same rule the old single-row `copy-path-line` resolver used).
     ///   `DisplayRow::Gap` rows are skipped, never emitted.
     /// - **Inline**: `Del` -> old lineno, `Add` -> new lineno, `Context` -> new lineno — mirroring
-    ///   [`Self::selection_line_ops`]'s per-side-precise handling (locked decision #8).
+    ///   [`Self::selection_line_ops`]'s per-side-precise handling (locked decision: which side
+    ///   a row contributes — new side, old on pure deletions).
     ///   `InlineRow::Gap` rows are skipped.
     ///
     /// Each entry is `(is_new_side, lineno)`, one per non-gap row in range order — the order the
     /// caller needs both to pick text (per side) and to collapse a range to its first/last
-    /// lineno (decision 6). `Err("no line to copy")` when nothing in range yields a lineno at
-    /// all: no file/view loaded, or the whole range is gap rows (decision 5 — a gap is hidden
+    /// lineno (the `path:lo-hi` range location format). `Err("no line to copy")` when nothing
+    /// in range yields a lineno at all: no file/view loaded, or the whole range is gap rows (gap
+    /// rows inside a range are skipped — a gap is hidden
     /// content, skipping it silently is correct, but an ALL-gap range has nothing left to copy).
     fn resolve_yank_rows(&self) -> Result<Vec<(bool, usize)>, &'static str> {
         let view = self.current_view_ref().ok_or("no line to copy")?;
@@ -3946,10 +4029,12 @@ impl App {
         }
     }
 
-    /// The pure half of `copy-lines` (`y`): resolve the active yank range (decision 4's side
+    /// The pure half of `copy-lines` (`y`): resolve the active yank range (the side-
+    /// contribution decision's
     /// rules via [`Self::resolve_yank_rows`]) to the selected rows' raw TEXT, no I/O. One line
     /// per resolved row, newline-joined, in range order — no `+`/`-` markers, no line numbers, no
-    /// path header (locked decision 3: the dominant use is pasting into a chat or a buffer, and
+    /// path header (locked decision: copied content is raw code, undecorated — the dominant
+    /// use is pasting into a chat or a buffer, and
     /// markers make the result non-compiling). Text comes straight from [`FileView::old_lines`]/
     /// [`FileView::new_lines`] indexed by the row's resolved lineno minus 1 — same-module private
     /// fields, no accessor needed.
@@ -3975,7 +4060,8 @@ impl App {
     /// in this UI (outline, footer) — never an absolute path.
     ///
     /// `lo`/`hi` are the resolved rows' FIRST and LAST entries from [`Self::resolve_yank_rows`]
-    /// (decision 6) — the range's endpoints in resolved-lineno space, not raw row indices (a row
+    /// (the `path:lo-hi` range location format) — the range's endpoints in resolved-lineno
+    /// space, not raw row indices (a row
     /// index is meaningless outside the TUI) and not a min/max sweep (a range's endpoints, per the
     /// plan, not its extremes). A single-row selection, or no selection, collapses to today's
     /// `path:12` form byte-for-byte; a genuine multi-row range emits `path:lo-hi`, not GitHub's
@@ -4009,7 +4095,8 @@ impl App {
     /// the bytes reached the tty, never that the terminal actually honored them. Factored out so
     /// the two verbs can't drift on wording.
     ///
-    /// Returns whether the write succeeded, so the callers can honor decision 8's "clear the
+    /// Returns whether the write succeeded, so the callers can honor the locked decision that a
+    /// successful yank clears the
     /// selection on success" precisely: a failed write must LEAVE the selection intact, or the
     /// user loses the range they built and has no way to retry the thing that just failed.
     fn copy_payload(&mut self, payload: String) -> bool {
@@ -4027,7 +4114,8 @@ impl App {
 
     /// `y` (default binding `copy-lines`): copy the active yank range's TEXT to the system
     /// clipboard. See [`Self::resolve_copy_lines`] for resolution and [`Self::copy_payload`] for
-    /// the write. Clears the active selection on success (decision 8, matching vim's `y` and
+    /// the write. Clears the active selection on success (the locked decision that a
+    /// successful yank clears the selection, matching vim's `y` and
     /// [`Self::stage_selection`]'s success paths) — NOT on either failure path (resolution error
     /// or a failed clipboard write), so the user keeps the range they built and can retry.
     pub fn copy_lines(&mut self) {
@@ -4062,7 +4150,8 @@ impl App {
 
     /// Park the cursor on [`Self::search_matches`]`[idx]`: auto-expand the gap it's hidden behind
     /// (if any — [`crate::align::gap_key_for_aligned_idx`] + [`FileView::expand_gap`], the
-    /// existing CS8/CS9 machinery), then locate the row in the ACTIVE layout's own vector by the
+    /// existing progressive-gap-expansion/tree-sitter-scope-reveal machinery), then locate the
+    /// row in the ACTIVE layout's own vector by the
     /// match's (old, new) lineno pair and land there. `wrapped` raises the footer notice the plan
     /// calls for; a match whose row can't be located post-expansion (should be unreachable once
     /// expanded) leaves the cursor where it was rather than panicking.
@@ -4135,11 +4224,12 @@ impl App {
         }
     }
 
-    // ── Outline staging (CS7) ───────────────────────────────────────────────────
+    // ── The outline staging verbs ───────────────────────────────────────────────
 
     /// Whether the changeset at `cs_idx` is a committed range rather than the uncommitted
     /// worktree layer — the per-index counterpart to [`Self::is_committed`] (which only reads the
-    /// ACTIVE changeset). CS7's outline verbs need this because the acted-on row's changeset is
+    /// ACTIVE changeset). The outline staging verbs need this because the acted-on row's changeset
+    /// is
     /// whichever one the outline cursor rests on, not necessarily the diff's current changeset.
     fn is_committed_at(&self, cs_idx: usize) -> bool {
         self.changesets.get(cs_idx).is_some_and(|view| {
@@ -4228,7 +4318,8 @@ impl App {
     }
 
     /// Footer refusal for an outline stage/discard verb — parallels [`Self::notify_unstageable_refusal`]
-    /// but for the two CS7-specific refusal reasons: `committed` (the row's changeset — or, for a
+    /// but for the two outline-staging-verbs-specific refusal reasons: `committed` (the row's
+    /// changeset — or, for a
     /// Dir row, at least one file under it — is a committed range, not the uncommitted worktree
     /// layer) or not (the cursor sits on a [`OutlineItem::Header`] row, which is never a target).
     fn notify_outline_refusal(&mut self, verb: &str, committed: bool) {
@@ -4323,7 +4414,8 @@ impl App {
 
     /// The outline-facing counterpart to [`Self::run_op`]: drain `ops` through [`Self::run_ops`],
     /// then restore the OUTLINE cursor to (or nearest to) `identity`'s row rather
-    /// than a diff-pane position (CS6's [`PositionMemento`]/[`Self::restore_position`] only make
+    /// than a diff-pane position (staging-preserves-the-diff-position's
+    /// [`PositionMemento`]/[`Self::restore_position`] only make
     /// sense when the diff pane, not the outline, was the focused surface the op started from).
     /// [`Self::coordinated_refresh`] (inside `run_ops`) itself calls `sync_outline_to_current`,
     /// which can leave the outline cursor on a wholly unrelated row (wherever the DIFF's current
@@ -4373,7 +4465,7 @@ impl App {
 
     /// Reposition (never rebuild/refocus) the outline cursor onto the row matching the CURRENT
     /// diff changeset+file — or, if a fold hides that row, its nearest visible (collapsed)
-    /// ancestor instead, WITHOUT auto-expanding it (CS5, `outline-fold` — preserves the user's
+    /// ancestor instead, WITHOUT auto-expanding it (`outline-fold` — preserves the user's
     /// fold intent; see [`Self::outline_target_index`]) — or clamps into bounds if no such row
     /// exists in the FULL build at all (e.g. Flat mode deduped the current file's changeset out
     /// of the list entirely). The sync-follow discipline's echo break: called ONLY from the
@@ -4455,7 +4547,8 @@ impl App {
     }
 
     /// Re-derive the UNFOCUSED split pane's scroll against its own cursor, row count, and
-    /// [`Self::alt_height`]. Test-only since the wheel's peek model (CS10): the renderer now
+    /// [`Self::alt_height`]. Test-only since the wheel's peek model (mouse support): the renderer
+    /// now
     /// bounds-clamps instead of deriving (see [`Self::clamp_alt_scroll`]), and no production
     /// path derives the unfocused pane's scroll — the pair re-derives naturally once focus
     /// swaps back onto it and a cursor op runs.
@@ -4468,7 +4561,8 @@ impl App {
     }
 
     /// Bounds-only clamp of the focused pane's scroll — the renderer's per-frame check under
-    /// the wheel's peek model (CS10). Unlike [`Self::derive_scroll`] it does NOT follow the
+    /// the wheel's peek model (mouse support). Unlike [`Self::derive_scroll`] it does NOT follow
+    /// the
     /// cursor, so a wheel-scrolled viewport (cursor possibly outside it) survives frames; it
     /// only keeps `scroll` inside the row list when a resize/zoom shrinks it.
     pub(crate) fn clamp_scroll(&mut self) {
@@ -4508,7 +4602,8 @@ impl App {
     }
 
     /// The widest display-column row currently in the active file's view(s) — both roles when
-    /// split, since [`Self::hscroll`] pans every content pane together (locked decision #1).
+    /// split, since [`Self::hscroll`] pans every content pane together (one pan offset shared
+    /// by every content pane).
     /// Walks the already-built [`FileView::display`] row list (shared by both the SBS and inline
     /// layouts — inline just re-derives its own row list from the same text), so this is a pure
     /// lookup over rows the renderer rebuilds every frame anyway, not a fresh scan of the file.
@@ -4539,7 +4634,8 @@ impl App {
     }
 
     /// Clamp [`Self::hscroll`] into `[0, max_row_width().saturating_sub(1)]` — the `-1` keeps at
-    /// least one column of the longest line visible (locked decision #4) rather than letting the
+    /// least one column of the longest line visible (the clamp keeps one column of the longest
+    /// line visible) rather than letting the
     /// pan run all the way to a blank viewport.
     fn clamp_hscroll(&mut self) {
         let max = self.max_row_width().saturating_sub(1);
@@ -4593,8 +4689,8 @@ impl App {
     }
 
     /// The `(scroll, cursor)` a split pane renders with: the focused pane contributes its own
-    /// `scroll`/`cursor`; the unfocused pane contributes its stashed `alt` scroll/cursor (CS1,
-    /// `unfocused-cursor-wash` — previously `None`, since only the focused pane ever drew a
+    /// `scroll`/`cursor`; the unfocused pane contributes its stashed `alt` scroll/cursor
+    /// (`unfocused-cursor-wash` — previously `None`, since only the focused pane ever drew a
     /// cursor; now the unfocused half's remembered position is always returned too, so the
     /// renderer can paint it with the dim [`crate::theme::Palette::cursor_unfocused_bg`] wash
     /// when it's within the visible `scroll..end` range). The cursor alone no longer says
@@ -4681,21 +4777,23 @@ impl App {
     }
 
     /// Reveal more of the collapsed gap under the cursor (`Enter`), or the WHOLE gap (`E`, when
-    /// `full`) — CS8's progressive unfold, extended by CS9 with a two-tier `Enter`: A silent
+    /// `full`) — progressive gap expansion's progressive unfold, extended by tree-sitter scope
+    /// reveal with a two-tier `Enter`: A silent
     /// no-op when the cursor isn't on a `Gap` row (or there's no loaded view): unlike a staging
     /// refusal this isn't a mode error worth interrupting the user over, same precedent as
     /// [`Self::next_hunk_row`] finding no later hunk.
     ///
-    /// - `full` (`E`): unchanged from CS8 — always the flat full-run reveal via
+    /// - `full` (`E`): unchanged from progressive gap expansion — always the flat full-run reveal
+    ///   via
     ///   [`FileView::expand_gap`], regardless of grammar.
-    /// - `!full` (`Enter`, CS9): FIRST tries a tree-sitter scope-reveal —
+    /// - `!full` (`Enter`, tree-sitter scope reveal): FIRST tries a tree-sitter scope-reveal —
     ///   [`gap_scope_start`] resolves the gap's anchor (the following row's new-side lineno,
-    ///   preferring new like CS6's [`Self::restore_position`], old-side for delete-only files)
-    ///   to the smallest enclosing [`crate::scope`] node, and [`FileView::scope_expand_gap`]
-    ///   widens the gap's trailing edge to uncover it. Falls back to the flat +10/+10 reveal
-    ///   (same as CS8) when: the file's extension has no bundled grammar, no allowlisted
-    ///   ancestor encloses the anchor, or the scope reveals nothing new (already fully visible)
-    ///   — so repeated `Enter` presses always widen the gap, uniformly.
+    ///   preferring new like [`Self::restore_position`], old-side for delete-only files) to the
+    ///   smallest enclosing [`crate::scope`] node, and [`FileView::scope_expand_gap`] widens the
+    ///   gap's trailing edge to uncover it. Falls back to the flat +10/+10 reveal (same as
+    ///   progressive gap expansion) when: the file's extension has no bundled grammar, no
+    ///   allowlisted ancestor encloses the anchor, or the scope reveals nothing new (already
+    ///   fully visible) — so repeated `Enter` presses always widen the gap, uniformly.
     ///
     /// `self.cursor`'s INDEX is left untouched either way. Rows revealed at the gap's leading
     /// edge insert immediately before the gap's own row (shifting the gap marker — and
@@ -4790,7 +4888,8 @@ impl App {
     /// Toggle between side-by-side and inline layouts (`L`). Deliberately does not try to
     /// re-derive an exactly equivalent `cursor` position for the new layout — the two layouts'
     /// row vectors track the same underlying content in a different shape, and translating
-    /// exactly isn't worth the complexity for M4; the user re-orients same as they would after a
+    /// exactly isn't worth the complexity for the staging-verbs work; the user re-orients same as
+    /// they would after a
     /// resize. It DOES clamp `cursor` to the new layout's `row_count()` (see
     /// [`Self::clamp_cursor`]) and re-derive `scroll` from it, so the result is always a valid,
     /// visible position even though it isn't a semantic equivalent of the old one.
@@ -4801,7 +4900,8 @@ impl App {
         };
         // The two layouts' row vectors are different coordinate spaces (a paired del/add is one
         // SBS row but two inline rows), so a selection anchor doesn't translate — cancel it, the
-        // simplest defensible choice (locked decision #8's "press L for per-side precision" flow
+        // simplest defensible choice (the locked decision that line selection works in both
+        // layouts — SBS row-pair, inline one-sided — so "press L for per-side precision" flow
         // starts a fresh selection anyway).
         self.selection_anchor = None;
         self.clamp_cursor();
@@ -4818,24 +4918,26 @@ impl App {
             };
         }
         self.derive_scroll();
-        // M11 CS3: the match ADDRESSES (aligned-space) can't actually change here — only which
-        // display/inline row each one resolves to — so carry `search_current` across rather than
+        // The in-diff search: the match ADDRESSES (aligned-space) can't actually change here —
+        // only which display/inline row each one resolves to — so carry `search_current` across
+        // rather than
         // losing the "you are on match N" highlight to a same-file layout flip. See
         // [`Self::recompute_search_keep_current`]'s doc comment.
         self.recompute_search_keep_current();
     }
 
-    /// Set the render layout directly — the config-startup (CS7) counterpart to
+    /// Set the render layout directly — the config-startup (view-config settings) counterpart to
     /// [`Self::toggle_layout`]. Called before the first [`Self::open_current`], whose
     /// `reset_panes` derives `cursor`/`scroll` fresh for whichever layout is active, so —
     /// unlike `toggle_layout`, which must clamp an EXISTING cursor into the new layout's row
     /// count — no separate clamp is needed here. Does NOT call `open_current` itself — the
-    /// caller applies every CS7 setting first, then opens once.
+    /// caller applies every view-config setting first, then opens once.
     pub fn set_layout(&mut self, layout: Layout) {
         self.layout = layout;
     }
 
-    /// Set `workon.review.diff.text`'s resolved mode directly — the config-startup (CS11)
+    /// Set `workon.review.diff.text`'s resolved mode directly — the config-startup (diff
+    /// foreground/background split)
     /// counterpart, mirroring [`Self::set_layout`]. Purely a render-time foreground selector: no
     /// cursor/scroll state depends on it, so unlike `set_layout` there is nothing else to clamp
     /// or re-derive, at startup OR on reload.
@@ -4843,19 +4945,21 @@ impl App {
         self.diff_text = mode;
     }
 
-    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|text` (CS7,
-    /// CS11) as the App's initial view-config state, via the same setters the interactive keys
-    /// drive
+    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|text` (the
+    /// view-config settings, the diff foreground/background split) as the App's initial
+    /// view-config state, via the same setters the interactive keys drive
     /// (see each setter's doc comment for why that's enough to stay on the gated path). Call
     /// once, right after construction and before [`Self::open_current`] (see `main.rs`) — the
     /// setters here don't themselves re-derive `cursor`/`scroll`, and the caller's
     /// `open_current` is what does that for whichever settings just landed. `maximize` has no
-    /// config surface (ADR-038 decision 8, same as `split_focus`) — it's a transient view action,
+    /// config surface (ADR-038, "Remove `workon.review.diff.zoom`", same as `split_focus`) —
+    /// it's a transient view action,
     /// not a startup preference, so there is no setting to apply here.
     ///
     /// `raw` is read via [`crate::config::ReviewConfig::view_config`] BEFORE `repo` moves into
     /// `App` (see `main.rs`) — its fields already collapsed an unset setting and a config-read
-    /// error to the same `None` (CS7 applies the current hardcoded default for either case, no
+    /// error to the same `None` (the view-config settings apply the current hardcoded default
+    /// for either case, no
     /// warning). Each setting additionally falls back to the default when SET but invalid — out
     /// of range (width), or an unrecognized string (mode/layout) — collecting a warning for
     /// those cases, same non-fatal posture as the keymap/theme resolution (ADR-034).
@@ -4942,7 +5046,8 @@ impl App {
     /// Instead: run `apply_view_config`, then replay only the TAIL of whichever interactive
     /// counterpart(s) actually changed something — [`Self::toggle_layout`]'s tail if `layout`
     /// flipped, [`Self::outline_cycle_mode`]'s tail if `outline.mode`/`outline.order` changed.
-    /// `maximize` has no config surface at all (ADR-038 decision 8) — `apply_view_config` never
+    /// `maximize` has no config surface at all (ADR-038, "Remove `workon.review.diff.zoom`")
+    /// — `apply_view_config` never
     /// touches it, so there is no tail to replay for it here.
     pub fn reload_view_config(&mut self, raw: &RawViewConfig) -> Vec<String> {
         let layout_before = self.layout;
@@ -5022,7 +5127,7 @@ impl App {
     /// The role a staging verb acts in for the current file: the single effective role, or the
     /// focused split pane's role. `None` for [`Role::Whole`] — the whole role fuses both
     /// sub-diffs, so staging there has no unambiguous direction and the verbs refuse (locked
-    /// decision #1).
+    /// decision: verbs act only in the unstaged/staged panes; direction = pane role).
     fn staging_role(&self) -> Option<Role> {
         match self.effective_zoom_for(self.current) {
             EffectiveZoom::Single(Role::Whole) => None,
@@ -5031,7 +5136,8 @@ impl App {
         }
     }
 
-    /// Toggle-direction by role (locked decision #1): the unstaged pane stages, the staged pane
+    /// Toggle-direction by role (verbs act only in the unstaged/staged panes; direction =
+    /// pane role): the unstaged pane stages, the staged pane
     /// unstages. `None` for [`Role::Whole`] (never a staging target).
     fn verb_for_role(role: Role) -> Option<StageVerb> {
         match role {
@@ -5043,7 +5149,8 @@ impl App {
 
     /// Mode-aware refusal notice for a staging verb / line-selection start that only makes sense
     /// outside the whole role — i.e. every call site below whose `staging_role()`/
-    /// `staging_role().is_none()` guard failed (locked decision #2's "targeted guard"). A
+    /// `staging_role().is_none()` guard failed (the locked decision that committed mode is
+    /// derived, not stored, with targeted guards). A
     /// committed changeset is ALWAYS whole-only (no staged/unstaged split exists — see
     /// [`Self::is_committed`]), so it gets its own wording. The non-committed branch's only
     /// remaining caller is a binary file (ADR-038 decision 10): `effective_zoom` short-circuits
@@ -5243,14 +5350,16 @@ impl App {
 
     /// Enqueue `op`, drain the queue on the same beat, then act on the outcome: a failure or panic
     /// surfaces on the footer (and the views still refresh — see [`Self::run_ops`] for why); a
-    /// `Completed` drain refreshes, rebuilding the views + attribution from the new index (locked
-    /// decision #5), then restores the reviewer's pre-op DIFF position (CS6) — a staging op is
+    /// `Completed` drain refreshes, rebuilding the views + attribution from the new index
+    /// (locked decision: the queue enqueues and drains in the same beat), then restores the
+    /// reviewer's pre-op DIFF position (staging preserves the diff position) — a staging op is
     /// the ONE nav path that does not reset to the role's first hunk; every manual nav still
     /// does, via `reset_panes` unchanged.
     ///
     /// A thin diff-facing wrapper over [`Self::run_ops`] (one op, one memento) — the diff pane's
     /// staging verbs (`s`/`S`/`d`/`D`) are the only callers, so the shared drain/refresh core
-    /// lives on `run_ops` and this just supplies the diff-position memento CS7's outline verbs
+    /// lives on `run_ops` and this just supplies the diff-position memento the outline staging
+    /// verbs
     /// don't want (see [`Self::outline_run_ops`], which restores the OUTLINE cursor instead).
     fn run_op(&mut self, op: impl StagingOp + 'static) {
         let memento = self.capture_position();
@@ -5271,7 +5380,8 @@ impl App {
     /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]), a (possibly
     /// multi-hunk) line selection ([`LineSelectionOp`], which applies as ONE merged patch rather
     /// than enqueueing one op per hunk — see that type's docs for why splitting is wrong), or
-    /// (CS7) several independent whole-file ops from an outline Dir row. The queue's trap-4
+    /// (the outline staging verbs) several independent whole-file ops from an outline Dir
+    /// row. The queue's live-index staging queue
     /// live-index staleness doesn't apply here: every op resolves its own direction from the live
     /// index inside `run` (see `queue.rs`'s module doc), so draining several back-to-back is safe.
     fn run_ops(&mut self, ops: Vec<Box<dyn StagingOp>>) -> Result<(), ()> {
@@ -5302,7 +5412,8 @@ impl App {
     }
 
     /// Snapshot the focused pane's file/role/position ahead of a staging op, for
-    /// [`Self::restore_position`] to reseat after the op's `coordinated_refresh` (CS6). `None`
+    /// [`Self::restore_position`] to reseat after the op's `coordinated_refresh` (staging
+    /// preserves the diff position). `None`
     /// when there's no current file, the current view is the whole role (never a staging
     /// target — [`Self::staging_role`]), or the focused role's view isn't loaded; restore is then
     /// a no-op and today's `reset_panes` first-hunk behavior stands.
@@ -5333,7 +5444,8 @@ impl App {
     }
 
     /// Reseat the focused pane to a pre-staging-op position after `coordinated_refresh` rebuilds
-    /// the views (CS6) — the staging-path counterpart to `reset_panes`' first-hunk reseat, which
+    /// the views (staging preserves the diff position) — the staging-path counterpart to
+    /// `reset_panes`' first-hunk reseat, which
     /// this deliberately leaves untouched for every manual nav (file/changeset switch, zoom
     /// cycle). Falls back to whatever `reset_panes` already produced (today's first-hunk
     /// behavior) when the acted-on file's path is gone (fully discarded) or its memento carried
@@ -5422,7 +5534,8 @@ impl App {
     /// grazed by only context/gap rows is dropped). Empty when there's no selection, no loaded
     /// focused view, or the range covers only context.
     ///
-    /// The two layouts differ in what a selected row contributes (locked decision #8):
+    /// The two layouts differ in what a selected row contributes (the locked decision that
+    /// line selection works in both layouts — SBS row-pair, inline one-sided):
     /// - **SBS** row-pair semantics: a selected `AlignedRow` keeps BOTH sides it changes — its Del
     ///   cell's old line and its Add cell's new line — because a side-by-side row can't split a
     ///   paired edit (per-side precision is what inline is for).
@@ -5731,7 +5844,8 @@ impl DiffState {
     /// committed range, so both sub-models are empty and every index map entry is `None`. This
     /// alone is enough to render the changeset read-only: [`effective_zoom`] collapses
     /// `Split`/`Unstaged`/`Staged` to [`EffectiveZoom::Single(Role::Whole)`] whenever both
-    /// sub-diffs are absent, so no committed-specific rendering path is needed for M5's spine.
+    /// sub-diffs are absent, so no committed-specific rendering path is needed for the
+    /// stack-and-outline work's spine.
     fn from_committed(model: DiffModel) -> Self {
         let n = model.files.len();
         Self {
@@ -5744,7 +5858,8 @@ impl DiffState {
     }
 }
 
-/// Index of the changeset the lib marked `current` (locked decision #6), or `0` if none is —
+/// Index of the changeset the lib marked `current` (locked decision: open on whichever
+/// changeset the lib marks current), or `0` if none is —
 /// the shared rule [`App::from_changesets`] uses to open, and [`App::refresh`] falls back to
 /// when the previously-active changeset's name no longer exists after a re-assembly.
 fn current_cs_index(changesets: &[ChangesetView]) -> usize {
@@ -5821,7 +5936,7 @@ fn loaded_views_satisfy(views: &LoadedViews, current_zoom: EffectiveZoom) -> boo
 /// involved. Routes through the SAME [`build_whole_view`]/[`build_sub_role_view`] free
 /// functions [`App::ensure_role_loaded`] calls, so a deferred-then-loader-completed open is
 /// byte-identical to an eager [`App::open_current`] — the invariant ADR-037 carries over from
-/// CS4's `complete_pending_open`.
+/// idle-deferred file loads' `complete_pending_open`.
 pub fn build_file_views(
     repo: &Repository,
     ts: &mut TsHighlighter,
@@ -5879,7 +5994,7 @@ fn set_if_absent(cs: &mut ChangesetView, role: Role, idx: usize, view: Option<Bo
 
 /// [`App::base_label`] for the changeset that would become active — a committed changeset's
 /// base rev (7-char short-sha), or `"HEAD"` for the uncommitted layer (worktree ↔ `HEAD`,
-/// unchanged from M2–M4).
+/// unchanged since the crate's original behavior).
 fn base_label_for(cs: &Changeset) -> String {
     match cs.span {
         ChangesetSpan::Committed { base, .. } => {
@@ -5949,8 +6064,9 @@ fn row_lineno(row: Row) -> Option<usize> {
 }
 
 /// The (old, new) 1-based line numbers a display row occupies — `None` on a filler side, and
-/// `(None, None)` for a gap row (which belongs to no hunk). `pub(crate)`: `render.rs`'s M11 CS3
-/// search-highlight lookup reuses this exact pairing (the same key [`crate::search::SearchMatch`]
+/// `(None, None)` for a gap row (which belongs to no hunk). `pub(crate)`: `render.rs`'s
+/// in-diff-search-highlight lookup reuses this exact pairing (the same key
+/// [`crate::search::SearchMatch`]
 /// carries) rather than re-deriving its own.
 pub(crate) fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
     match row {
@@ -5959,11 +6075,12 @@ pub(crate) fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<us
     }
 }
 
-/// CS9's tree-sitter scope-reveal inputs for the gap at `gap_cursor`: the anchor line and which
+/// The tree-sitter scope reveal's inputs for the gap at `gap_cursor`: the anchor line and which
 /// side it's in (`true` = new, `false` = old), resolved from the row immediately FOLLOWING the
 /// gap in `layout`'s row vector — the plan's rationale: the next hunk is what you're reading
 /// toward, so its enclosing scope is what's worth revealing. Prefers the new-side lineno when
-/// present, falling back to old (CS6's [`App::restore_position`] convention) for the rows a
+/// present, falling back to old (staging-preserves-the-diff-position's [`App::restore_position`]
+/// convention) for the rows a
 /// delete-only file's `Filler` new side never populates.
 ///
 /// Returns `None` when: there's no row after the gap (a trailing gap with nothing beyond it to
@@ -6245,7 +6362,7 @@ mod tests {
         assert!(app.current_view_ref().is_none());
     }
 
-    // ── CS4: idle-deferred loads ──────────────────────────────────────────────
+    // ── Idle-deferred file loads ────────────────────────────────────────────────
 
     /// A twin pair: one `App` with `defer_loads` off (the eager baseline), one with it on. Both
     /// built from independent copies of the SAME fixture so their diffs (and hunks) line up.
@@ -6359,7 +6476,8 @@ mod tests {
 
     #[test]
     fn build_file_views_matches_ensure_loaded_for_the_whole_role() {
-        // ADR-038: post-M11 `Role::Whole` is unreachable for an uncommitted file with a real
+        // ADR-038: post-in-diff-navigation, `Role::Whole` is unreachable for an uncommitted file
+        // with a real
         // sub-diff (the gate never resolves there for a maximized both-sub-diffs file, and an
         // unstaged-only file collapses to `Role::Unstaged`) — a committed changeset is the
         // natural way to exercise the loader against `Role::Whole`, since its whole role is
@@ -6794,7 +6912,8 @@ mod tests {
     #[test]
     fn cursor_move_after_hunk_jump_is_sane_when_whole_file_fits_one_pane() {
         // A small file (fits in the default pane height) with two hunks: `max_scroll() == 0`.
-        // Under the OLD scroll-primary model (M3), `next_hunk_row` jumped raw `scroll` to the
+        // Under the OLD scroll-primary model (the initial renderer), `next_hunk_row` jumped raw
+        // `scroll` to the
         // second hunk's row unclamped, over-scrolling past `max_scroll()`, and `scroll_by` had a
         // "don't snap backward" carve-out just to keep that over-scrolled position sane on the
         // very next relative move. The cursor-primary model makes the carve-out unnecessary:
@@ -7117,7 +7236,7 @@ mod tests {
         );
     }
 
-    // ---- M4/ADR-038 zoom: gate, maximize, and split per-pane state -------------------------
+    // ---- Staging verbs/ADR-038 zoom: gate, maximize, and split per-pane state --------------
 
     /// A file with three genuinely distinct HEAD / index / worktree states — so it has BOTH a
     /// staged sub-diff (HEAD ↔ index) and an unstaged one (index ↔ worktree), the precondition
@@ -7273,7 +7392,8 @@ mod tests {
         app.toggle_maximize();
         assert!(!app.maximized, "toggles back off");
 
-        // Persists across file navigation, like layout — and (ADR-038 decision 5) so does focus
+        // Persists across file navigation, like layout — and (ADR-038, "`reset_panes`
+        // preserves `split_focus` when `maximized` is set") so does focus
         // while maximized: maximize the STAGED pane, navigate away and back, and confirm both
         // survive — the case the old zoom-cycling test couldn't express.
         app.toggle_split_focus(); // -> Staged pane
@@ -7285,7 +7405,8 @@ mod tests {
         assert_eq!(
             app.split_focus,
             super::SplitPane::Staged,
-            "focus must persist across next_file while maximized (decision 5)"
+            "focus must persist across next_file while maximized (reset_panes preserves \
+             split_focus when maximized is set)"
         );
         app.prev_file();
         assert!(app.maximized, "and across prev_file");
@@ -7382,7 +7503,7 @@ mod tests {
         assert!(app.notice.is_none(), "clear_notice must clear a set notice");
     }
 
-    // ---- M4 refresh: in-place re-diff + rebuild -------------------------------------------
+    // ---- Staging verbs refresh: in-place re-diff + rebuild ----------------------------------
 
     #[test]
     fn refresh_after_external_worktree_edit_picks_up_the_change() {
@@ -7528,7 +7649,8 @@ mod tests {
         assert!(app.maximized, "refresh must not reset maximize");
     }
 
-    /// M7 CS2 fix: a session launched with an explicit `[SOURCE]` argument must have `refresh`
+    /// A stack/uncommitted-source-keywords fix: a session launched with an explicit `[SOURCE]`
+    /// argument must have `refresh`
     /// re-resolve THAT source, never silently downgrade to no-argument auto-detect. A Graphite
     /// stack is active (`assemble_changesets` would return the whole `a`/`b` stack for
     /// auto-detect), but the session was launched with `uncommitted` — so both the manual `r`
@@ -8081,7 +8203,7 @@ mod tests {
         assert!(app.take_pending_wave().is_none());
     }
 
-    // ---- M4 index watcher (`on_tick`) -------------------------------------------------------
+    // ---- Staging-verbs index watcher (`on_tick`) --------------------------------------------
 
     /// Stage `path` in the fixture's index, exactly as an external `git add` would — the write
     /// [`App::on_tick`] is meant to notice, since [`crate::refresh::IndexSignature`] only
@@ -8208,7 +8330,7 @@ mod tests {
         );
     }
 
-    // ---- M4 staging: hunk identity ---------------------------------------------------------
+    // ---- Staging verbs: hunk identity -------------------------------------------------------
 
     /// A modified file whose only two changes are its first and last line, with a dozen unchanged
     /// lines between — so the two hunks are far enough apart to leave a collapsed gap between
@@ -8302,7 +8424,7 @@ mod tests {
         assert_eq!(app.hunk_at_cursor(), None);
     }
 
-    // ---- M4 staging: verbs -----------------------------------------------------------------
+    // ---- Staging verbs: verbs --------------------------------------------------------------
 
     /// A file with three distinct HEAD/index/worktree states — both a staged and an unstaged
     /// sub-diff, and hunk-patchable (Modified). Same shape the split/maximize gate tests use.
@@ -8441,7 +8563,7 @@ mod tests {
         repo.assert(predicate::repo::has_untracked_file("new.txt"));
     }
 
-    // ---- CS6: staging preserves diff position ----------------------------------------------
+    // ---- Staging preserves the diff position ------------------------------------------------
 
     /// Three single-line edits well-separated (>6 lines of pure context apart, git's own
     /// hunk-splitting threshold) so each is its own hunk AND the context between any two
@@ -8687,7 +8809,7 @@ mod tests {
         assert_eq!(app.cursor, expected);
     }
 
-    // ---- M4 staging: discard confirm flow --------------------------------------------------
+    // ---- Staging verbs: discard confirm flow ------------------------------------------------
 
     #[test]
     fn discard_hunk_requests_confirm_then_y_reverts_the_worktree() {
@@ -8761,11 +8883,12 @@ mod tests {
         ));
     }
 
-    // ---- M4 staging: refusals --------------------------------------------------------------
+    // ---- Staging verbs: refusals ------------------------------------------------------------
 
     #[test]
     fn stage_hunk_on_a_binary_file_refuses_without_touching_the_index() {
-        // ADR-038 decision 10: post-M11, a binary file is `notify_unstageable_refusal`'s only
+        // ADR-038, "Reword `notify_unstageable_refusal`'s non-committed branch": post-in-diff-
+        // navigation, a binary file is `notify_unstageable_refusal`'s only
         // non-committed caller — a file with both real sub-diffs can no longer land in
         // `Role::Whole` at all (maximize only narrows to the focused pane's role), so this
         // re-points the old `Zoom::Combined`-forced test at the one case that still reaches it.
@@ -8857,7 +8980,7 @@ mod tests {
         );
     }
 
-    // ---- M4 line selection -----------------------------------------------------------------
+    // ---- Staging verbs: line selection -------------------------------------------------------
 
     /// One hunk with two independent paired changes (line 2 `b`->`B`, line 4 `d`->`D`, one
     /// context line `c` between them). SBS display rows: 0 ctx, 1 del/add (b/B), 2 ctx, 3 del/add
@@ -8915,7 +9038,8 @@ mod tests {
         assert_eq!(ops.len(), 1, "one hunk overlapped");
         let (hunk_idx, sel) = &ops[0];
         assert_eq!(*hunk_idx, 0);
-        // SBS row-pair semantics (locked decision #8): a paired row keeps BOTH sides.
+        // SBS row-pair semantics (line selection works in both layouts): a paired row keeps BOTH
+        // sides.
         assert_eq!(sel.keep_dels.len(), 1, "SBS keeps the row's deleted line");
         assert_eq!(sel.keep_adds.len(), 1, "SBS keeps the row's added line too");
     }
@@ -8940,7 +9064,8 @@ mod tests {
         let ops = app.selection_line_ops();
         assert_eq!(ops.len(), 1);
         let (_, sel) = &ops[0];
-        // Inline keeps exactly the one side the selected row shows (locked decision #8).
+        // Inline keeps exactly the one side the selected row shows (line selection works in
+        // both layouts).
         assert_eq!(
             sel.keep_dels.len(),
             1,
@@ -9357,10 +9482,10 @@ mod tests {
         );
     }
 
-    // ── M5 CS1: the changeset-stack spine ─────────────────────────────────────
+    // ── The changeset-stack spine ───────────────────────────────────────────────
 
     #[test]
-    fn single_uncommitted_changeset_matches_m4_shape() {
+    fn single_uncommitted_changeset_matches_full_width_shape() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
@@ -9422,7 +9547,8 @@ mod tests {
         );
 
         // Read-only follows from the natural collapse above; the refusal MESSAGE is
-        // committed-mode-aware (m5-changeset-nav locked decision #2) — a plain "already
+        // committed-mode-aware (m5-changeset-nav's locked decision that committed mode is
+        // derived, not stored, with targeted guards) — a plain "already
         // committed" notice, not the uncommitted "cycle zoom" hint (there's no zoom that would
         // help here).
         app.stage_hunk();
@@ -9525,10 +9651,11 @@ mod tests {
         assert_eq!(app.current_changeset().name, "current");
     }
 
-    // ── M5 CS2: continuous nav, changeset nav, committed-mode guards ─────────
+    // ── Continuous changeset navigation, committed-mode guards ───────────────
 
-    /// A two-committed-changeset stack for CS2's nav tests, hand-built the same way as the M5 CS1
-    /// tests above: `cs-a` (`root..mid`, TWO files — `a1.txt`/`a2.txt`) then `cs-b` (`mid..head`,
+    /// A two-committed-changeset stack for the continuous-changeset-navigation work's nav
+    /// tests, hand-built the same way as the changeset-stack-spine tests above: `cs-a`
+    /// (`root..mid`, TWO files — `a1.txt`/`a2.txt`) then `cs-b` (`mid..head`,
     /// ONE file — `b1.txt`), opening on `cs-a`'s first file. The two-file first changeset lets a
     /// test distinguish "advance within a changeset" from "cross into the next changeset" at its
     /// boundary, rather than every `next_file` immediately crossing.
@@ -9891,11 +10018,12 @@ mod tests {
         );
     }
 
-    // ── M5 CS3: outline side pane ───────────────────────────────────────────────
+    // ── The outline side pane (flat and stack modes) ──────────────────────────────
 
     /// A committed changeset (`base..head`, one file, not current) beneath an uncommitted
     /// changeset (one untracked file, current) — the mix the outline's "status column only for
-    /// the uncommitted changeset" test needs, hand-built the same way as every other M5 test in
+    /// the uncommitted changeset" test needs, hand-built the same way as every other
+    /// stack-and-outline test in
     /// this module (`Changeset` literal + `diff_changeset` + `ChangesetView::from_changeset_diff`
     /// for BOTH sources — the acquisition router handles either).
     fn committed_and_uncommitted_stack() -> App {
@@ -9969,7 +10097,7 @@ mod tests {
         let lone = app_from_fixture(&fixture);
         assert!(
             !lone.outline_open(),
-            "a lone uncommitted changeset must keep the M4 full-width look (outline closed)"
+            "a lone uncommitted changeset must keep the original full-width look (outline closed)"
         );
     }
 
@@ -10127,7 +10255,8 @@ mod tests {
 
     #[test]
     fn outline_hscroll_right_has_no_upper_clamp_in_the_method_itself() {
-        // Locked decision #2: `outline_hscroll_right` floors at 0 but does NOT clamp against the
+        // The locked decision that outline pan floors at 0 and clamps render-side:
+        // `outline_hscroll_right` floors at 0 but does NOT clamp against the
         // outline's content width — that clamp is render-side (`render_outline`), covered in
         // `render.rs`'s tests.
         let mut app = two_committed_changesets_two_and_one_files();
@@ -10188,7 +10317,8 @@ mod tests {
         let owned = Repository::open(repo.workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(owned, vec![view_a, view_b]);
         app.outline.mode = OutlineMode::Stack;
-        // CS3: pin BaseFirst explicitly — this test asserts per-header marker content, not
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — this test
+        // asserts per-header marker content, not
         // display order, so it doesn't need to track the new HeadFirst default.
         app.outline.order = OutlineOrder::BaseFirst;
 
@@ -10302,7 +10432,8 @@ mod tests {
         let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(repo, vec![view_pending, view_failed]);
         app.outline.mode = OutlineMode::Stack;
-        // CS3: pin BaseFirst explicitly — this test asserts the exact header vec, which is
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — this test
+        // asserts the exact header vec, which is
         // incidental to base -> head storage order here, not what's under test (the
         // loading/failed markers).
         app.outline.order = OutlineOrder::BaseFirst;
@@ -10462,7 +10593,8 @@ mod tests {
         let owned = Repository::open(repo.workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(owned, vec![view_a, view_b]);
         app.outline.mode = OutlineMode::Stack;
-        // CS3: pin BaseFirst explicitly — the regression this test guards needs cs-a BEFORE
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — the regression
+        // this test guards needs cs-a BEFORE
         // cs-b in the row list (an earlier row's insertion shifting a later row's index); the
         // new HeadFirst default would put cs-b (head) first instead, inverting the scenario.
         app.outline.order = OutlineOrder::BaseFirst;
@@ -10540,7 +10672,8 @@ mod tests {
         );
     }
 
-    /// CS5: `outline_snapshot`'s `change` field is lifted from the owning `FileChange::status`,
+    /// File-status letters and opt-in nerd icons: `outline_snapshot`'s `change` field is
+    /// lifted from the owning `FileChange::status`,
     /// a wholly separate axis from `status` (staged-ness — see `outline::OutlineFile::change`'s
     /// doc comment). `c1.txt` is a new file introduced by the committed changeset's head commit
     /// (`Added`); `u1.txt` is an untracked worktree file (`Untracked`) — distinct FileStatus
@@ -10650,7 +10783,8 @@ mod tests {
     fn outline_move_by_on_a_file_row_jumps_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Flat;
-        // CS3: pin BaseFirst explicitly — this test exercises `outline_move_by`'s row-crossing
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — this test
+        // exercises `outline_move_by`'s row-crossing
         // mechanics via hardcoded Flat-mode indices, not display order.
         app.outline.order = OutlineOrder::BaseFirst;
         app.outline.cursor = 0;
@@ -10672,7 +10806,8 @@ mod tests {
     fn outline_move_by_on_a_header_row_does_not_jump_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
-        // CS3: pin BaseFirst explicitly — this test's hardcoded row indices assume base -> head
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — this test's
+        // hardcoded row indices assume base -> head
         // order (header, a1, a2, header, b1); the new HeadFirst default is a display-order
         // concern orthogonal to what's under test here (whether a header move jumps the diff).
         app.outline.order = OutlineOrder::BaseFirst;
@@ -10696,12 +10831,14 @@ mod tests {
 
     #[test]
     fn coalesced_outline_burst_onto_a_header_matches_sequential_unit_moves() {
-        // A multi-row delta is CS2's coalesced stand-in for N unit presses, so the two must be
+        // A multi-row delta is coalescing-buffered-navigation-input's coalesced stand-in for N unit
+        // presses, so the two must be
         // indistinguishable — including which file the diff follows when the burst stops on a
         // header row (the LAST file crossed, exactly where unit presses leave it).
         let mut coalesced = two_committed_changesets_two_and_one_files();
         coalesced.outline.mode = OutlineMode::Stack;
-        // CS3: pin BaseFirst explicitly — the burst-vs-sequential equivalence under test doesn't
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — the
+        // burst-vs-sequential equivalence under test doesn't
         // depend on which end of the stack displays first, and the inline comments below assume
         // base -> head row order.
         coalesced.outline.order = OutlineOrder::BaseFirst;
@@ -10732,12 +10869,14 @@ mod tests {
 
     #[test]
     fn outline_confirm_on_a_header_row_toggles_fold_instead_of_jumping_and_keeps_focus() {
-        // CS5 (`outline-fold`) removes Enter's pre-CS5 jump-to-changeset-first-file behavior on a
+        // `outline-fold` removes Enter's pre-`outline-fold` jump-to-changeset-first-file behavior
+        // on a
         // Header row — it now toggles that row's fold instead, and deliberately does NOT return
         // focus (you're manipulating the outline, not confirming a jump).
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
-        // CS3: pin BaseFirst explicitly — cursor 3 is hardcoded to cs-b's header under base ->
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — cursor 3 is
+        // hardcoded to cs-b's header under base ->
         // head row order; the toggle mechanic under test is order-agnostic.
         app.outline.order = OutlineOrder::BaseFirst;
         app.outline.open = true;
@@ -10752,7 +10891,7 @@ mod tests {
         assert_eq!(
             app.current_cs(),
             before_cs,
-            "Enter on a header must NOT jump the diff (CS5)"
+            "Enter on a header must NOT jump the diff (outline-fold)"
         );
         assert_eq!(app.current, before_file);
         assert!(
@@ -10803,7 +10942,8 @@ mod tests {
 
     #[test]
     fn diff_initiated_nav_syncs_the_outline_cursor_in_tree_mode() {
-        // CS4: Tree mode's rows still carry the same cs_idx/file_idx a File row always has, so
+        // The outline's path-trie tree modes: Tree mode's rows still carry the same cs_idx/file_idx
+        // a File row always has, so
         // `sync_outline_to_current`'s match-by-those-fields logic needs no tree-specific branch —
         // this pins that it actually still lands correctly once the row also carries `guides`.
         let mut app = two_committed_changesets_two_and_one_files();
@@ -10916,7 +11056,7 @@ mod tests {
         );
         assert!(
             app.outline_focused(),
-            "confirming a Dir row toggles its fold (CS5) rather than returning focus"
+            "confirming a Dir row toggles its fold (outline-fold) rather than returning focus"
         );
         assert!(
             app.outline_items().len() < rows_before,
@@ -10937,7 +11077,7 @@ mod tests {
         assert!(!app.outline_open());
     }
 
-    // ── CS2: outline scrolloff viewport + g/G jumps ─────────────────────────────
+    // ── The outline scrolloff viewport + g/G jumps ───────────────────────────────
 
     /// Four committed changesets of three files each — Stack mode (the default) yields 16 rows
     /// (header + 3 files, ×4), long enough to exercise [`App::derive_outline_scroll`]'s margin
@@ -11054,7 +11194,8 @@ mod tests {
 
     #[test]
     fn outline_top_lands_cursor_zero_and_does_not_jump_a_header() {
-        // CS3: the outline's default order is now HeadFirst, so Stack mode's row 0 is cs-b's
+        // The outline side pane (flat and stack modes): the default order is now HeadFirst, so
+        // Stack mode's row 0 is cs-b's
         // (the head changeset's) header, not cs-a's — see
         // `stack_mode_head_first_shows_last_changesets_header_first_with_true_cs_idx` in
         // outline.rs for the row-order pin. `outline_top`'s own contract (row 0, no diff jump)
@@ -11082,7 +11223,8 @@ mod tests {
 
     #[test]
     fn outline_bottom_lands_on_the_last_row_and_jumps_a_file() {
-        // CS3: under the new HeadFirst default, Stack mode's row order is cs-b's header/file(s)
+        // The outline side pane (flat and stack modes): under the new HeadFirst default, Stack
+        // mode's row order is cs-b's header/file(s)
         // first, then cs-a's — so the LAST row is cs-a's last file (a2.txt, cs_idx 0, file_idx
         // 1), not cs-b's only file as it was under the old base-first order.
         let mut app = two_committed_changesets_two_and_one_files();
@@ -11135,7 +11277,7 @@ mod tests {
         );
     }
 
-    // ── CS7: view-config (`apply_view_config`) ─────────────────────────────────
+    // ── The view-config settings (`apply_view_config`) ───────────────────────────
 
     #[test]
     fn unset_view_config_keeps_current_defaults() {
@@ -11182,7 +11324,8 @@ mod tests {
 
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(warnings.len(), 1);
-        // Full-message pin (config-validation-completeness Decision 5): the range and fallback
+        // Full-message pin (invalid-value warnings name the allowed set and the fallback): the
+        // range and fallback
         // must come from the real `MIN_OUTLINE_WIDTH`/`MAX_OUTLINE_WIDTH`/`DEFAULT_OUTLINE_WIDTH`
         // constants, never hardcoded numbers.
         assert_eq!(
@@ -11441,13 +11584,14 @@ mod tests {
         );
     }
 
-    // ── CS4: summary panel ───────────────────────────────────────────────────────
+    // ── The summary panel ─────────────────────────────────────────────────────────
 
     /// Force the outline open+focused with `mode` and `cursor`, matching the state
     /// `summary_target` requires — the individual state-transition tests below build off this
     /// instead of repeating the three-field setup. Pins `order` to `BaseFirst` so a fixture's
     /// base -> head file/changeset indices line up with display order (the default `HeadFirst`
-    /// reverses the header row sequence — irrelevant to what's under test here, see CS3).
+    /// reverses the header row sequence — irrelevant to what's under test here, see the
+    /// outline side pane's stack-and-outline work).
     fn open_focused_outline(app: &mut App, mode: OutlineMode, cursor: usize) {
         app.outline.open = true;
         app.outline.focused = true;
@@ -11588,11 +11732,12 @@ mod tests {
         assert_eq!(paths, vec!["src/a.txt", "src/b.txt"]);
     }
 
-    // ── CS7: stage/unstage/discard from outline rows ─────────────────────────────
+    // ── The outline staging verbs: stage/unstage/discard from outline rows ─────────
 
-    /// Find the [`OutlineItem::File`] row index whose full path is `path` (in the CURRENT outline
-    /// mode/order) — the CS7 tests' stand-in for "click the row named X", since a row's raw index
-    /// shifts with mode/order and none of these tests want to hardcode it.
+    /// Find the [`OutlineItem::File`] row index whose full path is `path` (in the CURRENT
+    /// outline mode/order) — the outline-staging-verbs tests' stand-in for "click the row named
+    /// X", since a row's raw index shifts with mode/order and none of these tests want to
+    /// hardcode it.
     fn outline_file_row(app: &App, path: &str) -> usize {
         app.outline_items()
             .iter()
@@ -12041,7 +12186,7 @@ mod tests {
         }
     }
 
-    // ── CS5 (`outline-fold`): collapse/expand ───────────────────────────────────
+    // ── `outline-fold`: collapse/expand ─────────────────────────────────────────
 
     #[test]
     fn outline_toggle_fold_hides_the_headers_files_and_move_by_skips_them() {
@@ -12152,7 +12297,7 @@ mod tests {
         app.outline_confirm(); // collapse cs-b's header
         assert!(
             app.outline_focused(),
-            "toggling a fold keeps focus (CS5) — sanity for the nav below"
+            "toggling a fold keeps focus (outline-fold) — sanity for the nav below"
         );
 
         // A diff-initiated nav lands the diff on cs-b's (now-hidden) first file.
@@ -12375,7 +12520,8 @@ mod tests {
 
     #[test]
     fn outline_stage_targets_the_correct_row_when_an_unrelated_header_is_folded() {
-        // The highest-risk CS5 interaction: folding one changeset's header shifts every LATER
+        // The highest-risk outline-fold interaction: folding one changeset's header shifts every
+        // LATER
         // row's index in `outline_items()` — a stage/discard verb resolved against a stale
         // (unfiltered) index space would silently act on the wrong file. `outline_stage` reads
         // `outline_row_targets`, which reads `outline_items()` at the CURSOR's own index — the
@@ -12433,7 +12579,7 @@ mod tests {
         repo.assert(predicate::repo::has_staged_file("dirty.txt"));
     }
 
-    // ── CS8: progressive gap expansion ──────────────────────────────────────
+    // ── Progressive gap expansion ─────────────────────────────────────────────
 
     /// A single-file fixture with two hunks separated by a wide (40-line) unchanged run — wide
     /// enough that even a full 10/10 [`App::expand_gap_at_cursor`] press still leaves a
@@ -12456,7 +12602,8 @@ mod tests {
             .unwrap()
     }
 
-    /// The display-row index of the current file's ONLY gap row — the fixture shape every CS8
+    /// The display-row index of the current file's ONLY gap row — the fixture shape every
+    /// progressive-gap-expansion
     /// expansion test below relies on.
     fn only_gap_row(app: &App) -> usize {
         app.current_view_ref()
@@ -12568,7 +12715,8 @@ mod tests {
         app.expand_gap_at_cursor(false);
 
         // Move to hunk B (the LATER hunk) through the freshly rebuilt `display`/`display_hunk` —
-        // this is the coordinate-space desync CS8 must not introduce: `display_hunk` is
+        // this is the coordinate-space desync progressive gap expansion must not introduce:
+        // `display_hunk` is
         // recomputed by `rebuild_rows` from the SAME `aligned`/`hunks` every time, so the row
         // under the cursor must still resolve to the right hunk index after an expansion.
         app.next_hunk_row();
@@ -12654,7 +12802,7 @@ mod tests {
         );
     }
 
-    // ── diff-fold-keys CS3: reset (`zM`) / expand-all (`zR`) gaps ───────────
+    // ── `diff-fold-keys`: reset (`zM`) / expand-all (`zR`) gaps ──────────────
 
     #[test]
     fn reset_gaps_collapses_an_expanded_gap_back_to_the_freshly_loaded_shape() {
@@ -12799,10 +12947,11 @@ mod tests {
         );
     }
 
-    // ── M11 CS3 (`diff-search`) ──────────────────────────────────────────────
+    // ── The in-diff search (`diff-search`) ─────────────────────────────────────
 
     /// [`two_hunks_with_a_wide_gap_fixture`], but the middle of the hidden context run carries a
-    /// unique needle (`ctx20` → `needle_line`) — CS3's "hidden-context rows are searchable, and
+    /// unique needle (`ctx20` → `needle_line`) — the in-diff search's "hidden-context rows are
+    /// searchable, and
     /// jumping to one auto-expands its gap" fixture.
     fn two_hunks_with_a_buried_needle_fixture() -> Fixture {
         let mut committed = String::from("OLD_HUNK_A\n");
@@ -12893,7 +13042,8 @@ mod tests {
 
     /// One wide hidden context run (50 lines) with two needles far apart inside it — `needleA`
     /// near the leading edge (line 10), `needleB` near the trailing edge (line 35) — so jumping to
-    /// each in turn widens the SAME gap from opposite edges. CS3's "repeated jumps into one gap
+    /// each in turn widens the SAME gap from opposite edges. The in-diff search's "repeated jumps
+    /// into one gap
     /// accumulate rather than reset" fixture.
     fn one_gap_with_two_needles_fixture() -> Fixture {
         let mut committed = String::from("OLD_HUNK_A\n");
@@ -13170,11 +13320,12 @@ mod tests {
             app.search_current_index(),
             None,
             "a live prompt edit must reset the parked-match highlight even if the resulting \
-             query is unchanged — CS3 only carries the index across a layout flip, nothing else"
+             query is unchanged — the in-diff search only carries the index across a layout \
+             flip, nothing else"
         );
     }
 
-    // ── CS9: reveal gaps to the enclosing tree-sitter scope ─────────────────
+    // ── The tree-sitter scope reveal ──────────────────────────────────────────
 
     /// A `.rs` fixture where both edits sit inside the SAME long function, with a 40-line
     /// unchanged run between them wide enough that even a +10/+10 press would still leave a
@@ -13221,7 +13372,8 @@ mod tests {
 
     /// The `skipped` count of the current file's only [`DisplayRow::Gap`], found by scanning
     /// `display` (NOT via `app.cursor` — expanding the gap's leading edge shifts the gap marker
-    /// to a later index, same as [`only_gap_row`] re-finds it after an expansion in the CS8
+    /// to a later index, same as [`only_gap_row`] re-finds it after an expansion in the
+    /// progressive-gap-expansion
     /// tests above). Panics if there isn't exactly one gap row.
     fn gap_skipped(app: &App) -> usize {
         let row = only_gap_row(app);
@@ -13257,8 +13409,9 @@ mod tests {
 
     #[test]
     fn a_grammarless_file_falls_back_to_the_flat_plus_ten_reveal() {
-        // Reuse CS8's `.txt` fixture (no bundled grammar for that extension) — the scope-reveal
-        // path must find no lang key and fall straight through to +10/+10, same as before CS9.
+        // Reuse progressive gap expansion's `.txt` fixture (no bundled grammar for that
+        // extension) — the scope-reveal path must find no lang key and fall straight through
+        // to +10/+10, same as before the tree-sitter scope reveal.
         let fixture = two_hunks_with_a_wide_gap_fixture();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
@@ -13273,7 +13426,8 @@ mod tests {
         assert_eq!(
             skipped_before - skipped_after,
             20,
-            "no grammar for .txt: exactly the flat 10-before/10-after reveal, same as CS8"
+            "no grammar for .txt: exactly the flat 10-before/10-after reveal, same as \
+             progressive gap expansion"
         );
     }
 
@@ -13302,8 +13456,9 @@ mod tests {
 
     #[test]
     fn full_expand_ignores_scope_reveal_regardless_of_grammar() {
-        // `E` (full=true) must stay pure CS8 behavior even on a file with a grammar and a scope
-        // that would otherwise apply — scope-reveal is an `Enter`-only (CS9) refinement.
+        // `E` (full=true) must stay pure progressive-gap-expansion behavior even on a file
+        // with a grammar and a scope that would otherwise apply — scope-reveal is an
+        // `Enter`-only (tree-sitter scope reveal) refinement.
         let fixture = function_with_a_wide_internal_gap_fixture();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
@@ -13324,7 +13479,7 @@ mod tests {
         );
     }
 
-    // ── CS10: mouse (click-to-focus, wheel scrolling) ────────────────────────────
+    // ── Mouse support (click-to-focus, wheel scrolling) ────────────────────────────
 
     #[test]
     fn click_on_an_outline_file_row_focuses_selects_and_jumps_the_diff() {
@@ -13658,7 +13813,8 @@ mod tests {
         let hscroll_before = app.hscroll;
         let outline_hscroll_before = app.outline_hscroll();
 
-        // On the divider, outside both recorded regions — same column CS10's click no-op test
+        // On the divider, outside both recorded regions — same column mouse support's click no-op
+        // test
         // uses.
         app.handle_hwheel(20, 0, 4);
 
@@ -13703,7 +13859,7 @@ mod tests {
         assert_eq!((app.current_cs(), app.current), current_before);
     }
 
-    // ── CS2 (`outline-filter`, M11): fuzzy filter ─────────────────────────────────
+    // ── The outline fuzzy filter (`outline-filter`) ───────────────────────────────
 
     #[test]
     fn outline_items_applies_the_active_filter_and_keeps_true_indices() {
@@ -13893,11 +14049,11 @@ mod tests {
             app.outline_cursor(),
             cursor_before.min(app.outline_items().len().saturating_sub(1)),
             "the cursor merely clamps into the filtered list's bounds, exactly like the \
-             pre-CS2 fallback for an unresolvable sync target"
+             pre-outline-fuzzy-filter fallback for an unresolvable sync target"
         );
     }
 
-    // ── `copy-lines` / `copy-location` (M11 yank split) ─────────────────────
+    // ── `copy-lines` / `copy-location` (`yank split`) ────────────────────────
 
     /// A single pure deletion — `b` (old line 2) removed with nothing added in its place — so
     /// the row it produces has an old lineno but NO new one, the fallback case
@@ -14030,7 +14186,8 @@ mod tests {
     /// Multi-row selection -> content, in both layouts, over a range spanning a deletion, an
     /// addition, and a context row (`two_changes_one_hunk_fixture`: `a b c d e` -> `a B c D e`).
     /// SBS pairs `b`/`B` and `d`/`D` into single rows each carrying both sides, so the range
-    /// `[paired(b,B), context c, paired(d,D)]` resolves to the NEW side throughout (decision 4):
+    /// `[paired(b,B), context c, paired(d,D)]` resolves to the NEW side throughout (which side a
+    /// row contributes):
     /// `B`, `c`, `D`.
     #[test]
     fn multi_row_selection_copies_content_spanning_del_add_context_sbs() {
@@ -14047,7 +14204,8 @@ mod tests {
 
     /// Inline analog: the same span becomes `Del(b) Add(B) Context(c) Del(d) Add(D)` — selecting
     /// from the first `Add` through the second `Add` picks up `Add(B) Context(c) Del(d) Add(D)`.
-    /// Unlike SBS, inline is per-side precise (decision 4): the `Del(d)` row in the middle
+    /// Unlike SBS, inline is per-side precise (which side a row contributes): the `Del(d)` row in
+    /// the middle
     /// contributes its OLD text (`d`), separately from the following `Add(D)`'s NEW text — this
     /// is the row-precision inline exists for, not a bug.
     #[test]
@@ -14102,7 +14260,8 @@ mod tests {
         assert_eq!(app.resolve_copy_location(), Ok("f.txt:2-4".to_string()));
     }
 
-    /// Single-row selection collapses to the single-line `path:12` form (decision 6), not
+    /// Single-row selection collapses to the single-line `path:12` form (the `path:lo-hi` range
+    /// location format), not
     /// `path:12-12`.
     #[test]
     fn single_row_selection_collapses_to_the_single_line_location_form() {
@@ -14115,7 +14274,8 @@ mod tests {
         assert_eq!(app.resolve_copy_location(), Ok("f.txt:2".to_string()));
     }
 
-    /// A selection spanning a gap row: the gap contributes nothing (decision 5), but its
+    /// A selection spanning a gap row: the gap contributes nothing (gap rows inside a range are
+    /// skipped), but its
     /// neighbors on either side are still copied.
     #[test]
     fn selection_spanning_a_gap_row_skips_the_gap_but_copies_its_neighbors() {
@@ -14153,8 +14313,9 @@ mod tests {
         assert_eq!(app.resolve_copy_location(), Err("no line to copy"));
     }
 
-    /// Content yank in `Role::Whole` succeeds — locked decision 7 pins this against a future
-    /// "helpful" refusal: decision 4's side-selection rule is total (it always yields a side), so
+    /// Content yank in `Role::Whole` succeeds — the locked decision that there is no
+    /// whole-role exemption for yank pins this against a future "helpful" refusal: the
+    /// side-selection rule (which side a row contributes) is total (it always yields a side), so
     /// unlike the staging verbs there is nothing to refuse. `start_selection` itself still gates
     /// whole role (it's a staging-shaped verb), so the selection is set directly here rather than
     /// through `v`. ADR-038: `Role::Whole` for a file with real content is now only reachable
