@@ -1,7 +1,8 @@
 //! Changeset assembly: turning a stack model + repository state into an ordered list of
 //! reviewable [`Changeset`]s for the worktree whose `HEAD` is a given branch.
 //!
-//! This is the substrate the review TUI (M2+) consumes. It stays **diff-free**: every
+//! This is the substrate the review TUI (from the diff-model-and-patch-synthesis work onward)
+//! consumes. It stays **diff-free**: every
 //! [`Changeset`] carries resolved `git2::Oid` rev pairs (or the [`ChangesetSpan::Uncommitted`]
 //! marker), never a parsed diff. Detecting uncommitted changes uses `repo.statuses`, never
 //! `repo.diff_*`.

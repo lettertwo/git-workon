@@ -72,7 +72,7 @@ pub enum StackModel {
     /// `upstream..HEAD`. Unlike [`StackModel::Graphite`]/[`StackModel::GhStack`], this carries
     /// no branch-level stack topology: [`enumerate_stacks`] and [`current_stack`] treat it as
     /// flat (same as [`StackModel::None`]), since there is no metadata to enumerate stacks
-    /// from or to group branches into. Only [`crate::assemble_changesets`] (M1 changeset
+    /// from or to group branches into. Only [`crate::assemble_changesets`] (lib changeset
     /// assembly) gives this variant meaning, walking `upstream..HEAD` per-commit.
     ///
     /// Not reachable via [`StackModel::detect`] — see the module docs' Default-on-behavior
@@ -99,7 +99,8 @@ impl StackModel {
     /// stack-active. Auto-resolving to `Git` for every repository with an upstream-tracking
     /// branch would silently flip that routing for nearly every user. `Git` is reachable via
     /// explicit `workon.stackModel = git` config, or a caller mapping `None` to `Git` before
-    /// calling [`crate::assemble_changesets`] (the review crate does this from M3 onward).
+    /// calling [`crate::assemble_changesets`] (the review crate does this from the initial
+    /// renderer onward).
     ///
     /// **Graphite wins** when both tools' artifacts are present: `.graphite_repo_config`
     /// comes from an explicit, repo-wide `gt init`, while a `gh-stack` file can appear as a

@@ -206,7 +206,7 @@ fn graphite_current_branch_missing_ref_errors(
 }
 both_formats!(graphite_current_branch_missing_ref_errors);
 
-// ── Trap 7 ─────────────────────────────────────────────────────────────────────
+// ── Stale-metadata head ───────────────────────────────────────────────────────
 
 fn trap7_spans_stale_branch_revision_to_live_head(
     format: MetadataFormat,
