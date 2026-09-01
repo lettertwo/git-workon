@@ -75,8 +75,9 @@ pub enum SynthesisError {
     #[diagnostic(code(workon::review::hunk_out_of_range))]
     HunkOutOfRange { path: String, index: usize },
 
-    /// The file's status can't be expressed as a hunk patch (trap 3: whole-file ops route
-    /// around synthesis entirely; this is what a caller sees if it reaches synthesis anyway).
+    /// The file's status can't be expressed as a hunk patch (whole-file-ops fallback: whole-file
+    /// ops route around synthesis entirely; this is what a caller sees if it reaches synthesis
+    /// anyway).
     #[error("line-precise selection is not supported for '{path}' ({status:?})")]
     #[diagnostic(
         code(workon::review::line_selection_unsupported),
@@ -114,7 +115,8 @@ pub enum ApplyError {
     #[diagnostic(code(workon::review::git_spawn_failed))]
     GitSpawn(#[source] std::io::Error),
 
-    /// A whole-file operation's filesystem I/O failed (`file_ops.rs`, CS4).
+    /// A whole-file operation's filesystem I/O failed (`file_ops.rs`, the whole-file ops and
+    /// routing layer).
     #[error("file operation on '{path}' failed")]
     #[diagnostic(code(workon::review::file_op_io))]
     Io {

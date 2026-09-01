@@ -1,5 +1,5 @@
-//! Refresh generation/livelock coordination (trap 5): a pure state machine tracking which
-//! re-diff is the latest one requested, so a slow refresh that finishes after a newer one has
+//! Refresh generation/livelock coordination (refresh echo suppression): a pure state machine
+//! tracking which re-diff is the latest one requested, so a slow refresh that finishes after a newer one has
 //! already started doesn't clobber fresher results.
 //!
 //! ## Interlock with `queue.rs`
@@ -7,9 +7,10 @@
 //! [`RefreshCoordinator::note_index_event`] refuses to schedule a refresh while
 //! [`crate::queue::StagingQueue::len`] is nonzero (passed in as `staging_queue_len`) — a
 //! refresh only makes sense once the queue has drained, since an in-flight staging op is about
-//! to change the index again anyway (trap 4/5 interlock).
+//! to change the index again anyway (the live-index-staging-queue/refresh-echo-suppression
+//! interlock).
 //!
-//! ## M4 wiring intent (forward-looking; not built here)
+//! ## Staging-verbs wiring intent (forward-looking; not built here)
 //!
 //! A filesystem watcher will call [`RefreshCoordinator::note_index_event`] whenever `.git/index`
 //! changes, using [`IndexSignature::read`] to build the signature. When it returns `true`, the
@@ -29,9 +30,10 @@ pub struct IndexSignature {
 }
 
 impl IndexSignature {
-    /// Read the current signature of `<git_dir>/index`. M4 convenience for wiring a real
-    /// filesystem watcher; M2's tests use synthetic signatures (see `tests` below) since the
-    /// coordinator's logic never inspects the fields itself, only compares whole signatures.
+    /// Read the current signature of `<git_dir>/index`. A staging-verbs convenience for wiring a
+    /// real filesystem watcher; this module's own tests use synthetic signatures (see `tests`
+    /// below) since the coordinator's logic never inspects the fields itself, only compares
+    /// whole signatures.
     pub fn read(git_dir: &Path) -> io::Result<Self> {
         use std::os::unix::fs::MetadataExt;
 
@@ -62,8 +64,9 @@ pub enum Completion {
     Superseded,
 }
 
-/// Generation counter + last-seen index signature, implementing the trap-5 supersede/livelock
-/// invariants. See the module docs for the `queue.rs` interlock and the M4 wiring intent.
+/// Generation counter + last-seen index signature, implementing the refresh-echo-suppression
+/// supersede/livelock invariants. See the module docs for the `queue.rs` interlock and the
+/// staging-verbs wiring intent.
 pub struct RefreshCoordinator {
     next_gen: u64,
     latest_started: u64,
@@ -97,8 +100,9 @@ impl RefreshCoordinator {
     /// If it recorded the signature here, a genuinely external change event would be "seen" and
     /// suppressed the moment it arrived, before any refresh even ran to observe it; worse, the
     /// signature that actually needs recording is the one a refresh completes with, at the
-    /// specific point trap 5 cares about (see `complete`), not the raw event that triggered the
-    /// refresh in the first place. Comparisons live here; recording lives in `complete`.
+    /// specific point refresh echo suppression cares about (see `complete`), not the raw event
+    /// that triggered the refresh in the first place. Comparisons live here; recording lives in
+    /// `complete`.
     pub fn note_index_event(&mut self, sig: IndexSignature, staging_queue_len: usize) -> bool {
         if staging_queue_len > 0 {
             return false;

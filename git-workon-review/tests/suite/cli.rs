@@ -1,7 +1,7 @@
 use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 
-/// Locked design decision #7 (M3 plan): a clean worktree prints "nothing to review" to stderr
+/// Locked design decision (the initial-renderer plan): a clean worktree prints "nothing to review" to stderr
 /// and exits 0 without ever entering the TUI — no raw-mode/alternate-screen setup, so this stays
 /// a plain `assert_cmd` invocation (no PTY needed).
 #[test]
@@ -46,9 +46,10 @@ fn bash_candidates(cwd: &std::path::Path, word: &str) -> Vec<String> {
         .collect()
 }
 
-/// ADR-036 "Completion" section (CS5): the `stack`/`uncommitted` keywords plus local branch and
-/// tag names, offline, via git2 ref enumeration — this is the SOURCE positional's dynamic
-/// completer, exercised through the same `COMPLETE=bash` protocol M6 wired the binary to answer.
+/// ADR-036 "Completion" section (source completion and sub-delegation): the
+/// `stack`/`uncommitted` keywords plus local branch and tag names, offline, via git2 ref
+/// enumeration — this is the SOURCE positional's dynamic completer, exercised through the same
+/// `COMPLETE=bash` protocol the CLI-integration work wired the binary to answer.
 #[test]
 fn source_completion_offers_keywords_and_local_refs() {
     let fixture = FixtureBuilder::new()
@@ -100,7 +101,8 @@ fn source_completion_completes_range_rhs_with_lhs_prefix() {
 }
 
 /// The binary answers the `COMPLETE=<shell>` dynamic-completion protocol (clap_complete's
-/// `CompleteEnv`), so git-workon can delegate `git workon review <TAB>` completion to it (M6 CS3).
+/// `CompleteEnv`), so git-workon can delegate `git workon review <TAB>` completion to it
+/// (external-subcommand completion enumeration).
 /// A non-repo cwd degrades to keyword-only candidates (ADR-036: any git error → keywords only,
 /// never a completion-path error) rather than failing repo discovery — the load-bearing contract
 /// is that `COMPLETE` mode short-circuits into the completer *before* that discovery even runs.

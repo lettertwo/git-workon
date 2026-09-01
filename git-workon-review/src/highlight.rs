@@ -69,7 +69,8 @@ pub fn capture_index(name: &str) -> Option<usize> {
 
 /// Maps a file extension to the [`build_config`]/[`language_for_key`] key for its grammar, or
 /// `None` when no bundled grammar covers it. `pub(crate)` so [`crate::app`] can resolve a gap's
-/// anchor file to a scope-lookup language (CS9) without duplicating this table.
+/// anchor file to a scope-lookup language (tree-sitter scope reveal) without duplicating this
+/// table.
 pub(crate) fn lang_key_for_ext(ext: &str) -> Option<&'static str> {
     match ext {
         "rs" => Some("rust"),

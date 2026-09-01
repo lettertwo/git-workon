@@ -5,18 +5,19 @@
 //! read events through the [`AppEvent`] inbox rather than calling crossterm directly from the
 //! loop.
 //!
-//! ADR-037 (progressive pipeline) supersedes M4's locked decision #4 — the "no threads, no
+//! ADR-037 (progressive pipeline) supersedes the staging-verbs work's locked decision that the
+//! runtime stays sync, polling the index signature on Tick — the "no threads, no
 //! `mpsc`" letter of that note, recorded here in an earlier revision, no longer holds. A
 //! dedicated *input thread* (spawned by [`Tui::run`]) is now the ONLY code that calls
 //! crossterm's event API: it blocks on `event::read()` forever, maps each event exactly like
 //! this module's old `next_event`/`drain_pending` read arms did, and forwards mapped events into
 //! an `std::sync::mpsc` inbox that the main loop drains via [`recv_event`]/[`drain_pending`].
 //! `recv_timeout`'s timeout arm IS the `Tick` beat — unchanged from before, just relocated from
-//! `event::poll`'s timeout to the channel's. The M4 index watcher's *semantics* are exactly
+//! `event::poll`'s timeout to the channel's. The staging-verbs work's index watcher's *semantics* are exactly
 //! unchanged by this move: it still compares [`workon_review::refresh::IndexSignature`] and
 //! re-diffs in place via [`App::on_tick`] on every `Tick`; only the beat's mechanism moved.
 //!
-//! CS10 turns the mouse on: [`Tui::acquire`] enables capture for the whole session (undone by
+//! Mouse support turns the mouse on: [`Tui::acquire`] enables capture for the whole session (undone by
 //! [`Tui::restore`] and, unconditionally, the panic hook), and [`map_terminal_event`] maps a
 //! left-click or wheel-scroll into an [`AppEvent::Mouse`] the loop dispatches to
 //! [`workon_review::app::App::handle_click`]/[`workon_review::app::App::handle_wheel`] — every
@@ -63,7 +64,7 @@ use workon_review::theme::{Palette, PaletteContext};
 pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
-    /// A left-click or wheel-scroll (CS10) — the only [`MouseEventKind`]s [`map_terminal_event`]
+    /// A left-click or wheel-scroll (mouse support) — the only [`MouseEventKind`]s [`map_terminal_event`]
     /// maps; drag, move, non-left buttons, and up events are dropped at the mapping step, exactly
     /// like key release/repeat.
     Mouse(MouseEvent),
@@ -101,7 +102,7 @@ impl PartialEq for AppEvent {
     /// match on them directly. Every fully-comparable variant needs its own arm here: the
     /// `_ => false` catch-all exists ONLY for `FileReady`/`ChangesetReady`, and letting a
     /// comparable variant fall into it silently breaks reflexivity (`Mouse` did exactly that
-    /// when CS10 first added it — crossterm's `MouseEvent` derives `PartialEq` fine).
+    /// when mouse support first added it — crossterm's `MouseEvent` derives `PartialEq` fine).
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (AppEvent::Key(a), AppEvent::Key(b)) => a == b,
@@ -119,7 +120,7 @@ impl PartialEq for AppEvent {
 type InboxMessage = io::Result<AppEvent>;
 
 /// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press,
-/// resize, and (CS10, extended by the mouse h-wheel follow-up) a left-click or vertical/
+/// resize, and (mouse support, extended by the mouse h-wheel follow-up) a left-click or vertical/
 /// horizontal wheel-scroll map; key release/repeat, every other mouse kind (drag, move, non-left
 /// buttons, button-up), paste, and focus events are skipped (`None`). Pure and independent of any
 /// thread or channel, so it's unit-tested directly; the input thread's loop body is a thin wrapper
@@ -379,8 +380,8 @@ struct Pipeline<'a> {
 }
 
 /// Receive the next event from `inbox`, waiting up to `timeout`. A timeout with nothing received
-/// yields `Ok(AppEvent::Tick)` — the loop's regular redraw beat, and the mechanism the M4 index
-/// watcher polls on (see the module doc). A disconnected inbox (the input thread panicked, or
+/// yields `Ok(AppEvent::Tick)` — the loop's regular redraw beat, and the mechanism the
+/// staging-verbs work's index watcher polls on (see the module doc). A disconnected inbox (the input thread panicked, or
 /// exited after an error without this being observed yet) is surfaced as an `io::Error` rather
 /// than spinning — the loop must exit, not busy-loop on an empty channel forever.
 fn recv_event(inbox: &mpsc::Receiver<InboxMessage>, timeout: Duration) -> io::Result<AppEvent> {
@@ -621,7 +622,7 @@ fn action_needs_loaded_view(action: Action) -> bool {
 
 /// Apply an [`Action`] to `app`. Returns `true` when the loop should exit.
 ///
-/// Chokepoint (CS4): before doing anything else, force-complete a pending deferred open for every
+/// Chokepoint (idle-deferred file loads): before doing anything else, force-complete a pending deferred open for every
 /// action [`action_needs_loaded_view`] flags — see that function's doc comment for the principle
 /// and the exemption list. [`App::complete_pending_open`] is a no-op when nothing is pending, so
 /// this costs nothing outside defer mode (where `open_pending` is never set) or when the debounce
@@ -663,8 +664,9 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::OutlineConfirm => app.outline_confirm(),
         Action::OutlineCycleMode => app.outline_cycle_mode(),
         // `h`/`left` pans the diff back to column 0 first (mirroring the outline's own home
-        // position) and only actually focuses the outline once there — see the handoff's locked
-        // decision #2. Implemented here rather than in `App::focus_outline` itself, since that
+        // position) and only actually focuses the outline once there — see the hscroll handoff's
+        // locked decision that `h`/`left` pans back to column 0 before focusing the outline.
+        // Implemented here rather than in `App::focus_outline` itself, since that
         // method is also called from the outline toggle (`App::toggle_outline`) and the mouse
         // click/wheel paths (`App::handle_click`/`handle_wheel`), none of which should gain pan
         // behavior.
@@ -726,7 +728,7 @@ fn resolve_key(
             app.cancel_selection();
             return KeyOutcome::Handled;
         }
-        // M11 CS3 (`diff-search`): Esc with an ACCEPTED search active (the prompt itself already
+        // The in-diff search (`diff-search`): Esc with an ACCEPTED search active (the prompt itself already
         // closed — see [`apply_search_input_key`]'s own Esc arm for the prompt-open case) clears
         // it, ranked in this same tier (before the outline-focused-quit/focus-outline arms below —
         // see `update`'s doc comment).
@@ -736,7 +738,7 @@ fn resolve_key(
             return KeyOutcome::Handled;
         }
     }
-    // CS2 (outline-filter): with the outline focused (the input row does NOT have capture —
+    // The outline fuzzy filter (`outline-filter`): with the outline focused (the input row does NOT have capture —
     // that's `update`'s case-3 modal arm) and a query actively narrowing the list, Esc unwinds
     // the filter instead of quitting — mirroring how the selection-Esc arm above unwinds the
     // diff's innermost mode before Esc's outer meanings apply. Only the NEXT Esc reaches the
@@ -757,7 +759,7 @@ fn resolve_key(
     ))
 }
 
-/// `update`'s case-3 modal arm: apply one key press while the CS2 outline-filter INPUT has
+/// `update`'s case-3 modal arm: apply one key press while the outline fuzzy filter INPUT has
 /// keyboard capture (see [`App::outline_filter_focused`]). Every branch calls straight into an
 /// `App::outline_filter_*` method — no [`Action`]/[`map_key`] indirection, mirroring the
 /// confirm/help modals' own direct `key.code` matches just above this arm's call site, rather
@@ -809,7 +811,7 @@ fn prompt_edit_for_key(key: KeyEvent) -> Option<PromptEdit> {
     }
 }
 
-/// `update`'s case-3 modal arm: apply one key press while the CS2 outline-filter INPUT has
+/// `update`'s case-3 modal arm: apply one key press while the outline fuzzy filter INPUT has
 /// keyboard capture (see [`App::outline_filter_focused`]). Handles its own Enter/Esc and the
 /// outline-list-navigation extras (`Ctrl-c`/`Ctrl-n`/`Ctrl-p`/`Down`/`Up`) directly, then
 /// delegates every other key to [`prompt_edit_for_key`] — every branch calls straight into an
@@ -841,7 +843,7 @@ fn apply_filter_input_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// `update`'s search-prompt modal arm (M11 CS3, `diff-search`): apply one key press while the
+/// `update`'s search-prompt modal arm (the in-diff search, `diff-search`): apply one key press while the
 /// diff-view search prompt has keyboard capture (see [`App::search_focused`]). Mirrors
 /// [`apply_filter_input_key`]'s shape (own Enter/Esc first, then [`prompt_edit_for_key`]) but
 /// WITHOUT that arm's outline-list-navigation extras: the search prompt has no outline-list-
@@ -869,7 +871,7 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 
 /// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize is a
 /// no-op — ratatui re-measures `body_area` every frame regardless. Tick drives
-/// [`App::on_tick`], the M4 index watcher's poll (see the module doc).
+/// [`App::on_tick`], the staging-verbs work's index watcher's poll (see the module doc).
 ///
 /// A `Key` event clears any showing footer notice BEFORE applying the key's own action, so a
 /// notice stays visible until the user's next keystroke — that same keystroke both dismisses the
@@ -877,7 +879,7 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 /// tick isn't the user acting on the message.
 ///
 /// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
-/// CS2 outline-filter input having capture > the M11 CS3 search prompt having capture > an active
+/// outline fuzzy filter input having capture > the in-diff search prompt having capture > an active
 /// line selection OR an active search (diff-focused) > an active outline-filter query
 /// (outline-focused) > the outline having focus > the diff having focus with the outline open >
 /// the normal key map (where Esc quits). Concretely — the home-base model: the outline is where
@@ -892,7 +894,7 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 ///    reacts). Ranked just below the confirm modal — in practice the two are never up
 ///    together, since opening help doesn't run through a confirm, but the confirm winning keeps
 ///    a destructive prompt from ever being silently dismissed by a stray overlay key.
-/// 3. Otherwise, the CS2 outline-filter INPUT (`/`, while it has capture — see
+/// 3. Otherwise, the outline fuzzy filter INPUT (`/`, while it has capture — see
 ///    [`App::outline_filter_focused`]) captures next, mirroring the same swallow: typing/editing
 ///    keys reach [`crate::prompt::PromptState`], `Enter`/`Esc` return capture to the outline row
 ///    list KEEPING the query, `Ctrl-c` clears it and returns capture too, and `Down`/`Up`/
@@ -900,7 +902,7 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 ///    (opening help while filtering isn't reachable today — `?` isn't part of the input's own key
 ///    set — but the ordering still says which would win if that ever changed) and above every
 ///    other case, since none of them should observe a key the filter input itself consumes.
-/// 4. Otherwise, the M11 CS3 search prompt (`/` in the diff view, while it has capture — see
+/// 4. Otherwise, the in-diff search prompt (`/` in the diff view, while it has capture — see
 ///    [`App::search_focused`]) captures next, mirroring the outline-filter input's swallow:
 ///    typing/editing keys reach [`crate::prompt::PromptState`] (live-previewing highlights, never
 ///    moving the cursor), `Enter` accepts and jumps, `Esc` aborts back to whatever search (or
@@ -956,9 +958,9 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             KeyOutcome::Handled => false,
             KeyOutcome::Action(action) => apply_action(app, action),
         },
-        // CS10: all four modals swallow mouse input exactly like they swallow keys (cases 1-4
-        // above) — a click/wheel while a discard confirm, the help overlay, the CS2 outline-filter
-        // input, or the M11 CS3 search prompt is up does nothing.
+        // Mouse support: all four modals swallow mouse input exactly like they swallow keys (cases 1-4
+        // above) — a click/wheel while a discard confirm, the help overlay, the outline fuzzy
+        // filter input, or the in-diff search prompt is up does nothing.
         AppEvent::Mouse(_)
             if app.pending_confirm.is_some()
                 || app.help_visible
@@ -1026,7 +1028,8 @@ enum RunKind {
 /// calls would (see [`update_batch`]'s doc comment for why this only holds for same-sign runs).
 ///
 /// `MoveCursorBy` reads cursor-space state exactly like [`apply_action`]'s `Action::MoveCursorBy`
-/// arm does, and this is the OTHER path (besides `apply_action`) that can run it — CS2's
+/// arm does, and this is the OTHER path (besides `apply_action`) that can run it — the
+/// outline fuzzy filter's
 /// coalescing calls `App::move_cursor_by` directly rather than routing the flush through
 /// `apply_action`, so the same force-completion has to happen here too (see the plan's chokepoint
 /// note: whichever path applies `MoveCursorBy` must complete first). `OutlineMoveBy` needs no such
@@ -1077,7 +1080,8 @@ fn update_batch(
 
     for event in events {
         match event {
-            // The coalescable path: no modal is up (CS2's outline-filter input and the M11 CS3
+            // The coalescable path: no modal is up (the outline fuzzy filter input and the
+            // in-diff search
             // search prompt both included — a key while either has capture must reach
             // `apply_filter_input_key`/`apply_search_input_key` via the catch-all arm's `update`
             // delegation below, never `resolve_key`/the coalescing path), and this isn't the
@@ -1169,7 +1173,7 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut out = terminal_writer();
-        // CS10: disable mouse capture unconditionally, same as `Tui::restore` — a stray disable
+        // Mouse support: disable mouse capture unconditionally, same as `Tui::restore` — a stray disable
         // sequence when capture was never enabled (a panic before `Tui::acquire` reaches its own
         // `EnableMouseCapture`) is harmless, and there's no cheaper way from here to know whether
         // capture is currently on.
@@ -1198,7 +1202,7 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode()?;
         let mut out = terminal_writer();
-        // CS10: capture the mouse for the whole session — `map_terminal_event` only ever lets a
+        // Mouse support: capture the mouse for the whole session — `map_terminal_event` only ever lets a
         // left-click or wheel-scroll through, so this doesn't cost the terminal's normal
         // text-selection UX beyond what most terminals' shift-click bypass already covers.
         execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1220,9 +1224,10 @@ impl Tui {
     }
 
     /// Run the main loop against `app`, then restore the terminal. Callers must have already
-    /// called `app.open_current()` — under CS4's deferred-load mode (`app.set_defer_loads(true)`,
+    /// called `app.open_current()` — under idle-deferred file loads' deferred-load mode
+    /// (`app.set_defer_loads(true)`,
     /// `main.rs`'s default) that call marks the open PENDING rather than loading eagerly, so the
-    /// first frame shows CS4's placeholder until the ADR-037 loader thread answers (or a
+    /// first frame shows idle-deferred file loads' placeholder until the ADR-037 loader thread answers (or a
     /// force-completion chokepoint loads it synchronously first); a caller that never turned defer
     /// mode on gets eager behavior.
     ///
@@ -1333,7 +1338,7 @@ impl Tui {
         }
         self.restored = true;
         disable_raw_mode()?;
-        // CS10: disable mouse capture before leaving the alternate screen — same ordering
+        // Mouse support: disable mouse capture before leaving the alternate screen — same ordering
         // convention as the raw-mode/alternate-screen pair, undone in the reverse order acquire
         // set them up in.
         execute!(
@@ -1361,7 +1366,7 @@ fn draw_splash(frame: &mut Frame<'_>, msg: &str) {
     frame.render_widget(para, frame.area());
 }
 
-/// CS4's input-idle window: how long the loop waits with no new input before running a pending
+/// Idle-deferred file loads' input-idle window: how long the loop waits with no new input before running a pending
 /// deferred file open. Long enough that held-key autorepeat (~30-90ms between events on most
 /// terminals) usually keeps re-arming the debounce and deferring the load past the whole burst;
 /// short enough that releasing the key feels instant rather than laggy. Tunable if either edge
@@ -1395,7 +1400,7 @@ fn event_loop<W: Write>(
         // While an open is pending, wait on the short debounce window instead of the regular
         // 200ms redraw beat, so the deferred load's request goes out promptly once input goes
         // quiet — a plain timeout (no new inbox message) is what "quiet" means here. This borrows
-        // the same `Tick` beat the M4 index watcher already polls on (see the module doc); the
+        // the same `Tick` beat the staging-verbs work's index watcher already polls on (see the module doc); the
         // watcher occasionally running ~120ms early during a debounce window is harmless (its own
         // doc comment already tolerates an "unseen" signature settling one tick late).
         let timeout = if app.open_pending() {
@@ -1527,11 +1532,11 @@ mod tests {
         assert_eq!(map_terminal_event(Event::FocusLost), None);
     }
 
-    /// CS10: `map_terminal_event` maps ONLY a left-click-down or a wheel-scroll to
+    /// Mouse support: `map_terminal_event` maps ONLY a left-click-down or a wheel-scroll to
     /// `AppEvent::Mouse`; every other mouse kind — drag, move, button-up, and non-left buttons —
-    /// is still dropped, exactly like the pre-CS10 version dropped every mouse event outright.
+    /// is still dropped, exactly like the pre-mouse-support version dropped every mouse event outright.
     /// This supersedes the old `map_terminal_event_skips_release_repeat_mouse_paste_and_focus`
-    /// pin (split above into the non-mouse skip cases, which are unchanged by CS10).
+    /// pin (split above into the non-mouse skip cases, which are unchanged by mouse support).
     #[test]
     fn map_terminal_event_maps_left_down_and_scroll_but_drops_other_mouse_kinds() {
         let left_down = mouse(MouseEventKind::Down(MouseButton::Left));
@@ -1737,7 +1742,7 @@ mod tests {
 
     #[test]
     fn g_and_shift_g_map_to_outline_top_and_bottom_when_outline_focused() {
-        // CS2: `g`/`G` are bound per-view (`scroll-top`/`scroll-bottom` in both View::Diff and
+        // The configurable-per-view-keymaps work: `g`/`G` are bound per-view (`scroll-top`/`scroll-bottom` in both View::Diff and
         // View::Outline), so the SAME key must resolve to a different Action depending on which
         // pane has focus — outline-focused maps to the outline jump, not the diff scroll.
         let km = Keymap::defaults();
@@ -1764,7 +1769,7 @@ mod tests {
 
     #[test]
     fn enter_and_shift_e_map_to_expand_gap_in_diff_context() {
-        // CS8: `enter`/`E` are bound in View::Diff only (`expand-gap`/`expand-gap-all`) — Enter
+        // Progressive gap expansion: `enter`/`E` are bound in View::Diff only (`expand-gap`/`expand-gap-all`) — Enter
         // stays `OutlineConfirm` when the outline has focus (see the next test).
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
@@ -2120,7 +2125,7 @@ mod tests {
         let mut pending: Vec<KeyPress> = Vec::new();
 
         // A plain Tick with nothing changed externally must be a safe no-op wired all the way
-        // through `update` — the smoke test for M4's index-watcher hookup (the substantive
+        // through `update` — the smoke test for the staging-verbs work's index-watcher hookup (the substantive
         // signature-change/echo-suppression assertions live in `app.rs`'s own `on_tick` tests,
         // which have direct access to its private state).
         let quit = update(&mut app, &km, &mut pending, AppEvent::Tick);
@@ -2268,7 +2273,7 @@ mod tests {
 
     #[test]
     fn esc_ladder_search_prompt_then_active_search_then_outline_focus() {
-        // M11 CS3 (`diff-search`): three Esc presses in sequence, each landing on the NEXT lower
+        // The in-diff search (`diff-search`): three Esc presses in sequence, each landing on the NEXT lower
         // tier of the ladder once the higher one no longer applies — the prompt-open case first
         // (Esc aborts the EDIT, keeping the accepted query and its highlights), then the
         // accepted-search-active case (Esc clears the search entirely), then the ordinary
@@ -2400,7 +2405,7 @@ mod tests {
         repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
     }
 
-    /// CS10: a pending discard confirm swallows a mouse event exactly like it swallows a key —
+    /// Mouse support: a pending discard confirm swallows a mouse event exactly like it swallows a key —
     /// mirrors `pending_confirm_captures_y_and_n_and_ignores_other_keys` above. A click inside a
     /// live hit region must not move the cursor or resolve the confirm.
     #[test]
@@ -2444,9 +2449,10 @@ mod tests {
         );
     }
 
-    // ── M5 CS3: outline pane key routing ─────────────────────────────────────
+    // ── The outline side pane (flat and stack modes): outline pane key routing ───────────
 
-    /// A two-committed-changeset stack, built the same way as `app.rs`/`render.rs`'s own M5
+    /// A two-committed-changeset stack, built the same way as `app.rs`/`render.rs`'s own
+    /// outline-side-pane
     /// tests — `tui.rs` needs its own copy since it compiles into the separate bin crate (see
     /// `app_from_fixture`'s doc comment above for why the helpers can't be shared directly).
     fn two_committed_changesets_app(fixture: &git_workon_fixture::fixture::Fixture) -> App {
@@ -2786,7 +2792,7 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
-        // CS3: pin BaseFirst explicitly — this test exercises Enter's File-row jump + focus
+        // The outline side pane (flat and stack modes): pin BaseFirst explicitly — this test exercises Enter's File-row jump + focus
         // return, which is orthogonal to display order, but the row offset below assumes the
         // base->head row layout.
         app.set_outline_order(workon_review::outline::OutlineOrder::BaseFirst);
@@ -2794,8 +2800,8 @@ mod tests {
         app.toggle_outline(); // open + focus, cursor synced onto cs-b's file row
         assert!(app.outline_focused());
         // Move the outline cursor onto cs-a's FILE row (rows, BaseFirst: [Header a, File a.txt,
-        // Header b, File b.txt] — cursor starts at 3; -2 lands on File a.txt at row 1). CS5
-        // (`outline-fold`) removed Enter's old header-jump behavior — see
+        // Header b, File b.txt] — cursor starts at 3; -2 lands on File a.txt at row 1).
+        // `outline-fold` removed Enter's old header-jump behavior — see
         // `enter_on_a_header_row_toggles_fold_and_keeps_focus` below for that case — so this
         // keybinding-dispatch test needs a File row to still exercise a real jump+unfocus.
         app.outline_move_by(-2);
@@ -2830,7 +2836,7 @@ mod tests {
 
     #[test]
     fn enter_on_a_header_row_toggles_fold_and_keeps_focus() {
-        // CS5 (`outline-fold`): Enter on a Header/Dir row no longer jumps+unfocuses — it toggles
+        // `outline-fold`: Enter on a Header/Dir row no longer jumps+unfocuses — it toggles
         // that row's fold and deliberately keeps focus. This is the header-row counterpart to
         // `enter_confirms_an_outline_jump_and_returns_focus_to_the_diff` above, verified through
         // the same real keybinding-dispatch path (`update`/`map_key`), not a direct
@@ -2865,12 +2871,12 @@ mod tests {
         assert_eq!(
             app.current_cs(),
             before_cs,
-            "Enter on a header must NOT jump the diff (CS5)"
+            "Enter on a header must NOT jump the diff (outline-fold)"
         );
         assert_eq!(app.current, before_file);
         assert!(
             app.outline_focused(),
-            "Enter on a header toggles its fold and keeps focus (CS5), rather than confirming a \
+            "Enter on a header toggles its fold and keeps focus (outline-fold), rather than confirming a \
              jump"
         );
         assert!(
@@ -2879,7 +2885,7 @@ mod tests {
         );
     }
 
-    // ── CS3: help overlay ───────────────────────────────────────────────────
+    // ── The help footer and `?` overlay ─────────────────────────────────────
 
     #[test]
     fn question_mark_opens_the_help_overlay() {
@@ -3007,10 +3013,11 @@ mod tests {
         );
     }
 
-    // ── CS2: coalesce buffered nav input ─────────────────────────────────────
+    // ── Coalescing buffered navigation input ────────────────────────────────
 
     /// A single committed changeset with `n` distinct multi-line files ("f0.txt".."f{n-1}.txt"),
-    /// opened on file 0 — CS2's batching tests need several files so a coalesced outline jump has
+    /// opened on file 0 — the coalescing-buffered-navigation-input work's batching tests need
+    /// several files so a coalesced outline jump has
     /// intermediate rows to skip over, and several lines per file so a coalesced diff-cursor run
     /// has room to move without immediately clamping.
     fn many_files_app(fixture: &git_workon_fixture::fixture::Fixture, n: usize) -> App {
@@ -3371,7 +3378,7 @@ mod tests {
         assert_eq!(app.current, 1, "]f must have fired NextFile");
     }
 
-    // ── CS4: idle-deferred loads ──────────────────────────────────────────────
+    // ── Idle-deferred file loads ────────────────────────────────────────────────
 
     #[test]
     fn deferred_outline_burst_loads_nothing_until_completed() {
@@ -3385,7 +3392,8 @@ mod tests {
             .unwrap();
         let mut app = many_files_app(&fixture, 5);
         // `many_files_app` opens eagerly (defer mode isn't on yet) — file 0 is loaded before we
-        // flip the switch, exactly like a real session's startup open would be under CS4 (see
+        // flip the switch, exactly like a real session's startup open would be under
+        // idle-deferred file loads (see
         // `main.rs`, which turns defer mode on before its own initial `open_current`).
         app.set_defer_loads(true);
         app.set_outline_mode(OutlineMode::Flat);
@@ -3501,7 +3509,7 @@ mod tests {
         repo_eager.assert(predicate::repo::has_staged_file("a.txt"));
     }
 
-    // ── CS5: launch splash ────────────────────────────────────────────────────
+    // ── The launch splash and early terminal takeover ──────────────────────────
 
     #[test]
     fn splash_renders_the_message() {
@@ -3739,7 +3747,8 @@ mod tests {
 
     // ── diff-hscroll: `Action::FocusOutline` pans home before focusing ─────────────
 
-    /// Locked decision #2: `h`/`left` (`Action::FocusOutline`) pans the diff back toward column
+    /// The hscroll handoff's locked decision that `h`/`left` pans back to column 0 before
+    /// focusing the outline: `h`/`left` (`Action::FocusOutline`) pans the diff back toward column
     /// `0` first while panned, and only actually focuses the outline once there — implemented in
     /// this dispatch arm rather than in `App::focus_outline` itself (see that arm's comment), so
     /// this is only testable at the `apply_action` layer, not through `App` alone.
@@ -3823,10 +3832,11 @@ mod tests {
         );
     }
 
-    // ── CS2 (`outline-filter`, M11): the filter-input modal cascade arm ──────────
+    // ── The outline fuzzy filter (`outline-filter`): the filter-input modal cascade arm ────
 
     /// A single (uncommitted) changeset with three distinct files, outline open+focused in Flat
-    /// mode (no header row in the way) — CS2's cascade tests just need "type `/`, then some keys,
+    /// mode (no header row in the way) — the outline-fuzzy-filter work's cascade tests just
+    /// need "type `/`, then some keys,
     /// assert `App` state," and Flat mode keeps the row math simple (every row is a `File`).
     fn filter_test_app() -> App {
         use git_workon_fixture::prelude::*;

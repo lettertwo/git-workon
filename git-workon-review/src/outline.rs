@@ -4,9 +4,11 @@
 //! dependency, same posture as [`crate::align`]'s pure row-alignment module consumed by
 //! `app`/`render`.
 //!
-//! CS3 shipped two of the four modes ([`OutlineMode::Flat`]/[`OutlineMode::Stack`]); CS4 added
+//! The outline side pane (flat and stack modes) shipped two of the four modes
+//! ([`OutlineMode::Flat`]/[`OutlineMode::Stack`]); the outline's path-trie tree modes added
 //! the two path-trie modes ([`OutlineMode::Tree`]/[`OutlineMode::StackTree`]) via the private
-//! [`TrieNode`] builder below. CS5 adds each file row's [`crate::model::FileStatus`] (the `M`/
+//! [`TrieNode`] builder below. File-status letters and opt-in nerd icons adds each file row's
+//! [`crate::model::FileStatus`] (the `M`/
 //! `A`/`D`/... change-status letter — see [`OutlineFile::change`]/[`OutlineItem::File::change`]'s
 //! doc comments for why that's a wholly separate field from [`StagedStatus`], which tracks
 //! index/worktree staged-ness, not the underlying change kind). Pulling in
@@ -14,9 +16,9 @@
 //! a pure data module (no `App`/`ChangesetView` dependency), so importing its plain enum doesn't
 //! reintroduce the `App` coupling this module was factored out to avoid.
 //!
-//! CS5 (`outline-fold`) also adds a second stage layered on top of [`build_items`]: collapse/
-//! expand. [`build_items`] itself stays wholly unaware of fold state (its extensive mode/dedup/
-//! guide tests below are untouched by CS5) — [`apply_fold`] takes its output and a per-row
+//! Outline collapse/expand (fold) (`outline-fold`) also adds a second stage layered on top of
+//! [`build_items`]: collapse/expand. [`build_items`] itself stays wholly unaware of fold state
+//! (its extensive mode/dedup/guide tests below are untouched by it) — [`apply_fold`] takes its output and a per-row
 //! collapsed predicate and returns the filtered row list plus the two extra pieces of data render/
 //! cursor logic needs (a collapsed row's hidden-file count, and a full-list -> filtered-list index
 //! map for re-finding a fold-hidden target). [`fold_outline`] is the two steps composed —
@@ -37,8 +39,8 @@ pub enum OutlineMode {
     /// Every changed path across the whole stack, once each, no changeset headers.
     Flat,
     /// A changeset header row per changeset, followed by that changeset's file rows — the
-    /// default (locked choice for CS3: this is the mode that actually shows the stack
-    /// structure M5 exists to surface).
+    /// default (locked choice for the outline side pane (flat and stack modes): this is the mode
+    /// that actually shows the stack structure the stack-and-outline work exists to surface).
     #[default]
     Stack,
     /// [`Self::Flat`]'s de-duped path set, rendered as a directory trie (dir rows + file leaves)
@@ -50,7 +52,7 @@ pub enum OutlineMode {
 }
 
 impl OutlineMode {
-    /// `i`'s cycle order: `Stack -> StackTree -> Flat -> Tree -> Stack` (CS4) — the default
+    /// `i`'s cycle order: `Stack -> StackTree -> Flat -> Tree -> Stack` (`outline-mode-cycle`) — the default
     /// [`Self::Stack`] leads, its trie sibling [`Self::StackTree`] follows immediately, then the
     /// non-grouped pair [`Self::Flat`]/[`Self::Tree`] closes the loop.
     pub fn cycle(self) -> Self {
@@ -62,7 +64,7 @@ impl OutlineMode {
         }
     }
 
-    /// The kebab-cased display name (CS4, `outline-mode-cycle`) — used by the footer's `i
+    /// The kebab-cased display name (`outline-mode-cycle`) — used by the footer's `i
     /// →<next>` hint and mirrors `OUTLINE_MODE_OPTIONS`'s config strings (`app.rs`), so the
     /// two never drift apart.
     pub fn label(self) -> &'static str {
@@ -76,16 +78,18 @@ impl OutlineMode {
 }
 
 /// Which end of the stack the outline's stack-shaped modes ([`OutlineMode::Stack`]/
-/// [`OutlineMode::StackTree`]) display first — CS3 dogfooding feedback #2. Purely a display
+/// [`OutlineMode::StackTree`]) display first — outline-side-pane (flat and stack modes)
+/// dogfooding feedback #2. Purely a display
 /// order: [`OutlineItem`]'s `cs_idx`/`file_idx` always stay TRUE indices into `App::changesets`
 /// regardless of which way the rows are painted (see [`build_items`]'s doc comment).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OutlineOrder {
-    /// The most recently created (head) changeset's header renders first — the CS3 default.
+    /// The most recently created (head) changeset's header renders first — the outline-side-pane
+    /// (flat and stack modes) default.
     #[default]
     HeadFirst,
     /// The stack's base changeset renders first, matching `App::changesets`' own base -> head
-    /// storage order (today's pre-CS3 behavior).
+    /// storage order (today's pre-outline-side-pane behavior).
     BaseFirst,
 }
 
@@ -105,7 +109,7 @@ fn scan_order(
 }
 
 /// A file's staged-ness for the outline's status column — the data model `render.rs` derives its
-/// git-porcelain-style X/Y two-column status matrix from (CS3, `outline-status-xy`). Only
+/// git-porcelain-style X/Y two-column status matrix from (`outline-status-xy`). Only
 /// meaningful for the uncommitted changeset's files; a committed changeset's files always
 /// resolve to `None` because their `unstaged_idx`/`staged_idx` maps are always-empty (see
 /// `DiffState::from_committed`) — the same "derive, don't special-case" collapse
@@ -151,7 +155,8 @@ pub struct OutlineFile {
     /// underlying change is `Deleted` (that one) — they answer different questions ("is it
     /// staged" vs. "what kind of change is it") and must stay two distinct fields.
     pub status: StagedStatus,
-    /// CS5: the underlying change kind (Modified/Added/Deleted/...), lifted from the owning
+    /// File-status letters and opt-in nerd icons: the underlying change kind
+    /// (Modified/Added/Deleted/...), lifted from the owning
     /// [`crate::model::FileChange::status`] — drives the outline's `M`/`A`/`D`/`R`/`C`/`?`/`U`
     /// letter (`render::build_outline_line`), independent of [`Self::status`] above.
     pub change: FileStatus,
@@ -183,11 +188,13 @@ pub struct OutlineChangeset {
 /// index into THAT changeset's file list — together they're exactly what
 /// `App::switch_changeset`/`App::goto_changeset` need to jump the diff there.
 ///
-/// `guides` (on [`Self::Dir`]/[`Self::File`]) is the tree-guide vector CS4 adds: one bool per
+/// `guides` (on [`Self::Dir`]/[`Self::File`]) is the tree-guide vector the outline's
+/// path-trie tree modes adds: one bool per
 /// nesting level from the shallowest ancestor down to the row itself, `true` meaning "this
 /// level is its parent's last child". Rendering uses every-element-but-the-last to decide
 /// whether to draw a continuing `│` or blank space at that column, and the last element to draw
-/// `╰─`/`├─` for the row's own connector (CS4 rounds the last-child corner). [`OutlineMode::Flat`]/[`OutlineMode::Stack`] rows carry
+/// `╰─`/`├─` for the row's own connector (the outline's path-trie tree modes rounds the
+/// last-child corner). [`OutlineMode::Flat`]/[`OutlineMode::Stack`] rows carry
 /// an EMPTY `guides` — that's the signal to `render::build_outline_line` to fall back to the
 /// flat two-space indent instead of drawing tree connectors; a non-empty `guides` of length 1
 /// means "top-level tree row" (depth 0), so emptiness and depth-0 are deliberately distinguishable.
@@ -196,7 +203,7 @@ pub enum OutlineItem {
     /// A changeset header — emitted in [`OutlineMode::Stack`]/[`OutlineMode::StackTree`].
     Header {
         cs_idx: usize,
-        /// Changeset count (CS1, `outline-header-polish`) — paired with `cs_idx` at render time
+        /// Changeset count (`outline-header-polish`) — paired with `cs_idx` at render time
         /// to draw the `[i/n]` counter (`i` = `cs_idx + 1`, base=1). Always `changesets.len()` at
         /// build time, so it's the same for every `Header` row a given `build_items` call emits.
         n: usize,
@@ -211,25 +218,26 @@ pub enum OutlineItem {
     /// A directory row — only emitted in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`]. Not a
     /// jump target: it carries no `file_idx`, so `App::outline_move_by` no-ops on it (same as
     /// [`Self::Header`]); `App::outline_confirm` toggles this row's fold state instead of jumping
-    /// (CS5, `outline-fold`) and deliberately does NOT return focus to the diff — see that
+    /// (`outline-fold`) and deliberately does NOT return focus to the diff — see that
     /// method's doc comment. Fold state itself lives on `App` (per-[`OutlineMode`] sets keyed by
     /// [`FoldKey`]), not here — this row stays a plain data snapshot either way.
     Dir {
         name: String,
         /// The FULL path from the trie root (e.g. `"src/cmd"`), unlike `name` which is just the
-        /// leaf segment — CS4's summary panel needs the whole path to filter files under this
+        /// leaf segment — the summary panel needs the whole path to filter files under this
         /// directory (see `crate::summary::dir_summary`).
         path: String,
         /// `Some(cs_idx)` when this row's trie is per-changeset ([`OutlineMode::StackTree`] —
         /// the same true index its owning [`Self::Header`] carries); `None` in the cross-stack
         /// [`OutlineMode::Tree`], whose single trie spans every changeset (so a dir row there has
-        /// no single owning changeset to scope a summary to — CS4's `App::summary_for` instead
+        /// no single owning changeset to scope a summary to — the summary panel's
+        /// `App::summary_for` instead
         /// aggregates over [`latest_by_path`]'s de-duped set for that case).
         cs_idx: Option<usize>,
         guides: Vec<bool>,
     },
     /// A file row — the target of every outline->diff jump. `path` is the FULL path in
-    /// [`OutlineMode::Flat`]/[`OutlineMode::Stack`] (unchanged from CS3), but is just the leaf
+    /// [`OutlineMode::Flat`]/[`OutlineMode::Stack`] (unchanged from the outline side pane (flat and stack modes)), but is just the leaf
     /// segment in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`] — the ancestor directory rows
     /// already carry the rest of the path, so re-printing it on every leaf would be redundant.
     File {
@@ -237,7 +245,8 @@ pub enum OutlineItem {
         file_idx: usize,
         path: String,
         status: StagedStatus,
-        /// CS5: the change kind (Modified/Added/Deleted/...) — see [`OutlineFile::change`]'s doc
+        /// File-status letters and opt-in nerd icons: the change kind (Modified/Added/Deleted/...)
+        /// — see [`OutlineFile::change`]'s doc
         /// comment on why this is distinct from `status` above.
         change: FileStatus,
         guides: Vec<bool>,
@@ -264,7 +273,7 @@ impl OutlineItem {
 /// ROW SEQUENCE the outline paints flips. [`build_tree`]'s de-dupe is order-independent (see its
 /// own doc comment), so `order` is accepted but unused there.
 ///
-/// `pub(crate)` (CS5): this is the "unfiltered build" [`fold_outline`]'s doc comment refers to —
+/// `pub(crate)` (`outline-fold`): this is the "unfiltered build" [`fold_outline`]'s doc comment refers to —
 /// every outside-the-module consumer (i.e. `App`) goes through `fold_outline`/`apply_fold`
 /// instead, so a fold is never accidentally bypassed by calling this directly.
 pub(crate) fn build_items(
@@ -275,7 +284,7 @@ pub(crate) fn build_items(
     build_items_inner(changesets, mode, order, None)
 }
 
-/// [`build_items`] with CS2's per-row inclusion gate (`filter`) layered on — the REVISED
+/// [`build_items`] with the outline fuzzy filter's per-row inclusion gate (`filter`) layered on — the REVISED
 /// 2026-07-24 "rebuild from the surviving file set" entry point [`fold_outline_filtered`] calls.
 /// Deliberately walks the SAME, full, unpruned `changesets` slice `build_items` does (see
 /// [`is_included`]'s doc comment) — every `cs_idx`/`file_idx` this emits is therefore still
@@ -305,7 +314,7 @@ fn build_items_inner(
     }
 }
 
-// ── Fold (collapse/expand), CS5 `outline-fold` ──────────────────────────────────
+// ── Fold (collapse/expand), `outline-fold` ─────────────────────────────────────
 
 /// A foldable outline row's identity — the key `App`'s per-[`OutlineMode`] fold sets store.
 /// [`OutlineItem::Header`] is keyed by its changeset's label PLUS its `cs_idx`; [`OutlineItem::Dir`]
@@ -347,7 +356,8 @@ impl FoldKey {
     }
 }
 
-/// The outline's row list after CS5's fold filtering is layered on top of [`build_items`]'s raw
+/// The outline's row list after `outline-fold`'s fold filtering is layered on top of
+/// [`build_items`]'s raw
 /// build — see [`apply_fold`]/[`fold_outline`]'s doc comments for how it's derived, and
 /// `App::outline_items`'s doc comment for why this is the SINGLE choke point every cursor/
 /// staging/render consumer reads through.
@@ -355,7 +365,7 @@ impl FoldKey {
 pub(crate) struct FoldedOutline {
     /// The visible rows, in order — a subsequence of [`build_items`]'s full (unfiltered) output.
     pub items: Vec<OutlineItem>,
-    /// Parallel to `items`: the count of hidden FILE rows (not dirs — CS5's locked "N = hidden
+    /// Parallel to `items`: the count of hidden FILE rows (not dirs — `outline-fold`'s locked "N = hidden
     /// FILE rows only" rule) under a collapsed Header/Dir row. `0` for every other row, including
     /// an EXPANDED Header/Dir — render reads `0` as "no marker", so an expanded row never draws
     /// the trailing ` ▸ N` chevron.
@@ -363,7 +373,7 @@ pub(crate) struct FoldedOutline {
     /// Parallel to the FULL (unfiltered) [`build_items`] output, NOT to `items`: for original row
     /// `i`, the index into `items`/`hidden_counts` a cursor targeting that row should land on —
     /// its own filtered position if it survived filtering, or its nearest VISIBLE ancestor's if a
-    /// fold hides it (CS5's "lands on the collapsed ancestor without auto-expanding" rule). Used
+    /// fold hides it (`outline-fold`'s "lands on the collapsed ancestor without auto-expanding" rule). Used
     /// by `App::sync_outline_to_current` to re-target a diff-initiated jump onto a folded row's
     /// row instead of leaving the outline cursor on an arbitrary clamp.
     pub visible_index: Vec<usize>,
@@ -482,7 +492,7 @@ pub(crate) fn fold_outline(
     apply_fold(&items, is_folded)
 }
 
-// ── Fuzzy filter (CS2 `outline-filter`, REVISED 2026-07-24: filter-then-rebuild) ────
+// ── Fuzzy filter (`outline-filter`, REVISED 2026-07-24: filter-then-rebuild) ───────
 
 /// One row's fuzzy-match result against the SOURCE text it was scored on (a changeset's title, or
 /// a file's FULL repo-relative path — never a dir segment or a tree leaf; REVISED 2026-07-24 drops
@@ -569,7 +579,7 @@ fn score_changesets(changesets: &[OutlineChangeset], query: &str) -> QueryMatche
 }
 
 /// Whether `(cs_idx, file_idx)` survives filtering: unconditionally `true` when `filter` is
-/// `None` (the ordinary, unfiltered build every pre-CS2 test exercises), else `true` when either
+/// `None` (the ordinary, unfiltered build every pre-outline-filter test exercises), else `true` when either
 /// the file's OWN path matched, or its changeset's TITLE matched (a title match "keeps the WHOLE
 /// changeset, all files" — see [`score_changesets`]'s doc comment).
 fn is_included(filter: Option<&QueryMatches>, cs_idx: usize, file_idx: usize) -> bool {
@@ -819,7 +829,7 @@ fn build_flat(
 /// [`build_flat`]'s last-write-wins rule), independent of iteration/insertion order — the trie
 /// builders below re-sort by path segment anyway, so no stable-order bookkeeping is needed here.
 ///
-/// `pub(crate)`: CS4's `App::summary_for` reuses this directly to aggregate a
+/// `pub(crate)`: the summary panel's `App::summary_for` reuses this directly to aggregate a
 /// [`OutlineMode::Tree`] directory's files (`cs_idx: None` on that mode's [`OutlineItem::Dir`]
 /// rows) over the same last-write-wins de-duped set the Tree outline itself displays, rather than
 /// re-deriving the dedup logic in `app.rs`.
@@ -843,7 +853,8 @@ pub(crate) fn latest_by_path(changesets: &[OutlineChangeset]) -> HashMap<String,
 
 /// The file a de-duped path (or a trie leaf) resolves to: its true `(cs_idx, file_idx)` address
 /// into `App::changesets` plus the two per-file status axes the outline renders — staged-ness
-/// ([`StagedStatus`], CS3) and change kind ([`FileStatus`], CS5). Named because the bare 4-tuple
+/// ([`StagedStatus`], `outline-status-xy`) and change kind ([`FileStatus`], file-status
+/// letters and opt-in nerd icons). Named because the bare 4-tuple
 /// it replaced had to be re-explained (and type-annotated) at every use site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FileOccurrence {
@@ -887,7 +898,8 @@ impl TrieNode {
 }
 
 /// Flatten `node`'s children into `items`, depth-first, in "dirs before files at each level,
-/// alpha within group" order (CS3 dogfooding feedback #7: directories read before files at a
+/// alpha within group" order (the outline side pane (flat and stack modes) dogfooding
+/// feedback #7: directories read before files at a
 /// given level, matching the conventional file-tree convention of grouping folders above
 /// loose files). `ancestors_last` is the growing guide vector — see [`OutlineItem`]'s doc
 /// comment for how rendering consumes it.
@@ -1043,7 +1055,8 @@ mod tests {
         )
     }
 
-    /// [`cs`] variant that lets a test pin each file's [`FileStatus`] explicitly (CS5).
+    /// [`cs`] variant that lets a test pin each file's [`FileStatus`] explicitly (file-status
+    /// letters and opt-in nerd icons).
     fn cs_with_change(
         label: &str,
         current: bool,
@@ -1244,7 +1257,8 @@ mod tests {
         );
     }
 
-    /// CS3: [`OutlineOrder::HeadFirst`] flips [`build_flat`]'s DISPLAY scan (first-appearance
+    /// The outline side pane (flat and stack modes): [`OutlineOrder::HeadFirst`] flips
+    /// [`build_flat`]'s DISPLAY scan (first-appearance
     /// order now reads head -> base), but [`latest_by_path`]'s "closest-to-head wins" TARGET
     /// resolution never changes — a path touched by two changesets must resolve to the head-most
     /// one under BOTH orders.
@@ -1466,7 +1480,8 @@ mod tests {
         );
     }
 
-    /// CS3: [`OutlineOrder::HeadFirst`] (the new default) shows the LAST changeset's ([`cs-c`],
+    /// The outline side pane (flat and stack modes): [`OutlineOrder::HeadFirst`] (the new
+    /// default) shows the LAST changeset's ([`cs-c`],
     /// index 2 — the true, base-> head `App::changesets` index) header FIRST, while its `cs_idx`
     /// still equals its true index into `changesets` (2), never a display-order index (0).
     #[test]
@@ -1505,7 +1520,8 @@ mod tests {
         );
     }
 
-    /// CS3: [`OutlineOrder::BaseFirst`] restores the pre-CS3 base -> head header order.
+    /// The outline side pane (flat and stack modes): [`OutlineOrder::BaseFirst`] restores the
+    /// pre-outline-side-pane base -> head header order.
     #[test]
     fn stack_mode_base_first_restores_base_to_head_header_order() {
         let changesets = vec![
@@ -1559,7 +1575,7 @@ mod tests {
         );
     }
 
-    // ── Fold (collapse/expand), CS5 `outline-fold` ──────────────────────────────
+    // ── Fold (collapse/expand), `outline-fold` ─────────────────────────────────
 
     #[test]
     fn apply_fold_with_nothing_folded_leaves_every_row_visible_with_zero_markers() {
@@ -1801,7 +1817,7 @@ mod tests {
         assert_eq!(folded.hidden_counts, vec![2]);
     }
 
-    // ── Fuzzy filter (CS2 `outline-filter`, REVISED 2026-07-24: filter-then-rebuild) ────
+    // ── Fuzzy filter (`outline-filter`, REVISED 2026-07-24: filter-then-rebuild) ───────
 
     /// `fold_outline_filtered` with an always-visible fold (no key folded) — the shape most of
     /// these tests want; a couple below pass their own predicate to check fold interaction.

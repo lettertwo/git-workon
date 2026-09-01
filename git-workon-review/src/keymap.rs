@@ -100,7 +100,7 @@ pub enum Command {
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
 /// `name`), the default key tokens that reproduce the pre-config hardcoded binding, and a human
-/// description (the help overlay in CS3 renders from this).
+/// description (the help footer and `?` overlay renders from this).
 #[derive(Debug, Clone, Copy)]
 pub struct Registered {
     pub command: Command,
@@ -205,8 +205,9 @@ pub static REGISTRY: &[Registered] = &[
         // this view, and a bare-key binding can't coexist with a longer chord sharing its prefix
         // (see `shift_z_dispatches_toggle_maximize_with_no_collisions`'s doc comment for the
         // mechanics; `build_context`'s prefix-clash check would now warn on this, not just
-        // silently break dispatch). `Z` was free in `View::Diff`. ADR-038 decision 9: renamed
-        // from `cycle-zoom`, keeping the `Z` binding — a user config still naming `cycle-zoom`
+        // silently break dispatch). `Z` was free in `View::Diff`. ADR-038, "Rename the keymap
+        // action `cycle-zoom` to `toggle-maximize`": renamed from `cycle-zoom`, keeping the `Z`
+        // binding — a user config still naming `cycle-zoom`
         // degrades to the keymap's unknown-action warning rather than silently doing nothing.
         default_keys: "Z",
         description: "Maximize/restore the focused split pane",
@@ -278,7 +279,8 @@ pub static REGISTRY: &[Registered] = &[
         command: Command::NextHunk,
         view: View::Diff,
         name: "next-hunk",
-        // `n` moved off this default (M11 CS3, `diff-search`): it's now `search-next`'s default,
+        // `n` moved off this default (the in-diff search, `diff-search`): it's now
+        // `search-next`'s default,
         // which itself falls back to this exact action when no search is active — see that row's
         // description. `]h` alone still reaches it directly.
         default_keys: "]h",
@@ -694,7 +696,7 @@ pub struct Keymap {
     /// Active bindings when the outline has focus: global ∪ outline.
     outline: Vec<(KeySeq, Command)>,
     /// Resolved key sequences per registry row (parallel to [`REGISTRY`]) — the source for the
-    /// help overlay's "current keys for this action" (CS3).
+    /// help overlay's "current keys for this action" (the help footer and `?` overlay).
     resolved: Vec<Vec<KeySeq>>,
     /// Config problems collected during resolution (unknown action names, key collisions) — the
     /// caller surfaces these through the footer-notice mechanism at startup.
@@ -918,8 +920,9 @@ pub struct HelpSection {
 
 /// Build the help overlay's content for `focused` (the view with keyboard focus — [`View::Diff`]
 /// or [`View::Outline`]; never [`View::Global`]): a "Global" section, then the focused view's own
-/// section, each listing only BOUND actions (an action with no resolved keys — user-unbound — is
-/// skipped, per CS3). Pure and `Keymap`-driven — the display never hardcodes a key string, so a
+/// section, each listing only BOUND actions (an action with no resolved keys — user-unbound —
+/// is skipped, per the help footer and `?` overlay). Pure and `Keymap`-driven — the display
+/// never hardcodes a key string, so a
 /// rebind shows here automatically.
 pub fn help_sections(keymap: &Keymap, focused: View) -> Vec<HelpSection> {
     vec![
@@ -1006,7 +1009,7 @@ impl HintItem {
     }
 }
 
-/// CS4 (`outline-mode-cycle`): most hint labels are the static string baked into the `HintItem`,
+/// `outline-mode-cycle`: most hint labels are the static string baked into the `HintItem`,
 /// but `OutlineCycleMode`'s label shows the mode `i` would switch TO instead — computed from
 /// `outline_mode` (the outline's CURRENT mode, so this is `outline_mode.cycle()`'s label).
 fn render_hint_item(keymap: &Keymap, item: &HintItem, outline_mode: OutlineMode) -> Option<String> {
@@ -1030,8 +1033,9 @@ fn render_hint_item(keymap: &Keymap, item: &HintItem, outline_mode: OutlineMode)
     }
 }
 
-/// The diff view's curated footer hint set (locked design in CS3): nav, stage/discard, outline,
-/// help, quit — ~5-7 entries picked to make the tool feel learnable, not an exhaustive list.
+/// The diff view's curated footer hint set (locked design from the help-footer-and-`?`-overlay
+/// work): nav, stage/discard, outline, help, quit — ~5-7 entries picked to make the tool feel
+/// learnable, not an exhaustive list.
 const DIFF_HINTS: &[HintItem] = &[
     HintItem::Pair(Command::CursorDown, Command::CursorUp, "move"),
     HintItem::One(Command::StageHunk, "stage"),
@@ -1041,7 +1045,7 @@ const DIFF_HINTS: &[HintItem] = &[
     HintItem::One(Command::Quit, "quit"),
 ];
 
-/// The outline view's curated footer hint set (locked design in CS3).
+/// The outline view's curated footer hint set (locked design from the help-footer-and-`?`-overlay work).
 const OUTLINE_HINTS: &[HintItem] = &[
     HintItem::Pair(Command::OutlineDown, Command::OutlineUp, "move"),
     HintItem::One(Command::OutlineConfirm, "open"),
@@ -1289,8 +1293,9 @@ mod tests {
     }
 
     /// `l`/`right` are free in the Diff view (they're only bound in the Outline view, to
-    /// `focus-diff`) — the handoff's locked decision #2 reuses them for `hscroll-right` there,
-    /// mirroring the Outline view's `l`/`right` = focus-diff.
+    /// `focus-diff`) — the hscroll handoff's locked decision that `h`/`left` pans back to column
+    /// 0 before focusing the outline reuses them for `hscroll-right` there, mirroring the
+    /// Outline view's `l`/`right` = focus-diff.
     #[test]
     fn l_and_right_dispatch_hscroll_right_in_the_diff_view() {
         let km = Keymap::defaults();
@@ -1348,9 +1353,10 @@ mod tests {
         );
     }
 
-    /// CS3 (diff-fold-keys) originally bound `n` as an extra default on `next-hunk`, for symmetry
-    /// with the outline's `n`/`p` changeset nav. M11 CS3 (`diff-search`) reclaims `n` as
-    /// `search-next`'s default instead (falling back to `next-hunk` itself when no search is
+    /// The gap-reset/expand-all-keys work (`diff-fold-keys`) originally bound `n` as an extra
+    /// default on `next-hunk`, for symmetry with the outline's `n`/`p` changeset nav. The
+    /// in-diff search (`diff-search`) reclaims `n` as `search-next`'s default instead (falling
+    /// back to `next-hunk` itself when no search is
     /// active — `App::search_next` — so `n`'s PRACTICAL effect on an unbound-search diff is
     /// unchanged); `p` is untouched, still `prev-hunk`'s extra default. `primary_key` still picks
     /// the first token, so the footer/help keep showing `]h`/`[h` for `next-hunk`/`prev-hunk`
@@ -1375,7 +1381,8 @@ mod tests {
         );
     }
 
-    /// CS3 (diff-fold-keys): `toggle-maximize` (named `cycle-zoom` before ADR-038) was rebound
+    /// The gap-reset/expand-all-keys work (`diff-fold-keys`): `toggle-maximize` (named
+    /// `cycle-zoom` before ADR-038) was rebound
     /// from bare `z` to `Z` to make room for the `zM`/`zR` gap fold-all chords in `View::Diff`.
     /// This wasn't optional bookkeeping — `match_keys` gives a strict-prefix match precedence
     /// over an exact one in the SAME scan (see its doc comment): had it stayed on bare `z`
@@ -1432,8 +1439,8 @@ mod tests {
         );
     }
 
-    /// M11 (`copy-lines`/`copy-location`, the yank split): `y` was free in both `View::Global`
-    /// and `View::Diff` (unlike `p`, which `[h`'s extra default and the outline's
+    /// In-diff navigation (`copy-lines`/`copy-location`, the yank split): `y` was free in both
+    /// `View::Global` and `View::Diff` (unlike `p`, which `[h`'s extra default and the outline's
     /// `prev-changeset` already claim), so no existing binding needed to move to make room for
     /// it — unlike the `z` -> `Z` rebind above. `Y` is likewise free (verified against
     /// every `default_keys` entry in this registry when the yank split was designed). Pins both
@@ -1653,7 +1660,7 @@ mod tests {
         );
     }
 
-    // ── CS3: help overlay / footer hint builders ────────────────────────────
+    // ── Help footer and `?` overlay: help overlay / footer hint builders ─────
 
     #[test]
     fn help_sections_groups_global_and_the_focused_view_only() {
@@ -1675,8 +1682,8 @@ mod tests {
 
     #[test]
     fn help_sections_cycle_mode_entry_spells_out_the_full_order() {
-        // CS4: descriptions are static `&'static str`s baked into `REGISTRY`, so the help
-        // overlay can't mark the CURRENT mode dynamically without a broader refactor — the
+        // `outline-mode-cycle`: descriptions are static `&'static str`s baked into `REGISTRY`,
+        // so the help overlay can't mark the CURRENT mode dynamically without a broader refactor — the
         // locked fallback is a static full-order description, with the dynamic `→next` shown
         // only in the footer hint (see `footer_hint_outline_cycle_label_tracks_the_current_mode`).
         let km = Keymap::defaults();

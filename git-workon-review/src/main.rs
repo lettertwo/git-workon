@@ -38,7 +38,8 @@ struct Cli {
 fn main() -> Result<()> {
     // Respond to the `COMPLETE=<shell>` dynamic-completion protocol before anything else — mirrors
     // git-workon's own entry point. Exits early when `COMPLETE` is set; a no-op otherwise. This is
-    // what lets git-workon delegate `git workon review <TAB>` completion here (M6 CS3).
+    // what lets git-workon delegate `git workon review <TAB>` completion here (external-
+    // subcommand completion enumeration).
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
@@ -51,16 +52,19 @@ fn main() -> Result<()> {
         .into_diagnostic()?
         .to_string();
 
-    // No `[SOURCE]` argument: the M5 auto-detect entry point (locked decision #7), unchanged —
-    // the full Graphite stack when one is active, or a single synthetic uncommitted changeset
-    // otherwise (keeps a non-Graphite repo byte-identical to M2–M4's `diff_uncommitted` path).
-    // A `[SOURCE]` argument routes through the ADR-036 classifier/resolver instead (M7 CS2/CS3).
+    // No `[SOURCE]` argument: the stack-and-outline work's auto-detect entry point (locked
+    // decision: auto-detect Graphite, else a single uncommitted changeset), unchanged — the
+    // full Graphite stack when one is active, or a single synthetic uncommitted changeset
+    // otherwise (keeps a non-Graphite repo byte-identical to the original `diff_uncommitted`
+    // path). A `[SOURCE]` argument routes through the ADR-036 classifier/resolver instead (the
+    // stack/uncommitted source keywords and `<ref>`-and-range-resolution work).
     // `source` is kept (not just the resolved changesets) so it can be handed to `App` below —
     // `App::refresh` re-runs THIS same ask on every refresh rather than downgrading to
-    // auto-detect (M7 CS2 fix).
+    // auto-detect (a stack/uncommitted-source-keywords fix).
     //
-    // Everything from here through the theme probe runs BEFORE the terminal is taken (CS5's
-    // splash enters the alternate screen further down, for the diff/build phase only). That
+    // Everything from here through the theme probe runs BEFORE the terminal is taken (the
+    // launch splash and early terminal takeover's splash enters the alternate screen further
+    // down, for the diff/build phase only). That
     // ordering is deliberate, not incidental:
     // - PR resolution fetches over the network, and auth-git2 may interactively PROMPT for an
     //   ssh passphrase / https credentials — inside raw-mode alternate screen the prompt would
@@ -94,8 +98,9 @@ fn main() -> Result<()> {
     }
 
     // Resolve the palette selection first, before `repo` moves — a config-read error degrades to
-    // dark rather than aborting the review (CS5). `Auto` runs the terminal-derivation probe (CS6),
-    // which needs the controlling tty and so lives outside the pure `theme.rs`; it is bounded by a
+    // dark rather than aborting the review (the launch splash and early terminal takeover). `Auto`
+    // runs the terminal-derivation probe, which needs the controlling tty and so lives outside
+    // the pure `theme.rs`; it is bounded by a
     // hard timeout and always yields a curated fallback on a silent/hostile terminal, never a
     // hang. `Dark`/`Light`/a read error stay `resolve_runtime`'s own I/O-free ladder below — this
     // only feeds `auto_base` (what to cache for `PaletteContext`), so a non-`Auto` selection gets
@@ -111,8 +116,9 @@ fn main() -> Result<()> {
         _ => (Palette::dark(), false),
     };
 
-    // CS2 (`no-color-mono`): read the env kill-switch once here — `resolve_runtime` applies it
-    // last in its ladder (after resolution AND overrides), so it always wins over an override.
+    // NO_COLOR monochrome rendering (`no-color-mono`): read the env kill-switch once here —
+    // `resolve_runtime` applies it last in its ladder (after resolution AND overrides), so it
+    // always wins over an override.
     // `FORCE_COLOR` is deliberately not consulted (see `no_color`'s doc comment).
     let no_color_env = no_color(std::env::var_os("NO_COLOR").as_deref());
     if no_color_env {
@@ -156,7 +162,8 @@ fn main() -> Result<()> {
         terminal_query::flush_pending_tty_input();
     }
 
-    // CS5: take the terminal while the diffs build — on a deep stack this used to be the bulk of
+    // The launch splash and early terminal takeover: take the terminal while the diffs build —
+    // on a deep stack this used to be the bulk of
     // the launch with the terminal dead the whole time. Everything that could print, prompt, or
     // flush is done (see the block comment above the resolve), so from here the terminal belongs
     // to the TUI. `Tui`'s Drop restores it, so the `?`s below put the shell back before miette
@@ -195,7 +202,7 @@ fn main() -> Result<()> {
         // `App::from_changesets`, which panics on empty input. Restore the terminal BEFORE
         // printing: the message must land on the normal screen, not vanish with the alternate
         // one. A tty-less launch has no terminal to restore — the message prints exactly as
-        // before CS5.
+        // before the launch splash and early terminal takeover.
         if views.is_empty() || (views.len() == 1 && views[0].file_count() == 0) {
             if let Ok(tui) = tui.as_mut() {
                 tui.restore().into_diagnostic()?;
@@ -209,7 +216,8 @@ fn main() -> Result<()> {
 
         // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here
         // after acquisition is done borrowing it. `App::from_changesets` opens on whichever
-        // changeset the lib marked `current` (locked decision #6).
+        // changeset the lib marked `current` (locked decision: open on whichever changeset the
+        // lib marks current).
         let mut app = seat_app(
             repo,
             views,
@@ -220,7 +228,8 @@ fn main() -> Result<()> {
         );
 
         // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
-        // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
+        // surfaced at before the launch splash and early terminal takeover moved the terminal
+        // takeover ahead of the diff phase.
         tui.into_diagnostic()?
             .run(&mut app, keymap, theme, repo_path, &palette_ctx)
             .into_diagnostic()?;
@@ -253,9 +262,10 @@ fn main() -> Result<()> {
 }
 
 /// The app-seating tail both `changesets.len()` arms of `main` share byte-identically (F5):
-/// build `App` from `views`, wire the review source, defer file loads (CS4), apply CS7's
-/// view-config settings, open the current file, and surface any keymap/view-config/theme-override
-/// warnings as a startup notice. `open_current` is a no-op on an empty file list — safe for the
+/// build `App` from `views`, wire the review source, defer file loads (idle-deferred file
+/// loads), apply the view-config settings, open the current file, and surface any
+/// keymap/view-config/theme-override warnings as a startup notice. `open_current` is a no-op
+/// on an empty file list — safe for the
 /// streamed arm's `Pending` slots (no files yet), which `Tui::run_streamed`'s `ChangesetReady`
 /// handling re-runs it for once the active changeset's diff actually lands.
 fn seat_app(
@@ -270,13 +280,13 @@ fn seat_app(
     if let Some(source) = source {
         app.set_review_source(source);
     }
-    // CS4: defer file loads to the event loop's input-idle window rather than blocking here (or
-    // on any later selection change) — `app.open_current()` below marks the initial open pending
+    // Idle-deferred file loads: defer file loads to the event loop's input-idle window rather
+    // than blocking here (or on any later selection change) — `app.open_current()` below marks the initial open pending
     // instead of loading eagerly; see `tui::run`'s doc comment for the resulting startup
     // contract.
     app.set_defer_loads(true);
 
-    // Apply CS7's view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
+    // Apply the view-config settings BEFORE `open_current`: `App::apply_view_config`'s setters
     // only set the raw layout/mode/width fields, and `open_current` is what derives
     // `cursor`/`scroll` fresh from whichever settings just landed (see each setter's doc
     // comment).

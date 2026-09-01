@@ -5,8 +5,9 @@
 //! `refs/heads/stack` or `heads/stack` classify as [`Source::Ref`]. Resolution
 //! ([`resolve_source`]) is where repo state comes in.
 //!
-//! CS3 wires real `<ref>` dispatch (shape-aware: Graphite-tracked branch, other branch,
-//! bare commit-ish) and `Range` (`a..b` / `a...b`, git-diff semantics). CS4 wires `Pr`: any
+//! `<ref>` and range resolution wires real `<ref>` dispatch (shape-aware: Graphite-tracked
+//! branch, other branch, bare commit-ish) and `Range` (`a..b` / `a...b`, git-diff semantics).
+//! PR-reference resolution wires `Pr`: any
 //! form git-workon-lib's `parse_pr_reference` accepts (`pr-123`, `#123`, `pr#123`, GitHub URLs;
 //! a bare number never matches — that spelling stays a `Ref`), reused end-to-end for
 //! resolution too (`check_gh_available` → `fetch_pr_metadata` → fork-aware fetch → one
@@ -54,7 +55,7 @@ pub enum Source {
         head_text: String,
         dots: RangeDots,
     },
-    /// Everything else — a candidate ref, resolved by shape (CS3).
+    /// Everything else — a candidate ref, resolved by shape (`<ref>` and range resolution).
     Ref(String),
 }
 
@@ -125,7 +126,7 @@ pub fn resolve_source(
 /// hinted pre-TUI error. The network round-trip (`check_gh_available`, `fetch_pr_metadata`,
 /// `fetch_branch_fresh`) lives entirely in this function so [`pr_changeset_from_metadata`] can
 /// stay a pure git2 mapping, fixture-testable without gh (the real gh path is exercised manually
-/// — see the CS4 changeset description).
+/// — see the PR-reference-resolution changeset description).
 ///
 /// Both refs are fetched with [`workon::fetch_branch_fresh`], not [`workon::fetch_branch`]:
 /// review's whole point is freshness, and `fetch_branch`'s existence short-circuit (right for
@@ -453,7 +454,8 @@ fn trunk_commit_oid(repo: &Repository) -> Option<Oid> {
     revparse_to_commit(repo, &name)
 }
 
-/// Dynamic `[SOURCE]` completion candidates (ADR-036 "Completion" section, CS5): the `stack` /
+/// Dynamic `[SOURCE]` completion candidates (ADR-036 "Completion" section, source completion
+/// and sub-delegation): the `stack` /
 /// `uncommitted` keywords, plus local branch and tag names via offline git2 ref enumeration —
 /// never a PR number (network stays out of the TAB hot path). When `current` contains `..` or
 /// `...`, only the right-hand side is a ref candidate; each is emitted prefixed with the
@@ -694,7 +696,8 @@ mod tests {
         );
     }
 
-    // ── CS5: SOURCE completion — `split_range_rhs` (the pure half of `complete_source`) ─────
+    // ── Source completion and sub-delegation: `split_range_rhs` (the pure half of
+    // `complete_source`) ─────────────────────────────────────────────────────────────
 
     #[test]
     fn split_range_rhs_no_dots_is_whole_word() {
@@ -713,7 +716,8 @@ mod tests {
         assert_eq!(split_range_rhs("main...fe"), ("main...", "fe"));
     }
 
-    // ── CS4: PR metadata → changeset mapping (the gh-free half of `resolve_pr`) ─────────────
+    // ── PR-reference resolution: PR metadata → changeset mapping (the gh-free half of
+    // `resolve_pr`) ─────────────────────────────────────────────────────────────────
 
     /// [`pr_changeset_from_metadata`] is the pure git2 half of PR resolution — everything
     /// downstream of `fetch_pr_metadata`/`fetch_branch`, which the real `gh` path can't exercise

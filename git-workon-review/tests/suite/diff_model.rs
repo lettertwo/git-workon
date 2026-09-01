@@ -1,7 +1,8 @@
 //! Model-shape and byte-fidelity tests for `workon_review::model`/`workon_review::acquire`.
 //!
 //! The EOFNL characterization test pins what git2 0.21 actually emits for a no-trailing-newline
-//! file (plan risk #2) — this is normative for CS2/CS3's patch synthesis, not just a sanity
+//! file (plan risk #2) — this is normative for whole-hunk patch synthesis and the patch-apply
+//! chokepoint, not just a sanity
 //! check. Fixtures used for byte assertions pin `core.autocrlf=false` so bytes are
 //! platform-stable (plan risk #6).
 
@@ -171,7 +172,8 @@ fn binary_file_has_no_hunks() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// ── EOFNL characterization (plan risk #2 — normative for CS2/CS3) ────────────
+// ── EOFNL characterization (plan risk #2 — normative for whole-hunk patch synthesis and the
+// patch-apply chokepoint) ─────────────────────────────────────────────────────────────────
 
 /// Pins git2 0.21's actual EOFNL behavior for a file with no trailing newline whose middle
 /// line changes: git2 emits the trailing context line WITHOUT its newline, immediately
@@ -343,7 +345,8 @@ fn hunk_to_diff_bytes_matches_diff_print() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-// ── whole diff (CS1: HEAD ↔ worktree-with-index, M3's default zoom) ───────
+// ── whole diff (the diff model and whole-diff acquisition: HEAD ↔ worktree-with-index, the
+// initial renderer's default zoom) ────────────────────────────────────────────────────────
 
 #[test]
 fn partially_staged_file_appears_fused_in_whole() -> Result<(), Box<dyn std::error::Error>> {

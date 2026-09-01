@@ -1,4 +1,4 @@
-//! CS4's summary panel: pure builders for the renderable data `render.rs`'s `render_summary`
+//! The summary panel: pure builders for the renderable data `render.rs`'s `render_summary`
 //! paints when the outline is OPEN AND FOCUSED and its cursor rests on a
 //! [`crate::outline::OutlineItem::Header`]/[`crate::outline::OutlineItem::Dir`] row instead of a
 //! file — mirrors [`crate::outline`]'s pure-module posture (no [`crate::app::App`]/git2
@@ -125,8 +125,9 @@ pub struct DirSummary {
 /// SEGMENT prefix of `file_path` — `"src"` matches `"src/a.rs"` but must NOT match `"src2/b.rs"`
 /// (a raw [`str::starts_with`] would wrongly match the latter).
 ///
-/// `pub(crate)`: CS7's `App::outline_row_targets` reuses this to resolve a Dir row's files
-/// (`s`/`d` in the outline), the same segment-boundary rule [`dir_summary`] already relies on —
+/// `pub(crate)`: the outline-staging-verbs work's `App::outline_row_targets` reuses this to
+/// resolve a Dir row's files (`s`/`d` in the outline), the same segment-boundary rule
+/// [`dir_summary`] already relies on —
 /// rather than re-deriving it in `app.rs`.
 pub(crate) fn path_is_under(file_path: &str, dir_path: &str) -> bool {
     file_path

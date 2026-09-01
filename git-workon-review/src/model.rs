@@ -1,8 +1,9 @@
 //! The diff model: [`DiffModel`]/[`FileChange`]/[`Hunk`]/[`HunkLine`] built directly from
 //! git2 [`git2::Diff`]/[`git2::Patch`] structures.
 //!
-//! Per the M2 design decision, this is NOT a unified-diff-text parser: it walks git2's own
-//! line callbacks (content bytes + origin chars, including the EOFNL origins `=`/`>`/`<`) so
+//! Per the diff-model-and-patch-synthesis design decision, this is NOT a unified-diff-text
+//! parser: it walks git2's own line callbacks (content bytes + origin chars, including the
+//! EOFNL origins `=`/`>`/`<`) so
 //! the model can byte-exactly re-render the patches it read ([`Hunk::to_diff_bytes`]).
 //!
 //! ## EOFNL characterization (see `tests/diff_model.rs`)
@@ -102,10 +103,11 @@ pub enum FileStatus {
 }
 
 impl FileStatus {
-    /// The single-character letter the outline's file rows render for this status (CS5):
-    /// `M`/`A`/`D`/`R`/`C`/`?`/`U`, mirroring `git status --short`'s XY letters where they exist
-    /// (`?` for untracked, `U` for unmerged/conflicted — git's own convention, not this crate's
-    /// invention). No mapping like this existed elsewhere in the crate before CS5 (checked the
+    /// The single-character letter the outline's file rows render for this status (file-status
+    /// letters and opt-in nerd icons): `M`/`A`/`D`/`R`/`C`/`?`/`U`, mirroring `git status
+    /// --short`'s XY letters where they exist (`?` for untracked, `U` for unmerged/conflicted —
+    /// git's own convention, not this crate's invention). No mapping like this existed
+    /// elsewhere in the crate before this work (checked the
     /// winbar/header, which only special-cases `Renamed`/`Copied` for the `old -> new` label,
     /// never prints a letter) — this is the canonical one going forward.
     pub fn letter(self) -> char {
@@ -131,7 +133,7 @@ impl From<git2::Delta> for FileStatus {
             git2::Delta::Untracked => FileStatus::Untracked,
             git2::Delta::Conflicted => FileStatus::Unmerged,
             // Modified, Unmodified, Ignored, Typechange, Unreadable: none of these are
-            // distinct routing targets in the M2 model; fall back to Modified, the ordinary
+            // distinct routing targets in the diff model; fall back to Modified, the ordinary
             // hunk-diffable case.
             _ => FileStatus::Modified,
         }

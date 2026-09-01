@@ -1,10 +1,11 @@
-//! Routing: the ONE place (per the M2 design decision) that decides, for a given
-//! [`FileChange`], whether a staging verb goes through the patch-synthesis-and-apply path
-//! (`synthesis.rs`/`apply.rs`) or the whole-file path (`file_ops.rs`). The TUI (M4) calls only
+//! Routing: the ONE place (per the diff-model-and-patch-synthesis design decision) that
+//! decides, for a given [`FileChange`], whether a staging verb goes through the
+//! patch-synthesis-and-apply path (`synthesis.rs`/`apply.rs`) or the whole-file path
+//! (`file_ops.rs`). The TUI (staging verbs) calls only
 //! [`apply_hunk`]/[`apply_lines`]/[`apply_line_selections`]/[`apply_file`] — it never picks a
 //! path itself.
 //!
-//! ## The routing table (trap 3)
+//! ## The routing table (whole-file-ops fallback)
 //!
 //! - [`FileStatus::Modified`]/[`FileStatus::Renamed`]/[`FileStatus::Copied`], non-binary: a
 //!   hunk patch can express both a preimage and a postimage, so `apply_hunk`/`apply_lines`
@@ -38,9 +39,9 @@ use crate::synthesis::{partial_hunk_patch, whole_hunk_patch, LineSelection, Patc
 /// doc comments above.
 ///
 /// Also the **line-op eligibility predicate** the TUI pre-validates against before offering
-/// line selection: `apply_lines` REFUSES a non-hunk-patchable file (trap 3, no silent widening),
-/// so the TUI checks this first and shows a "use the whole-file op" notice instead of enqueuing a
-/// doomed line op.
+/// line selection: `apply_lines` REFUSES a non-hunk-patchable file (whole-file-ops fallback, no
+/// silent widening), so the TUI checks this first and shows a "use the whole-file op" notice
+/// instead of enqueuing a doomed line op.
 pub fn is_hunk_patchable(file: &FileChange) -> bool {
     !file.is_binary
         && matches!(
@@ -87,15 +88,15 @@ pub fn apply_hunk(
 /// Apply `verb` to a line-precise selection of `file`'s hunk at `hunk_idx`.
 ///
 /// Unlike `apply_hunk`, this never falls back to a file-level op: line selection on a status a
-/// hunk patch can't express (or a binary file) is a REFUSAL (trap 3), not a silent widening to
-/// "the whole file." `partial_hunk_patch` already carries that refusal
+/// hunk patch can't express (or a binary file) is a REFUSAL (whole-file-ops fallback), not a
+/// silent widening to "the whole file." `partial_hunk_patch` already carries that refusal
 /// ([`crate::error::SynthesisError::LineSelectionUnsupported`] /
 /// [`crate::error::SynthesisError::BinaryFile`]), so calling it unconditionally and propagating
 /// its `Result` is both the simplest routing and the correct one.
 ///
 /// Single-hunk only — see [`apply_line_selections`] for a selection spanning multiple hunks,
-/// which must NOT be applied as N separate calls to this function (trap 7, see that function's
-/// docs).
+/// which must NOT be applied as N separate calls to this function (stale-metadata head, see
+/// that function's docs).
 pub fn apply_lines(
     repo: &Repository,
     applier: &dyn Applier,
@@ -111,7 +112,7 @@ pub fn apply_lines(
 }
 
 /// Apply `verb` to a line-precise selection spanning POSSIBLY MULTIPLE hunks of `file`, as ONE
-/// combined patch (trap 7).
+/// combined patch (stale-metadata head).
 ///
 /// Each `(hunk_idx, LineSelection)` synthesizes its own single-hunk [`PatchText`] via
 /// [`partial_hunk_patch`] (same refusals as [`apply_lines`]: propagated from the FIRST hunk that

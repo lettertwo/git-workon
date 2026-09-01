@@ -6,11 +6,11 @@
 //!
 //! ## Status
 //!
-//! M2: the diff model ([`model`]), its acquisition from [`workon::Changeset`]s
+//! The diff model ([`model`]), its acquisition from [`workon::Changeset`]s
 //! ([`acquire`]), patch synthesis ([`synthesis`]), the apply chokepoint ([`apply`]), whole-file
 //! ops ([`file_ops`]), the patch-vs-file-op routing layer ([`ops`]), the FIFO staging queue
 //! ([`queue`]), and the refresh generation coordinator ([`refresh`]) exist; the round-trip
-//! verdict corpus lands in the next M2 changeset.
+//! verdict corpus exists too, in `tests/suite/roundtrip_corpus.rs`.
 
 pub mod acquire;
 pub mod align;

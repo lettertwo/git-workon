@@ -201,7 +201,8 @@ pub fn diff_changesets(
 }
 
 /// Resolve the changeset stack the review App opens on for the worktree whose `HEAD` is
-/// `head_branch` (locked design decision M5-fork-7, "auto-detect"): the full Graphite stack
+/// `head_branch` (locked design decision: auto-detect Graphite, else a single uncommitted
+/// changeset): the full Graphite stack
 /// when one is active, or a single synthetic [`Changeset`] spanning the uncommitted worktree
 /// otherwise.
 ///
@@ -210,7 +211,7 @@ pub fn diff_changesets(
 /// (see its module docs) rather than a reviewable uncommitted layer, and mapping `None` to
 /// [`StackModel::Git`] instead would make every branch without upstream tracking (the common
 /// case for a scratch/local branch) fail with `NoUpstream` before it ever got to review a dirty
-/// tree — a regression from M2–M4's "just diff the worktree" default. So the non-Graphite case
+/// tree — a regression from the original "just diff the worktree" default. So the non-Graphite case
 /// is built directly here, matching exactly what `assemble_changesets`'s own
 /// `insert_uncommitted_layer` would produce for a lone dirty tree: one `current` entry, no
 /// title, not needing a restack.

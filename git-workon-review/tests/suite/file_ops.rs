@@ -1,4 +1,4 @@
-//! Trap 3 (whole-file ops): tripwires proving the naive hunk-patch shapes for
+//! Whole-file-ops fallback: tripwires proving the naive hunk-patch shapes for
 //! deletion/untracked files misbehave (empty-blob-stage / rejection), then the routed
 //! `ops.rs`/`file_ops.rs` behavior that exists to route around them.
 //!
@@ -70,7 +70,8 @@ fn naive_deletion_hunk_patch(path: &str, committed_content: &str) -> PatchText {
 /// TRIPWIRE: a naive whole-hunk stage of a deletion (deleting every line, but keeping the
 /// `a/`/`b/` paths as if the file still existed) is ACCEPTED by `git apply --cached` — it
 /// stages an EMPTY BLOB for the path instead of removing the index entry. This is exactly the
-/// bug `ops.rs`'s routing to `file_ops::stage_file` exists to prevent (trap 3). Verified
+/// bug `ops.rs`'s routing to `file_ops::stage_file` exists to prevent (the whole-file-ops
+/// fallback). Verified
 /// directly against `CliApplier` (the oracle), bypassing `ops.rs`/`synthesis.rs` entirely,
 /// since `whole_hunk_patch` already refuses `FileStatus::Deleted` and can't produce this patch
 /// itself.

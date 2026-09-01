@@ -1,12 +1,12 @@
-//! OSC 52 clipboard writes (M11, `copy-lines`/`copy-location`).
+//! OSC 52 clipboard writes (in-diff navigation, `copy-lines`/`copy-location`).
 //!
 //! The only clipboard mechanism this crate has: an OSC 52 "set clipboard" escape sequence
-//! written to the controlling tty. No `arboard`-style dependency — the M11 handoff's locked
-//! decision 1 rejected both a pure-`arboard` approach (dependency tree, dead over SSH) and an
-//! `arboard`-with-OSC-52-fallback hybrid (two code paths for one keybinding, which the
-//! CLAUDE.md "simplicity wins" rule doesn't allow without a concrete reason). `base64_encode`
-//! below hand-rolls the small amount of base64 OSC 52 needs rather than pulling in a crate for
-//! it.
+//! written to the controlling tty. No `arboard`-style dependency — the locked decision that
+//! clipboard writes go through OSC 52 only rejected both a pure-`arboard` approach (dependency
+//! tree, dead over SSH) and an `arboard`-with-OSC-52-fallback hybrid (two code paths for one
+//! keybinding, which the CLAUDE.md "simplicity wins" rule doesn't allow without a concrete
+//! reason). `base64_encode` below hand-rolls the small amount of base64 OSC 52 needs rather
+//! than pulling in a crate for it.
 //!
 //! ## Fire-and-forget, by protocol
 //!
@@ -126,8 +126,9 @@ mod tests {
         assert_eq!(base64_encode(b"src/app.rs:42"), "c3JjL2FwcC5yczo0Mg==");
     }
 
-    /// Assert the exact byte sequence, not terminal behavior (per the M11 handoff) — this is the
-    /// wire format every OSC-52-aware terminal parses, so any drift here is a real regression.
+    /// Assert the exact byte sequence, not terminal behavior (per the copy `path:line` handoff)
+    /// — this is the wire format every OSC-52-aware terminal parses, so any drift here is a
+    /// real regression.
     #[test]
     fn osc52_sequence_wraps_base64_payload_in_esc_bracket_st() {
         let seq = osc52_sequence("foo");

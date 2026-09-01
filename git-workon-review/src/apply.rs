@@ -1,9 +1,9 @@
 //! Applying a [`PatchText`] to a repository's index or working tree — the one chokepoint
-//! (per the M2 design decision) parameterizable over two backends: [`Git2Applier`] (libgit2's
-//! `Repository::apply`) and [`CliApplier`] (`git apply` on stdin). The round-trip corpus (CS6)
-//! runs every scenario against both; `CliApplier` is the oracle.
+//! (per the diff-model-and-patch-synthesis design decision) parameterizable over two backends:
+//! [`Git2Applier`] (libgit2's `Repository::apply`) and [`CliApplier`] (`git apply` on stdin).
+//! The round-trip verdict corpus runs every scenario against both; `CliApplier` is the oracle.
 //!
-//! ## The flag matrix (trap 1's chokepoint, prototype-verified)
+//! ## The flag matrix (the direction-dependent-drop-rules chokepoint, prototype-verified)
 //!
 //! `git apply` takes ONLY `--cached`/`--reverse`, patch on stdin — never `--unidiff-zero`,
 //! never `--3way`. [`StageVerb::plan`] encodes the same matrix for both backends:
@@ -44,8 +44,8 @@ pub enum ApplyDirection {
 }
 
 /// The three staging actions a review session performs. [`StageVerb::plan`] is the flag
-/// matrix above, encoded once so `ops.rs` (CS4) and the applier tests share one source of
-/// truth.
+/// matrix above, encoded once so `ops.rs` (the whole-file ops and routing layer) and the
+/// applier tests share one source of truth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StageVerb {
     Stage,
@@ -124,7 +124,7 @@ impl Applier for Git2Applier {
 
 /// Applies by spawning `git apply` with the patch on stdin, cwd set to the repository's
 /// working directory. `Index` destination -> `--cached`; `Reverse` direction -> `--reverse`.
-/// Never `--unidiff-zero`, never `--3way` (prototype chokepoint, trap 1).
+/// Never `--unidiff-zero`, never `--3way` (prototype chokepoint, direction-dependent drop rules).
 pub struct CliApplier;
 
 impl Applier for CliApplier {

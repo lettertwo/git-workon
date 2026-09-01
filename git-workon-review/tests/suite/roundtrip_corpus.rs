@@ -1,4 +1,5 @@
-//! The round-trip verdict corpus (trap 6): every write-path scenario from M2's trap corpus,
+//! The round-trip verdict corpus (the git2-vs-CLI round-trip verdict): every write-path scenario
+//! from the diff-model-and-patch-synthesis trap corpus,
 //! driven through the `ops.rs` entry points and run against BOTH backends —
 //! [`workon_review::apply::CliApplier`] (the oracle) and [`workon_review::apply::Git2Applier`]
 //! (the backend under verification).
@@ -400,7 +401,7 @@ fn partial_stage_dels_only_verify(fixture: &Fixture) {
 }
 
 /// Two separate changes ("old2"->"new2", "old4"->"new4") in one hunk, separated by a context
-/// line — the shape the direction rules (trap 1) need: keeping one change and dropping the
+/// line — the shape the direction-dependent drop rules need: keeping one change and dropping the
 /// other must not treat the dropped one uniformly across stage/unstage/discard.
 const TWO_CHANGE_COMMITTED: &str = "line1\nold2\nline3\nold4\nline5\n";
 const TWO_CHANGE_MODIFIED: &str = "line1\nnew2\nline3\nnew4\nline5\n";
@@ -1353,8 +1354,8 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// swallowed by loosening this test.
 const KNOWN_DIVERGENCES: &[&str] = &[];
 
-/// The VERDICT: renders the git2-vs-CLI comparison for `docs/rfc/workon-review.md`'s "M2
-/// verdict" section. Collects divergences instead of panicking per-scenario so the full set is
+/// The VERDICT: renders the git2-vs-CLI comparison for `docs/rfc/workon-review.md`'s "git2 vs
+/// CLI apply verdict" section. Collects divergences instead of panicking per-scenario so the full set is
 /// visible in one run.
 #[test]
 fn corpus_against_git2() {

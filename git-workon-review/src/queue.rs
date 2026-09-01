@@ -1,6 +1,7 @@
-//! FIFO staging queue (trap 4): callers enqueue [`StagingOp`]s, [`StagingQueue::pump`] runs the
-//! head op synchronously against the live index. Runtime-agnostic per the M2 design decision —
-//! no tokio, no owned thread; the caller (M4's TUI event loop) decides when to pump.
+//! FIFO staging queue (live-index staging queue): callers enqueue [`StagingOp`]s,
+//! [`StagingQueue::pump`] runs the head op synchronously against the live index.
+//! Runtime-agnostic per the diff-model-and-patch-synthesis design decision — no tokio, no owned
+//! thread; the caller (the staging-verbs work's TUI event loop) decides when to pump.
 //!
 //! ## The stale-snapshot trap
 //!
@@ -69,9 +70,10 @@ pub trait StagingOp: Send {
 }
 
 /// Lets an already-boxed trait object be re-enqueued through [`StagingQueue::enqueue`] (which
-/// takes `impl StagingOp + 'static` and boxes internally) without unboxing first — CS7's
-/// `App::run_ops` collects a `Vec<Box<dyn StagingOp>>` of heterogeneous per-file ops (one
-/// [`crate::stage_op::FileStagingOp`] per outline target) and enqueues them one at a time.
+/// takes `impl StagingOp + 'static` and boxes internally) without unboxing first — the
+/// outline-staging-verbs work's `App::run_ops` collects a `Vec<Box<dyn StagingOp>>` of
+/// heterogeneous per-file ops (one [`crate::stage_op::FileStagingOp`] per outline target) and
+/// enqueues them one at a time.
 impl StagingOp for Box<dyn StagingOp> {
     fn run(&mut self, ctx: &OpContext<'_>) -> Result<(), ApplyError> {
         (**self).run(ctx)
@@ -91,8 +93,8 @@ pub enum OpOutcome {
 /// otherwise read as a false positive candidate once combined with the rest of the struct).
 type SleepFn = Box<dyn FnMut(Duration)>;
 
-/// Runtime-agnostic FIFO queue of staging operations (trap 4). Only the head op ever runs;
-/// [`StagingQueue::pump`] runs it synchronously to completion (including its one retry, if
+/// Runtime-agnostic FIFO queue of staging operations (live-index staging queue). Only the head
+/// op ever runs; [`StagingQueue::pump`] runs it synchronously to completion (including its one retry, if
 /// index-lock contention is hit) before removing it.
 pub struct StagingQueue {
     queue: VecDeque<(OpId, Box<dyn StagingOp>)>,
@@ -315,8 +317,8 @@ mod tests {
     }
 
     /// Toggles staged/unstaged state of `path` by resolving direction from the LIVE index
-    /// inside `run` — proves ops must not cache the direction at enqueue time (trap 4's
-    /// stale-snapshot bug).
+    /// inside `run` — proves ops must not cache the direction at enqueue time (the live-index
+    /// staging queue's stale-snapshot bug).
     struct ToggleOp {
         path: &'static str,
     }

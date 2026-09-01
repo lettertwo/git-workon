@@ -9,7 +9,7 @@
 //! This module reads only hunk counters (`old_start`/`old_count`/`new_start`/`new_count`),
 //! [`crate::model::Hunk::lines`], and each line's kind + `old_lnum`/`new_lnum`. Content is NOT
 //! read from hunk lines here — rendering reads full file text by line number so numbers and
-//! content stay in sync (M4 concern; out of scope for this module).
+//! content stay in sync (a staging-verbs concern; out of scope for this module).
 //!
 //! ## Lineno invariant
 //!
@@ -22,7 +22,7 @@
 //! so the pairing code below `expect()`s the lineno for the side each kind is documented to
 //! carry.
 //!
-//! ## Progressive gap expansion (CS8)
+//! ## Progressive gap expansion
 //!
 //! [`collapse_gaps`]'s collapsed [`DisplayRow::Gap`]/[`InlineRow::Gap`] markers each carry a
 //! `key` — the hidden run's start index in the pre-collapse [`AlignedRow`] space — so a caller
@@ -230,7 +230,7 @@ pub enum DisplayRow {
 /// Number of context lines kept around hunk content on each side of a gap.
 pub const CONTEXT_LINES: usize = 3;
 
-/// How far a single collapsed gap has been expanded (CS8). Accumulates across repeated `Enter`
+/// How far a single collapsed gap has been expanded. Accumulates across repeated `Enter`
 /// presses: `before`/`after` each independently widen how many rows are revealed at that edge of
 /// the gap, and `full` — once set — reveals the whole run regardless of `before`/`after`.
 ///
@@ -412,8 +412,9 @@ fn measure_context_run(
 }
 
 /// The currently-hidden [`AlignedRow`] sub-range `[start, end)` for the gap keyed `key`, given
-/// its current `expansion` (if any) — used by [`crate::app::FileView::scope_expand_gap`] (CS9) to
-/// measure how much of a gap's hidden run a candidate tree-sitter scope range would additionally
+/// its current `expansion` (if any) — used by [`crate::app::FileView::scope_expand_gap`]
+/// (tree-sitter scope reveal) to measure how much of a gap's hidden run a candidate tree-sitter
+/// scope range would additionally
 /// uncover. `None` when `key` no longer denotes an actual gap: not a context-run start, the run is
 /// too short to have collapsed in the first place, or `expansion` already reveals the whole run.
 ///
@@ -448,8 +449,8 @@ pub(crate) fn gap_hidden_range(
 /// UNEXPANDED context run contains `aligned_idx`, or `None` when `aligned_idx` isn't inside a
 /// context run at all, or that run is too short to ever collapse (same `keep_before`/`keep_after`/
 /// `run_len` test [`collapse_gaps_inner`] uses — a run collapse decision never depends on the
-/// current [`GapExpansion`] state, only on the run's own length and position). M11 CS3 (search):
-/// a match address lives in the pre-collapse `AlignedRow` space, so jumping to one that isn't
+/// current [`GapExpansion`] state, only on the run's own length and position). The in-diff
+/// search: a match address lives in the pre-collapse `AlignedRow` space, so jumping to one that isn't
 /// currently visible needs this reverse lookup — "which gap, if any, would need expanding to
 /// reveal this row" — before [`crate::app::FileView::expand_gap`] can be called with the right key.
 pub(crate) fn gap_key_for_aligned_idx(rows: &[AlignedRow], aligned_idx: usize) -> Option<usize> {
@@ -949,10 +950,10 @@ mod tests {
         );
     }
 
-    // ── CS8: progressive gap expansion ──────────────────────────────────────
+    // ── Progressive gap expansion ─────────────────────────────────────────────
 
     /// One change row, a run of `run_len` context rows, one more change row — the shape every
-    /// CS8 expansion test collapses. With `context = 3` the base hidden count is
+    /// progressive-gap-expansion test collapses. With `context = 3` the base hidden count is
     /// `run_len - 2 * 3`.
     fn change_then_context_run_then_change(run_len: usize) -> Vec<AlignedRow> {
         let mut rows = vec![change_row(
@@ -974,8 +975,9 @@ mod tests {
     #[test]
     fn collapse_gaps_matches_collapse_gaps_with_expansions_over_an_empty_map() {
         // `collapse_gaps` is a thin wrapper — pin that it's byte-for-byte the same output as
-        // calling the expansion-aware entry point with nothing to expand (the pre-CS8 behavior
-        // every other test in this module already exercises via `collapse_gaps_with`).
+        // calling the expansion-aware entry point with nothing to expand (the pre-progressive-
+        // gap-expansion behavior every other test in this module already exercises via
+        // `collapse_gaps_with`).
         let rows = change_then_context_run_then_change(16);
         let via_collapse_gaps = collapse_gaps(&rows);
         let via_expansions = collapse_gaps_with_expansions(&rows, &HashMap::new());
@@ -1004,9 +1006,9 @@ mod tests {
         }
     }
 
-    /// The single [`DisplayRow::Gap`]'s `(key, skipped)` in `display` — the CS8 expansion tests'
-    /// index-free lookup (the gap's display position depends on how much kept context precedes
-    /// it, which is exactly what these tests vary).
+    /// The single [`DisplayRow::Gap`]'s `(key, skipped)` in `display` — the
+    /// progressive-gap-expansion tests' index-free lookup (the gap's display position depends
+    /// on how much kept context precedes it, which is exactly what these tests vary).
     fn only_gap(display: &[DisplayRow]) -> (usize, usize) {
         display
             .iter()
