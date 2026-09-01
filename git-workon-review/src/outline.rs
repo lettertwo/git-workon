@@ -116,7 +116,7 @@ fn scan_order(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StagedStatus {
     /// No staged/unstaged sub-diff info for this file (a committed changeset's file, or an
-    /// uncommitted file that — impossibly — has a combined change but neither sub-change).
+    /// uncommitted file that — impossibly — has a whole-role change but neither sub-change).
     #[default]
     None,
     /// The file has an unstaged (index ↔ worktree) change but no staged one.

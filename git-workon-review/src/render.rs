@@ -431,13 +431,13 @@ fn gutter_width(max_lineno: usize) -> usize {
 }
 
 /// How a rendered pane resolves a changed cell's (line, edit) background pair — one per [`Role`].
-/// ADR-038 decision 7: `Role::Combined` is reachable only for a committed changeset (no
+/// ADR-038 decision 7: `Role::Whole` is reachable only for a committed changeset (no
 /// staged/unstaged split to attribute against) or a binary file (no cells at all), so it never
 /// needs a per-cell staged-ness lookup any more — [`attribution_mode`] maps it straight to
 /// `Plain`, the same as the unstaged pane.
 #[derive(Clone, Copy)]
 enum AttributionMode {
-    /// Combined view, or the unstaged zoom pane: every changed cell IS the not-yet-staged set —
+    /// The whole role, or the unstaged zoom pane: every changed cell IS the not-yet-staged set —
     /// render bright, unconditionally (today's plain colors).
     Plain,
     /// Staged zoom pane (single-zoom or the split's bottom pane): every changed cell IS already
@@ -448,7 +448,7 @@ enum AttributionMode {
 /// Resolve the [`AttributionMode`] to render `role` with.
 fn attribution_mode(role: Role) -> AttributionMode {
     match role {
-        Role::Combined | Role::Unstaged => AttributionMode::Plain,
+        Role::Whole | Role::Unstaged => AttributionMode::Plain,
         Role::Staged => AttributionMode::StagedUniform,
     }
 }
@@ -458,7 +458,7 @@ fn attribution_mode(role: Role) -> AttributionMode {
 /// resolving through separate paths.
 ///
 /// Takes no line number: staged-ness is now a property of the pane's role alone. The per-cell
-/// lookup this replaced belonged to the deleted combined-view attribution (ADR-038 decision 7).
+/// lookup this replaced belonged to the deleted whole-view attribution (ADR-038 decision 7).
 fn is_staged(mode: AttributionMode) -> bool {
     matches!(mode, AttributionMode::StagedUniform)
 }
@@ -1592,7 +1592,7 @@ fn changeset_prefix_spans(
 /// for the three ways a single role happens: a file that is only staged, one that is only
 /// unstaged, and a split maximized (`Z`) onto one of its halves.
 ///
-/// [`Role::Combined`] gets no word deliberately. It is reachable only for a binary file (which
+/// [`Role::Whole`] gets no word deliberately. It is reachable only for a binary file (which
 /// renders a placeholder, not a diff) and for a committed changeset's files, where there is no
 /// staged/unstaged distinction for a badge to disambiguate — see [`crate::app::effective_zoom`].
 /// The same uppercase wording as the split's captions, so `Z` reads as the caption moving into
@@ -1612,7 +1612,7 @@ fn single_role_badge(app: &App, split_collapsed: bool) -> Option<&'static str> {
     match role {
         Role::Unstaged => Some("UNSTAGED"),
         Role::Staged => Some("STAGED"),
-        Role::Combined => None,
+        Role::Whole => None,
     }
 }
 
@@ -2179,7 +2179,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
             let cursor = Some(app.cursor);
             // The single pane is the focused one, so it shows any active selection.
             let selection = app.selection_range();
-            // CS1 (`unfocused-cursor-wash`, locked decision #1): the single/combined diff body's
+            // CS1 (`unfocused-cursor-wash`, locked decision #1): the single/whole diff body's
             // cursor dims to the unfocused wash while the outline holds focus instead — it never
             // holds real focus itself in that state.
             let focused = !app.outline_focused();
@@ -4167,12 +4167,12 @@ mod tests {
     }
 
     #[test]
-    fn committed_changeset_combined_view_renders_plain() {
-        // Pre-ADR-038, `Role::Combined` on a committed changeset (no staged/unstaged split to
+    fn committed_changeset_whole_view_renders_plain() {
+        // Pre-ADR-038, `Role::Whole` on a committed changeset (no staged/unstaged split to
         // attribute against — `DiffState::from_committed` leaves both sub-models empty) had a
         // real failure mode: `Attribution::build(None, None)`'s empty `unstaged_adds` set would
         // have made EVERY Add cell read as "already staged" (the dim pair) without an explicit
-        // `is_committed` skip. ADR-038 decision 7 deletes `attribute.rs` entirely — `Role::Combined`
+        // `is_committed` skip. ADR-038 decision 7 deletes `attribute.rs` entirely — `Role::Whole`
         // now maps straight to `AttributionMode::Plain` (see `attribution_mode`), with no
         // `Attributed` variant left to build an empty-set lookup from, so that failure mode is
         // structurally unreachable rather than merely guarded. This test pins the still-real
@@ -4214,8 +4214,7 @@ mod tests {
         app.open_current();
         assert!(app.is_committed());
         // Park the cursor off the changed row so its highlight tint doesn't blend into the Add
-        // cell's background and muddy the color comparison below (same convention as
-        // `combined_view_colors_a_staged_change_dim_and_an_unstaged_change_bright`).
+        // cell's background and muddy the color comparison below.
         app.cursor = 0;
         app.derive_scroll();
 
@@ -6408,7 +6407,7 @@ mod tests {
         // Gotcha: `App::from_changesets` defaults the outline open but UNFOCUSED, so at launch the
         // one lit label must be on the diff side, not the outline's — this is also the general
         // "diff focused, effective zoom Single" case, since a Committed changeset's file has no
-        // unstaged/staged split (always `EffectiveZoom::Single(Role::Combined)`).
+        // unstaged/staged split (always `EffectiveZoom::Single(Role::Whole)`).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -6420,7 +6419,7 @@ mod tests {
         );
         assert_eq!(
             app.effective_zoom_for(app.current),
-            EffectiveZoom::Single(Role::Combined)
+            EffectiveZoom::Single(Role::Whole)
         );
 
         let theme = Palette::dark();
@@ -6733,7 +6732,7 @@ mod tests {
     /// A committed changeset has no staged/unstaged split for a badge to disambiguate — see
     /// `single_role_badge`.
     #[test]
-    fn a_committed_changesets_combined_pane_carries_no_header_badge() {
+    fn a_committed_changesets_whole_pane_carries_no_header_badge() {
         use git2::Repository;
         use workon::{Changeset, ChangesetSpan};
 
@@ -6769,7 +6768,7 @@ mod tests {
         app.open_current();
         assert_eq!(
             app.effective_zoom_for(app.current),
-            EffectiveZoom::Single(Role::Combined)
+            EffectiveZoom::Single(Role::Whole)
         );
 
         let header = header_row(&mut app);
@@ -6907,7 +6906,7 @@ mod tests {
 
     #[test]
     fn diff_cursor_dims_when_outline_holds_focus_single_zoom() {
-        // Locked decision #1: the diff body (single/combined zoom) paints its cursor row with the
+        // Locked decision #1: the diff body (single/whole zoom) paints its cursor row with the
         // dim unfocused wash, not full `cursor_bg`, whenever the outline (not the diff) holds
         // focus.
         let old = "l1\nl2\nl3\n";

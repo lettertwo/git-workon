@@ -43,6 +43,16 @@ the uncommitted layer, and all of `git workon review <ref> | <a..b> | pr-123`. I
 forced role for binary files, which cannot be staged. Combined is the crate's reading view; the two
 sub-roles exist because the index is writable. `Role::Combined` stays.
 
+**Amended 2026-08-31.** I renamed `Role::Combined` to `Role::Whole`. The mechanism above is
+unchanged; only the name was wrong. "Combined" reads as a selectable view, and after this ADR
+there is no such view left to select (`Zoom::Combined` is gone). The role survives only as
+the diff `effective_zoom` falls back to when there is no staged/unstaged split to show (a
+committed changeset, or a binary file). `Whole` names what the role actually is: the whole
+change, `HEAD` ↔ worktree for the uncommitted layer, or `base` ↔ `head` for a committed
+changeset, with no split. I considered `ReadOnly` and rejected it. It names a property of the
+role (verbs refuse there), not which trees it diffs, and the role is also a valid content
+source for yank, so "read-only" undersells it.
+
 ## Decision
 
 **1. Delete the `Zoom` enum.** All four variants, the `cycle_zoom` cycle, and `set_zoom`.
@@ -56,12 +66,12 @@ unrepresentable.
 
 | Condition | Result |
 |---|---|
-| `!can_stage` | `Single(Combined)` |
+| `!can_stage` | `Single(Whole)` |
 | both sub-diffs, `maximized` | `Single(focus.role())` |
 | both sub-diffs, not maximized | `Split` |
 | unstaged only | `Single(Unstaged)` |
 | staged only | `Single(Staged)` |
-| neither | `Single(Combined)` |
+| neither | `Single(Whole)` |
 
 Maximize applies only where the result would otherwise be `Split`. Everywhere else the pane already
 fills the body, so the flag is inert rather than special-cased.
@@ -81,8 +91,8 @@ replaces. There are existing tests asserting zoom survives both; they carry over
 rather than being deleted.
 
 **7. Delete `attribute.rs` and its render integration.** With `Zoom::Combined` gone,
-`Role::Combined` is unreachable on an uncommitted changeset, and `combined_attribution` already
-returns `None` for non-combined roles and for committed changesets. Every surviving combined render
+`Role::Whole` is unreachable on an uncommitted changeset, and `combined_attribution` already
+returns `None` for non-whole roles and for committed changesets. Every surviving whole-role render
 is already `AttributionMode::Plain`. Remove the module, its `pub mod` line,
 `combined_attribution`, and `AttributionMode::Attributed` — which also drops that enum's lifetime
 parameter, leaving `Plain` and `StagedUniform`.
@@ -99,10 +109,10 @@ keymap already warns on unknown action names, so a user config naming `cycle-zoo
 warning rather than silently doing nothing. Preserve the `zM`/`zR` collision constraint that moved
 this action off bare `z` in the first place.
 
-**10. Reword `notify_combined_refusal`'s non-committed branch.** It reads
+**10. Reword `notify_unstageable_refusal`'s non-committed branch.** It reads
 `"{verb} in the unstaged/staged pane — cycle zoom ({key})"`. After this change, binary files are
 its only caller, and that advice is wrong for them: `effective_zoom` short-circuits on `!can_stage`
-before it looks at anything else, so no key press moves them out of `Role::Combined`. State that
+before it looks at anything else, so no key press moves them out of `Role::Whole`. State that
 the file is not stageable. This is a pre-existing defect the change exposes rather than creates —
 the branch is currently shared with the ordinary combined-zoom case, where the advice is correct,
 which masks it.
@@ -124,18 +134,18 @@ maximize gives either one the full body.
 
 Committed-changeset review is unaffected. Worth stating plainly, because the change reads like it
 should affect it: `git workon review <ref>`, ranges, PRs, and stack navigation render exclusively
-through `Role::Combined` and are untouched.
+through `Role::Whole` and are untouched.
 
 If a fused uncommitted view is wanted later, `attribute.rs` and its tests are recoverable from
 history at this ADR's commit, and the asymmetry rationale is preserved in its module header.
 
 ## Gotchas
 
-- **Do not follow `Role::Combined` into the model.** The likeliest way to break this is to read
-  "remove combined" as reaching `DiffState.files` — which *is* the combined model, and is the
-  file-list spine: `role_change(idx, Role::Combined)` returns `diff.files[idx]`, and
+- **Do not follow `Role::Whole` into the model.** The likeliest way to break this is to read
+  "remove combined" as reaching `DiffState.files` — which *is* the whole-diff model, and is the
+  file-list spine: `role_change(idx, Role::Whole)` returns `diff.files[idx]`, and
   `unstaged_idx`/`staged_idx` are offsets into it.
-- **`effective_zoom` keeps every downgrade to `Role::Combined`.** Binary files and the
+- **`effective_zoom` keeps every downgrade to `Role::Whole`.** Binary files and the
   no-sub-diff case still land there. Only the `Zoom::Combined` arm goes.
 - **Around twenty tests reach a view state by setting zoom** (`set_zoom(Zoom::Combined)`,
   `app.zoom = Zoom::…`, across `app.rs` and `render.rs`). This is not a mechanical rewrite. Each

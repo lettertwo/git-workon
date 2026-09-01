@@ -343,10 +343,10 @@ fn hunk_to_diff_bytes_matches_diff_print() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-// ── combined diff (CS1: HEAD ↔ worktree-with-index, M3's default zoom) ───────
+// ── whole diff (CS1: HEAD ↔ worktree-with-index, M3's default zoom) ───────
 
 #[test]
-fn partially_staged_file_appears_fused_in_combined() -> Result<(), Box<dyn std::error::Error>> {
+fn partially_staged_file_appears_fused_in_whole() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .config("core.autocrlf", "false")
         .partially_staged_file(
@@ -363,9 +363,9 @@ fn partially_staged_file_appears_fused_in_combined() -> Result<(), Box<dyn std::
     assert_eq!(diffs.staged.files.len(), 1);
     assert_eq!(diffs.unstaged.files.len(), 1);
 
-    // Combined fuses both onto one file, diffing straight from HEAD to the workdir.
-    assert_eq!(diffs.combined.files.len(), 1);
-    let file = &diffs.combined.files[0];
+    // Whole fuses both onto one file, diffing straight from HEAD to the workdir.
+    assert_eq!(diffs.whole.files.len(), 1);
+    let file = &diffs.whole.files[0];
     assert_eq!(file.path, "f.txt");
     assert_eq!(file.status, FileStatus::Modified);
     assert_eq!(file.hunks.len(), 1);
@@ -383,7 +383,7 @@ fn partially_staged_file_appears_fused_in_combined() -> Result<(), Box<dyn std::
 }
 
 #[test]
-fn untracked_file_appears_as_added_in_combined() -> Result<(), Box<dyn std::error::Error>> {
+fn untracked_file_appears_as_added_in_whole() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .config("core.autocrlf", "false")
         .untracked_file("new.txt", "hello\nworld\n")
@@ -391,8 +391,8 @@ fn untracked_file_appears_as_added_in_combined() -> Result<(), Box<dyn std::erro
     let repo = fixture.repo()?;
 
     let diffs = diff_uncommitted(repo)?;
-    assert_eq!(diffs.combined.files.len(), 1);
-    let file = &diffs.combined.files[0];
+    assert_eq!(diffs.whole.files.len(), 1);
+    let file = &diffs.whole.files[0];
     assert_eq!(file.path, "new.txt");
     // Matches the unstaged side's convention (see `untracked_file_has_full_content_as_addition`):
     // git2 reports untracked deltas as `Delta::Untracked`, not `Delta::Added` — all lines are
@@ -407,8 +407,8 @@ fn untracked_file_appears_as_added_in_combined() -> Result<(), Box<dyn std::erro
 }
 
 #[test]
-fn renamed_in_worktree_file_surfaces_as_renamed_in_combined(
-) -> Result<(), Box<dyn std::error::Error>> {
+fn renamed_in_worktree_file_surfaces_as_renamed_in_whole() -> Result<(), Box<dyn std::error::Error>>
+{
     let fixture = FixtureBuilder::new()
         .config("core.autocrlf", "false")
         // Deleted from the working tree, still in HEAD/index...
@@ -420,8 +420,8 @@ fn renamed_in_worktree_file_surfaces_as_renamed_in_combined(
     let repo = fixture.repo()?;
 
     let diffs = diff_uncommitted(repo)?;
-    assert_eq!(diffs.combined.files.len(), 1);
-    let file = &diffs.combined.files[0];
+    assert_eq!(diffs.whole.files.len(), 1);
+    let file = &diffs.whole.files[0];
     assert_eq!(file.status, FileStatus::Renamed);
     assert_eq!(file.path, "new.txt");
     assert_eq!(file.old_path.as_deref(), Some("old.txt"));

@@ -3064,7 +3064,7 @@ mod tests {
         app.toggle_outline(); // open + focus, cursor synced onto file 0's row (index 0 in Flat mode)
         assert!(app.outline_focused());
         assert!(
-            app.role_view_ref(0, Role::Combined).is_some(),
+            app.role_view_ref(0, Role::Whole).is_some(),
             "file 0 loaded by open_current"
         );
 
@@ -3090,12 +3090,12 @@ mod tests {
         assert_eq!(app.current, 4, "the diff jumps to the landing file only");
         for skipped in 1..4 {
             assert!(
-                app.role_view_ref(skipped, Role::Combined).is_none(),
+                app.role_view_ref(skipped, Role::Whole).is_none(),
                 "file {skipped} must never have been visited, so its view must not be loaded"
             );
         }
         assert!(
-            app.role_view_ref(4, Role::Combined).is_some(),
+            app.role_view_ref(4, Role::Whole).is_some(),
             "the landing file's view IS loaded"
         );
     }
@@ -3410,7 +3410,7 @@ mod tests {
         );
         for f in 1..=4 {
             assert!(
-                app.role_view_ref(f, Role::Combined).is_none(),
+                app.role_view_ref(f, Role::Whole).is_none(),
                 "file {f} must not be loaded — not even the landing file, until completed"
             );
         }
@@ -3419,7 +3419,7 @@ mod tests {
 
         assert!(!app.open_pending());
         assert!(
-            app.role_view_ref(4, Role::Combined).is_some(),
+            app.role_view_ref(4, Role::Whole).is_some(),
             "completing the pending open loads only the landing file"
         );
     }

@@ -4,10 +4,11 @@
 //! Ported from the `review-tui-spike` prototype's `model.rs` — renamed here because `model`
 //! already means the diff model in this crate (see the M3 plan's naming rule).
 //!
-//! Renders the **combined** (`HEAD` ↔ worktree) diff only (locked design decision #2 in the M3
-//! plan) — the staged/unstaged split zoom is M4. [`App`] owns its own [`git2::Repository`]
-//! handle so it can lazily read blob/worktree content per file as the user navigates to it,
-//! independent of whatever handle acquired the [`DiffModel`] it was built from.
+//! Renders the staged/unstaged split when both sides have content, and the **whole** (`HEAD`
+//! ↔ worktree, or `base` ↔ `head` for a committed changeset) diff otherwise — see
+//! [`Role`]/[`EffectiveZoom`]. [`App`] owns its own [`git2::Repository`] handle so it can
+//! lazily read blob/worktree content per file as the user navigates to it, independent of
+//! whatever handle acquired the [`DiffModel`] it was built from.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
@@ -48,7 +49,7 @@ const SCROLLOFF: usize = 2;
 /// [`App::hscroll_right`].
 const HSCROLL_STEP: usize = 8;
 
-/// Loaded, aligned, highlighted view of one file's combined diff.
+/// Loaded, aligned, highlighted view of one file's diff, for one [`Role`].
 ///
 /// Full text is read once per side, from whichever source the file's status says still exists:
 ///
@@ -131,9 +132,9 @@ impl FileView {
     /// already role-correct because `file` is that role's own [`FileChange`], but the surrounding
     /// text must match the same two revisions the hunks were diffed against, or context lines
     /// render one revision on one side and a different one on the other:
-    /// - old side: [`Role::Combined`]/[`Role::Staged`] read the `HEAD` blob; [`Role::Unstaged`]
+    /// - old side: [`Role::Whole`]/[`Role::Staged`] read the `HEAD` blob; [`Role::Unstaged`]
     ///   reads the INDEX blob (unstaged is index ↔ worktree).
-    /// - new side: [`Role::Combined`]/[`Role::Unstaged`] read the worktree file when `new_tree`
+    /// - new side: [`Role::Whole`]/[`Role::Unstaged`] read the worktree file when `new_tree`
     ///   is `None` (the uncommitted layer); for a committed changeset `new_tree` is the changeset's
     ///   `head` commit tree, whose blob is read instead (its new side is `base..head`, not the
     ///   current worktree). [`Role::Staged`] reads the INDEX blob (staged is `HEAD` ↔ index).
@@ -149,7 +150,7 @@ impl FileView {
         let old_text = match file.status {
             FileStatus::Added | FileStatus::Untracked => String::new(),
             _ => match role {
-                Role::Combined | Role::Staged => read_head_blob(repo, head_tree, old_source_path),
+                Role::Whole | Role::Staged => read_head_blob(repo, head_tree, old_source_path),
                 Role::Unstaged => read_index_blob(repo, old_source_path),
             },
         };
@@ -157,7 +158,7 @@ impl FileView {
         let new_text = match file.status {
             FileStatus::Deleted => String::new(),
             _ => match role {
-                Role::Combined | Role::Unstaged => match new_tree {
+                Role::Whole | Role::Unstaged => match new_tree {
                     Some(tree) => read_head_blob(repo, tree, &file.path),
                     None => read_workdir_file(repo, &file.path),
                 },
@@ -483,10 +484,10 @@ impl FileView {
     }
 }
 
-/// The tree a COMBINED-role [`FileView`]'s old side reads from (see [`FileView::load`]'s role
+/// The tree a WHOLE-role [`FileView`]'s old side reads from (see [`FileView::load`]'s role
 /// table): the changeset's `base` commit for a committed changeset, or the live `HEAD` for the
 /// uncommitted layer — the only case M2–M4 ever had, and what [`App::base_label`] already
-/// names. A committed changeset's combined role is `base..head` (there is no staged/unstaged
+/// names. A committed changeset's whole role is `base..head` (there is no staged/unstaged
 /// split to disagree with it — see [`DiffState::from_committed`]), so the old side must read
 /// `base`'s blob, not whatever `HEAD` happens to be right now.
 ///
@@ -509,10 +510,10 @@ fn old_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tre
     }
 }
 
-/// The tree a COMBINED-role [`FileView`]'s NEW side reads from (see [`FileView::load`]'s role
+/// The tree a WHOLE-role [`FileView`]'s NEW side reads from (see [`FileView::load`]'s role
 /// table): the changeset's `head` commit for a committed changeset, or `None` for the uncommitted
 /// layer — where `None` means "read the worktree", the only new-side source M2–M4 ever had. A
-/// committed changeset's combined role is `base..head`, so its new side must read `head`'s blob,
+/// committed changeset's whole role is `base..head`, so its new side must read `head`'s blob,
 /// not the current worktree (which for an OLDER committed changeset differs from `head` and would
 /// break the align invariant against the `base..head` hunks). The mirror of [`old_side_tree_for`].
 ///
@@ -527,12 +528,12 @@ fn new_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tre
     }
 }
 
-/// Build a [`Role::Combined`] [`FileView`] against `repo`/`ts` for a file whose combined
+/// Build a [`Role::Whole`] [`FileView`] against `repo`/`ts` for a file whose whole
 /// [`FileChange`] is `file` and whose changeset span is `span` — the shared core
-/// [`App::ensure_role_loaded`]'s combined branch and ADR-037's [`build_file_views`] (the loader
+/// [`App::ensure_role_loaded`]'s whole branch and ADR-037's [`build_file_views`] (the loader
 /// job's pure body) both call, so a deferred-then-loader-completed open is byte-identical to an
 /// eager one. `None` for a binary file or an unreadable tree; never panics.
-fn build_combined_view(
+fn build_whole_view(
     repo: &Repository,
     ts: &mut TsHighlighter,
     span: ChangesetSpan,
@@ -551,13 +552,13 @@ fn build_combined_view(
         &head_tree,
         new_tree.as_ref(),
         file,
-        Role::Combined,
+        Role::Whole,
         ts,
     ))
 }
 
-/// Build a non-Combined ([`Role::Unstaged`]/[`Role::Staged`]) [`FileView`] against `repo`/`ts` for
-/// sub-role file `file` — the mirror of [`build_combined_view`], shared the same way. Non-Combined
+/// Build a non-Whole ([`Role::Unstaged`]/[`Role::Staged`]) [`FileView`] against `repo`/`ts` for
+/// sub-role file `file` — the mirror of [`build_whole_view`], shared the same way. Non-Whole
 /// roles are uncommitted-only (a committed changeset's staged/unstaged sub-models are always
 /// empty — see [`DiffState::from_committed`]), so the new side always stays worktree/index (`None`
 /// to [`FileView::load`]) and the old side is always live `HEAD`, never a changeset's `base`.
@@ -568,11 +569,7 @@ fn build_sub_role_view(
     role: Role,
     file: &FileChange,
 ) -> Option<FileView> {
-    debug_assert_ne!(
-        role,
-        Role::Combined,
-        "build_sub_role_view is non-Combined only"
-    );
+    debug_assert_ne!(role, Role::Whole, "build_sub_role_view is non-Whole only");
     if file.is_binary {
         return None;
     }
@@ -645,13 +642,15 @@ pub enum Layout {
     Inline,
 }
 
-/// Which of the three per-file diff roles a [`FileView`] is built from. The **combined** role is
-/// `HEAD` ↔ worktree (the whole change); **unstaged** is index ↔ worktree; **staged** is `HEAD` ↔
-/// index. A file need not have a change in every role — an untracked file has only an unstaged
-/// change; a freshly `git add`ed one only a staged change; a partially-staged file has all three.
+/// Which of the three per-file diff roles a [`FileView`] is built from. The **whole** role is
+/// `HEAD` ↔ worktree for an uncommitted changeset (`base` ↔ `head` for a committed one) — the
+/// whole change with no staged/unstaged split; **unstaged** is index ↔ worktree; **staged** is
+/// `HEAD` ↔ index. A file need not have a change in every role — an untracked file has only an
+/// unstaged change; a freshly `git add`ed one only a staged change; a partially-staged file has
+/// all three.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
-    Combined,
+    Whole,
     Unstaged,
     Staged,
 }
@@ -692,12 +691,12 @@ pub enum EffectiveZoom {
 /// `DiffModel`) and whether it's stageable at all (`can_stage` = non-binary in M4).
 ///
 /// Rules (a pure gate, unit-tested against the full truth table — ADR-038 decision 3):
-/// - not stageable → [`Role::Combined`] (binary files render the placeholder; no attribution);
+/// - not stageable → [`Role::Whole`] (binary files render the placeholder; no attribution);
 /// - both sub-diffs, maximized → `Single(focus_role)`;
 /// - both sub-diffs, not maximized → `Split`;
 /// - unstaged only → `Single(Unstaged)`;
 /// - staged only → `Single(Staged)`;
-/// - neither → `Single(Combined)`.
+/// - neither → `Single(Whole)`.
 ///
 /// Maximize applies only where the result would otherwise be `Split` — everywhere else the pane
 /// already fills the body, so the flag is inert rather than special-cased.
@@ -709,7 +708,7 @@ pub fn effective_zoom(
     can_stage: bool,
 ) -> EffectiveZoom {
     if !can_stage {
-        return EffectiveZoom::Single(Role::Combined);
+        return EffectiveZoom::Single(Role::Whole);
     }
     if has_unstaged && has_staged {
         if maximized {
@@ -722,7 +721,7 @@ pub fn effective_zoom(
     } else if has_staged {
         EffectiveZoom::Single(Role::Staged)
     } else {
-        EffectiveZoom::Single(Role::Combined)
+        EffectiveZoom::Single(Role::Whole)
     }
 }
 
@@ -1105,7 +1104,7 @@ fn derive_scroll_value(
 /// A committed changeset's [`Self::diff`] has empty staged/unstaged sub-models (see
 /// [`DiffState::from_committed`]), which is enough on its own to render it read-only: the
 /// existing [`effective_zoom`] gate collapses `Split`/`Unstaged`/`Staged` to
-/// [`EffectiveZoom::Single(Role::Combined)`] whenever both sub-diffs are absent — no
+/// [`EffectiveZoom::Single(Role::Whole)`] whenever both sub-diffs are absent — no
 /// committed-specific rendering code needed for M5's spine (the mode-aware staging refusal and
 /// zoom lock riding this natural collapse are [`App::is_committed`]'s targeted guards).
 pub struct ChangesetView {
@@ -1114,7 +1113,7 @@ pub struct ChangesetView {
     /// Per-file, per-role lazily built views (parallel to [`DiffState::files`]). A slot stays
     /// `None` until first access; a role slot ALSO stays `None` forever when that file has no
     /// change in that role (see [`App::ensure_role_loaded`]).
-    views_combined: Vec<Option<FileView>>,
+    views_whole: Vec<Option<FileView>>,
     views_unstaged: Vec<Option<FileView>>,
     views_staged: Vec<Option<FileView>>,
     /// ADR-037's per-changeset acquisition state. `Ready` for every changeset this changeset
@@ -1146,7 +1145,7 @@ impl ChangesetView {
         Self {
             cs,
             diff,
-            views_combined: (0..n).map(|_| None).collect(),
+            views_whole: (0..n).map(|_| None).collect(),
             views_unstaged: (0..n).map(|_| None).collect(),
             views_staged: (0..n).map(|_| None).collect(),
             slot: ChangesetSlot::Ready,
@@ -1216,7 +1215,7 @@ impl ChangesetView {
         self.diff.files.len()
     }
 
-    /// This changeset's combined file list — `App::outline_items` reads this to build the
+    /// This changeset's whole file list — `App::outline_items` reads this to build the
     /// outline's rows without reaching into [`Self::diff`] directly (private to this module).
     pub fn files(&self) -> &[FileChange] {
         &self.diff.files
@@ -1744,7 +1743,7 @@ impl App {
         &mut self.changesets[self.current_cs]
     }
 
-    /// The active changeset's combined file list — `render.rs` and tests read this instead of
+    /// The active changeset's whole file list — `render.rs` and tests read this instead of
     /// the old `pub files` field, which moved onto [`ChangesetView`] (see [`Self::cur`]).
     pub fn files(&self) -> &[FileChange] {
         &self.cur().diff.files
@@ -1793,8 +1792,8 @@ impl App {
     /// Whether the ACTIVE changeset is a committed range (`base..head`) rather than the
     /// uncommitted worktree layer — derived from [`workon::ChangesetSpan`] on every call rather
     /// than cached (locked decision #2's "derive, don't store" mode gate). Drives every
-    /// committed-mode guard: the mode-aware staging refusal, skipping combined attribution (no
-    /// staged/unstaged sets exist to color by), and locking zoom to combined.
+    /// committed-mode guard: the mode-aware staging refusal, skipping whole-role attribution (no
+    /// staged/unstaged sets exist to color by), and locking zoom to whole.
     pub fn is_committed(&self) -> bool {
         matches!(
             self.cur().cs.span,
@@ -2012,13 +2011,13 @@ impl App {
     }
 
     /// The sub-[`FileChange`] backing file `idx`'s `role` view: `self.files[idx]` itself for
-    /// [`Role::Combined`], or the matching entry in the unstaged/staged model (`None` if that
+    /// [`Role::Whole`], or the matching entry in the unstaged/staged model (`None` if that
     /// role has no change for this file). Used by staging verbs to apply against the ROLE's own
-    /// sub-diff rather than the combined one.
+    /// sub-diff rather than the whole one.
     pub(crate) fn role_change(&self, idx: usize, role: Role) -> Option<&FileChange> {
         let diff = &self.cur().diff;
         match role {
-            Role::Combined => diff.files.get(idx),
+            Role::Whole => diff.files.get(idx),
             Role::Unstaged => diff
                 .unstaged_idx
                 .get(idx)
@@ -2053,7 +2052,7 @@ impl App {
     fn views_for(&self, role: Role) -> &[Option<FileView>] {
         let cur = self.cur();
         match role {
-            Role::Combined => &cur.views_combined,
+            Role::Whole => &cur.views_whole,
             Role::Unstaged => &cur.views_unstaged,
             Role::Staged => &cur.views_staged,
         }
@@ -2062,7 +2061,7 @@ impl App {
     fn views_for_mut(&mut self, role: Role) -> &mut [Option<FileView>] {
         let cur = self.cur_mut();
         match role {
-            Role::Combined => &mut cur.views_combined,
+            Role::Whole => &mut cur.views_whole,
             Role::Unstaged => &mut cur.views_unstaged,
             Role::Staged => &mut cur.views_staged,
         }
@@ -2101,20 +2100,20 @@ impl App {
     }
 
     /// Load file `idx`'s [`FileView`] for one `role`, unless already loaded, binary, or the role
-    /// has no change for the file. The combined role builds from [`Self::files`]; the sub-roles
+    /// has no change for the file. The whole role builds from [`Self::files`]; the sub-roles
     /// build from the matching [`FileChange`] in the unstaged/staged model. Each role's text is
     /// sourced from the two revisions its hunks were diffed against (see [`FileView::load`]) so
     /// context lines match on both sides.
     fn ensure_role_loaded(&mut self, idx: usize, role: Role) {
         let model_idx = match role {
-            Role::Combined => {
+            Role::Whole => {
                 let Some(file) = self.cur().diff.files.get(idx) else {
                     return;
                 };
                 if file.is_binary {
                     return;
                 }
-                if self.cur().views_combined.get(idx).map(Option::is_some) != Some(false) {
+                if self.cur().views_whole.get(idx).map(Option::is_some) != Some(false) {
                     return;
                 }
                 None
@@ -2123,7 +2122,7 @@ impl App {
             Role::Staged => self.cur().diff.staged_idx.get(idx).copied().flatten(),
         };
 
-        if role != Role::Combined {
+        if role != Role::Whole {
             let Some(mi) = model_idx else {
                 return; // no change in this role for this file
             };
@@ -2133,12 +2132,12 @@ impl App {
             let file = match role {
                 Role::Unstaged => self.cur().diff.unstaged_model.files[mi].clone(),
                 Role::Staged => self.cur().diff.staged_model.files[mi].clone(),
-                Role::Combined => unreachable!(),
+                Role::Whole => unreachable!(),
             };
             // `file` is cloned out of `self.cur()` (rather than a borrow) because
             // `build_sub_role_view` needs `&self.repo` and `&mut self.highlighter` at once, which
             // a borrow still anchored in `self.cur()` would conflict with — same rationale as the
-            // combined path below.
+            // whole path below.
             let Some(view) = build_sub_role_view(&self.repo, &mut self.highlighter, role, &file)
             else {
                 return;
@@ -2153,18 +2152,18 @@ impl App {
             return;
         }
 
-        // Combined role. `self.cur().cs.span`/`self.cur().diff.files[idx].clone()` are read out
+        // Whole role. `self.cur().cs.span`/`self.cur().diff.files[idx].clone()` are read out
         // (rather than borrowed) for the same reason as the sub-role branch above —
-        // `build_combined_view` needs `&self.repo` and `&mut self.highlighter` together.
+        // `build_whole_view` needs `&self.repo` and `&mut self.highlighter` together.
         let span = self.cur().cs.span;
         let file = self.cur().diff.files[idx].clone();
-        let Some(view) = build_combined_view(&self.repo, &mut self.highlighter, span, &file) else {
+        let Some(view) = build_whole_view(&self.repo, &mut self.highlighter, span, &file) else {
             return;
         };
         if self.handle_geometry_mismatch(&view) {
             return;
         }
-        self.cur_mut().views_combined[idx] = Some(view);
+        self.cur_mut().views_whole[idx] = Some(view);
     }
 
     /// A just-built `view` whose [`FileView::geometry_mismatch`] is set means its hunks were
@@ -2384,10 +2383,10 @@ impl App {
         let idx = self.current;
         let zoom = self.effective_zoom_for(idx);
         let diff = &self.cur().diff;
-        let combined_file = diff.files.get(idx)?.clone();
+        let whole_file = diff.files.get(idx)?.clone();
         Some(FileLoadSpec {
             span: self.cur().cs.span,
-            combined_file,
+            whole_file,
             zoom,
             unstaged_file: diff
                 .unstaged_idx
@@ -2646,7 +2645,7 @@ impl App {
         if !(can_stage && has_unstaged && has_staged) {
             if self.is_committed() {
                 self.notify(
-                    "changeset is committed — combined view only, nothing to maximize",
+                    "changeset is committed — nothing to maximize",
                     Severity::Info,
                 );
             }
@@ -3688,7 +3687,7 @@ impl App {
     /// by value before recomputing, then re-finds its index in the new (address-identical) list and
     /// restores it if still present — `SearchMatch` is `Copy + PartialEq`, so this is cheap. A
     /// maximize toggle does NOT use this path even though it also funnels through `reset_panes`:
-    /// it swaps which role's (staged/unstaged/combined) content is current, a genuinely different
+    /// it swaps which role's (staged/unstaged/whole) content is current, a genuinely different
     /// match list, so the plain reset in [`Self::recompute_search`] is the correct behavior there
     /// too.
     fn recompute_search_keep_current(&mut self) {
@@ -4228,7 +4227,7 @@ impl App {
         }
     }
 
-    /// Footer refusal for an outline stage/discard verb — parallels [`Self::notify_combined_refusal`]
+    /// Footer refusal for an outline stage/discard verb — parallels [`Self::notify_unstageable_refusal`]
     /// but for the two CS7-specific refusal reasons: `committed` (the row's changeset — or, for a
     /// Dir row, at least one file under it — is a committed range, not the uncommitted worktree
     /// layer) or not (the cursor sits on a [`OutlineItem::Header`] row, which is never a target).
@@ -4341,7 +4340,7 @@ impl App {
 
     /// Re-find `identity`'s row in the freshly rebuilt [`Self::outline_items`] and reseat
     /// [`OutlineState::cursor`] there; clamps into bounds instead when the row is gone (a fully
-    /// discarded file drops out of the combined diff — and with it its row — entirely). Does not
+    /// discarded file drops out of the whole diff — and with it its row — entirely). Does not
     /// touch [`OutlineState::focused`] — an outline-initiated op
     /// only ever runs while the outline already has focus, and nothing here changes that.
     fn restore_outline_position(&mut self, identity: &OutlineRowIdentity, pre_op_cursor: usize) {
@@ -4362,7 +4361,7 @@ impl App {
         });
         match found {
             Some(idx) => self.outline.cursor = idx,
-            // Row gone (the NORMAL outcome of a successful discard — the file left the combined
+            // Row gone (the NORMAL outcome of a successful discard — the file left the whole
             // diff and took its row with it): stay near where the user was ACTING, not wherever
             // the refresh's `sync_outline_to_current` just parked the cursor (the diff's current
             // file, unrelated to the acted-on row). `pre_op_cursor` is the acted-on row's own
@@ -4600,13 +4599,13 @@ impl App {
     /// renderer can paint it with the dim [`crate::theme::Palette::cursor_unfocused_bg`] wash
     /// when it's within the visible `scroll..end` range). The cursor alone no longer says
     /// whether a pane holds focus — callers resolve that separately (`split_focus_role`,
-    /// `outline_focused`) and pick the wash accordingly. Combined resolves to the focused
+    /// `outline_focused`) and pick the wash accordingly. Whole resolves to the focused
     /// (single) state.
     pub(crate) fn pane_render_state(&self, role: Role) -> (usize, Option<usize>) {
         let pane = match role {
             Role::Unstaged => SplitPane::Unstaged,
             Role::Staged => SplitPane::Staged,
-            Role::Combined => return (self.scroll, Some(self.cursor)),
+            Role::Whole => return (self.scroll, Some(self.cursor)),
         };
         if self.split_focus == pane {
             (self.scroll, Some(self.cursor))
@@ -5010,7 +5009,7 @@ impl App {
 
     /// Whether a staging verb would act on the current file rather than refuse — the same
     /// [`Self::staging_role`] gate `stage_file`/`stage_hunk`/`start_selection` check before they
-    /// call [`Self::notify_combined_refusal`], read here by the renderer so the footer stops
+    /// call [`Self::notify_unstageable_refusal`], read here by the renderer so the footer stops
     /// advertising `stage`/`discard` where they can only refuse (`render::render_footer`).
     ///
     /// Deliberately the SAME predicate rather than a second one that reconstructs the conditions
@@ -5021,37 +5020,37 @@ impl App {
     }
 
     /// The role a staging verb acts in for the current file: the single effective role, or the
-    /// focused split pane's role. `None` for [`Role::Combined`] — the combined view fuses both
+    /// focused split pane's role. `None` for [`Role::Whole`] — the whole role fuses both
     /// sub-diffs, so staging there has no unambiguous direction and the verbs refuse (locked
     /// decision #1).
     fn staging_role(&self) -> Option<Role> {
         match self.effective_zoom_for(self.current) {
-            EffectiveZoom::Single(Role::Combined) => None,
+            EffectiveZoom::Single(Role::Whole) => None,
             EffectiveZoom::Single(role) => Some(role),
             EffectiveZoom::Split => Some(self.split_focus_role()),
         }
     }
 
     /// Toggle-direction by role (locked decision #1): the unstaged pane stages, the staged pane
-    /// unstages. `None` for [`Role::Combined`] (never a staging target).
+    /// unstages. `None` for [`Role::Whole`] (never a staging target).
     fn verb_for_role(role: Role) -> Option<StageVerb> {
         match role {
             Role::Unstaged => Some(StageVerb::Stage),
             Role::Staged => Some(StageVerb::Unstage),
-            Role::Combined => None,
+            Role::Whole => None,
         }
     }
 
     /// Mode-aware refusal notice for a staging verb / line-selection start that only makes sense
-    /// outside the combined view — i.e. every call site below whose `staging_role()`/
+    /// outside the whole role — i.e. every call site below whose `staging_role()`/
     /// `staging_role().is_none()` guard failed (locked decision #2's "targeted guard"). A
-    /// committed changeset is ALWAYS combined-only (no staged/unstaged split exists — see
+    /// committed changeset is ALWAYS whole-only (no staged/unstaged split exists — see
     /// [`Self::is_committed`]), so it gets its own wording. The non-committed branch's only
     /// remaining caller is a binary file (ADR-038 decision 10): `effective_zoom` short-circuits
     /// on `!can_stage` before it looks at anything else, so no key press moves it out of
-    /// `Role::Combined` — advising a key would be wrong, so this states non-stageability instead.
+    /// `Role::Whole` — advising a key would be wrong, so this states non-stageability instead.
     /// `verb` ("stage"/"select") keeps each call site's original non-committed wording.
-    fn notify_combined_refusal(&mut self, verb: &str) {
+    fn notify_unstageable_refusal(&mut self, verb: &str) {
         if self.is_committed() {
             self.notify(
                 "changeset is already committed — nothing to stage",
@@ -5066,7 +5065,7 @@ impl App {
     }
 
     /// Stage (unstaged pane) or unstage (staged pane) the hunk under the cursor (`s`). Refuses on
-    /// the combined view, or when the cursor isn't in a hunk.
+    /// the whole role, or when the cursor isn't in a hunk.
     ///
     /// When a line selection is active, `s` acts on the SELECTION instead
     /// ([`Self::stage_selection`]) — the hunk under the cursor is irrelevant once the user has
@@ -5080,7 +5079,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify_combined_refusal("stage");
+            self.notify_unstageable_refusal("stage");
             return;
         };
         let Some(verb) = Self::verb_for_role(role) else {
@@ -5091,7 +5090,7 @@ impl App {
             return;
         };
         // The hunk index is into the ROLE's own hunks, so the op must apply against that role's
-        // sub-`FileChange`, not the combined one.
+        // sub-`FileChange`, not the whole one.
         let Some(file) = self.role_change(self.current, role).cloned() else {
             return;
         };
@@ -5099,26 +5098,26 @@ impl App {
     }
 
     /// Stage (unstaged pane) or unstage (staged pane) the whole current file (`S`) — ignores the
-    /// cursor. Refuses on the combined view.
+    /// cursor. Refuses on the whole role.
     pub fn stage_file(&mut self) {
         if self.cur().diff.files.is_empty() {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify_combined_refusal("stage");
+            self.notify_unstageable_refusal("stage");
             return;
         };
         let Some(verb) = Self::verb_for_role(role) else {
             return;
         };
         // A whole-file op routes on path + status only ([`crate::ops::apply_file`]), which the
-        // combined file carries authoritatively (e.g. Untracked-ness for a discard).
+        // whole file carries authoritatively (e.g. Untracked-ness for a discard).
         let file = self.cur().diff.files[self.current].clone();
         self.run_op(FileStagingOp::file(file, verb));
     }
 
     /// Request confirmation to discard the hunk under the cursor from the worktree (`d`). Refuses
-    /// on the combined view, in a staged pane (discard only reverts worktree changes), or when the
+    /// on the whole role, in a staged pane (discard only reverts worktree changes), or when the
     /// cursor isn't in a hunk. The discard itself runs when the user answers `y`.
     ///
     /// When a line selection is active, `d` acts on the SELECTION instead
@@ -5132,7 +5131,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify_combined_refusal("stage");
+            self.notify_unstageable_refusal("stage");
             return;
         };
         if role != Role::Unstaged {
@@ -5153,13 +5152,13 @@ impl App {
     }
 
     /// Request confirmation to discard the whole current file's worktree changes (`D`). Refuses on
-    /// the combined view or in a staged pane; the discard runs on `y`.
+    /// the whole role or in a staged pane; the discard runs on `y`.
     pub fn discard_file(&mut self) {
         if self.cur().diff.files.is_empty() {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify_combined_refusal("stage");
+            self.notify_unstageable_refusal("stage");
             return;
         };
         if role != Role::Unstaged {
@@ -5304,7 +5303,7 @@ impl App {
 
     /// Snapshot the focused pane's file/role/position ahead of a staging op, for
     /// [`Self::restore_position`] to reseat after the op's `coordinated_refresh` (CS6). `None`
-    /// when there's no current file, the current view is the combined role (never a staging
+    /// when there's no current file, the current view is the whole role (never a staging
     /// target — [`Self::staging_role`]), or the focused role's view isn't loaded; restore is then
     /// a no-op and today's `reset_panes` first-hunk behavior stands.
     fn capture_position(&self) -> Option<PositionMemento> {
@@ -5368,7 +5367,7 @@ impl App {
         };
 
         // The memento's linenos were captured in `m.role`'s own frame (new = worktree for
-        // Unstaged/Combined, new = index for Staged — see `FileView::load`'s table). Preferring
+        // Unstaged/Whole, new = index for Staged — see `FileView::load`'s table). Preferring
         // new over old is correct BOTH when the role is unchanged (the common case: same pane,
         // same frame) AND on the one role change that can happen here — unstaged -> staged after
         // fully staging a file in Split. In that case the staged view's new side (index) now
@@ -5391,14 +5390,14 @@ impl App {
     }
 
     /// Start a line selection anchored at the current cursor (`v`). Refuses (a notice, no anchor
-    /// set) on the combined view or any non-staging role — you can only select lines where you can
+    /// set) on the whole role or any non-staging role — you can only select lines where you can
     /// stage them (same gate as the verbs). A no-op on an empty file list.
     pub fn start_selection(&mut self) {
         if self.cur().diff.files.is_empty() {
             return;
         }
         if self.staging_role().is_none() {
-            self.notify_combined_refusal("select");
+            self.notify_unstageable_refusal("select");
             return;
         }
         self.selection_anchor = Some(self.cursor);
@@ -5507,7 +5506,7 @@ impl App {
     }
 
     /// Stage (unstaged pane) / unstage (staged pane) the active line selection (`s` with a
-    /// selection up). Refuses on the combined view (cycle-zoom notice), on a file no line op can
+    /// selection up). Refuses on the whole role (cycle-zoom notice), on a file no line op can
     /// express ([`ops::supports_line_ops`] — Deleted/Unmerged/binary, per-status notice), and on
     /// a selection that covers no changed lines. Otherwise applies every overlapped hunk's kept
     /// lines as ONE merged patch via [`LineSelectionOp`] (never one op per hunk — see that
@@ -5518,7 +5517,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify_combined_refusal("stage");
+            self.notify_unstageable_refusal("stage");
             return;
         };
         let Some(verb) = Self::verb_for_role(role) else {
@@ -5557,7 +5556,7 @@ impl App {
             return;
         }
         let Some(role) = self.staging_role() else {
-            self.notify_combined_refusal("stage");
+            self.notify_unstageable_refusal("stage");
             return;
         };
         if role != Role::Unstaged {
@@ -5694,9 +5693,9 @@ impl From<WorktreeDiffs> for DiffState {
         let WorktreeDiffs {
             staged,
             unstaged,
-            combined,
+            whole,
         } = diffs;
-        let files = combined.files;
+        let files = whole.files;
         let unstaged_idx = files
             .iter()
             .map(|f| find_role_change(&unstaged, f))
@@ -5731,7 +5730,7 @@ impl DiffState {
     /// diffed by [`crate::acquire::diff_committed`]) — there is no staged/unstaged split for a
     /// committed range, so both sub-models are empty and every index map entry is `None`. This
     /// alone is enough to render the changeset read-only: [`effective_zoom`] collapses
-    /// `Split`/`Unstaged`/`Staged` to [`EffectiveZoom::Single(Role::Combined)`] whenever both
+    /// `Split`/`Unstaged`/`Staged` to [`EffectiveZoom::Single(Role::Whole)`] whenever both
     /// sub-diffs are absent, so no committed-specific rendering path is needed for M5's spine.
     fn from_committed(model: DiffModel) -> Self {
         let n = model.files.len();
@@ -5777,7 +5776,7 @@ fn outline_row_identity(item: &OutlineItem) -> Option<(usize, Option<usize>)> {
 #[derive(Debug, Clone)]
 pub struct FileLoadSpec {
     span: ChangesetSpan,
-    combined_file: FileChange,
+    whole_file: FileChange,
     /// The [`EffectiveZoom`] `App` had AT DISPATCH TIME — the views built are shaped by this,
     /// not by whatever `App`'s zoom/current file happen to be when the result lands (which may
     /// have changed by then; that's fine, see the ADR's "Generations": within a generation, a
@@ -5819,7 +5818,7 @@ fn loaded_views_satisfy(views: &LoadedViews, current_zoom: EffectiveZoom) -> boo
 
 /// Build every [`FileView`] a [`FileLoadSpec`] needs, against `repo`/`ts` — the ADR-037 loader
 /// thread's pure job body: unit-testable directly against a fixture repo, no threads or channels
-/// involved. Routes through the SAME [`build_combined_view`]/[`build_sub_role_view`] free
+/// involved. Routes through the SAME [`build_whole_view`]/[`build_sub_role_view`] free
 /// functions [`App::ensure_role_loaded`] calls, so a deferred-then-loader-completed open is
 /// byte-identical to an eager [`App::open_current`] — the invariant ADR-037 carries over from
 /// CS4's `complete_pending_open`.
@@ -5831,7 +5830,7 @@ pub fn build_file_views(
     match spec.zoom {
         EffectiveZoom::Single(role) => {
             let view = match role {
-                Role::Combined => build_combined_view(repo, ts, spec.span, &spec.combined_file),
+                Role::Whole => build_whole_view(repo, ts, spec.span, &spec.whole_file),
                 Role::Unstaged => spec
                     .unstaged_file
                     .as_ref()
@@ -5867,7 +5866,7 @@ pub fn build_file_views(
 fn set_if_absent(cs: &mut ChangesetView, role: Role, idx: usize, view: Option<Box<FileView>>) {
     let view = view.map(|boxed| *boxed);
     let slots = match role {
-        Role::Combined => &mut cs.views_combined,
+        Role::Whole => &mut cs.views_whole,
         Role::Unstaged => &mut cs.views_unstaged,
         Role::Staged => &mut cs.views_staged,
     };
@@ -5893,10 +5892,10 @@ fn base_label_for(cs: &Changeset) -> String {
     }
 }
 
-/// Index of the [`FileChange`] in a role's [`DiffModel`] that corresponds to combined `file`, or
+/// Index of the [`FileChange`] in a role's [`DiffModel`] that corresponds to whole `file`, or
 /// `None` when the role has no change for it (e.g. an untracked file in the staged model).
 ///
-/// Matches by `path` (the common case), with rename-aware fallbacks: the combined and sub-diffs
+/// Matches by `path` (the common case), with rename-aware fallbacks: the whole and sub-diffs
 /// agree on a rename's new `path`, but a file renamed in only one role can leave the match to
 /// `old_path` on either side. Path equality wins for the overwhelming majority; the fallbacks just
 /// avoid dropping the odd asymmetric-rename pairing.
@@ -6090,7 +6089,7 @@ mod tests {
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
 
     #[test]
-    fn combined_files_arrive_path_sorted() {
+    fn whole_files_arrive_path_sorted() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .untracked_file("z_new.txt", "hello\n")
@@ -6236,7 +6235,7 @@ mod tests {
             .build()
             .unwrap();
         // Overwrite the worktree copy with binary content post-build (the fixture staged plain
-        // text) so the combined diff's content-sniffing sees NUL bytes and flags it binary.
+        // text) so the whole diff's content-sniffing sees NUL bytes and flags it binary.
         let repo = fixture.repo().unwrap();
         std::fs::write(repo.workdir().unwrap().join("bin.dat"), [0u8, 1, 2, 0, 3]).unwrap();
 
@@ -6359,11 +6358,11 @@ mod tests {
     // ── ADR-037: the loader's request/result seam ────────────────────────────────
 
     #[test]
-    fn build_file_views_matches_ensure_loaded_for_the_combined_role() {
-        // ADR-038: post-M11 `Role::Combined` is unreachable for an uncommitted file with a real
+    fn build_file_views_matches_ensure_loaded_for_the_whole_role() {
+        // ADR-038: post-M11 `Role::Whole` is unreachable for an uncommitted file with a real
         // sub-diff (the gate never resolves there for a maximized both-sub-diffs file, and an
         // unstaged-only file collapses to `Role::Unstaged`) — a committed changeset is the
-        // natural way to exercise the loader against `Role::Combined`, since its combined role is
+        // natural way to exercise the loader against `Role::Whole`, since its whole role is
         // its ONLY role (`DiffState::from_committed` leaves both sub-models empty).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -6415,9 +6414,9 @@ mod tests {
         let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
 
         let LoadedViews::Single(role, Some(loader_view)) = views else {
-            panic!("expected a loaded Combined-role view");
+            panic!("expected a loaded Whole-role view");
         };
-        assert_eq!(role, Role::Combined);
+        assert_eq!(role, Role::Whole);
         assert_eq!(loader_view.old_text(), eager_view_ref.old_text());
         assert_eq!(loader_view.new_text(), eager_view_ref.new_text());
         assert_eq!(loader_view.display.len(), eager_view_ref.display.len());
@@ -7141,9 +7140,9 @@ mod tests {
     fn effective_zoom_gate_truth_table() {
         use super::effective_zoom;
         use super::EffectiveZoom::{Single, Split};
-        use super::Role::{Combined, Staged, Unstaged};
+        use super::Role::{Staged, Unstaged, Whole};
 
-        // Not stageable (binary) collapses to Combined regardless of focus, maximize, or which
+        // Not stageable (binary) collapses to Whole regardless of focus, maximize, or which
         // sub-diffs exist.
         for focus in [Unstaged, Staged] {
             for maximized in [false, true] {
@@ -7151,7 +7150,7 @@ mod tests {
                     for hs in [false, true] {
                         assert_eq!(
                             effective_zoom(focus, maximized, hu, hs, false),
-                            Single(Combined),
+                            Single(Whole),
                             "focus={focus:?} maximized={maximized} hu={hu} hs={hs} \
                              can_stage=false"
                         );
@@ -7192,12 +7191,12 @@ mod tests {
             }
         }
 
-        // Neither: Single(Combined) regardless of focus/maximize.
+        // Neither: Single(Whole) regardless of focus/maximize.
         for focus in [Unstaged, Staged] {
             for maximized in [false, true] {
                 assert_eq!(
                     effective_zoom(focus, maximized, false, false, true),
-                    Single(Combined)
+                    Single(Whole)
                 );
             }
         }
@@ -7642,7 +7641,7 @@ mod tests {
 
     /// The confirmed repro (2026-07-27 handoff): `file.hunks` are diffed against the workdir
     /// state as it stood at diff-acquisition time, but `FileView::load`'s new-side text for
-    /// `Role::Unstaged`/`Combined` is a LIVE workdir read (see its role table) — if the file grows
+    /// `Role::Unstaged`/`Whole` is a LIVE workdir read (see its role table) — if the file grows
     /// on disk in between (an editor or agent writing to it while the TUI sits idle), the hunk
     /// geometry and the freshly-read line count describe different revisions of the same file.
     /// Before the fix this panicked the `debug_assert_eq!` in `align.rs`'s tail-gap clamp
@@ -7723,7 +7722,7 @@ mod tests {
         assert_eq!(app.files().len(), 2, "root..head touches a.txt and b.txt");
         app.next_file(); // caches file 1 ("b.txt") too
         app.prev_file(); // back to file 0 — the file `refresh`'s tail will re-seat
-        assert!(app.role_view_ref(1, Role::Combined).is_some());
+        assert!(app.role_view_ref(1, Role::Whole).is_some());
 
         let gen_before = app.generation();
         app.refresh();
@@ -7740,7 +7739,7 @@ mod tests {
         assert_eq!(app.files().len(), 2);
         assert_eq!(app.current, 0, "file position by path is preserved");
         assert!(
-            app.role_view_ref(1, Role::Combined).is_some(),
+            app.role_view_ref(1, Role::Whole).is_some(),
             "file 1's view cache must survive untouched — refresh's tail only (re)opens the \
              CURRENT file (0), so a still-populated cache at 1 proves the whole ChangesetView \
              (not just its diff) was carried over rather than rebuilt fresh"
@@ -8766,9 +8765,9 @@ mod tests {
 
     #[test]
     fn stage_hunk_on_a_binary_file_refuses_without_touching_the_index() {
-        // ADR-038 decision 10: post-M11, a binary file is `notify_combined_refusal`'s only
+        // ADR-038 decision 10: post-M11, a binary file is `notify_unstageable_refusal`'s only
         // non-committed caller — a file with both real sub-diffs can no longer land in
-        // `Role::Combined` at all (maximize only narrows to the focused pane's role), so this
+        // `Role::Whole` at all (maximize only narrows to the focused pane's role), so this
         // re-points the old `Zoom::Combined`-forced test at the one case that still reaches it.
         use super::Severity;
 
@@ -8778,8 +8777,8 @@ mod tests {
             .build()
             .unwrap();
         // Overwrite the worktree copy with binary content post-build, same technique as
-        // `ensure_loaded_skips_binary_files` — the combined diff's content-sniffing then flags it
-        // binary, which forces `Role::Combined` regardless of maximize/focus.
+        // `ensure_loaded_skips_binary_files` — the whole diff's content-sniffing then flags it
+        // binary, which forces `Role::Whole` regardless of maximize/focus.
         let repo = fixture.repo().unwrap();
         std::fs::write(repo.workdir().unwrap().join("bin.dat"), [0u8, 1, 2, 0, 3]).unwrap();
 
@@ -9303,7 +9302,7 @@ mod tests {
     #[test]
     fn start_selection_on_a_binary_file_refuses() {
         // Same re-point as `stage_hunk_on_a_binary_file_refuses_without_touching_the_index`: a
-        // binary file is the only non-committed case left that lands in `Role::Combined`.
+        // binary file is the only non-committed case left that lands in `Role::Whole`.
         use super::Severity;
 
         let fixture = FixtureBuilder::new()
@@ -9320,9 +9319,12 @@ mod tests {
 
         assert!(
             app.selection_anchor.is_none(),
-            "the combined view has no staging direction, so selection is refused"
+            "the whole role has no staging direction, so selection is refused"
         );
-        let notice = app.notice.as_ref().expect("combined selection must refuse");
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("whole-role selection must refuse");
         assert_eq!(notice.severity, Severity::Error);
         assert!(
             notice.text.contains("not stageable"),
@@ -9415,8 +9417,8 @@ mod tests {
         assert_eq!(app.files().len(), 1);
         assert_eq!(
             app.effective_zoom_for(0),
-            EffectiveZoom::Single(Role::Combined),
-            "empty staged/unstaged sub-models collapse every zoom to combined-only, for free"
+            EffectiveZoom::Single(Role::Whole),
+            "empty staged/unstaged sub-models collapse every zoom to whole-only, for free"
         );
 
         // Read-only follows from the natural collapse above; the refusal MESSAGE is
@@ -9427,7 +9429,7 @@ mod tests {
         let notice = app
             .notice
             .as_ref()
-            .expect("staging must refuse on a combined-only (committed) changeset");
+            .expect("staging must refuse on a whole-only (committed) changeset");
         assert!(
             notice.text.contains("already committed"),
             "got: {:?}",
@@ -9701,7 +9703,7 @@ mod tests {
         );
     }
 
-    /// Regression: navigating to an OLDER committed changeset and loading its combined view must
+    /// Regression: navigating to an OLDER committed changeset and loading its whole view must
     /// source the new side from that changeset's `head` commit tree, not the current worktree. The
     /// same file `f.txt` is touched by both changesets, so `cs-a`'s head (`mid`) content differs
     /// from the worktree (which holds `head`'s content). Before the `new_side_tree_for` fix the new
@@ -9726,7 +9728,7 @@ mod tests {
             .create("mid")
             .unwrap();
         // cs-b (mid..head) adds "three" — so the checked-out worktree copy is "one\ntwo\nthree\n",
-        // three lines, which must NOT be what cs-a's combined new side reads.
+        // three lines, which must NOT be what cs-a's whole new side reads.
         let head = fixture
             .commit("main")
             .file("f.txt", "one\ntwo\nthree\n")
@@ -9765,11 +9767,11 @@ mod tests {
         app.open_current();
         assert_eq!(app.current_cs(), 1, "opens on cs-b (its current: true)");
 
-        // Navigate back to the older changeset and load its combined view. Pre-fix this panics at
+        // Navigate back to the older changeset and load its whole view. Pre-fix this panics at
         // align.rs:165; post-fix it loads cleanly.
         app.prev_changeset();
         assert_eq!(app.current_cs(), 0, "prev lands on cs-a");
-        let view = app.current_view().expect("cs-a's combined view must load");
+        let view = app.current_view().expect("cs-a's whole view must load");
 
         assert_eq!(
             view.new_text(),
@@ -14151,15 +14153,15 @@ mod tests {
         assert_eq!(app.resolve_copy_location(), Err("no line to copy"));
     }
 
-    /// Content yank in `Role::Combined` succeeds — locked decision 7 pins this against a future
+    /// Content yank in `Role::Whole` succeeds — locked decision 7 pins this against a future
     /// "helpful" refusal: decision 4's side-selection rule is total (it always yields a side), so
     /// unlike the staging verbs there is nothing to refuse. `start_selection` itself still gates
-    /// combined (it's a staging-shaped verb), so the selection is set directly here rather than
-    /// through `v`. ADR-038: `Role::Combined` for a file with real content is now only reachable
+    /// whole role (it's a staging-shaped verb), so the selection is set directly here rather than
+    /// through `v`. ADR-038: `Role::Whole` for a file with real content is now only reachable
     /// on a committed changeset (a binary file has no loaded view to copy from), so this exercises
     /// it there instead of via a forced `Zoom::Combined`.
     #[test]
-    fn content_yank_succeeds_in_combined_role() {
+    fn content_yank_succeeds_in_whole_role() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -14190,7 +14192,7 @@ mod tests {
         assert_eq!(
             app.staging_role(),
             None,
-            "a committed changeset always resolves to Role::Combined (effective_zoom)"
+            "a committed changeset always resolves to Role::Whole (effective_zoom)"
         );
         app.cursor = 1;
         app.selection_anchor = Some(1);
