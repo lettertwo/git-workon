@@ -1,5 +1,5 @@
-//! The file-status-letters-and-opt-in-nerd-icons work's opt-in nerd-font file-type icon table —
-//! a pure module, no [`crate::app::App`]/[`crate::outline`] dependency, mirroring
+//! The opt-in nerd-font file-type icon table (part of file-status letters and opt-in nerd
+//! icons) — a pure module, no [`crate::app::App`]/[`crate::outline`] dependency, mirroring
 //! [`crate::summary`]'s pure-module posture.
 //!
 //! A terminal cannot report which font (patched with the nerd-font private-use glyphs or not)
@@ -31,8 +31,8 @@ use ratatui::style::Color;
 /// the summary panel's glyphs, and the winbar's marker/diffstat/file icons alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IconMode {
-    /// No icon glyph — today's plain `[glyph][letter] path` row (the file-status-letters-and-
-    /// opt-in-nerd-icons work's unconditional part only).
+    /// No icon glyph — today's plain `[glyph][letter] path` row (the unconditional part of
+    /// file-status letters and opt-in nerd icons only).
     #[default]
     None,
     /// A nerd-font private-use glyph per file extension (falling back to

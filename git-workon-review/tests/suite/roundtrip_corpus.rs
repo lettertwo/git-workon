@@ -1354,8 +1354,9 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// swallowed by loosening this test.
 const KNOWN_DIVERGENCES: &[&str] = &[];
 
-/// The VERDICT: renders the git2-vs-CLI comparison for `docs/rfc/workon-review.md`'s "git2 vs
-/// CLI apply verdict" section. Collects divergences instead of panicking per-scenario so the full set is
+/// The VERDICT: renders the git2-vs-CLI comparison for `docs/rfc/workon-review.md`'s "git2 vs CLI
+/// apply verdict" section. Collects divergences instead of panicking per-scenario so the full set
+/// is
 /// visible in one run.
 #[test]
 fn corpus_against_git2() {

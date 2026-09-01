@@ -17,8 +17,9 @@
 //! reintroduce the `App` coupling this module was factored out to avoid.
 //!
 //! Outline collapse/expand (fold) (`outline-fold`) also adds a second stage layered on top of
-//! [`build_items`]: collapse/expand. [`build_items`] itself stays wholly unaware of fold state
-//! (its extensive mode/dedup/guide tests below are untouched by it) — [`apply_fold`] takes its output and a per-row
+//! [`build_items`]: collapse/expand. [`build_items`] itself stays wholly unaware of fold state (its
+//! extensive mode/dedup/guide tests below are untouched by it) — [`apply_fold`] takes its output
+//! and a per-row
 //! collapsed predicate and returns the filtered row list plus the two extra pieces of data render/
 //! cursor logic needs (a collapsed row's hidden-file count, and a full-list -> filtered-list index
 //! map for re-finding a fold-hidden target). [`fold_outline`] is the two steps composed —
@@ -52,7 +53,8 @@ pub enum OutlineMode {
 }
 
 impl OutlineMode {
-    /// `i`'s cycle order: `Stack -> StackTree -> Flat -> Tree -> Stack` (`outline-mode-cycle`) — the default
+    /// `i`'s cycle order: `Stack -> StackTree -> Flat -> Tree -> Stack` (`outline-mode-cycle`) —
+    /// the default
     /// [`Self::Stack`] leads, its trie sibling [`Self::StackTree`] follows immediately, then the
     /// non-grouped pair [`Self::Flat`]/[`Self::Tree`] closes the loop.
     pub fn cycle(self) -> Self {
@@ -237,7 +239,8 @@ pub enum OutlineItem {
         guides: Vec<bool>,
     },
     /// A file row — the target of every outline->diff jump. `path` is the FULL path in
-    /// [`OutlineMode::Flat`]/[`OutlineMode::Stack`] (unchanged from the outline side pane (flat and stack modes)), but is just the leaf
+    /// [`OutlineMode::Flat`]/[`OutlineMode::Stack`] (unchanged from the outline side pane (flat and
+    /// stack modes)), but is just the leaf
     /// segment in [`OutlineMode::Tree`]/[`OutlineMode::StackTree`] — the ancestor directory rows
     /// already carry the rest of the path, so re-printing it on every leaf would be redundant.
     File {
@@ -273,7 +276,8 @@ impl OutlineItem {
 /// ROW SEQUENCE the outline paints flips. [`build_tree`]'s de-dupe is order-independent (see its
 /// own doc comment), so `order` is accepted but unused there.
 ///
-/// `pub(crate)` (`outline-fold`): this is the "unfiltered build" [`fold_outline`]'s doc comment refers to —
+/// `pub(crate)` (`outline-fold`): this is the "unfiltered build" [`fold_outline`]'s doc comment
+/// refers to —
 /// every outside-the-module consumer (i.e. `App`) goes through `fold_outline`/`apply_fold`
 /// instead, so a fold is never accidentally bypassed by calling this directly.
 pub(crate) fn build_items(
@@ -284,7 +288,8 @@ pub(crate) fn build_items(
     build_items_inner(changesets, mode, order, None)
 }
 
-/// [`build_items`] with the outline fuzzy filter's per-row inclusion gate (`filter`) layered on — the REVISED
+/// [`build_items`] with the outline fuzzy filter's per-row inclusion gate (`filter`) layered on —
+/// the REVISED
 /// 2026-07-24 "rebuild from the surviving file set" entry point [`fold_outline_filtered`] calls.
 /// Deliberately walks the SAME, full, unpruned `changesets` slice `build_items` does (see
 /// [`is_included`]'s doc comment) — every `cs_idx`/`file_idx` this emits is therefore still
@@ -365,15 +370,17 @@ impl FoldKey {
 pub(crate) struct FoldedOutline {
     /// The visible rows, in order — a subsequence of [`build_items`]'s full (unfiltered) output.
     pub items: Vec<OutlineItem>,
-    /// Parallel to `items`: the count of hidden FILE rows (not dirs — `outline-fold`'s locked "N = hidden
-    /// FILE rows only" rule) under a collapsed Header/Dir row. `0` for every other row, including
+    /// Parallel to `items`: the count of hidden FILE rows (not dirs —
+    /// `outline-fold`'s locked "N = hidden FILE rows only" rule) under a collapsed Header/Dir
+    /// row. `0` for every other row, including
     /// an EXPANDED Header/Dir — render reads `0` as "no marker", so an expanded row never draws
     /// the trailing ` ▸ N` chevron.
     pub hidden_counts: Vec<usize>,
     /// Parallel to the FULL (unfiltered) [`build_items`] output, NOT to `items`: for original row
     /// `i`, the index into `items`/`hidden_counts` a cursor targeting that row should land on —
     /// its own filtered position if it survived filtering, or its nearest VISIBLE ancestor's if a
-    /// fold hides it (`outline-fold`'s "lands on the collapsed ancestor without auto-expanding" rule). Used
+    /// fold hides it (`outline-fold`'s "lands on the collapsed ancestor without auto-expanding"
+    /// rule). Used
     /// by `App::sync_outline_to_current` to re-target a diff-initiated jump onto a folded row's
     /// row instead of leaving the outline cursor on an arbitrary clamp.
     pub visible_index: Vec<usize>,
@@ -579,7 +586,8 @@ fn score_changesets(changesets: &[OutlineChangeset], query: &str) -> QueryMatche
 }
 
 /// Whether `(cs_idx, file_idx)` survives filtering: unconditionally `true` when `filter` is
-/// `None` (the ordinary, unfiltered build every pre-outline-filter test exercises), else `true` when either
+/// `None` (the ordinary, unfiltered build every pre-outline-filter test exercises), else `true`
+/// when either
 /// the file's OWN path matched, or its changeset's TITLE matched (a title match "keeps the WHOLE
 /// changeset, all files" — see [`score_changesets`]'s doc comment).
 fn is_included(filter: Option<&QueryMatches>, cs_idx: usize, file_idx: usize) -> bool {

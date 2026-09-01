@@ -125,8 +125,8 @@ pub struct DirSummary {
 /// SEGMENT prefix of `file_path` — `"src"` matches `"src/a.rs"` but must NOT match `"src2/b.rs"`
 /// (a raw [`str::starts_with`] would wrongly match the latter).
 ///
-/// `pub(crate)`: the outline-staging-verbs work's `App::outline_row_targets` reuses this to
-/// resolve a Dir row's files (`s`/`d` in the outline), the same segment-boundary rule
+/// `pub(crate)`: the outline staging verbs' `App::outline_row_targets` reuses this to resolve a
+/// Dir row's files (`s`/`d` in the outline), the same segment-boundary rule
 /// [`dir_summary`] already relies on —
 /// rather than re-deriving it in `app.rs`.
 pub(crate) fn path_is_under(file_path: &str, dir_path: &str) -> bool {

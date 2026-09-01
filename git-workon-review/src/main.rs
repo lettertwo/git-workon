@@ -52,7 +52,7 @@ fn main() -> Result<()> {
         .into_diagnostic()?
         .to_string();
 
-    // No `[SOURCE]` argument: the stack-and-outline work's auto-detect entry point (locked
+    // No `[SOURCE]` argument: the stack-and-outline auto-detect entry point (locked
     // decision: auto-detect Graphite, else a single uncommitted changeset), unchanged — the
     // full Graphite stack when one is active, or a single synthetic uncommitted changeset
     // otherwise (keeps a non-Graphite repo byte-identical to the original `diff_uncommitted`
@@ -280,8 +280,9 @@ fn seat_app(
     if let Some(source) = source {
         app.set_review_source(source);
     }
-    // Idle-deferred file loads: defer file loads to the event loop's input-idle window rather
-    // than blocking here (or on any later selection change) — `app.open_current()` below marks the initial open pending
+    // Idle-deferred file loads: defer file loads to the event loop's input-idle window rather than
+    // blocking here (or on any later selection change) — `app.open_current()` below marks the
+    // initial open pending
     // instead of loading eagerly; see `tui::run`'s doc comment for the resulting startup
     // contract.
     app.set_defer_loads(true);

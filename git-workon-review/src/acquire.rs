@@ -211,8 +211,8 @@ pub fn diff_changesets(
 /// (see its module docs) rather than a reviewable uncommitted layer, and mapping `None` to
 /// [`StackModel::Git`] instead would make every branch without upstream tracking (the common
 /// case for a scratch/local branch) fail with `NoUpstream` before it ever got to review a dirty
-/// tree — a regression from the original "just diff the worktree" default. So the non-Graphite case
-/// is built directly here, matching exactly what `assemble_changesets`'s own
+/// tree — a regression from the original "just diff the worktree" default. So the
+/// non-Graphite case is built directly here, matching exactly what `assemble_changesets`'s own
 /// `insert_uncommitted_layer` would produce for a lone dirty tree: one `current` entry, no
 /// title, not needing a restack.
 pub fn resolve_changesets(

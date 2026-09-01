@@ -1,7 +1,7 @@
 //! FIFO staging queue (live-index staging queue): callers enqueue [`StagingOp`]s,
 //! [`StagingQueue::pump`] runs the head op synchronously against the live index.
 //! Runtime-agnostic per the diff-model-and-patch-synthesis design decision — no tokio, no owned
-//! thread; the caller (the staging-verbs work's TUI event loop) decides when to pump.
+//! thread; the caller (the staging-verbs TUI event loop) decides when to pump.
 //!
 //! ## The stale-snapshot trap
 //!
@@ -70,10 +70,10 @@ pub trait StagingOp: Send {
 }
 
 /// Lets an already-boxed trait object be re-enqueued through [`StagingQueue::enqueue`] (which
-/// takes `impl StagingOp + 'static` and boxes internally) without unboxing first — the
-/// outline-staging-verbs work's `App::run_ops` collects a `Vec<Box<dyn StagingOp>>` of
-/// heterogeneous per-file ops (one [`crate::stage_op::FileStagingOp`] per outline target) and
-/// enqueues them one at a time.
+/// takes `impl StagingOp + 'static` and boxes internally) without unboxing first — the outline
+/// staging verbs' `App::run_ops` collects a `Vec<Box<dyn StagingOp>>` of heterogeneous per-file
+/// ops (one [`crate::stage_op::FileStagingOp`] per outline target) and enqueues them one at a
+/// time.
 impl StagingOp for Box<dyn StagingOp> {
     fn run(&mut self, ctx: &OpContext<'_>) -> Result<(), ApplyError> {
         (**self).run(ctx)
@@ -93,8 +93,9 @@ pub enum OpOutcome {
 /// otherwise read as a false positive candidate once combined with the rest of the struct).
 type SleepFn = Box<dyn FnMut(Duration)>;
 
-/// Runtime-agnostic FIFO queue of staging operations (live-index staging queue). Only the head
-/// op ever runs; [`StagingQueue::pump`] runs it synchronously to completion (including its one retry, if
+/// Runtime-agnostic FIFO queue of staging operations (live-index staging queue). Only the head op
+/// ever runs; [`StagingQueue::pump`] runs it synchronously to completion (including its one retry,
+/// if
 /// index-lock contention is hit) before removing it.
 pub struct StagingQueue {
     queue: VecDeque<(OpId, Box<dyn StagingOp>)>,

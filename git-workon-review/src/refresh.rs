@@ -1,5 +1,6 @@
 //! Refresh generation/livelock coordination (refresh echo suppression): a pure state machine
-//! tracking which re-diff is the latest one requested, so a slow refresh that finishes after a newer one has
+//! tracking which re-diff is the latest one requested, so a slow refresh that finishes after a
+//! newer one has
 //! already started doesn't clobber fresher results.
 //!
 //! ## Interlock with `queue.rs`

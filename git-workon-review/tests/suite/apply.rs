@@ -1,5 +1,6 @@
 //! Whole-hunk apply round-trips, run against BOTH `Git2Applier` and `CliApplier` via
-//! `for_each_applier` (git2-vs-CLI round-trip verdict: CLI is the oracle, git2 is re-verified against it). Each
+//! `for_each_applier` (git2-vs-CLI round-trip verdict: CLI is the oracle, git2 is re-verified
+//! against it). Each
 //! test builds a FRESH fixture per applier — appliers mutate live repository state, so sharing
 //! one fixture across both runs would let the second applier's assertions depend on the
 //! first's side effects.

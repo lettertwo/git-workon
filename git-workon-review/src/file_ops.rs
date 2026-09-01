@@ -1,7 +1,7 @@
-//! Whole-file operations (whole-file-ops fallback): the staging verbs a hunk patch cannot
-//! express, because a hunk patch always has BOTH a pre-image and a post-image to diff between.
-//! Creations, deletions, and untracked files each have only one side — synthesizing a hunk
-//! patch for them either has no preimage to apply against (untracked: git rejects it) or stages an EMPTY BLOB
+//! Whole-file operations (whole-file-ops fallback): the staging verbs a hunk patch cannot express,
+//! because a hunk patch always has BOTH a pre-image and a post-image to diff between. Creations,
+//! deletions, and untracked files each have only one side — synthesizing a hunk patch for them
+//! either has no preimage to apply against (untracked: git rejects it) or stages an EMPTY BLOB
 //! instead of removing the file (deleted: git happily accepts a patch that deletes every line
 //! of a tracked file, but that isn't the same operation as removing the index entry). `ops.rs`
 //! routes those statuses here instead of through `synthesis`/`apply`.

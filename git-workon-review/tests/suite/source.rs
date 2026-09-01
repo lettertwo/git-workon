@@ -1,4 +1,4 @@
-//! Fixture tests for the source-selector work's `Source` classifier + resolver (ADR-036): the
+//! Fixture tests for the source selector's `Source` classifier + resolver (ADR-036): the
 //! `stack`/`uncommitted` keywords, and `<ref>` shape-aware dispatch + `Range` resolution. Output
 //! assertions pin `NO_COLOR=1` per the FORCE_COLOR trap this dev environment sets.
 

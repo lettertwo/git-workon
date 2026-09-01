@@ -1045,7 +1045,8 @@ const DIFF_HINTS: &[HintItem] = &[
     HintItem::One(Command::Quit, "quit"),
 ];
 
-/// The outline view's curated footer hint set (locked design from the help-footer-and-`?`-overlay work).
+/// The outline view's curated footer hint set (locked design from the help-footer-and-`?`-overlay
+/// work).
 const OUTLINE_HINTS: &[HintItem] = &[
     HintItem::Pair(Command::OutlineDown, Command::OutlineUp, "move"),
     HintItem::One(Command::OutlineConfirm, "open"),
@@ -1683,8 +1684,9 @@ mod tests {
     #[test]
     fn help_sections_cycle_mode_entry_spells_out_the_full_order() {
         // `outline-mode-cycle`: descriptions are static `&'static str`s baked into `REGISTRY`,
-        // so the help overlay can't mark the CURRENT mode dynamically without a broader refactor — the
-        // locked fallback is a static full-order description, with the dynamic `→next` shown
+        // so the help overlay can't mark the CURRENT mode dynamically without a broader
+        // refactor — the locked fallback is a static full-order description, with the dynamic
+        // `→next` shown
         // only in the footer hint (see `footer_hint_outline_cycle_label_tracks_the_current_mode`).
         let km = Keymap::defaults();
         let sections = help_sections(&km, View::Outline);

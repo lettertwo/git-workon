@@ -1,7 +1,8 @@
 use assert_cmd::cargo_bin_cmd;
 use git_workon_fixture::prelude::*;
 
-/// Locked design decision (the initial-renderer plan): a clean worktree prints "nothing to review" to stderr
+/// Locked design decision (the initial-renderer plan): a clean worktree prints "nothing to review"
+/// to stderr
 /// and exits 0 without ever entering the TUI — no raw-mode/alternate-screen setup, so this stays
 /// a plain `assert_cmd` invocation (no PTY needed).
 #[test]

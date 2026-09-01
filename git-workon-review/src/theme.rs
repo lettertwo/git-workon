@@ -18,7 +18,8 @@
 //! and leaves [`Palette::paint_canvas`] `false` so a transparent/backgrounded terminal isn't
 //! painted over; the curated schemes and the probe's curated fallback set it `true`.
 //!
-//! **Promoting semantic foregrounds to palette knobs:** semantic chrome — error/warn/current-marker colors — was previously ANSI/const
+//! **Promoting semantic foregrounds to palette knobs:** semantic chrome —
+//! error/warn/current-marker colors — was previously ANSI/const
 //! in `crate::render` (`FG_ERROR`/`FG_WARN`/`FG_CURRENT`), deliberately excluded from the palette on
 //! the reasoning that these colors never sit on a tint and are never a theme knob. That boundary is
 //! now revised: they ARE palette knobs ([`Palette::error_fg`]/[`Palette::warn_fg`]/
@@ -36,7 +37,8 @@
 //! it's the outline's changeset-header-row accent, used only there (see
 //! `render::changeset_title_spans`'s doc comment for the outline-only gating).
 //!
-//! **The git-style XY status matrix addition (`outline-status-xy`):** [`Palette::modified_fg`] (base09, orange/amber) is a
+//! **The git-style XY status matrix addition (`outline-status-xy`):** [`Palette::modified_fg`]
+//! (base09, orange/amber) is a
 //! fifth semantic-chrome field, same three-scheme mapping again — the outline's committed-file
 //! "modified" tint (M/R/C letters). Deliberately a NEW field rather than reusing
 //! [`Palette::warn_fg`]: "this changeset needs restacking" and "this file was modified" are
@@ -139,7 +141,8 @@ pub(crate) fn parse_hex_color(s: &str) -> Option<Color> {
 }
 
 /// Per-slot base16 and per-tint color overrides, read from `workon.review.theme.*` git config
-/// (the user-configurable color-override keys) and applied on top of an already-resolved [`Palette`] via
+/// (the user-configurable color-override keys) and applied on top of an already-resolved
+/// [`Palette`] via
 /// [`Palette::apply_overrides`]. `slots` is private — built only through [`ThemeOverrides::set_slot`]
 /// so the 0–15 index invariant lives in one place; the tint fields mirror
 /// [`Palette`]'s diff/cursor tint fields verbatim (same names, kebab-case in config).
@@ -169,11 +172,13 @@ pub struct ThemeOverrides {
     pub cursor_unfocused_bg: Option<Color>,
     pub pane_header_focused_fg: Option<Color>,
     pub filler_fg: Option<Color>,
-    /// The in-diff search (`diff-search`): every search match's highlight — a new, open-ended tint (no
-    /// scheme slot maps to it, so this is the ONLY way to set it; see [`Palette::search_match_bg`]'s
+    /// The in-diff search (`diff-search`): every search match's highlight — a new,
+    /// open-ended tint (no scheme slot maps to it, so this is the ONLY way to set it; see
+    /// [`Palette::search_match_bg`]'s
     /// doc comment for the derived defaults).
     pub search_match_bg: Option<Color>,
-    /// The in-diff search: the CURRENT search match's highlight, distinct from [`Self::search_match_bg`].
+    /// The in-diff search: the CURRENT search match's highlight, distinct from
+    /// [`Self::search_match_bg`].
     pub search_current_bg: Option<Color>,
 }
 
@@ -303,7 +308,8 @@ pub(crate) fn staged_foreground(accent: Color, background: Color, edit_bg: Color
 /// (the terminal-derivation probe for `theme=auto`): a probed dark background reuses
 /// [`Palette::dark`]'s hand-tuned tints, a light one reuses
 /// [`Palette::light`]'s derived washes. A non-RGB color (never produced by the OSC probe) reads as
-/// dark. `pub` (not `pub(crate)`) since NO_COLOR monochrome rendering (`no-color-mono`) also calls this from `main.rs`,
+/// dark. `pub` (not `pub(crate)`) since NO_COLOR monochrome rendering (`no-color-mono`) also calls
+/// this from `main.rs`,
 /// which depends on this lib crate externally, to pick [`Palette::mono`]'s ladder.
 pub fn is_light_background(color: Color) -> bool {
     match color {
@@ -389,7 +395,8 @@ pub struct Palette {
 
     /// Whole-line ("this line contains a deletion") / word-level edit ("this exact text IS the
     /// deletion") background for an unstaged (bright) Del cell (the diff foreground/background
-    /// split renamed the old intensity-named fields — the axis was always attribution precision, not intensity).
+    /// split renamed the old intensity-named fields — the axis was always attribution precision,
+    /// not intensity).
     pub del_line_bg: Color,
     pub del_edit_bg: Color,
     /// Bright Add-cell background pair (counterpart of [`Palette::del_line_bg`]).
@@ -469,8 +476,9 @@ pub struct Palette {
     /// del/add/cursor/selection tints it composites with (see `render.rs`'s `compose_segments`
     /// bg-merge).
     pub search_match_bg: Color,
-    /// The in-diff search: background wash for the CURRENT search match — a more saturated step of the same
-    /// hue as [`Palette::search_match_bg`], so "here" reads distinctly from "also matches."
+    /// The in-diff search: background wash for the CURRENT search match — a more saturated
+    /// step of the same hue as [`Palette::search_match_bg`], so "here" reads distinctly from
+    /// "also matches."
     pub search_current_bg: Color,
     /// Footer text color for an [`crate::app::Severity::Error`] notice, a pending-discard confirm
     /// prompt, and a Failed changeset's marker/message — a clearly-red tone (base08). Promoted
@@ -478,13 +486,15 @@ pub struct Palette {
     /// revising ADR-035's hybrid boundary — see this
     /// module's doc comment).
     pub error_fg: Color,
-    /// Warning tone for a needs-restack marker (needs-restack as a boolean glyph in amber) — an amber (base0A), distinct
+    /// Warning tone for a needs-restack marker (needs-restack as a boolean glyph in amber) — an
+    /// amber (base0A), distinct
     /// from [`Palette::error_fg`]'s red: a stale-parent changeset is a heads-up to `gt restack`,
     /// not a failure. Promoted from `render.rs`'s `FG_WARN` const (promoting semantic foregrounds
     /// to palette knobs).
     pub warn_fg: Color,
-    /// Tone for the outline's "this is the lib-marked `current` changeset" marker (needs-restack
-    /// as a boolean glyph in amber's outline half) — a green (base0B), distinct from every other marker color so
+    /// Tone for the outline's "this is the lib-marked `current` changeset" marker (needs-restack as
+    /// a boolean glyph in amber's outline half) — a green (base0B), distinct from every other
+    /// marker color so
     /// "current" reads unambiguously at a glance. Promoted from `render.rs`'s `FG_CURRENT` const
     /// (promoting semantic foregrounds to palette knobs).
     pub current_fg: Color,
@@ -505,9 +515,9 @@ pub struct Palette {
     /// (and the probe's curated fallback); `false` for [`Palette::from_terminal`], so `auto`
     /// preserves the terminal's own background (transparency, images) rather than flattening it.
     pub paint_canvas: bool,
-    /// Whether this palette carries no hue (the NO_COLOR-monochrome-rendering work's `NO_COLOR`
-    /// follow-up, `no-color-mono`
-    /// finding). `true` only for [`Palette::mono`]; `false` for every other constructor. Sources
+    /// Whether this palette carries no hue (NO_COLOR monochrome rendering's `NO_COLOR` follow-up,
+    /// `no-color-mono` finding). `true` only for [`Palette::mono`]; `false` for every other
+    /// constructor. Sources
     /// of color OUTSIDE the palette itself — namely [`crate::icons::icon_for_path`]'s hardcoded
     /// per-filetype `Rgb` — can't consult a palette field to know they should go achromatic, so
     /// `render.rs`'s icon paint sites check this flag directly and collapse to
@@ -654,8 +664,9 @@ impl Palette {
             dim: base.slot(3),
             gutter: base.slot(4),
             filler_fg: base.slot(1),
-            // The in-diff search: derived the same way as `cursor_bg`/`selection_bg` above — blend the
-            // scheme's amber (base0A) toward a light base00; the current match uses a shallower
+            // The in-diff search: derived the same way as `cursor_bg`/`selection_bg` above —
+            // blend the scheme's amber (base0A) toward a light base00; the current match uses a
+            // shallower
             // ratio (closer to the undimmed accent) so it reads more saturated than a plain match.
             search_match_bg: tint_toward(base.slot(10), base00, CURSOR),
             search_current_bg: tint_toward(base.slot(10), base00, EDIT),
@@ -675,7 +686,8 @@ impl Palette {
     /// see [`crate::terminal_query`]), so **syntax matches the terminal**.
     ///
     /// The **diff washes are derived from the probed accents** (the ADR-035 derived-washes
-    /// addendum, revising the terminal-derivation-probe-for-`theme=auto` curated-tints refinement): del washes blend probed base08 (ANSI
+    /// addendum, revising the terminal-derivation-probe-for-`theme=auto` curated-tints refinement):
+    /// del washes blend probed base08 (ANSI
     /// red) toward the probed background, add washes probed base0B (ANSI green) — the same
     /// `accent:mix(bg, 90)` arithmetic terminal theme authors use for their own editor diff
     /// backgrounds (laserwave's `BG_DELETE`/`BG_ADD`, the dogfood reference), so `auto`'s washes
@@ -763,7 +775,7 @@ impl Palette {
     /// collapse to `Color::Reset` — the terminal's own default fg/bg, nothing painted
     /// (`paint_canvas: false`, since Reset already means "don't touch"). `render.rs` has no
     /// non-color channel (reverse/dim modifiers) to fall back on for the 11 diff/cursor washes —
-    /// adding one is a render.rs change, out of the NO_COLOR-monochrome-rendering work's scope
+    /// adding one is a render.rs change, out of NO_COLOR monochrome rendering's scope
     /// (`render.rs` must not change) — so
     /// those instead become achromatic (`r == g == b`) `Rgb` grayscale ladders: near-black for a
     /// dark terminal, near-white for a light one (picked by `light`, matching `main.rs`'s
@@ -876,16 +888,16 @@ impl Palette {
     }
 
     /// Apply `workon.review.theme.*` overrides on top of an already-resolved palette (the
-    /// user-configurable color-override keys) — works the same on ANY base (`dark`/`light`/`auto`'s
-    /// probe result), applied last in `main.rs`'s resolution chain.
+    /// user-configurable color-override keys) — works the same on ANY base
+    /// (`dark`/`light`/`auto`'s probe result), applied last in `main.rs`'s resolution chain.
     ///
     /// **Uniform slot rule:** a slot override rewrites every palette field role-mapped to that
     /// slot, regardless of which base authored the field's current value — base00 →
     /// [`Palette::background`] (and sets [`Palette::paint_canvas`], so an explicitly chosen
     /// background always paints, even under `auto`, which otherwise leaves the canvas
-    /// unpainted), base01 → [`Palette::filler_fg`], base02 → [`Palette::selection_bg`] (the diff
-    /// foreground/background split: these two were parsed but wired to nothing before — setting
-    /// them failed silently), base03
+    /// unpainted), base01 → [`Palette::filler_fg`], base02 → [`Palette::selection_bg`] (the
+    /// diff foreground/background split: these two were parsed but wired to nothing before —
+    /// setting them failed silently), base03
     /// → [`Palette::dim`], base04 → [`Palette::gutter`], base05 → [`Palette::foreground`], base08
     /// → [`Palette::error_fg`], base09 → [`Palette::modified_fg`], base0A → [`Palette::warn_fg`],
     /// base0B → [`Palette::current_fg`], base0C → [`Palette::heading_fg`], plus every
@@ -1017,7 +1029,8 @@ mod tests {
     fn dark_syntax_resolves_representative_captures_to_the_historical_colors() {
         let theme = Palette::dark();
         let color = |name: &str| theme.syntax(capture_index(name).unwrap());
-        // The exact C_* consts highlight.rs shipped with the initial renderer (base16-eighties.dark accents).
+        // The exact C_* consts highlight.rs shipped with the initial renderer (base16-eighties.dark
+        // accents).
         assert_eq!(color("keyword"), Color::Rgb(0xcc, 0x99, 0xcc)); // C_PURPLE / base0E
         assert_eq!(color("string"), Color::Rgb(0x99, 0xcc, 0x99)); // C_GREEN / base0B
         assert_eq!(color("comment"), Color::Rgb(0x74, 0x73, 0x69)); // C_COMMENT / base03
@@ -1028,7 +1041,8 @@ mod tests {
 
     #[test]
     fn dark_diff_tints_match_the_historical_constants() {
-        // The pixel-identity gate: `Palette::dark` must reproduce the original hand-tuned tints exactly.
+        // The pixel-identity gate: `Palette::dark` must reproduce the original hand-tuned tints
+        // exactly.
         // Pinned to the literals so a future refactor can't silently drift dark.
         let t = Palette::dark();
         assert_eq!(t.del_line_bg, Color::Rgb(60, 24, 24));
@@ -1056,7 +1070,8 @@ mod tests {
 
     #[test]
     fn dark_heading_fg_takes_the_eighties_dark_cyan_accent() {
-        // Distinguishable changeset header rows: no historical constant to reproduce (this field is new) — unlike
+        // Distinguishable changeset header rows: no historical constant to reproduce (this field is
+        // new) — unlike
         // `dark_semantic_fg_matches_the_historical_render_rs_constants` above, it takes base0C
         // straight from the scheme.
         let t = Palette::dark();
@@ -1065,7 +1080,8 @@ mod tests {
 
     #[test]
     fn dark_modified_fg_takes_the_eighties_dark_orange_accent() {
-        // The git-style XY status matrix: no historical constant to reproduce (this field is new, same reasoning as
+        // The git-style XY status matrix: no historical constant to reproduce (this field is new,
+        // same reasoning as
         // `dark_heading_fg_takes_the_eighties_dark_cyan_accent` above) — takes base09 straight
         // from the scheme.
         let t = Palette::dark();
@@ -1441,7 +1457,8 @@ mod tests {
 
     #[test]
     fn staged_foreground_backs_off_when_the_staged_wash_equals_the_unstaged_one() {
-        // The motivating failure (ADR-035, the diff foreground/background split): a theme whose staged edit wash equals its
+        // The motivating failure (ADR-035, the diff foreground/background split): a theme whose
+        // staged edit wash equals its
         // unstaged one collapses a flat 40% dim of the accent to unreadable contrast. The
         // derivation must back off to a smaller ratio that still clears the floor, rather than
         // returning the nominal (contrast-failing) dim.

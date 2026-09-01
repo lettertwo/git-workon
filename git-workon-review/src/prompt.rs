@@ -1,10 +1,10 @@
 //! A one-row text-input primitive: [`PromptState`] holds a buffer plus a byte-offset cursor and
 //! exposes pure edit operations (never touches [`crate::app::App`] or terminal I/O — the
 //! keymap/cascade wiring that turns key events into these calls, and the pane it renders inside,
-//! are a later changeset's job). The in-diff-navigation work's outline fuzzy filter (`/` in the
+//! are a later changeset's job). In-diff navigation's outline fuzzy filter (`/` in the
 //! outline pane) and in-diff search (`/` in the diff pane) both need "one editable line with a
-//! blinking-cursor feel"; rather than
-//! grow that logic twice, this module is that shared line editor, built once and unused until
+//! blinking-cursor feel"; rather than grow that logic twice, this module is that shared line
+//! editor, built once and unused until
 //! the next two changesets wire it up.
 //!
 //! Emacs/readline-flavored bindings were chosen over vim-insert-mode ones because the prototype's

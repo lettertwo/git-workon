@@ -449,8 +449,8 @@ pub(crate) fn gap_hidden_range(
 /// UNEXPANDED context run contains `aligned_idx`, or `None` when `aligned_idx` isn't inside a
 /// context run at all, or that run is too short to ever collapse (same `keep_before`/`keep_after`/
 /// `run_len` test [`collapse_gaps_inner`] uses — a run collapse decision never depends on the
-/// current [`GapExpansion`] state, only on the run's own length and position). The in-diff
-/// search: a match address lives in the pre-collapse `AlignedRow` space, so jumping to one that isn't
+/// current [`GapExpansion`] state, only on the run's own length and position). The in-diff search:
+/// a match address lives in the pre-collapse `AlignedRow` space, so jumping to one that isn't
 /// currently visible needs this reverse lookup — "which gap, if any, would need expanding to
 /// reveal this row" — before [`crate::app::FileView::expand_gap`] can be called with the right key.
 pub(crate) fn gap_key_for_aligned_idx(rows: &[AlignedRow], aligned_idx: usize) -> Option<usize> {

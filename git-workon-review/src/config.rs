@@ -118,7 +118,7 @@ pub enum Theme {
 
 /// One decomposed `workon.review.<view>.bind.<action>` (or bare `workon.review.bind.<action>`)
 /// config entry: the raw, unparsed value string. Token-grammar parsing (space/reserved-word/
-/// modifier/chord) is the configurable-per-view-keymaps work's job — see
+/// modifier/chord) is left for the configurable per-view keymaps to do — see
 /// [ADR-034](../../../docs/adr/034-review-git-native-config-schema.md).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawBinding {
@@ -131,8 +131,8 @@ pub struct RawBinding {
 
 /// The four view-config settings, read raw (unset → `None`) and owned — see
 /// [`ReviewConfig::view_config`]. Validation (range/enum checks) and default fallback are
-/// [`crate::app::App::apply_view_config`]'s job, same division as [`RawBinding`]'s
-/// configurable-per-view-keymaps work.
+/// [`crate::app::App::apply_view_config`]'s job, the same raw-vs-validated split
+/// [`RawBinding`] draws for the configurable per-view keymaps.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawViewConfig {
     pub outline_width: Option<i64>,
@@ -213,7 +213,7 @@ pub fn resolve_runtime(repo: &Repository, ctx: &PaletteContext) -> RuntimeConfig
 /// bare `workon.review.bind.<action>` is the global keymap; `workon.review.<view>.bind.<action>`
 /// is a per-view keymap entry. Returns `None` for anything else under `workon.review.*`
 /// (`theme`, a view setting, or an unrecognized shape) — not this reader's job to
-/// validate/warn on unknown bind shapes; that's the configurable-per-view-keymaps work's
+/// validate/warn on unknown bind shapes; that's the configurable per-view keymaps' own
 /// collision/unknown-action validation pass. View settings and `theme` are read directly by
 /// their own getters, not through this.
 fn parse_bind_key(name: &str) -> Option<(View, String)> {
@@ -479,8 +479,8 @@ impl<'repo> ReviewConfig<'repo> {
     /// with git's native precedence (local > global > system) applied.
     ///
     /// Token-grammar parsing (space/reserved-word/modifier/chord), unknown-action validation,
-    /// and collision detection are the configurable-per-view-keymaps work's job — this is the
-    /// raw read only.
+    /// and collision detection are left for the configurable per-view keymaps to do — this is
+    /// the raw read only.
     pub fn bindings(&self) -> Result<Vec<RawBinding>, git2::Error> {
         let config = self.repo.config()?;
         // Gather each (view, action) once with its fully-qualified key name. The `entries()`
@@ -1340,8 +1340,9 @@ mod tests {
         assert!(warnings[0].contains("diff.zoom"), "got: {warnings:?}");
     }
 
-    /// The known-key-drift-test-is-mandatory test. `KNOWN_SCALAR_KEYS` is a second source of
-    /// truth alongside the getters that actually read `workon.review.*` — this enumerates every scalar getter, sets
+    /// The known-key-drift-test-is-mandatory test. `KNOWN_SCALAR_KEYS` is a second source of truth
+    /// alongside the getters that actually read `workon.review.*` — this enumerates every scalar
+    /// getter, sets
     /// its documented key on a fixture, and asserts BOTH that the getter reads it back AND that
     /// the same key is claimed by the registry (`is_claimed`), so a getter added without a
     /// matching registry entry fails here (not just "the registry agrees with itself"). The
