@@ -15,9 +15,9 @@ include = [
   "Cargo.toml",
   "LICENSE*",
 ]
-# Not yet published: this crate has no bin target yet (the MCP server lands in a later
-# slice) and the store schema is still settling. Follow the ADR-033 posture: flipping to
-# publish is a deferred sub-decision, not an oversight to fix later.
+# Not yet published: this crate has no bin target (the MCP server is its own crate,
+# git-workon-mcp — ADR-040) and the store schema is still settling. Follow the ADR-033
+# posture: flipping to publish is a deferred sub-decision, not an oversight to fix later.
 publish = false
 
 [lib]

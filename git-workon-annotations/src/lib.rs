@@ -8,8 +8,8 @@
 //!
 //! This crate is serde-free and git2-free: [`store::AnnotationStore`] takes a `commondir`
 //! path (the caller resolves it, e.g. via `git2::Repository::commondir()`), and the types
-//! here are plain structs with rusqlite row mapping. JSON only enters at the MCP boundary
-//! (a later slice, hosted as a second bin target in this crate — see ADR-039).
+//! here are plain structs with rusqlite row mapping. JSON only enters at the MCP boundary,
+//! owned by `git-workon-mcp`, this crate's second consumer (see ADR-040).
 //!
 //! ## Status
 //!
