@@ -970,6 +970,14 @@ impl ChangesetIdentity {
     }
 }
 
+/// This session's [`ChangesetKey`] for an ARBITRARY changeset — the shared core
+/// [`App::current_changeset_key`] (the active one) and [`App::summary_for`] (an outline
+/// selection, which need not be the active changeset) both key their ADR-039 lookups off. See
+/// [`ChangesetIdentity`]'s doc comment for why name alone is ambiguous.
+fn changeset_key_for(cs: &Changeset) -> ChangesetKey {
+    ChangesetKey::new(cs.name.clone(), cs.span == ChangesetSpan::Uncommitted)
+}
+
 /// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
 /// than the diff) currently has keyboard focus, its own cursor (an index into
 /// [`App::outline_items`]'s row list — a wholly separate coordinate space from [`App::cursor`]),
@@ -1921,8 +1929,7 @@ impl App {
     /// `ChangesetIdentity` itself, since that type's fields are private to this module's own
     /// nav-identity use and carry no annotations-crate conversion.
     fn current_changeset_key(&self) -> ChangesetKey {
-        let cs = &self.cur().cs;
-        ChangesetKey::new(cs.name.clone(), cs.span == ChangesetSpan::Uncommitted)
+        changeset_key_for(&self.cur().cs)
     }
 
     /// The active file `idx`'s `role` view's annotation markers, one [`MarkerKind`] per
@@ -2338,11 +2345,13 @@ impl App {
         }
     }
 
-    /// Set the active walkthrough by name and reload its stops (`main.rs`'s future `--tour`
-    /// flag, and tests). Nothing infers a tour automatically today — the store has no "list
-    /// tours" query (a tour's identity is just whatever name its stops share), so a tour must
-    /// be named explicitly by the caller, matching how [`Self::set_review_source`] is a setter
-    /// rather than a constructor parameter.
+    /// Set the active walkthrough by name and reload its stops (`main.rs`'s `--tour` flag, and
+    /// tests). Nothing infers a tour automatically today — the store has no "list tours" query
+    /// (a tour's identity is just whatever name its stops share), so a tour must be named
+    /// explicitly by the caller, matching how [`Self::set_review_source`] is a setter rather
+    /// than a constructor parameter. Fail-soft on an unknown name: [`Self::reload_tour_stops`]
+    /// yields an empty stop list, so [`Self::tour_next`]/[`Self::tour_prev`] fall straight into
+    /// their existing "no active tour" notice rather than erroring.
     pub fn set_tour(&mut self, tour: impl Into<String>) {
         self.tour_name = Some(tour.into());
         self.tour_idx = None;
@@ -2354,6 +2363,20 @@ impl App {
             (Some(store), Some(name)) => store.tour(name).unwrap_or_default(),
             _ => Vec::new(),
         };
+    }
+
+    /// The active tour's step position for the diff header's progress indicator
+    /// (`diff_header_line`'s "stop i/n") — `Some((1-based index, total))` once
+    /// [`Self::tour_next`]/[`Self::tour_prev`] has parked on a stop, `None` before the first
+    /// step or when no tour is active/has stops. Not derived from [`Self::tour_name`] alone
+    /// (a tour can be SET but not yet STEPPED into), matching the "stop" wording — showing
+    /// "stop -/n" for a not-yet-entered tour would claim a position that doesn't exist yet.
+    pub fn tour_progress(&self) -> Option<(usize, usize)> {
+        let idx = self.tour_idx?;
+        if self.tour_stops.is_empty() {
+            return None;
+        }
+        Some((idx + 1, self.tour_stops.len()))
     }
 
     /// `]t`: step to the next stop of the active tour (see [`Self::set_tour`]). Clamps at the
@@ -3676,6 +3699,14 @@ impl App {
                 let view = &self.changesets[cs_idx];
                 let label = display_label(&view.cs);
                 let failure_message = view.failure_message().map(|s| s.to_string());
+                // ADR-039's per-changeset walkthrough prose: `None` on a store-open failure or
+                // when no `Chapter` annotation has been authored for this changeset — degrades
+                // silently, matching every other `annotations`-optional read in this module.
+                let chapter = self
+                    .annotations
+                    .as_ref()
+                    .and_then(|store| store.chapter(&changeset_key_for(&view.cs)).ok().flatten())
+                    .map(|annotation| annotation.body);
                 Summary::Changeset(summary::changeset_summary(
                     label,
                     view.cs.current,
@@ -3683,6 +3714,7 @@ impl App {
                     view.is_pending(),
                     view.is_failed(),
                     failure_message,
+                    chapter,
                     view.files(),
                 ))
             }

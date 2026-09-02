@@ -33,6 +33,13 @@ struct Cli {
     /// a PR reference
     #[arg(value_name = "SOURCE", add = ArgValueCompleter::new(complete_source))]
     source: Option<String>,
+
+    /// Open into an ADR-039 walkthrough by name — `]t` then steps to its first stop. Fail-soft
+    /// on an unknown name: `App::set_tour` degrades to an empty tour, which reads exactly like
+    /// no `--tour` flag at all plus the usual "no active tour" notice on `]t` — there's no
+    /// "list tours" query yet for this flag to validate against up front.
+    #[arg(long, value_name = "NAME")]
+    tour: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -222,6 +229,7 @@ fn main() -> Result<()> {
             repo,
             views,
             source,
+            cli.tour.as_deref(),
             &view_config,
             &keymap,
             &theme_override_warnings,
@@ -248,6 +256,7 @@ fn main() -> Result<()> {
             repo,
             views,
             source,
+            cli.tour.as_deref(),
             &view_config,
             &keymap,
             &theme_override_warnings,
@@ -272,6 +281,7 @@ fn seat_app(
     repo: Repository,
     views: Vec<ChangesetView>,
     source: Option<Source>,
+    tour: Option<&str>,
     view_config: &config::RawViewConfig,
     keymap: &Keymap,
     theme_override_warnings: &[String],
@@ -279,6 +289,12 @@ fn seat_app(
     let mut app = App::from_changesets(repo, views);
     if let Some(source) = source {
         app.set_review_source(source);
+    }
+    // `--tour`: fail-soft per `Cli::tour`'s doc comment — an unknown name just yields an empty
+    // stop list, so the reviewer's first `]t` gets the existing "no active tour" notice rather
+    // than a startup error.
+    if let Some(tour) = tour {
+        app.set_tour(tour.to_string());
     }
     // Idle-deferred file loads: defer file loads to the event loop's input-idle window rather than
     // blocking here (or on any later selection change) — `app.open_current()` below marks the
@@ -324,6 +340,18 @@ fn surface_warnings(app: &mut App, keymap: &Keymap, extra_warnings: Vec<String>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tour_flag_parses_into_cli() {
+        let cli = Cli::try_parse_from(["git-workon-review", "--tour", "explain-stack"]).unwrap();
+        assert_eq!(cli.tour.as_deref(), Some("explain-stack"));
+    }
+
+    #[test]
+    fn tour_flag_defaults_to_none() {
+        let cli = Cli::try_parse_from(["git-workon-review"]).unwrap();
+        assert_eq!(cli.tour, None);
+    }
 
     #[test]
     fn no_color_truth_table() {
