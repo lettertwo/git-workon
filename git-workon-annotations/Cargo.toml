@@ -1,0 +1,37 @@
+[package]
+authors.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+description = "Anchored-annotation store shared by review comments and walkthroughs"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["git", "review", "annotations", "workon"]
+license.workspace = true
+name = "git-workon-annotations"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+include = [
+  "src/**/*",
+  "Cargo.toml",
+  "LICENSE*",
+]
+# Not yet published: this crate has no bin target yet (the MCP server lands in a later
+# slice) and the store schema is still settling. Follow the ADR-033 posture: flipping to
+# publish is a deferred sub-decision, not an oversight to fix later.
+publish = false
+
+[lib]
+name = "workon_annotations"
+
+[dependencies]
+miette.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+
+[package.metadata.dist]
+# Redundant with publish = false today; load-bearing once a bin target and the publish flip
+# land (see ADR-033's posture, adopted here) so cargo-dist doesn't silently start shipping it.
+dist = false
+
+[dev-dependencies]
+tempfile = "3"
