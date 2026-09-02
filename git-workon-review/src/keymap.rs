@@ -77,6 +77,7 @@ pub enum Command {
     SearchPrev,
     CopyLines,
     CopyLocation,
+    AnnotationView,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -390,6 +391,13 @@ pub static REGISTRY: &[Registered] = &[
         name: "copy-location",
         default_keys: "Y",
         description: "Copy path:line (or path:lo-hi) for the selected rows to the clipboard",
+    },
+    Registered {
+        command: Command::AnnotationView,
+        view: View::Diff,
+        name: "annotation-view",
+        default_keys: "c",
+        description: "View the comment thread/tour stop anchored to the row under the cursor",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {

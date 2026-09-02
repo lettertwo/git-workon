@@ -15,8 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{
-    App, DiffTextMode, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role,
-    Severity, Summary,
+    App, DiffTextMode, EffectiveZoom, FileView, Layout as AppLayout, MarkerKind, Notice, Region,
+    Role, Severity, Summary,
 };
 use crate::config::View;
 use crate::highlight::FgSpan;
@@ -28,6 +28,7 @@ use crate::search::SearchSide;
 use crate::summary::{ChangesetSummary, DirSummary, SummaryFileRow};
 use crate::theme::Palette;
 use crate::wordiff::Span as WordSpan;
+use workon_annotations::AnnotationKind;
 
 // The on-tint colors (diff add/del gradient + staged variants, cursor/selection washes, and syntax
 // foreground) come from a [`Palette`] threaded through render (ADR-035). The canvas background and
@@ -60,6 +61,15 @@ const NERD_BRANCH_ICON: char = '\u{f418}'; // nf-oct-git-branch
 const NERD_DIFF_ADDED: char = '\u{f457}'; // nf-oct-diff-added
 /// Nerd-mode diffstat glyph for the summary panel's deleted-lines count, replacing the plain `-`.
 const NERD_DIFF_REMOVED: char = '\u{f458}'; // nf-oct-diff-removed
+/// Nerd-mode annotation-marker glyph for a row carrying a comment thread, replacing the plain
+/// `¶` (U+00B6) — ADR-039's gutter marker (see [`annotation_marker`]).
+const NERD_ANNOTATION_COMMENT: char = '\u{f075}'; // nf-fa-comment
+/// Nerd-mode annotation-marker glyph for a row carrying a walkthrough tour stop, replacing the
+/// plain `▸` (U+25B8, the same chevron [`fold_marker`] uses for a collapsed-gap hint).
+const NERD_ANNOTATION_TOUR: char = '\u{f277}'; // nf-fa-map-signs
+/// Nerd-mode annotation-marker glyph for a row carrying BOTH a comment thread and a tour stop
+/// ([`MarkerKind::Both`]), replacing the plain `✳` (U+2733).
+const NERD_ANNOTATION_BOTH: char = '\u{f005}'; // nf-fa-star
 
 /// The current-changeset marker for the active icon strategy. These four one-switch helpers are
 /// the single source of each semantic marker's glyph pair — the outline's Header arm, the summary
@@ -93,6 +103,20 @@ fn loading_marker(icons: IconMode) -> char {
     match icons {
         IconMode::Nerd => NERD_LOADING_MARKER,
         IconMode::None => '\u{2026}',
+    }
+}
+
+/// The gutter annotation-marker glyph for `kind` under the active icon strategy (see
+/// [`current_marker`]) — ADR-039's gutter cell, painted into the trailing gutter separator by
+/// [`build_pane_line`]/[`build_inline_line`].
+fn annotation_marker(icons: IconMode, kind: MarkerKind) -> char {
+    match (icons, kind) {
+        (IconMode::Nerd, MarkerKind::Comment) => NERD_ANNOTATION_COMMENT,
+        (IconMode::Nerd, MarkerKind::Tour) => NERD_ANNOTATION_TOUR,
+        (IconMode::Nerd, MarkerKind::Both) => NERD_ANNOTATION_BOTH,
+        (IconMode::None, MarkerKind::Comment) => '\u{00B6}',
+        (IconMode::None, MarkerKind::Tour) => '\u{25B8}',
+        (IconMode::None, MarkerKind::Both) => '\u{2733}',
     }
 }
 
@@ -793,6 +817,8 @@ fn search_bg_spans(
 }
 
 /// Build a single rendered line for one pane at a display row's resolved [`Row`]/[`CellKind`].
+/// `marker` is this row's ADR-039 annotation marker (if any), painted into the gutter's
+/// trailing separator cell — see [`annotation_marker`].
 #[allow(clippy::too_many_arguments)]
 fn build_pane_line(
     view: &FileView,
@@ -808,6 +834,8 @@ fn build_pane_line(
     hscroll: usize,
     text_mode: DiffTextMode,
     search_spans: &[(usize, usize, Color)],
+    icons: IconMode,
+    marker: Option<MarkerKind>,
 ) -> Line<'static> {
     match row {
         Row::Filler => {
@@ -825,7 +853,8 @@ fn build_pane_line(
             }
             .and_then(|v| v.get(n - 1));
 
-            let gutter = format!("{n:>gutter_w$} ");
+            let marker_ch = marker.map(|k| annotation_marker(icons, k)).unwrap_or(' ');
+            let gutter = format!("{n:>gutter_w$}{marker_ch}");
             let mut spans = vec![TSpan::styled(gutter, Style::default().fg(theme.gutter))];
 
             let emphasis = match kind {
@@ -937,6 +966,9 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
     if app.help_visible {
         render_help_overlay(frame, app, keymap, area);
     }
+    if app.annotation_overlay_visible {
+        render_annotation_overlay(frame, app, area);
+    }
 }
 
 /// Convert a ratatui [`Rect`] into the [`Region`] shape [`App::hit_regions`] stores (mouse support)
@@ -1007,6 +1039,47 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Help (?/q/Esc to close) ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
+/// The annotation view/reply overlay (`c`, [`App::toggle_annotation_overlay`]) — the row-under-
+/// cursor's comment thread and/or tour stop, on the same centered-modal shape
+/// [`render_help_overlay`] uses (`centered_rect` + [`Clear`]). Lists each root annotation's
+/// kind, author, and body, followed by its replies (already interleaved by
+/// [`App::annotations_at_cursor`]) indented one level. An empty result (nothing anchors to this
+/// row — an orphaned anchor renders nothing here rather than a stale location, per ADR-039) shows
+/// a single "no annotations on this row" line instead of an empty box.
+fn render_annotation_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let annotations = app.annotations_at_cursor();
+
+    let mut lines: Vec<Line> = Vec::new();
+    if annotations.is_empty() {
+        lines.push(Line::from("no annotations on this row"));
+    } else {
+        for annotation in &annotations {
+            let is_reply = annotation.parent_uid.is_some();
+            let kind = match annotation.kind {
+                AnnotationKind::Comment => "comment",
+                AnnotationKind::TourStop => "tour stop",
+                AnnotationKind::Chapter => "chapter",
+            };
+            let prefix = if is_reply { "  \u{21b3} " } else { "" };
+            lines.push(Line::from(TSpan::styled(
+                format!("{prefix}{kind} \u{2014} {}", annotation.author),
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            for body_line in annotation.body.lines() {
+                lines.push(Line::from(format!("{prefix}  {body_line}")));
+            }
+            lines.push(Line::from(""));
+        }
+    }
+
+    let popup_area = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Annotations (c/Esc to close) ");
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
@@ -1844,7 +1917,10 @@ fn render_footer_notice_or_hint(
 
 /// Write a gap row's `··· N unchanged lines (Enter to expand) ···` marker across the FULL body
 /// width (both panes and the divider column) — unlike a per-pane content row, a gap hides the
-/// same span on both sides, so it isn't "about" one side or the other.
+/// same span on both sides, so it isn't "about" one side or the other. `marker` is the ADR-039
+/// annotation marker (if any) an annotation anchored INSIDE this collapsed run resolves to —
+/// surfaced on the gap row itself (the same " ▸ N" trailing-marker shape [`fold_marker`] uses
+/// for a collapsed outline row) rather than silently dropped.
 #[allow(clippy::too_many_arguments)]
 fn render_gap_row(
     buf: &mut Buffer,
@@ -1855,8 +1931,13 @@ fn render_gap_row(
     is_selected: bool,
     theme: &Palette,
     focused: bool,
+    icons: IconMode,
+    marker: Option<MarkerKind>,
 ) {
-    let msg = format!("··· {skipped} unchanged lines (Enter to expand) ···");
+    let mut msg = format!("··· {skipped} unchanged lines (Enter to expand) ···");
+    if let Some(kind) = marker {
+        msg.push_str(&format!(" {}", annotation_marker(icons, kind)));
+    }
     let line = Line::from(TSpan::styled(msg, Style::default().fg(theme.dim)));
     // Cursor wins over selection on the same row.
     let line = if is_cursor {
@@ -2461,6 +2542,10 @@ fn render_pane_sbs(
     let end = (scroll + area.height as usize).min(view.display.len());
 
     let mode = attribution_mode(role);
+    // ADR-039: one marker index per rendered window (not per annotation) — see
+    // `App::annotation_markers`'s doc comment.
+    let icons = app.icon_mode();
+    let markers = app.annotation_markers(idx, role);
 
     // Phase 1 (mutable): populate the word-span cache for visible paired rows. Phase 2 below
     // re-borrows `app`/`view` immutably to build lines — kept as the same two-phase dance the
@@ -2503,6 +2588,8 @@ fn render_pane_sbs(
                     is_selected,
                     theme,
                     focused,
+                    icons,
+                    markers.get(&row_idx).copied(),
                 );
             }
             DisplayRow::Row(row) => {
@@ -2535,6 +2622,7 @@ fn render_pane_sbs(
                     Vec::new()
                 };
 
+                let row_marker = markers.get(&row_idx).copied();
                 let old_line = build_pane_line(
                     view,
                     Side::Old,
@@ -2549,6 +2637,8 @@ fn render_pane_sbs(
                     hscroll,
                     text_mode,
                     &old_search,
+                    icons,
+                    row_marker,
                 );
                 let new_line = build_pane_line(
                     view,
@@ -2564,6 +2654,8 @@ fn render_pane_sbs(
                     hscroll,
                     text_mode,
                     &new_search,
+                    icons,
+                    row_marker,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
@@ -2638,6 +2730,8 @@ fn build_inline_line(
     hscroll: usize,
     text_mode: DiffTextMode,
     search_spans: &[(usize, usize, Color)],
+    icons: IconMode,
+    marker: Option<MarkerKind>,
 ) -> Line<'static> {
     let (old_opt, new_opt, text, hl, kind) = match *row {
         InlineRow::Context { old, new } => (
@@ -2666,8 +2760,9 @@ fn build_inline_line(
         }
     };
 
+    let marker_ch = marker.map(|k| annotation_marker(icons, k)).unwrap_or(' ');
     let gutter = format!(
-        "{} {} ",
+        "{} {} {marker_ch}",
         gutter_field(old_opt, old_gutter_w),
         gutter_field(new_opt, new_gutter_w)
     );
@@ -2745,6 +2840,10 @@ fn render_pane_inline(
     let end = (scroll + area.height as usize).min(view.inline.len());
 
     let mode = attribution_mode(role);
+    // ADR-039: one marker index per rendered window — see `render_pane_sbs`'s identical
+    // comment.
+    let icons = app.icon_mode();
+    let markers = app.annotation_markers(idx, role);
 
     // Same two-phase mutable/immutable dance as `render_pane_sbs`, over the inline coordinate
     // space instead.
@@ -2775,6 +2874,8 @@ fn render_pane_inline(
                     is_selected,
                     theme,
                     focused,
+                    icons,
+                    markers.get(&row_idx).copied(),
                 );
             }
             row => {
@@ -2818,6 +2919,8 @@ fn render_pane_inline(
                     hscroll,
                     text_mode,
                     &search_spans,
+                    icons,
+                    markers.get(&row_idx).copied(),
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let line = if is_cursor {
@@ -2859,6 +2962,8 @@ mod tests {
     use crate::outline::OutlineItem;
     use crate::theme::Palette;
     use crate::wordiff::Span as WordSpan;
+    use workon_annotations::store::AnnotationStore;
+    use workon_annotations::{Anchor, AnnotationKind, ChangesetKey, NewAnnotation};
 
     /// Render one frame against the default (unrebound) keymap and the dark theme — the vast
     /// majority of `render.rs` tests don't care about keybindings and only ever ran dark. Tests
@@ -7353,6 +7458,102 @@ mod tests {
             warn_style(&lit),
             warn_style(&dim),
             "the warn glyph's style is unaffected by the prefix text's focus"
+        );
+    }
+
+    // ── ADR-039: the gutter annotation marker and the view/reply overlay ────────────
+
+    fn single_line_anchor(path: &str, new_side: bool, lineno: u32, target: &str) -> Anchor {
+        Anchor {
+            path: path.to_string(),
+            new_side,
+            lineno,
+            end_lineno: lineno,
+            target: target.to_string(),
+            before: Vec::new(),
+            after: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn comment_marker_renders_in_the_gutter_sbs() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let store = AnnotationStore::open(fixture.repo().unwrap().commondir()).unwrap();
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Comment,
+                changeset: ChangesetKey::new("main", true),
+                anchor: Some(single_line_anchor("tracked.txt", true, 2, "CHANGED")),
+                body: "why?".into(),
+                author: "reviewer".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+        let row = content
+            .iter()
+            .position(|line| line.contains("CHANGED"))
+            .expect("the changed row renders");
+        // Plain (non-nerd) icon mode's comment marker glyph — see `annotation_marker`.
+        assert!(
+            content[row].contains('\u{00B6}'),
+            "the gutter cell carries the comment marker on the annotated row: {:?}",
+            content[row]
+        );
+    }
+
+    #[test]
+    fn annotation_overlay_shows_the_row_content() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let store = AnnotationStore::open(fixture.repo().unwrap().commondir()).unwrap();
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Comment,
+                changeset: ChangesetKey::new("main", true),
+                anchor: Some(single_line_anchor("tracked.txt", true, 2, "CHANGED")),
+                body: "why is this here?".into(),
+                author: "reviewer".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let (&row_idx, _) = app.annotation_markers(0, role).iter().next().unwrap();
+        app.cursor = row_idx;
+        app.toggle_annotation_overlay();
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf).join("\n");
+        assert!(
+            content.contains("why is this here?"),
+            "the overlay shows the comment body"
+        );
+        assert!(
+            content.contains("reviewer"),
+            "the overlay shows the comment's author"
         );
     }
 }
