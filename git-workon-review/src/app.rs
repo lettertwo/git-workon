@@ -1561,6 +1561,17 @@ pub struct App {
     /// [`Self::poll_annotations`]. `None` until the first poll (or forever, alongside
     /// [`Self::annotations`], when the store failed to open).
     annotations_fingerprint: Option<Fingerprint>,
+    /// The active walkthrough's name, set by [`Self::set_tour`] — `None` until a caller (a
+    /// future `--tour` flag, or a test) picks one; nothing in this crate infers a tour on its
+    /// own (the store has no "list tours" query — see [`Self::set_tour`]'s doc comment).
+    tour_name: Option<String>,
+    /// The active tour's stops, ordered by `seq` (mirrors [`workon_annotations::store::AnnotationStore::tour`]'s
+    /// own ordering) — reloaded by [`Self::reload_tour_stops`] whenever [`Self::tour_name`]
+    /// changes or [`Self::poll_annotations`] observes a store write.
+    tour_stops: Vec<Annotation>,
+    /// Index into [`Self::tour_stops`] the reviewer is currently parked on, or `None` before the
+    /// first [`Self::tour_next`]/[`Self::tour_prev`] step.
+    tour_idx: Option<usize>,
     /// Whether the annotation view/reply overlay (`c`, [`Self::toggle_annotation_overlay`]) is
     /// showing — the same modal-capture shape as [`Self::help_visible`] (see that field's doc
     /// comment); `tui::update` intercepts every key while this is `true`.
@@ -1770,6 +1781,9 @@ impl App {
             refreshing_for_geometry_mismatch: false,
             annotations,
             annotations_fingerprint: None,
+            tour_name: None,
+            tour_stops: Vec::new(),
+            tour_idx: None,
             annotation_overlay_visible: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
@@ -1846,9 +1860,9 @@ impl App {
 
     /// A SIBLING poll to the index-signature check above, over the annotations store's own
     /// write-visibility fingerprint (`PRAGMA data_version` + this crate's revision counter —
-    /// see [`workon_annotations::Fingerprint`]'s doc comment). Nothing reads this yet beyond the
-    /// fingerprint bookkeeping itself — a later commit's active tour reload is the first
-    /// consumer.
+    /// see [`workon_annotations::Fingerprint`]'s doc comment). Reloads the active tour's stops
+    /// when another connection (a future MCP server, or this TUI's own future authoring path)
+    /// committed since the last poll.
     ///
     /// Deliberately does NOT call [`Self::coordinated_refresh`] and does NOT bump
     /// [`Self::generation`] (ADR-039's gotcha): an annotation write changes what a gutter
@@ -1865,6 +1879,7 @@ impl App {
             return;
         }
         self.annotations_fingerprint = Some(fingerprint);
+        self.reload_tour_stops();
     }
 
     /// This session's [`ChangesetKey`] for the ACTIVE changeset — the annotations crate's
@@ -1967,8 +1982,110 @@ impl App {
         self.annotation_overlay_visible = !self.annotation_overlay_visible;
     }
 
-    /// The bounded-reveal step [`Self::jump_to_search_match`] uses (a later commit's tour
-    /// stepping reuses it too — locked decision: the same widen-just-enough reveal, never
+    /// Set the active walkthrough by name and reload its stops (`main.rs`'s future `--tour`
+    /// flag, and tests). Nothing infers a tour automatically today — the store has no "list
+    /// tours" query (a tour's identity is just whatever name its stops share), so a tour must
+    /// be named explicitly by the caller, matching how [`Self::set_review_source`] is a setter
+    /// rather than a constructor parameter.
+    pub fn set_tour(&mut self, tour: impl Into<String>) {
+        self.tour_name = Some(tour.into());
+        self.tour_idx = None;
+        self.reload_tour_stops();
+    }
+
+    fn reload_tour_stops(&mut self) {
+        self.tour_stops = match (self.annotations.as_ref(), self.tour_name.as_deref()) {
+            (Some(store), Some(name)) => store.tour(name).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+    }
+
+    /// `]t`: step to the next stop of the active tour (see [`Self::set_tour`]). Clamps at the
+    /// last stop — does not wrap. A no-op with a footer notice when no tour is active or it has
+    /// no stops.
+    pub fn tour_next(&mut self) {
+        self.tour_step(1);
+    }
+
+    /// `[t`: step to the previous stop of the active tour. See [`Self::tour_next`].
+    pub fn tour_prev(&mut self) {
+        self.tour_step(-1);
+    }
+
+    fn tour_step(&mut self, delta: i64) {
+        if self.tour_stops.is_empty() {
+            self.notify("no active tour", Severity::Info);
+            return;
+        }
+        let len = self.tour_stops.len() as i64;
+        let next = match self.tour_idx {
+            Some(i) => (i as i64 + delta).clamp(0, len - 1),
+            None => 0,
+        };
+        self.tour_idx = Some(next as usize);
+        self.goto_tour_stop(next as usize);
+    }
+
+    /// Land the diff view on tour stop `stop_idx`: switch changeset/file if the stop anchors
+    /// elsewhere in the stack (`switch_changeset` → `complete_pending_open`, per the plan), then
+    /// reveal and park the cursor on the stop's anchored row via the same bounded-reveal step
+    /// [`Self::jump_to_search_match`] uses (see [`Self::reveal_aligned_idx`]).
+    ///
+    /// `ensure_loaded` runs UNCONDITIONALLY, even when the stop's file is already
+    /// current — `switch_changeset`'s own `open_current` is what loads a view on a real switch,
+    /// but a stop landing on the ALREADY-current file/changeset skips that branch entirely, and
+    /// nothing else in this session eagerly loads a view on construction (see
+    /// `test_support::app_from_fixture`'s callers, which load explicitly). Without this, the
+    /// first step of a tour that opens on the file the reviewer is already looking at would
+    /// silently no-op on the `role_view_ref` lookup below instead of resolving the anchor.
+    fn goto_tour_stop(&mut self, stop_idx: usize) {
+        let Some(stop) = self.tour_stops.get(stop_idx).cloned() else {
+            return;
+        };
+        let Some(anchor) = stop.anchor.clone() else {
+            return;
+        };
+        if let Some(cs_idx) = self.changesets.iter().position(|v| {
+            v.cs.name == stop.changeset.name()
+                && (v.cs.span == ChangesetSpan::Uncommitted) == stop.changeset.uncommitted()
+        }) {
+            let file_idx = self.changesets[cs_idx]
+                .files()
+                .iter()
+                .position(|f| f.path == anchor.path)
+                .unwrap_or(0);
+            if cs_idx != self.current_cs || file_idx != self.current {
+                self.switch_changeset(cs_idx, file_idx);
+            }
+        }
+        self.complete_pending_open();
+        self.ensure_loaded(self.current);
+
+        let role = self.focused_role_for(self.current);
+        let Some(aligned_idx) = self.role_view_ref(self.current, role).and_then(|view| {
+            aligned_idx_for_lineno(&view.aligned, anchor.new_side, anchor.lineno as usize)
+        }) else {
+            return;
+        };
+        self.reveal_aligned_idx(aligned_idx);
+
+        let layout = self.layout;
+        if let Some(view) = self.current_view_ref() {
+            if let Some((row_idx, is_gap)) =
+                resolve_marker_row(view, layout, anchor.new_side, anchor.lineno as usize)
+            {
+                if !is_gap {
+                    self.cursor = row_idx;
+                }
+            }
+        }
+        self.cancel_selection();
+        self.derive_scroll();
+        self.clamp_cursor();
+    }
+
+    /// The bounded-reveal step shared by [`Self::jump_to_search_match`] and
+    /// [`Self::goto_tour_stop`] (locked decision: the same widen-just-enough reveal, never
     /// `full: true` — commit `bcb673c`'s fix, see [`crate::align::CONTEXT_LINES`]): if
     /// `aligned_idx` in the current view sits inside a collapsed gap, widen whichever edge is
     /// nearer it by just enough rows to surface it plus a small context margin. A no-op when
@@ -6500,7 +6617,7 @@ mod tests {
     use crate::icons::IconMode;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
-    use workon_annotations::store::AnnotationStore;
+    use workon_annotations::store::{AnnotationStore, TourStop, Walkthrough};
     use workon_annotations::{Anchor, AnnotationKind, ChangesetKey, NewAnnotation};
 
     /// Open the annotations store at `fixture`'s commondir — [`AnnotationStore::open`] the same
@@ -14786,6 +14903,61 @@ mod tests {
             app.generation(),
             generation_before,
             "an annotation write must never bump the ADR-037 generation counter"
+        );
+    }
+
+    #[test]
+    fn tour_next_and_prev_step_through_stops_and_switch_files() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "a1\na2\n", "a1\nCHANGED_A\n")
+            .unstaged_file("b.txt", "b1\nb2\n", "b1\nCHANGED_B\n")
+            .build()
+            .unwrap();
+        let store = seed_store(&fixture);
+        store
+            .put_walkthrough(Walkthrough {
+                changeset: ChangesetKey::new("main", true),
+                tour: "onboarding".into(),
+                chapter: None,
+                chapter_author: None,
+                stops: vec![
+                    TourStop {
+                        anchor: single_line_anchor("a.txt", true, 2, "CHANGED_A"),
+                        body: "first stop".into(),
+                        author: "agent".into(),
+                        seq: 1,
+                    },
+                    TourStop {
+                        anchor: single_line_anchor("b.txt", true, 2, "CHANGED_B"),
+                        body: "second stop".into(),
+                        author: "agent".into(),
+                        seq: 2,
+                    },
+                ],
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_tour("onboarding");
+
+        app.tour_next();
+        assert_eq!(app.files()[app.current].path, "a.txt");
+        assert_eq!(
+            app.role_view_ref(app.current, app.focused_role_for(app.current))
+                .unwrap()
+                .new_line(2),
+            "CHANGED_A"
+        );
+
+        app.tour_next();
+        assert_eq!(app.files()[app.current].path, "b.txt");
+
+        app.tour_prev();
+        assert_eq!(
+            app.files()[app.current].path,
+            "a.txt",
+            "tour_prev steps back to the first stop's file"
         );
     }
 }

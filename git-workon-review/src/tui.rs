@@ -481,6 +481,8 @@ enum Action {
     CopyLines,
     CopyLocation,
     AnnotationView,
+    TourNext,
+    TourPrev,
     None,
 }
 
@@ -522,6 +524,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::CopyLines => Action::CopyLines,
         Command::CopyLocation => Action::CopyLocation,
         Command::AnnotationView => Action::AnnotationView,
+        Command::TourNext => Action::TourNext,
+        Command::TourPrev => Action::TourPrev,
         Command::NextFile => Action::NextFile,
         Command::PrevFile => Action::PrevFile,
         Command::NextHunk => Action::NextHunk,
@@ -599,10 +603,11 @@ fn map_key(
 /// have produced — e.g. `j` then immediately `s` must stage the same hunk eager code would have.
 ///
 /// Exempt (returns `false`): every action that ends in its own fresh `open_current` (`NextFile`,
-/// `PrevFile`, `NextChangeset`, `PrevChangeset`, `ToggleMaximize`, and the outline nav/confirm
-/// actions), since those simply set a NEW pending open rather than needing the current one
-/// force-completed; plus pure UI toggles/no-ops (`Refresh` rebuilds all views itself;
-/// `ToggleHelp`/`AnnotationView`/`Quit`/`None` touch no view state at all).
+/// `PrevFile`, `NextChangeset`, `PrevChangeset`, `ToggleMaximize`, and the outline nav/confirm actions,
+/// plus `TourNext`/`TourPrev` — `App::goto_tour_stop` calls `switch_changeset` itself when the
+/// stop lands elsewhere in the stack), since those simply set a NEW pending open rather than
+/// needing the current one force-completed; plus pure UI toggles/no-ops (`Refresh` rebuilds all
+/// views itself; `ToggleHelp`/`AnnotationView`/`Quit`/`None` touch no view state at all).
 fn action_needs_loaded_view(action: Action) -> bool {
     matches!(
         action,
@@ -702,6 +707,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::CopyLines => app.copy_lines(),
         Action::CopyLocation => app.copy_location(),
         Action::AnnotationView => app.toggle_annotation_overlay(),
+        Action::TourNext => app.tour_next(),
+        Action::TourPrev => app.tour_prev(),
         Action::None => {}
     }
     false
