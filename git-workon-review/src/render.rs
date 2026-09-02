@@ -969,6 +969,13 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
     if app.annotation_overlay_visible {
         render_annotation_overlay(frame, app, area);
     }
+    // Drawn last (topmost) — the editor modal outranks every other modal in `tui::update`'s
+    // Esc-ladder (case 2, just below the pending confirm), so it must never render underneath
+    // one of these when both happen to be true (not reachable via normal input today, but the
+    // z-order should still match the precedence ordering).
+    if app.editor_is_open() {
+        render_editor_overlay(frame, app, area);
+    }
 }
 
 /// Convert a ratatui [`Rect`] into the [`Region`] shape [`App::hit_regions`] stores (mouse support)
@@ -1080,6 +1087,31 @@ fn render_annotation_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Annotations (c/Esc to close) ");
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
+/// The annotation-authoring editor modal ([`App::editor_is_open`], ADR-039 slice 3) — same
+/// centered-modal shape [`render_help_overlay`]/[`render_annotation_overlay`] use
+/// (`centered_rect` + [`Clear`]). Content is [`App::editor_wrapped_lines`], wrapped to the
+/// popup's own inner width (border columns subtracted first) so the cursor's wrapped position
+/// ([`App::editor_cursor_screen_pos`], the same width) lines up with what's actually on screen.
+/// No visible block cursor glyph yet (unlike [`crate::prompt::PromptState::render_line`]'s
+/// reversed cell) — the wrapped row/col this method already computes is exactly what a future
+/// cursor-placement pass would need; deferred since ratatui's own terminal cursor (not a styled
+/// cell) is the more natural fit and needs a `Frame::set_cursor_position` call this render pass
+/// doesn't otherwise make.
+fn render_editor_overlay(frame: &mut Frame, app: &App, area: Rect) {
+    let popup_area = centered_rect(60, 60, area);
+    frame.render_widget(Clear, popup_area);
+    let inner_width = popup_area.width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = app
+        .editor_wrapped_lines(inner_width.max(1))
+        .into_iter()
+        .map(Line::from)
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Annotate (Ctrl-s to submit, Esc to cancel) ");
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 

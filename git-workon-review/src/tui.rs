@@ -481,6 +481,8 @@ enum Action {
     CopyLines,
     CopyLocation,
     AnnotationView,
+    AnnotationCreate,
+    AnnotationResolve,
     TourNext,
     TourPrev,
     None,
@@ -524,6 +526,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::CopyLines => Action::CopyLines,
         Command::CopyLocation => Action::CopyLocation,
         Command::AnnotationView => Action::AnnotationView,
+        Command::AnnotationCreate => Action::AnnotationCreate,
+        Command::AnnotationResolve => Action::AnnotationResolve,
         Command::TourNext => Action::TourNext,
         Command::TourPrev => Action::TourPrev,
         Command::NextFile => Action::NextFile,
@@ -608,6 +612,11 @@ fn map_key(
 /// stop lands elsewhere in the stack), since those simply set a NEW pending open rather than
 /// needing the current one force-completed; plus pure UI toggles/no-ops (`Refresh` rebuilds all
 /// views itself; `ToggleHelp`/`AnnotationView`/`Quit`/`None` touch no view state at all).
+///
+/// `AnnotationCreate`/`AnnotationResolve` join the first group too: both resolve
+/// [`App::current_view_ref`] at ACTION time (anchor capture, and locating the root under the
+/// cursor) rather than at render time the way `AnnotationView`'s overlay does, so they need the
+/// same eager-load guarantee `j` + `s` does.
 fn action_needs_loaded_view(action: Action) -> bool {
     matches!(
         action,
@@ -628,6 +637,8 @@ fn action_needs_loaded_view(action: Action) -> bool {
             | Action::ExpandAllGaps
             | Action::SearchNext
             | Action::SearchPrev
+            | Action::AnnotationCreate
+            | Action::AnnotationResolve
     )
 }
 
@@ -707,6 +718,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::CopyLines => app.copy_lines(),
         Action::CopyLocation => app.copy_location(),
         Action::AnnotationView => app.toggle_annotation_overlay(),
+        Action::AnnotationCreate => app.open_annotation_editor_for_create(),
+        Action::AnnotationResolve => app.resolve_annotation_at_cursor(),
         Action::TourNext => app.tour_next(),
         Action::TourPrev => app.tour_prev(),
         Action::None => {}
@@ -887,6 +900,47 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// `update`'s case-2 modal arm (ADR-039 slice 3): apply one key press while the annotation
+/// editor ([`App::editor_is_open`]) has keyboard capture. Handles its own `Ctrl-s`/`Enter`/
+/// `Up`/`Down`/`Esc` first, then delegates every other key to [`prompt_edit_for_key`] — same
+/// shape as [`apply_filter_input_key`]/[`apply_search_input_key`], but the multi-line extras
+/// ([`crate::editor::EditorState::newline`]/`move_up`/`move_down`) [`prompt_edit_for_key`] has
+/// no token for, since [`crate::prompt::PromptState`] is single-line.
+///
+/// `Esc` on a DIRTY buffer ([`App::editor_is_dirty`]) raises a `pending_confirm`
+/// (`PendingOp::DiscardEditorDraft`) instead of discarding outright — same "a destructive op
+/// gets a confirm" rule the staging discards follow, applied to a draft instead of a worktree
+/// change; a clean buffer's `Esc` just closes, nothing to lose.
+fn apply_editor_input_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('s') if ctrl => return app.submit_editor(),
+        KeyCode::Enter => return app.editor_newline(),
+        KeyCode::Up => return app.editor_move_up(),
+        KeyCode::Down => return app.editor_move_down(),
+        KeyCode::Esc => {
+            return if app.editor_is_dirty() {
+                app.request_editor_discard_confirm()
+            } else {
+                app.cancel_editor()
+            };
+        }
+        _ => {}
+    }
+    match prompt_edit_for_key(key) {
+        Some(PromptEdit::InsertChar(c)) => app.editor_insert_char(c),
+        Some(PromptEdit::Backspace) => app.editor_backspace(),
+        Some(PromptEdit::Delete) => app.editor_delete(),
+        Some(PromptEdit::MoveLeft) => app.editor_move_left(),
+        Some(PromptEdit::MoveRight) => app.editor_move_right(),
+        Some(PromptEdit::MoveHome) => app.editor_move_home(),
+        Some(PromptEdit::MoveEnd) => app.editor_move_end(),
+        Some(PromptEdit::ClearToStart) => app.editor_clear_to_start(),
+        Some(PromptEdit::DeleteWordBack) => app.editor_delete_word_back(),
+        None => {}
+    }
+}
+
 /// Apply one [`AppEvent`] to `app`. Returns `true` when the loop should exit (q/Esc). Resize is a
 /// no-op — ratatui re-measures `body_area` every frame regardless. Tick drives
 /// [`App::on_tick`], the staging-verbs index watcher's poll (see the module doc).
@@ -896,27 +950,38 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
 ///
-/// Esc precedence (highest first): a pending discard confirm > the help overlay being open >
-/// the annotation overlay being open > the outline fuzzy filter input having capture > the
-/// in-diff search prompt having capture > an active line selection OR an active search
-/// (diff-focused) > an active outline-filter query (outline-focused) > the outline having focus >
-/// the diff having focus with the outline open > the normal key map (where Esc quits).
-/// Concretely — the home-base model: the outline is where Esc always eventually lands you before
-/// it quits, unwinding any inner mode (selection, search, filter) along the way.
+/// Esc precedence (highest first): a pending discard confirm > the annotation editor modal being
+/// open > the help overlay being open > the annotation overlay being open > the outline fuzzy
+/// filter input having capture > the in-diff search prompt having capture > an active line
+/// selection OR an active search (diff-focused) > an active outline-filter query
+/// (outline-focused) > the outline having focus > the diff having focus with the outline open >
+/// the normal key map (where Esc quits). Concretely — the home-base model: the outline is where
+/// Esc always eventually lands you before it quits, unwinding any inner mode (selection, search,
+/// filter) along the way.
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
 ///    that neither clears the notice nor runs a normal action while it's up.
-/// 2. Otherwise, the help overlay (`?`) captures the keyboard next, mirroring the confirm modal's
+/// 2. Otherwise, the annotation editor modal ([`App::editor_is_open`], ADR-039 slice 3) captures
+///    the keyboard next: every key routes to [`apply_editor_input_key`]. Ranked just below the
+///    confirm modal — a DIRTY buffer's `Esc` raises its OWN pending confirm
+///    (`PendingOp::DiscardEditorDraft`, see [`App::request_editor_discard_confirm`]) rather than
+///    discarding outright, so the confirm modal winning here keeps that draft-discard prompt from
+///    ever being silently dismissed by a stray editor key, same rationale as help winning over
+///    case 3 below.
+/// 3. Otherwise, the help overlay (`?`) captures the keyboard next, mirroring the confirm modal's
 ///    swallow: `?`/`q`/`Esc` close it, every other key is a no-op (nothing on the diff behind it
-///    reacts). Ranked just below the confirm modal — in practice the two are never up
-///    together, since opening help doesn't run through a confirm, but the confirm winning keeps
+///    reacts). Ranked just below the editor modal — in practice the two are never up
+///    together, since opening help doesn't run through the editor, but the editor winning keeps
 ///    a destructive prompt from ever being silently dismissed by a stray overlay key.
-/// 3. Otherwise, the annotation overlay (`c`, [`App::annotation_overlay_visible`]) captures the
-///    keyboard next, mirroring help's own swallow: `c`/`q`/`Esc` close it, every other key is a
-///    no-op. Ranked just below help — the two can't be up together (opening one never routes
-///    through the other) — and above every case below, for the same reason help is.
-/// 4. Otherwise, the outline fuzzy filter INPUT (`/`, while it has capture — see
+/// 4. Otherwise, the annotation overlay (`c`, [`App::annotation_overlay_visible`]) captures the
+///    keyboard next, mirroring help's own swallow: `c`/`q`/`Esc` close it; a reply key opens the
+///    editor modal (case 2 above then wins on the NEXT key press); `C`
+///    ([`App::resolve_annotation_at_cursor`]) toggles the row's root annotation's status without
+///    closing the overlay; every other key is a no-op. Ranked just below help — the two can't be
+///    up together (opening one never routes through the other) — and above every case below, for
+///    the same reason help is.
+/// 5. Otherwise, the outline fuzzy filter INPUT (`/`, while it has capture — see
 ///    [`App::outline_filter_focused`]) captures next, mirroring the same swallow: typing/editing
 ///    keys reach [`crate::prompt::PromptState`], `Enter`/`Esc` return capture to the outline row
 ///    list KEEPING the query, `Ctrl-c` clears it and returns capture too, and `Down`/`Up`/
@@ -925,31 +990,31 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 ///    `?` nor `c` is part of the input's own key set — but the ordering still says which would
 ///    win if that ever changed) and above every other case, since none of them should observe a
 ///    key the filter input itself consumes.
-/// 5. Otherwise, the in-diff search prompt (`/` in the diff view, while it has capture — see
+/// 6. Otherwise, the in-diff search prompt (`/` in the diff view, while it has capture — see
 ///    [`App::search_focused`]) captures next, mirroring the outline-filter input's swallow:
 ///    typing/editing keys reach [`crate::prompt::PromptState`] (live-previewing highlights, never
 ///    moving the cursor), `Enter` accepts and jumps, `Esc` aborts back to whatever search (or
 ///    none) was active before `/` was pressed. Ranked below the outline-filter input for the same
 ///    "can't actually collide today, but the ordering says who'd win" reason — the two prompts
 ///    can never both have capture (one requires outline focus, the other diff focus).
-/// 6. Otherwise, with the diff focused, Esc CANCELS an active line selection OR clears an active
+/// 7. Otherwise, with the diff focused, Esc CANCELS an active line selection OR clears an active
 ///    search (selection wins if, somehow, both are active) instead of moving focus or quitting
-///    (`q` still quits). This arm is guarded to defer to case 8 when the outline has focus. Other
+///    (`q` still quits). This arm is guarded to defer to case 9 when the outline has focus. Other
 ///    keys fall through to the normal map — `j`/`k` extend a selection, `n`/`N` step a search.
-/// 7. Otherwise, with the outline focused and a NON-EMPTY filter query (capture on the row list,
-///    not the input — that's case 4), Esc CLEARS the filter ([`App::outline_filter_clear`])
-///    instead of quitting — the outline-side mirror of case 6's unwind-the-innermost-mode rule;
-///    only the next Esc reaches case 8's quit leaf.
-/// 8. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
+/// 8. Otherwise, with the outline focused and a NON-EMPTY filter query (capture on the row list,
+///    not the input — that's case 5), Esc CLEARS the filter ([`App::outline_filter_clear`])
+///    instead of quitting — the outline-side mirror of case 7's unwind-the-innermost-mode rule;
+///    only the next Esc reaches case 9's quit leaf.
+/// 9. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
 ///    outline is home base; there's nowhere further out to walk to.
-/// 9. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
-///    focuses the outline (same effect as `h`/[`App::focus_outline`]) rather than quitting.
-/// 10. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`)
+/// 10. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
+///     focuses the outline (same effect as `h`/[`App::focus_outline`]) rather than quitting.
+/// 11. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`)
 ///     quits — there's no outline to walk out to.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 6-10);
-/// the confirm, help, annotation overlay, and the two prompt modals (cases 1-5) deliberately do
-/// not. Cases 6-10 are delegated to [`resolve_key`], shared with [`update_batch`].
+/// A `Key` event clears any showing footer notice before applying its own action (cases 7-11);
+/// the confirm, editor, help, annotation overlay, and the two prompt modals (cases 1-6)
+/// deliberately do not. Cases 7-11 are delegated to [`resolve_key`], shared with [`update_batch`].
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
@@ -962,6 +1027,10 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             }
             false
         }
+        AppEvent::Key(key) if app.editor_is_open() => {
+            apply_editor_input_key(app, key);
+            false
+        }
         AppEvent::Key(key) if app.help_visible => {
             match key.code {
                 KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => app.toggle_help(),
@@ -970,14 +1039,19 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             false
         }
         // The annotation overlay (`c`, `App::toggle_annotation_overlay`) captures the keyboard
-        // exactly like the help overlay above — `c`/`q`/`Esc` close it, every other key is
-        // swallowed. Ranked just below help (the two can't be up together; opening one never
-        // routes through the other), same as help is ranked just below the confirm modal.
+        // exactly like the help overlay above — `c`/`q`/`Esc` close it; `A` opens the editor
+        // modal in REPLY mode (case 2 above then wins on the next key press, since `editor_is_open`
+        // becomes true); `C` toggles the row's root annotation's status without closing the
+        // overlay. Every other key is swallowed. Ranked just below help (the two can't be up
+        // together; opening one never routes through the other), same as help is ranked just
+        // below the editor modal.
         AppEvent::Key(key) if app.annotation_overlay_visible => {
             match key.code {
                 KeyCode::Char('c') | KeyCode::Char('q') | KeyCode::Esc => {
                     app.toggle_annotation_overlay()
                 }
+                KeyCode::Char('A') => app.open_annotation_editor_for_reply(),
+                KeyCode::Char('C') => app.resolve_annotation_at_cursor(),
                 _ => {}
             }
             false
@@ -994,12 +1068,13 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             KeyOutcome::Handled => false,
             KeyOutcome::Action(action) => apply_action(app, action),
         },
-        // Mouse support: all five modals swallow mouse input exactly like they swallow keys
-        // (cases 1-5 above) — a click/wheel while a discard confirm, the help overlay, the
-        // annotation overlay, the outline fuzzy filter input, or the in-diff search prompt is up
-        // does nothing.
+        // Mouse support: all six modals swallow mouse input exactly like they swallow keys
+        // (cases 1-6 above) — a click/wheel while a discard confirm, the editor modal, the help
+        // overlay, the annotation overlay, the outline fuzzy filter input, or the in-diff search
+        // prompt is up does nothing.
         AppEvent::Mouse(_)
             if app.pending_confirm.is_some()
+                || app.editor_is_open()
                 || app.help_visible
                 || app.annotation_overlay_visible
                 || app.outline_filter_focused()
@@ -2275,6 +2350,83 @@ mod tests {
             app.pending_confirm.is_none(),
             "the confirm arm consumes Esc first"
         );
+    }
+
+    /// ADR-039 slice 3: the annotation editor modal's Esc-ladder case (case 2, between the
+    /// pending-confirm case and help) — a DIRTY buffer raises a `PendingOp::DiscardEditorDraft`
+    /// confirm rather than discarding outright.
+    #[test]
+    fn esc_on_a_dirty_editor_raises_a_discard_confirm() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.open_annotation_editor_for_create();
+        assert!(
+            app.editor_is_open(),
+            "a loaded file's cursor row must capture an anchor and open the editor"
+        );
+        app.editor_insert_char('x');
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+        assert!(!quit, "the editor modal swallows Esc, it never quits");
+        assert!(
+            app.editor_is_open(),
+            "a dirty buffer's Esc must not close the editor outright"
+        );
+        assert!(matches!(
+            app.pending_confirm.as_ref().map(|c| &c.op),
+            Some(PendingOp::DiscardEditorDraft)
+        ));
+
+        // Answering `y` (the confirm modal, which outranks the editor modal — case 1 over case 2)
+        // actually discards the draft.
+        app.resolve_confirm(true);
+        assert!(!app.editor_is_open());
+    }
+
+    /// The mirror of the test above: a CLEAN buffer's Esc closes the editor immediately, no
+    /// confirm — nothing to lose.
+    #[test]
+    fn esc_on_a_clean_editor_closes_it_immediately() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.open_annotation_editor_for_create();
+        assert!(app.editor_is_open());
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
+        assert!(
+            !app.editor_is_open(),
+            "a clean buffer's Esc closes the editor with no confirm"
+        );
+        assert!(app.pending_confirm.is_none());
     }
 
     #[test]
