@@ -1,0 +1,49 @@
+[package]
+authors.workspace = true
+categories = ["command-line-utilities", "development-tools"]
+description = "MCP server exposing git-workon's review annotations to a coding agent"
+edition.workspace = true
+homepage.workspace = true
+keywords = ["git", "review", "mcp", "workon"]
+license.workspace = true
+name = "git-workon-mcp"
+repository.workspace = true
+rust-version.workspace = true
+version = "0.1.0"
+include = [
+  "src/**/*",
+  "Cargo.toml",
+  "LICENSE*",
+]
+# Not yet published: reached only via git-workon's external-subcommand PATH dispatch, and
+# its deps (rmcp, tokio) are pinned to a fast-moving SDK. Follow the ADR-033 posture:
+# flipping to publish is a deferred sub-decision, not an oversight to fix later.
+publish = false
+
+[dependencies]
+git-workon-annotations.workspace = true
+miette.workspace = true
+git2.workspace = true
+serde_json.workspace = true
+
+rmcp = { version = "3.2", default-features = false, features = [
+  "server",
+  "macros",
+  "transport-io",
+] }
+tokio = { version = "1", features = ["rt", "macros"] }
+# Derive macros expand to literal `serde::`/`schemars::` paths, so rmcp's re-exports
+# (`rmcp::serde`, `rmcp::schemars`) don't satisfy `#[derive(Deserialize, JsonSchema)]`
+# without a `#[serde(crate = ...)]`/`#[schemars(crate = ...)]` on every type. Depending on
+# these directly is simpler; the versions are already in Cargo.lock via rmcp, so this adds
+# no new resolution, just a name for what's already there.
+serde = { version = "1", features = ["derive"] }
+schemars = { version = "1" }
+
+[package.metadata.dist]
+# Redundant with publish = false today; load-bearing if the publish flip ever lands (see
+# ADR-033's posture, adopted here) so cargo-dist doesn't silently start shipping it.
+dist = false
+
+[dev-dependencies]
+tempfile = "3"
