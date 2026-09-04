@@ -15,16 +15,17 @@ fn main() -> Result<()> {
     Cli::parse();
 
     let repo = Repository::discover(".").into_diagnostic()?;
-    let combined = diff_uncommitted(&repo).into_diagnostic()?.combined;
+    let diffs = diff_uncommitted(&repo).into_diagnostic()?;
 
-    if combined.files.is_empty() {
+    if diffs.combined.files.is_empty() {
         eprintln!("nothing to review");
         return Ok(());
     }
 
     // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here after
-    // `diff_uncommitted` is done borrowing it.
-    let mut app = App::new(repo, combined);
+    // `diff_uncommitted` is done borrowing it. The whole `WorktreeDiffs` goes in: the file list is
+    // combined-driven, but the per-role zoom panes need the staged/unstaged sub-diffs too.
+    let mut app = App::new(repo, diffs);
     app.open_current();
 
     tui::run(&mut app).into_diagnostic()?;
