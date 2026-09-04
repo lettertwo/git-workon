@@ -468,3 +468,80 @@ fn empty_range_between_same_tag_prints_named_nothing_to_review_and_exits_zero() 
         .success()
         .stderr(predicate::str::contains("nothing to review in v1..v1"));
 }
+
+// `workon.stackModel` must beat auto-detection. `StackModel::detect` picks Graphite whenever a
+// `.graphite_repo_config` exists, so a gh-stack repo whose Graphite artifacts linger reads the
+// wrong (empty) metadata and the stack branch falls through to git inference with no upstream.
+// Each of the three stack-model decisions in the binary is pinned separately.
+
+fn lingering_graphite_over_gh_stack() -> Result<Fixture, Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .gh_stack(None, 1, "main", &["a", "b", "c"])
+        .config("workon.stackModel", "gh-stack")
+        .build()?;
+    Ok(fixture)
+}
+
+fn names(changesets: &[workon::Changeset]) -> Vec<&str> {
+    changesets.iter().map(|c| c.name.as_str()).collect()
+}
+
+#[test]
+fn stack_keyword_honors_stack_model_config_over_lingering_graphite_artifacts(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = lingering_graphite_over_gh_stack()?;
+    let repo = fixture.repo()?;
+
+    let changesets = resolve_source(repo, "b", Source::classify("stack"))?;
+    assert_eq!(names(&changesets), vec!["a", "b", "c"]);
+    Ok(())
+}
+
+#[test]
+fn auto_detect_honors_stack_model_config_over_lingering_graphite_artifacts(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = lingering_graphite_over_gh_stack()?;
+    let repo = fixture.repo()?;
+
+    let changesets = resolve_changesets(repo, "b")?;
+    assert_eq!(names(&changesets), vec!["a", "b", "c"]);
+    Ok(())
+}
+
+#[test]
+fn ref_on_gh_stack_tracked_branch_resolves_the_whole_stack_under_stack_model_config(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = lingering_graphite_over_gh_stack()?;
+    let repo = fixture.repo()?;
+
+    let changesets = resolve_source(repo, "some-other-branch", Source::classify("b"))?;
+    assert_eq!(names(&changesets), vec!["a", "b", "c"]);
+    let current: Vec<&str> = changesets
+        .iter()
+        .filter(|c| c.current)
+        .map(|c| c.name.as_str())
+        .collect();
+    assert_eq!(current, vec!["b"]);
+    Ok(())
+}
+
+/// Without the config, detection's Graphite-wins tiebreak still applies and the gh-stack
+/// branch has no Graphite row: the `stack` keyword reports the missing upstream. Documents the
+/// trap the config escape hatch exists for.
+#[test]
+fn stack_keyword_without_stack_model_config_still_loses_to_lingering_graphite_artifacts(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .gh_stack(None, 1, "main", &["a", "b", "c"])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let err = resolve_source(repo, "b", Source::classify("stack")).unwrap_err();
+    assert!(
+        matches!(err, SourceError::NoUpstream { ref branch } if branch == "b"),
+        "{err:?}"
+    );
+    Ok(())
+}

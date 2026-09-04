@@ -6,7 +6,9 @@
 //! git2 diffs and then a [`DiffModel`].
 
 use git2::{DiffFindOptions, DiffOptions, Oid, Repository};
-use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel, UncommittedLayer};
+use workon::{
+    assemble_changesets, Changeset, ChangesetSpan, StackModel, UncommittedLayer, WorkonConfig,
+};
 
 use crate::error::DiffError;
 use crate::model::DiffModel;
@@ -200,10 +202,22 @@ pub fn diff_changesets(
         .collect()
 }
 
+/// The stack provider in effect for `repo`: `workon.stackModel` when set, else auto-detect
+/// (see [`WorkonConfig::stack_model`] for the precedence). Every stack-model decision in this
+/// crate goes through here so an explicit config always beats [`StackModel::detect`]'s
+/// Graphite-wins tiebreak, which otherwise blinds a gh-stack repo whose Graphite artifacts
+/// linger in the common dir. A config read error or an unrecognized value falls back to
+/// detection: the model only picks which metadata to read, so it is not worth failing over.
+pub fn stack_model(repo: &Repository) -> StackModel {
+    WorkonConfig::new(repo)
+        .and_then(|config| config.stack_model(None))
+        .unwrap_or_else(|_| StackModel::detect(repo))
+}
+
 /// Resolve the changeset stack the review App opens on for the worktree whose `HEAD` is
-/// `head_branch` (locked design decision: auto-detect Graphite, else a single uncommitted
-/// changeset): the full Graphite stack
-/// when one is active, or a single synthetic [`Changeset`] spanning the uncommitted worktree
+/// `head_branch` (locked design decision: auto-detect a stack tool, else a single uncommitted
+/// changeset): the full stack when a metadata-backed model (Graphite or gh-stack) is active
+/// per [`stack_model`], or a single synthetic [`Changeset`] spanning the uncommitted worktree
 /// otherwise.
 ///
 /// This does NOT simply forward to [`workon::assemble_changesets`] with the detected
@@ -219,7 +233,7 @@ pub fn resolve_changesets(
     repo: &Repository,
     head_branch: &str,
 ) -> Result<Vec<Changeset>, DiffError> {
-    match StackModel::detect(repo) {
+    match stack_model(repo) {
         model @ (StackModel::Graphite | StackModel::GhStack) => Ok(assemble_changesets(
             repo,
             head_branch,
