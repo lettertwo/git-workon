@@ -14,7 +14,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -22,7 +22,9 @@ use crossterm::terminal::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use workon_review::app::App;
+use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
 use workon_review::render;
+use workon_review::theme::Palette;
 
 /// One event the review loop reacts to. `Tick` is now also the index-watcher's poll beat (see the
 /// module doc's note on locked decision #4) — `next_event`'s mapping and this enum otherwise stay
@@ -55,6 +57,7 @@ pub fn next_event(timeout: Duration) -> io::Result<Option<AppEvent>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Quit,
+    ToggleHelp,
     MoveCursorBy(i64),
     ScrollTop,
     ScrollBottom,
@@ -81,84 +84,81 @@ enum Action {
     None,
 }
 
-/// Map one key press to an [`Action`], given `pending` (a `]` or `[` seen on the previous call,
-/// awaiting its `f`/`h` suffix), the current pane height (for `Ctrl-d`/`Ctrl-u` half-page
-/// deltas), and whether the outline pane currently has focus. Unrecognized suffixes drop the
-/// pending bracket rather than re-processing the key.
+/// Convert a resolved rebindable [`Command`] into the concrete [`Action`] the loop applies,
+/// supplying the runtime context the registry can't hold — here, the pane height that sizes a
+/// half-page scroll (`Ctrl-d`/`Ctrl-u`). This is the seam between the config-driven keymap and the
+/// hardcoded action effects.
+fn command_to_action(command: Command, pane_height: usize) -> Action {
+    let half_page = (pane_height / 2).max(1) as i64;
+    match command {
+        Command::Quit => Action::Quit,
+        Command::ToggleOutline => Action::ToggleOutline,
+        Command::ToggleHelp => Action::ToggleHelp,
+        Command::CursorDown => Action::MoveCursorBy(1),
+        Command::CursorUp => Action::MoveCursorBy(-1),
+        Command::HalfPageDown => Action::MoveCursorBy(half_page),
+        Command::HalfPageUp => Action::MoveCursorBy(-half_page),
+        Command::ScrollTop => Action::ScrollTop,
+        Command::ScrollBottom => Action::ScrollBottom,
+        Command::ToggleLayout => Action::ToggleLayout,
+        Command::CycleZoom => Action::CycleZoom,
+        Command::ToggleSplitFocus => Action::ToggleSplitFocus,
+        Command::Refresh => Action::Refresh,
+        Command::StageHunk => Action::StageHunk,
+        Command::StageFile => Action::StageFile,
+        Command::DiscardHunk => Action::DiscardHunk,
+        Command::DiscardFile => Action::DiscardFile,
+        Command::StartSelection => Action::StartSelection,
+        Command::NextFile => Action::NextFile,
+        Command::PrevFile => Action::PrevFile,
+        Command::NextHunk => Action::NextHunk,
+        Command::PrevHunk => Action::PrevHunk,
+        Command::NextChangeset => Action::NextChangeset,
+        Command::PrevChangeset => Action::PrevChangeset,
+        Command::OutlineDown => Action::OutlineMoveBy(1),
+        Command::OutlineUp => Action::OutlineMoveBy(-1),
+        Command::OutlineConfirm => Action::OutlineConfirm,
+        Command::OutlineCycleMode => Action::OutlineCycleMode,
+    }
+}
+
+/// Map one key press to an [`Action`] through the resolved [`Keymap`], given `pending` (the
+/// in-flight multi-key sequence buffer — generalized from the old `]`/`[` bracket chord to ANY
+/// bound sequence), the current pane height (for the half-page deltas), and whether the outline
+/// pane currently has focus.
 ///
-/// `outline_focused` re-routes the plain single-key map (NOT the bracket-pending path, which is
-/// diff-only chording that can't be mid-flight while the outline has focus) to the outline's own
-/// small key set (locked design: "only outline-relevant keys — `j k Enter i o Esc` — act" while
-/// it has focus). `o` always toggles regardless of focus (checked before the split) since it's
-/// the one key that must work from EITHER side to move focus between panes; `q` still quits from
-/// either side too — the locked design only enumerates outline-focused keys, it doesn't say `q`
-/// should stop working.
+/// Dispatch order:
+/// 1. The keymap ([`Keymap::advance`]) consumes the key. A bound sequence fires its command; a
+///    strict prefix reports [`Dispatch::Pending`] and holds the buffer for the next key; an
+///    unrecognized suffix mid-sequence drops the buffer without re-processing (the old
+///    bracket-drop behavior, now general).
+/// 2. `Esc` stays HARDCODED (ADR-034: the whole `Esc`-precedence cascade is never routed through
+///    the registry). Reached only as a fresh, otherwise-unbound key: it unfocuses the outline when
+///    the outline has focus, else quits — the terminal leaf of the cascade `update` enforces.
+///
+/// `outline_focused` selects the keymap's outline vs diff context; the global bindings (`q`/`o`)
+/// are active in both, so `o` toggles and `q` quits from either pane.
 fn map_key(
-    pending: &mut Option<char>,
+    keymap: &Keymap,
+    pending: &mut Vec<KeyPress>,
     key: KeyEvent,
     pane_height: usize,
     outline_focused: bool,
 ) -> Action {
-    if let Some(bracket) = pending.take() {
-        return match (bracket, key.code) {
-            (']', KeyCode::Char('f')) => Action::NextFile,
-            ('[', KeyCode::Char('f')) => Action::PrevFile,
-            (']', KeyCode::Char('h')) => Action::NextHunk,
-            ('[', KeyCode::Char('h')) => Action::PrevHunk,
-            (']', KeyCode::Char('c')) => Action::NextChangeset,
-            ('[', KeyCode::Char('c')) => Action::PrevChangeset,
-            _ => Action::None,
-        };
-    }
-
-    if key.code == KeyCode::Char('o') {
-        return Action::ToggleOutline;
-    }
-
-    if outline_focused {
-        return match key.code {
-            KeyCode::Char('q') => Action::Quit,
-            KeyCode::Char('j') | KeyCode::Down => Action::OutlineMoveBy(1),
-            KeyCode::Char('k') | KeyCode::Up => Action::OutlineMoveBy(-1),
-            KeyCode::Enter => Action::OutlineConfirm,
-            KeyCode::Char('i') => Action::OutlineCycleMode,
-            KeyCode::Esc => Action::OutlineUnfocus,
-            _ => Action::None,
-        };
-    }
-
-    match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-        KeyCode::Char('j') | KeyCode::Down => Action::MoveCursorBy(1),
-        KeyCode::Char('k') | KeyCode::Up => Action::MoveCursorBy(-1),
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Action::MoveCursorBy((pane_height / 2).max(1) as i64)
+    match keymap.advance(outline_focused, pending, key) {
+        Dispatch::Command(command) => command_to_action(command, pane_height),
+        Dispatch::Pending => Action::None,
+        Dispatch::Unmatched { mid_sequence } => {
+            if !mid_sequence && key.code == KeyCode::Esc {
+                if outline_focused {
+                    Action::OutlineUnfocus
+                } else {
+                    Action::Quit
+                }
+            } else {
+                Action::None
+            }
         }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            Action::MoveCursorBy(-((pane_height / 2).max(1) as i64))
-        }
-        KeyCode::Char('g') => Action::ScrollTop,
-        KeyCode::Char('G') => Action::ScrollBottom,
-        KeyCode::Char('L') => Action::ToggleLayout,
-        KeyCode::Char('z') => Action::CycleZoom,
-        KeyCode::Char('w') => Action::ToggleSplitFocus,
-        KeyCode::Char('r') => Action::Refresh,
-        KeyCode::Char('s') => Action::StageHunk,
-        KeyCode::Char('S') => Action::StageFile,
-        KeyCode::Char('d') => Action::DiscardHunk,
-        KeyCode::Char('D') => Action::DiscardFile,
-        KeyCode::Char('v') => Action::StartSelection,
-        KeyCode::Tab => Action::NextFile,
-        KeyCode::BackTab => Action::PrevFile,
-        KeyCode::Char(']') => {
-            *pending = Some(']');
-            Action::None
-        }
-        KeyCode::Char('[') => {
-            *pending = Some('[');
-            Action::None
-        }
-        _ => Action::None,
     }
 }
 
@@ -166,6 +166,7 @@ fn map_key(
 fn apply_action(app: &mut App, action: Action) -> bool {
     match action {
         Action::Quit => return true,
+        Action::ToggleHelp => app.toggle_help(),
         Action::MoveCursorBy(delta) => app.move_cursor_by(delta),
         Action::ScrollTop => app.scroll_top(),
         Action::ScrollBottom => app.scroll_bottom(),
@@ -203,24 +204,30 @@ fn apply_action(app: &mut App, action: Action) -> bool {
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
 ///
-/// Esc precedence (highest first): a pending discard confirm > the outline having focus > an
-/// active line selection > the normal key map (where Esc quits). Concretely:
+/// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
+/// outline having focus > an active line selection > the normal key map (where Esc quits).
+/// Concretely:
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
 ///    that neither clears the notice nor runs a normal action while it's up.
-/// 2. Otherwise, while the outline pane has focus, Esc returns focus to the diff (via the normal
+/// 2. Otherwise, the help overlay (`?`) captures the keyboard next, mirroring the confirm modal's
+///    swallow: `?`/`q`/`Esc` close it, every other key is a no-op (nothing on the diff behind it
+///    reacts). Ranked just below the confirm modal — in practice the two are never up
+///    together, since opening help doesn't run through a confirm, but the confirm winning keeps
+///    a destructive prompt from ever being silently dismissed by a stray overlay key.
+/// 3. Otherwise, while the outline pane has focus, Esc returns focus to the diff (via the normal
 ///    map's `outline_focused` branch — see [`map_key`]) rather than quitting or falling into the
 ///    selection-cancel case below (locked design: "Esc must still not quit when the outline has
 ///    focus"). The selection-Esc arm below is guarded to defer to this case.
-/// 3. Otherwise, with an active line selection, Esc CANCELS the selection instead of quitting (`q`
+/// 4. Otherwise, with an active line selection, Esc CANCELS the selection instead of quitting (`q`
 ///    still quits). Other keys fall through to the normal map — `j`/`k` extend the selection,
 ///    `s`/`d` act on it.
-/// 4. Otherwise the normal map applies, where Esc (like `q`) quits.
+/// 5. Otherwise the normal map applies, where Esc (like `q`) quits.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 2-4); the
-/// confirm modal (case 1) deliberately does not.
-fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
+/// A `Key` event clears any showing footer notice before applying its own action (cases 3-5); the
+/// confirm and help modals (cases 1-2) deliberately do not.
+fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
             match key.code {
@@ -228,6 +235,13 @@ fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                     app.resolve_confirm(false)
                 }
+                _ => {}
+            }
+            false
+        }
+        AppEvent::Key(key) if app.help_visible => {
+            match key.code {
+                KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => app.toggle_help(),
                 _ => {}
             }
             false
@@ -245,7 +259,7 @@ fn update(app: &mut App, pending: &mut Option<char>, event: AppEvent) -> bool {
             app.clear_notice();
             apply_action(
                 app,
-                map_key(pending, key, app.pane_height, app.outline_focused()),
+                map_key(keymap, pending, key, app.pane_height, app.outline_focused()),
             )
         }
         AppEvent::Tick => {
@@ -288,7 +302,7 @@ fn install_panic_hook() {
 
 /// Run the review TUI's terminal lifecycle and main loop against `app`. Callers must have
 /// already loaded the initial file (`app.open_current()`) before calling this.
-pub fn run(app: &mut App) -> io::Result<()> {
+pub fn run(app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut out = terminal_writer();
@@ -296,7 +310,7 @@ pub fn run(app: &mut App) -> io::Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = event_loop(&mut terminal, app);
+    let result = event_loop(&mut terminal, app, keymap, theme);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -308,25 +322,29 @@ pub fn run(app: &mut App) -> io::Result<()> {
 fn event_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     app: &mut App,
+    keymap: &Keymap,
+    theme: &Palette,
 ) -> io::Result<()> {
-    let mut pending: Option<char> = None;
+    let mut pending: Vec<KeyPress> = Vec::new();
     let mut quit = false;
 
     loop {
-        terminal.draw(|f| render::render(f, app))?;
+        terminal.draw(|f| render::render(f, app, keymap, theme))?;
 
         if quit {
             return Ok(());
         }
 
         if let Some(event) = next_event(Duration::from_millis(200))? {
-            quit = update(app, &mut pending, event);
+            quit = update(app, keymap, &mut pending, event);
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::KeyModifiers;
+
     use super::*;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -339,163 +357,175 @@ mod tests {
 
     #[test]
     fn quit_keys_map_to_quit() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('q')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('q')), 20, false),
             Action::Quit
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Esc), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Esc), 20, false),
             Action::Quit
         );
     }
 
     #[test]
     fn scroll_keys_map_by_one_line() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('j')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('j')), 20, false),
             Action::MoveCursorBy(1)
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Down), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Down), 20, false),
             Action::MoveCursorBy(1)
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('k')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('k')), 20, false),
             Action::MoveCursorBy(-1)
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Up), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Up), 20, false),
             Action::MoveCursorBy(-1)
         );
     }
 
     #[test]
     fn ctrl_d_u_scroll_by_half_the_pane_height() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, ctrl_key('d'), 21, false),
+            map_key(&km, &mut pending, ctrl_key('d'), 21, false),
             Action::MoveCursorBy(10)
         );
         assert_eq!(
-            map_key(&mut pending, ctrl_key('u'), 21, false),
+            map_key(&km, &mut pending, ctrl_key('u'), 21, false),
             Action::MoveCursorBy(-10)
         );
         // A pane height of 1 still scrolls by at least one line.
         assert_eq!(
-            map_key(&mut pending, ctrl_key('d'), 1, false),
+            map_key(&km, &mut pending, ctrl_key('d'), 1, false),
             Action::MoveCursorBy(1)
         );
     }
 
     #[test]
     fn g_and_shift_g_map_to_top_and_bottom() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('g')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('g')), 20, false),
             Action::ScrollTop
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('G')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('G')), 20, false),
             Action::ScrollBottom
         );
     }
 
     #[test]
     fn shift_l_maps_to_toggle_layout() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('L')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('L')), 20, false),
             Action::ToggleLayout
         );
     }
 
     #[test]
     fn z_and_w_map_to_zoom_and_split_focus() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('z')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false),
             Action::CycleZoom
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('w')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('w')), 20, false),
             Action::ToggleSplitFocus
         );
     }
 
     #[test]
     fn r_maps_to_refresh() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('r')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('r')), 20, false),
             Action::Refresh
         );
     }
 
     #[test]
     fn tab_and_backtab_map_to_file_nav() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Tab), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Tab), 20, false),
             Action::NextFile
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::BackTab), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::BackTab), 20, false),
             Action::PrevFile
         );
     }
 
     #[test]
     fn bracket_f_maps_to_file_nav() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char(']')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false),
             Action::None
         );
-        assert_eq!(pending, Some(']'));
+        // The buffer holds the in-flight chord prefix (generalized from the old `Option<char>`).
+        assert_eq!(pending, vec![KeyPress::from_event(key(KeyCode::Char(']')))]);
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('f')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('f')), 20, false),
             Action::NextFile
         );
-        assert_eq!(pending, None);
+        assert!(pending.is_empty());
 
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('[')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('[')), 20, false),
             Action::None
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('f')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('f')), 20, false),
             Action::PrevFile
         );
     }
 
     #[test]
     fn bracket_h_maps_to_hunk_nav() {
-        let mut pending = None;
-        map_key(&mut pending, key(KeyCode::Char(']')), 20, false);
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false);
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('h')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('h')), 20, false),
             Action::NextHunk
         );
 
-        map_key(&mut pending, key(KeyCode::Char('[')), 20, false);
+        map_key(&km, &mut pending, key(KeyCode::Char('[')), 20, false);
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('h')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('h')), 20, false),
             Action::PrevHunk
         );
     }
 
     #[test]
     fn unrecognized_bracket_suffix_drops_pending_without_side_effect() {
-        let mut pending = None;
-        map_key(&mut pending, key(KeyCode::Char(']')), 20, false);
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        map_key(&km, &mut pending, key(KeyCode::Char(']')), 20, false);
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('x')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('x')), 20, false),
             Action::None
         );
-        assert_eq!(
-            pending, None,
+        assert!(
+            pending.is_empty(),
             "pending bracket must be cleared, not left dangling"
         );
     }
@@ -526,7 +556,8 @@ mod tests {
             .build()
             .unwrap();
         let mut app = app_from_fixture(&fixture);
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
         app.notify("something happened", Severity::Info);
         assert!(app.notice.is_some());
@@ -534,6 +565,7 @@ mod tests {
         // Any key — even one that maps to no action — dismisses the notice.
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('x'))),
         );
@@ -554,10 +586,12 @@ mod tests {
             .unwrap();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('r'))),
         );
@@ -578,14 +612,15 @@ mod tests {
             .build()
             .unwrap();
         let mut app = app_from_fixture(&fixture);
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
         app.notify("something happened", Severity::Info);
 
-        update(&mut app, &mut pending, AppEvent::Tick);
+        update(&mut app, &km, &mut pending, AppEvent::Tick);
         assert!(app.notice.is_some(), "a Tick event must not clear a notice");
 
-        update(&mut app, &mut pending, AppEvent::Resize(80, 24));
+        update(&mut app, &km, &mut pending, AppEvent::Resize(80, 24));
         assert!(
             app.notice.is_some(),
             "a Resize event must not clear a notice"
@@ -603,13 +638,14 @@ mod tests {
             .unwrap();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
         // A plain Tick with nothing changed externally must be a safe no-op wired all the way
         // through `update` — the smoke test for M4's index-watcher hookup (the substantive
         // signature-change/echo-suppression assertions live in `app.rs`'s own `on_tick` tests,
         // which have direct access to its private state).
-        let quit = update(&mut app, &mut pending, AppEvent::Tick);
+        let quit = update(&mut app, &km, &mut pending, AppEvent::Tick);
 
         assert!(!quit, "Tick must never quit the loop");
         assert_eq!(app.files().len(), 1);
@@ -618,35 +654,37 @@ mod tests {
 
     #[test]
     fn staging_keys_map_to_their_actions() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('s')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('s')), 20, false),
             Action::StageHunk
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('S')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('S')), 20, false),
             Action::StageFile
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('d')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('d')), 20, false),
             Action::DiscardHunk
         );
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('D')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('D')), 20, false),
             Action::DiscardFile
         );
         // Ctrl-d keeps its half-page meaning — the plain-`d` staging arm must not shadow it.
         assert_eq!(
-            map_key(&mut pending, ctrl_key('d'), 20, false),
+            map_key(&km, &mut pending, ctrl_key('d'), 20, false),
             Action::MoveCursorBy(10)
         );
     }
 
     #[test]
     fn v_maps_to_start_selection() {
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&mut pending, key(KeyCode::Char('v')), 20, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('v')), 20, false),
             Action::StartSelection
         );
     }
@@ -663,18 +701,29 @@ mod tests {
             .unwrap();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
         // Lowest precedence: with neither a confirm nor a selection up, Esc quits.
         assert!(
-            update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Esc))),
+            update(
+                &mut app,
+                &km,
+                &mut pending,
+                AppEvent::Key(key(KeyCode::Esc))
+            ),
             "Esc quits when nothing modal is active"
         );
 
         // Middle precedence: an active selection makes Esc cancel the selection (not quit).
         app.start_selection();
         assert!(app.selection_anchor.is_some());
-        let quit = update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Esc)));
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
         assert!(!quit, "Esc must not quit while a selection is active");
         assert!(
             app.selection_anchor.is_none(),
@@ -684,7 +733,12 @@ mod tests {
         // Highest precedence: a pending confirm captures Esc as a cancel, even with a selection up.
         app.start_selection();
         app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
-        let quit = update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Esc)));
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
         assert!(!quit, "Esc must not quit while a confirm is pending");
         assert!(
             app.pending_confirm.is_none(),
@@ -704,7 +758,8 @@ mod tests {
             .unwrap();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
         // A pending confirm makes every non-answer key a no-op — the cursor doesn't move and the
         // confirm stays up.
@@ -712,6 +767,7 @@ mod tests {
         let cursor_before = app.cursor;
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('j'))),
         );
@@ -727,6 +783,7 @@ mod tests {
         // `n` cancels it.
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('n'))),
         );
@@ -736,6 +793,7 @@ mod tests {
         app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('y'))),
         );
@@ -808,12 +866,14 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
         // Default: open, unfocused.
         assert!(app.outline_open() && !app.outline_focused());
 
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('o'))),
         );
@@ -821,6 +881,7 @@ mod tests {
 
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('o'))),
         );
@@ -831,6 +892,7 @@ mod tests {
 
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('o'))),
         );
@@ -855,12 +917,14 @@ mod tests {
         let diff_cursor_before = app.cursor;
         let diff_file_before = app.current;
         let outline_cursor_before = app.outline_cursor();
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
         // `k` (not `j`): the outline cursor starts on the last row (cs-b's file, since it's the
         // active/current changeset), so `j` would clamp in place — `k` has room to move.
         update(
             &mut app,
+            &km,
             &mut pending,
             AppEvent::Key(key(KeyCode::Char('k'))),
         );
@@ -891,9 +955,15 @@ mod tests {
         app.toggle_outline(); // close
         app.toggle_outline(); // open + focus
         assert!(app.outline_focused());
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
-        let quit = update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Esc)));
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Esc)),
+        );
 
         assert!(!quit, "Esc must not quit while the outline has focus");
         assert!(
@@ -920,9 +990,15 @@ mod tests {
         assert!(app.outline_focused());
         // Move the outline cursor up onto cs-a's header row.
         app.outline_move_by(-3);
-        let mut pending = None;
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
 
-        update(&mut app, &mut pending, AppEvent::Key(key(KeyCode::Enter)));
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Enter)),
+        );
 
         assert_eq!(
             app.current_cs(),
@@ -933,6 +1009,134 @@ mod tests {
         assert!(
             !app.outline_focused(),
             "Enter returns focus to the diff after jumping"
+        );
+    }
+
+    // ── CS3: help overlay ───────────────────────────────────────────────────
+
+    #[test]
+    fn question_mark_opens_the_help_overlay() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert!(!app.help_visible);
+
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('?'))),
+        );
+        assert!(app.help_visible, "? opens the help overlay");
+    }
+
+    #[test]
+    fn while_help_is_open_other_keys_are_swallowed() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        app.toggle_help();
+        assert!(app.help_visible);
+        let cursor_before = app.cursor;
+
+        // `j` would normally move the cursor — while help is up it must be a pure no-op, exactly
+        // like the pending-confirm modal's swallow.
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('j'))),
+        );
+
+        assert!(!quit);
+        assert!(
+            app.help_visible,
+            "an unrelated key must not close the overlay"
+        );
+        assert_eq!(
+            app.cursor, cursor_before,
+            "a swallowed key must not run its normal action"
+        );
+    }
+
+    #[test]
+    fn question_mark_q_and_esc_all_close_the_help_overlay() {
+        use git_workon_fixture::prelude::*;
+
+        for close_key in [
+            key(KeyCode::Char('?')),
+            key(KeyCode::Char('q')),
+            key(KeyCode::Esc),
+        ] {
+            let fixture = FixtureBuilder::new()
+                .config("core.autocrlf", "false")
+                .build()
+                .unwrap();
+            let mut app = app_from_fixture(&fixture);
+            let km = Keymap::defaults();
+            let mut pending: Vec<KeyPress> = Vec::new();
+
+            app.toggle_help();
+            assert!(app.help_visible);
+
+            let quit = update(&mut app, &km, &mut pending, AppEvent::Key(close_key));
+
+            assert!(!quit, "closing help must not also quit the app");
+            assert!(
+                !app.help_visible,
+                "{close_key:?} must close the help overlay"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pending_confirm_still_wins_over_an_open_help_overlay() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        app.toggle_help();
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+
+        // `y` while BOTH modals are up must resolve the confirm (case 1 wins per `update`'s
+        // documented precedence), not close help or fall through to a normal action.
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Char('y'))),
+        );
+
+        assert!(
+            app.pending_confirm.is_none(),
+            "the confirm modal must capture y first"
+        );
+        assert!(
+            app.help_visible,
+            "the confirm arm must not have touched help_visible"
         );
     }
 }

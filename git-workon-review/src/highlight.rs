@@ -7,25 +7,29 @@
 
 use std::collections::HashMap;
 
-use ratatui::style::Color;
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
 /// Files with more lines than this are skipped (plain fg) to keep
 /// highlighting fast.
 pub const MAX_HIGHLIGHT_LINES: usize = 20_000;
 
-/// Foreground color spans for a single line: byte range + color.
+/// Foreground syntax span for a single line: a byte range and the semantic *capture index* —
+/// the position in [`HIGHLIGHT_NAMES`] of the capture that covers it. The color is resolved at
+/// render time against the active [`crate::theme::Palette`] (ADR-035), NOT baked in here: the
+/// tree-sitter pass is theme-free and cacheable, and a theme switch recolors by re-rendering.
 #[derive(Debug, Clone)]
 pub struct FgSpan {
     pub start: usize,
     pub end: usize,
-    pub color: Color,
+    /// Index into [`HIGHLIGHT_NAMES`]; resolve via [`crate::theme::Palette::syntax`].
+    pub capture: usize,
 }
 
 /// The standard highlight-capture names we recognize. `configure()` matches
 /// dotted capture names by longest prefix, so e.g. `keyword.control` maps to
-/// `keyword`. Parallel with `HIGHLIGHT_COLORS`.
-const HIGHLIGHT_NAMES: &[&str] = &[
+/// `keyword`. This is the capture *index space* — theme-invariant (see ADR-035); the
+/// per-capture colors live in [`crate::theme`]'s `SYNTAX_SLOTS` template.
+pub(crate) const HIGHLIGHT_NAMES: &[&str] = &[
     "attribute",
     "comment",
     "constant",
@@ -56,56 +60,11 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "variable.parameter",
 ];
 
-// A small dark theme in the same family as syntect's base16-eighties.dark so
-// the two engines look comparable side by side.
-const C_RED: Color = Color::Rgb(0xf2, 0x77, 0x7a);
-const C_ORANGE: Color = Color::Rgb(0xf9, 0x91, 0x57);
-const C_YELLOW: Color = Color::Rgb(0xff, 0xcc, 0x66);
-const C_GREEN: Color = Color::Rgb(0x99, 0xcc, 0x99);
-const C_CYAN: Color = Color::Rgb(0x66, 0xcc, 0xcc);
-const C_BLUE: Color = Color::Rgb(0x66, 0x99, 0xcc);
-const C_PURPLE: Color = Color::Rgb(0xcc, 0x99, 0xcc);
-const C_FG: Color = Color::Rgb(0xd3, 0xd0, 0xc8);
-const C_COMMENT: Color = Color::Rgb(0x74, 0x73, 0x69);
-
-const HIGHLIGHT_COLORS: &[Color] = &[
-    C_ORANGE,  // attribute
-    C_COMMENT, // comment
-    C_ORANGE,  // constant
-    C_ORANGE,  // constant.builtin
-    C_YELLOW,  // constructor
-    C_FG,      // embedded
-    C_CYAN,    // escape
-    C_BLUE,    // function
-    C_BLUE,    // function.builtin
-    C_BLUE,    // function.macro
-    C_BLUE,    // function.method
-    C_PURPLE,  // keyword
-    C_RED,     // label
-    C_ORANGE,  // number
-    C_FG,      // operator
-    C_CYAN,    // property
-    C_FG,      // punctuation
-    C_FG,      // punctuation.bracket
-    C_FG,      // punctuation.delimiter
-    C_CYAN,    // punctuation.special
-    C_GREEN,   // string
-    C_CYAN,    // string.special
-    C_RED,     // tag
-    C_YELLOW,  // type
-    C_YELLOW,  // type.builtin
-    C_FG,      // variable
-    C_RED,     // variable.builtin
-    C_FG,      // variable.parameter
-];
-
-/// Color for a highlight-capture name, for tests and debugging.
-#[cfg(test)]
-pub fn color_of(name: &str) -> Option<Color> {
-    HIGHLIGHT_NAMES
-        .iter()
-        .position(|n| *n == name)
-        .map(|i| HIGHLIGHT_COLORS[i])
+/// The capture index for a highlight-capture name — its position in [`HIGHLIGHT_NAMES`], which is
+/// exactly what an [`FgSpan::capture`] holds. Used by [`crate::theme`] and tests to relate a named
+/// capture to the index the highlighter records. `None` for an unrecognized name.
+pub fn capture_index(name: &str) -> Option<usize> {
+    HIGHLIGHT_NAMES.iter().position(|n| *n == name)
 }
 
 fn lang_key_for_ext(ext: &str) -> Option<&'static str> {
@@ -279,8 +238,9 @@ impl TsHighlighter {
                     stack.pop();
                 }
                 HighlightEvent::Source { start, end } => {
-                    let Some(&idx) = stack.last() else { continue };
-                    let color = HIGHLIGHT_COLORS[idx];
+                    let Some(&capture) = stack.last() else {
+                        continue;
+                    };
                     let mut pos = start;
                     while pos < end {
                         let line_idx = line_starts.partition_point(|&s| s <= pos) - 1;
@@ -298,7 +258,7 @@ impl TsHighlighter {
                             out[line_idx].push(FgSpan {
                                 start: pos - line_start,
                                 end: seg_end - line_start,
-                                color,
+                                capture,
                             });
                         }
                         pos = match line_starts.get(line_idx + 1) {
@@ -325,8 +285,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names_and_colors_are_parallel() {
-        assert_eq!(HIGHLIGHT_NAMES.len(), HIGHLIGHT_COLORS.len());
+    fn names_and_syntax_template_are_parallel() {
+        // The capture index space (`HIGHLIGHT_NAMES`) and the theme's per-capture syntax template
+        // must stay the same length — a capture with no slot (or vice versa) would panic at render.
+        assert_eq!(HIGHLIGHT_NAMES.len(), crate::theme::syntax_slot_count());
     }
 
     #[test]
@@ -338,30 +300,33 @@ mod tests {
             .expect("rust grammar available");
         assert_eq!(hl.len(), 3);
 
-        // Line 0: `fn` at bytes 0..2 should be keyword-colored.
-        let kw = color_of("keyword").unwrap();
+        // Spans now carry the semantic capture INDEX (color is resolved at render time against the
+        // theme — see `FgSpan`), so these assert on the capture, not a baked color.
+
+        // Line 0: `fn` at bytes 0..2 should be a keyword capture.
+        let kw = capture_index("keyword").unwrap();
         assert!(
             hl[0]
                 .iter()
-                .any(|s| s.start == 0 && s.end >= 2 && s.color == kw),
+                .any(|s| s.start == 0 && s.end >= 2 && s.capture == kw),
             "expected keyword span over `fn` on line 0, got {:?}",
             hl[0]
         );
 
-        // Line 0: `main` should be function-colored.
-        let func = color_of("function").unwrap();
+        // Line 0: `main` should be a function capture.
+        let func = capture_index("function").unwrap();
         assert!(
             hl[0]
                 .iter()
-                .any(|s| { s.color == func && &src[..11][s.start..s.end.min(11)] == "main" }),
+                .any(|s| { s.capture == func && &src[..11][s.start..s.end.min(11)] == "main" }),
             "expected function span over `main` on line 0, got {:?}",
             hl[0]
         );
 
-        // Line 1: string literal should be string-colored.
-        let string = color_of("string").unwrap();
+        // Line 1: string literal should be a string capture.
+        let string = capture_index("string").unwrap();
         assert!(
-            hl[1].iter().any(|s| s.color == string),
+            hl[1].iter().any(|s| s.capture == string),
             "expected string span on line 1, got {:?}",
             hl[1]
         );
@@ -386,10 +351,10 @@ mod tests {
             }
         }
         // The multiline comment should produce comment spans on all 3 lines.
-        let comment = color_of("comment").unwrap();
+        let comment = capture_index("comment").unwrap();
         for (i, spans) in hl.iter().enumerate() {
             assert!(
-                spans.iter().any(|s| s.color == comment),
+                spans.iter().any(|s| s.capture == comment),
                 "expected comment span on line {i}"
             );
         }

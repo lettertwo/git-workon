@@ -18,6 +18,7 @@ use workon::{Changeset, ChangesetSource};
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
 use crate::apply::{Git2Applier, StageVerb};
+use crate::config::RawViewConfig;
 use crate::highlight::{FgSpan, TsHighlighter};
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
@@ -96,11 +97,14 @@ impl FileView {
     /// render one revision on one side and a different one on the other:
     /// - old side: [`Role::Combined`]/[`Role::Staged`] read the `HEAD` blob; [`Role::Unstaged`]
     ///   reads the INDEX blob (unstaged is index ↔ worktree).
-    /// - new side: [`Role::Combined`]/[`Role::Unstaged`] read the worktree file;
-    ///   [`Role::Staged`] reads the INDEX blob (staged is `HEAD` ↔ index).
+    /// - new side: [`Role::Combined`]/[`Role::Unstaged`] read the worktree file when `new_tree`
+    ///   is `None` (the uncommitted layer); for a committed changeset `new_tree` is the changeset's
+    ///   `head` commit tree, whose blob is read instead (its new side is `base..head`, not the
+    ///   current worktree). [`Role::Staged`] reads the INDEX blob (staged is `HEAD` ↔ index).
     fn load(
         repo: &Repository,
         head_tree: &git2::Tree<'_>,
+        new_tree: Option<&git2::Tree<'_>>,
         file: &FileChange,
         role: Role,
         ts: &mut TsHighlighter,
@@ -117,7 +121,10 @@ impl FileView {
         let new_text = match file.status {
             FileStatus::Deleted => String::new(),
             _ => match role {
-                Role::Combined | Role::Unstaged => read_workdir_file(repo, &file.path),
+                Role::Combined | Role::Unstaged => match new_tree {
+                    Some(tree) => read_head_blob(repo, tree, &file.path),
+                    None => read_workdir_file(repo, &file.path),
+                },
                 Role::Staged => read_index_blob(repo, &file.path),
             },
         };
@@ -314,6 +321,24 @@ fn old_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2:
     }
 }
 
+/// The tree a COMBINED-role [`FileView`]'s NEW side reads from (see [`FileView::load`]'s role
+/// table): the changeset's `head` commit for a committed changeset, or `None` for the uncommitted
+/// layer — where `None` means "read the worktree", the only new-side source M2–M4 ever had. A
+/// committed changeset's combined role is `base..head`, so its new side must read `head`'s blob,
+/// not the current worktree (which for an OLDER committed changeset differs from `head` and would
+/// break the align invariant against the `base..head` hunks). The mirror of [`old_side_tree_for`].
+///
+/// A free function for the same borrow-checker reason as [`old_side_tree_for`]: the returned
+/// [`git2::Tree`] borrows only `repo`, leaving `&mut self.highlighter` free at the call site.
+fn new_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2::Tree<'_>> {
+    match source {
+        ChangesetSource::Committed { head, .. } => {
+            repo.find_commit(head).and_then(|c| c.tree()).ok()
+        }
+        ChangesetSource::Uncommitted => None,
+    }
+}
+
 fn read_head_blob(repo: &Repository, tree: &git2::Tree<'_>, path: &str) -> String {
     tree.get_path(Path::new(path))
         .and_then(|entry| entry.to_object(repo))
@@ -343,6 +368,19 @@ fn read_workdir_file(repo: &Repository, path: &str) -> String {
         .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
         .unwrap_or_default()
 }
+
+/// Default outline pane width (locked design: "~35 cols") — the CS7
+/// (`workon.review.outline.width`) fallback when the setting is unset, out of range, or the
+/// config read fails. Was a `render.rs`-local const before CS7; now App-owned state since it's
+/// configurable per session (see [`OutlineState::width`]).
+pub const DEFAULT_OUTLINE_WIDTH: u16 = 35;
+/// Sane clamp bounds for `workon.review.outline.width` (CS7). Below `MIN_OUTLINE_WIDTH` the
+/// pane can't show a useful path fragment; above `MAX_OUTLINE_WIDTH` it would swallow the diff
+/// pane on any reasonable terminal. Also addresses M5's deferred narrow-terminal papercut: a
+/// user on a narrow terminal can now set a smaller width instead of losing the diff pane
+/// entirely to a fixed 35-col outline.
+pub const MIN_OUTLINE_WIDTH: u16 = 10;
+pub const MAX_OUTLINE_WIDTH: u16 = 200;
 
 /// Which layout the renderer draws the current file's rows in — runtime-toggled via `L`
 /// (prototype analog: `<leader>rl`), and persists across file navigation (neither
@@ -440,6 +478,43 @@ pub fn effective_zoom(
     }
 }
 
+/// Parse `workon.review.outline.mode` (CS7) into an [`OutlineMode`]. Canonical strings mirror
+/// the variant names, kebab-cased: `flat`, `stack`, `tree`, `stack-tree`. `None` on anything
+/// else — [`App::apply_view_config`] falls back to [`OutlineMode::default`] and warns.
+fn parse_outline_mode(raw: &str) -> Option<OutlineMode> {
+    match raw {
+        "flat" => Some(OutlineMode::Flat),
+        "stack" => Some(OutlineMode::Stack),
+        "tree" => Some(OutlineMode::Tree),
+        "stack-tree" => Some(OutlineMode::StackTree),
+        _ => None,
+    }
+}
+
+/// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. Canonical strings mirror the
+/// variant names: `sbs`, `inline`. `None` on anything else — [`App::apply_view_config`] falls
+/// back to [`Layout::default`] and warns.
+fn parse_diff_layout(raw: &str) -> Option<Layout> {
+    match raw {
+        "sbs" => Some(Layout::Sbs),
+        "inline" => Some(Layout::Inline),
+        _ => None,
+    }
+}
+
+/// Parse `workon.review.diff.zoom` (CS7) into a [`Zoom`]. Canonical strings mirror the variant
+/// names: `split`, `combined`, `unstaged`, `staged`. `None` on anything else —
+/// [`App::apply_view_config`] falls back to [`Zoom::default`] and warns.
+fn parse_diff_zoom(raw: &str) -> Option<Zoom> {
+    match raw {
+        "split" => Some(Zoom::Split),
+        "combined" => Some(Zoom::Combined),
+        "unstaged" => Some(Zoom::Unstaged),
+        "staged" => Some(Zoom::Staged),
+        _ => None,
+    }
+}
+
 /// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
 /// than the diff) currently has keyboard focus, its own cursor (an index into
 /// [`App::outline_items`]'s row list — a wholly separate coordinate space from [`App::cursor`]),
@@ -451,6 +526,9 @@ pub struct OutlineState {
     pub focused: bool,
     pub cursor: usize,
     pub mode: OutlineMode,
+    /// The outline pane's column width — `workon.review.outline.width` (CS7), defaulting to
+    /// [`DEFAULT_OUTLINE_WIDTH`]. Read by `render.rs` in place of the old fixed const.
+    pub width: u16,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -659,6 +737,10 @@ pub struct App {
     /// rebuilt-from-scratch — `open`/`focused`/`mode` persist, like [`Self::layout`]/
     /// [`Self::zoom`]) by every diff-initiated nav and by [`Self::refresh`].
     outline: OutlineState,
+    /// Whether the `?` help overlay is showing (CS3). While `true`, `tui::update` intercepts
+    /// every key as a modal (mirroring [`Self::pending_confirm`]'s capture) — see its doc comment
+    /// for the precedence between the two modals.
+    pub help_visible: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -755,6 +837,7 @@ impl App {
             focused: false,
             cursor: 0,
             mode: OutlineMode::default(),
+            width: DEFAULT_OUTLINE_WIDTH,
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -791,6 +874,7 @@ impl App {
             selection_anchor: None,
             refresh_coordinator,
             outline,
+            help_visible: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1153,7 +1237,17 @@ impl App {
                 let Ok(head_tree) = self.repo.head().and_then(|h| h.peel_to_tree()) else {
                     return;
                 };
-                FileView::load(&self.repo, &head_tree, &file, role, &mut self.highlighter)
+                // Non-Combined roles are uncommitted-only (committed changesets have empty
+                // staged/unstaged sub-models), so the new side always stays worktree/index —
+                // `None` here preserves that exactly.
+                FileView::load(
+                    &self.repo,
+                    &head_tree,
+                    None,
+                    &file,
+                    role,
+                    &mut self.highlighter,
+                )
             };
             self.views_for_mut(role)[idx] = Some(view);
             return;
@@ -1169,15 +1263,22 @@ impl App {
         let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.source) else {
             return;
         };
+        // New-side source mirrors the old side: `None` (worktree) for the uncommitted layer,
+        // the changeset's `head` tree for a committed changeset. Same free-fn borrow dance as
+        // `old_side_tree_for` — both trees borrow only `self.repo`, so `&mut self.highlighter`
+        // stays free for `FileView::load`.
+        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.source);
         let file = self.cur().diff.files[idx].clone();
         let view = FileView::load(
             &self.repo,
             &head_tree,
+            new_tree.as_ref(),
             &file,
             Role::Combined,
             &mut self.highlighter,
         );
         drop(head_tree);
+        drop(new_tree);
         self.cur_mut().views_combined[idx] = Some(view);
     }
 
@@ -1262,6 +1363,18 @@ impl App {
             Zoom::Staged => Zoom::Split,
         };
         self.open_current();
+    }
+
+    /// Set the requested zoom directly — the config-startup (CS7) counterpart to
+    /// [`Self::cycle_zoom`]. Skips `cycle_zoom`'s committed-changeset guard: that guard exists
+    /// only to give interactive feedback when a cycle would be a no-op, not to enforce the
+    /// invariant itself — [`Self::effective_zoom_for`] (driven from [`Self::open_current`]'s
+    /// `reset_panes`, which [`Self::apply_view_config`]'s caller runs right after this) already
+    /// collapses a non-stageable changeset to [`Role::Combined`] regardless of the requested
+    /// zoom, so setting the raw value here can never bypass the gate. Does NOT call
+    /// `open_current` itself — the caller applies every CS7 setting first, then opens once.
+    pub fn set_zoom(&mut self, zoom: Zoom) {
+        self.zoom = zoom;
     }
 
     /// Swap focus between the two split panes (`w`) — swaps `cursor`/`scroll`/`pane_height` with
@@ -1414,6 +1527,13 @@ impl App {
         self.outline.cursor
     }
 
+    /// The outline pane's column width — `workon.review.outline.width` (CS7), or
+    /// [`DEFAULT_OUTLINE_WIDTH`] if never set. Read by `render.rs` in place of the old fixed
+    /// const.
+    pub fn outline_width(&self) -> u16 {
+        self.outline.width
+    }
+
     pub fn outline_mode(&self) -> OutlineMode {
         self.outline.mode
     }
@@ -1435,6 +1555,13 @@ impl App {
         }
     }
 
+    /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
+    /// view currently has keyboard focus (see `render::render_help_overlay`), so there is no
+    /// extra state to reposition here, unlike [`Self::toggle_outline`]'s three-state cycle.
+    pub fn toggle_help(&mut self) {
+        self.help_visible = !self.help_visible;
+    }
+
     /// Return focus to the diff without closing the outline (`Esc` while the outline has focus —
     /// `tui::update` routes it here instead of quitting, per the locked design's "Esc must still
     /// not quit when the outline has focus").
@@ -1448,6 +1575,23 @@ impl App {
     pub fn outline_cycle_mode(&mut self) {
         self.outline.mode = self.outline.mode.cycle();
         self.sync_outline_to_current();
+    }
+
+    /// Set the outline pane width directly (CS7: `workon.review.outline.width`, applied by
+    /// [`Self::apply_view_config`] at startup — there's no interactive key for this today). The
+    /// caller is responsible for clamping into `[MIN_OUTLINE_WIDTH, MAX_OUTLINE_WIDTH]`
+    /// (`apply_view_config` does); this setter trusts its input.
+    pub fn set_outline_width(&mut self, width: u16) {
+        self.outline.width = width;
+    }
+
+    /// Set the outline mode directly — the config-startup (CS7) counterpart to
+    /// [`Self::outline_cycle_mode`]. Unlike the interactive cycle, this does NOT call
+    /// [`Self::sync_outline_to_current`]: [`Self::apply_view_config`] runs before the first
+    /// [`Self::open_current`], matching how [`Self::from_changesets`] seeds
+    /// [`OutlineState::mode`] today (the outline cursor starts at `0` either way).
+    pub fn set_outline_mode(&mut self, mode: OutlineMode) {
+        self.outline.mode = mode;
     }
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
@@ -1704,6 +1848,83 @@ impl App {
             };
         }
         self.derive_scroll();
+    }
+
+    /// Set the render layout directly — the config-startup (CS7) counterpart to
+    /// [`Self::toggle_layout`]. Called before the first [`Self::open_current`], whose
+    /// `reset_panes` derives `cursor`/`scroll` fresh for whichever layout is active, so —
+    /// unlike `toggle_layout`, which must clamp an EXISTING cursor into the new layout's row
+    /// count — no separate clamp is needed here. Does NOT call `open_current` itself — the
+    /// caller applies every CS7 setting first, then opens once.
+    pub fn set_layout(&mut self, layout: Layout) {
+        self.layout = layout;
+    }
+
+    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom` (CS7) as
+    /// the App's initial view-config state, via the same setters the interactive keys drive
+    /// (see each setter's doc comment for why that's enough to stay on the gated path). Call
+    /// once, right after construction and before [`Self::open_current`] (see `main.rs`) — the
+    /// setters here don't themselves re-derive `cursor`/`scroll`, and the caller's
+    /// `open_current` is what does that for whichever settings just landed.
+    ///
+    /// `raw` is read via [`crate::config::ReviewConfig::view_config`] BEFORE `repo` moves into
+    /// `App` (see `main.rs`) — its fields already collapsed an unset setting and a config-read
+    /// error to the same `None` (CS7 applies the current hardcoded default for either case, no
+    /// warning). Each setting additionally falls back to the default when SET but invalid — out
+    /// of range (width), or an unrecognized string (mode/layout/zoom) — collecting a warning for
+    /// those cases, same non-fatal posture as the keymap/theme resolution (ADR-034).
+    pub fn apply_view_config(&mut self, raw: &RawViewConfig) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        let width = match raw.outline_width {
+            Some(w) => match u16::try_from(w) {
+                Ok(w) if (MIN_OUTLINE_WIDTH..=MAX_OUTLINE_WIDTH).contains(&w) => w,
+                _ => {
+                    warnings.push(format!(
+                        "workon.review.outline.width = {w} out of range \
+                         ({MIN_OUTLINE_WIDTH}-{MAX_OUTLINE_WIDTH}); using default"
+                    ));
+                    DEFAULT_OUTLINE_WIDTH
+                }
+            },
+            None => DEFAULT_OUTLINE_WIDTH,
+        };
+        self.set_outline_width(width);
+
+        let mode = match &raw.outline_mode {
+            Some(m) => parse_outline_mode(m).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.outline.mode = '{m}' unrecognized; using default"
+                ));
+                OutlineMode::default()
+            }),
+            None => OutlineMode::default(),
+        };
+        self.set_outline_mode(mode);
+
+        let layout = match &raw.diff_layout {
+            Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.diff.layout = '{l}' unrecognized; using default"
+                ));
+                Layout::default()
+            }),
+            None => Layout::default(),
+        };
+        self.set_layout(layout);
+
+        let zoom = match &raw.diff_zoom {
+            Some(z) => parse_diff_zoom(z).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.diff.zoom = '{z}' unrecognized; using default"
+                ));
+                Zoom::default()
+            }),
+            None => Zoom::default(),
+        };
+        self.set_zoom(zoom);
+
+        warnings
     }
 
     /// Set a transient footer notice (see [`Self::notice`]'s doc comment). Overwrites any
@@ -2411,8 +2632,12 @@ mod tests {
     use workon::{Changeset, ChangesetSource};
 
     use super::test_support::app_from_fixture;
-    use super::{find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, EffectiveZoom, Role};
+    use super::{
+        find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, EffectiveZoom, Layout, Role,
+        Zoom, DEFAULT_OUTLINE_WIDTH,
+    };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
+    use crate::config::ReviewConfig;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, StagedStatus};
 
@@ -4537,6 +4762,88 @@ mod tests {
         assert_eq!(app.current, 0);
     }
 
+    /// Regression: navigating to an OLDER committed changeset and loading its combined view must
+    /// source the new side from that changeset's `head` commit tree, not the current worktree. The
+    /// same file `f.txt` is touched by both changesets, so `cs-a`'s head (`mid`) content differs
+    /// from the worktree (which holds `head`'s content). Before the `new_side_tree_for` fix the new
+    /// side read the worktree, whose line count disagreed with `cs-a`'s `base..head` hunks and
+    /// tripped the align invariant (align.rs:165 "trailing context ... must be equal length"). No
+    /// color pinning needed: `new_text()` returns the raw blob text, not highlighted spans.
+    #[test]
+    fn older_committed_changesets_new_side_reads_its_head_tree_not_the_worktree() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("f.txt", "one\n")
+            .create("root")
+            .unwrap();
+        // cs-a (root..mid) adds "two" to f.txt — its head-tree copy is "one\ntwo\n".
+        let mid = fixture
+            .commit("main")
+            .file("f.txt", "one\ntwo\n")
+            .create("mid")
+            .unwrap();
+        // cs-b (mid..head) adds "three" — so the checked-out worktree copy is "one\ntwo\nthree\n",
+        // three lines, which must NOT be what cs-a's combined new side reads.
+        let head = fixture
+            .commit("main")
+            .file("f.txt", "one\ntwo\nthree\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            source: ChangesetSource::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "cs-b".to_string(),
+            source: ChangesetSource::Committed { base: mid, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::from_changeset_diff(
+            cs_b.clone(),
+            crate::acquire::diff_changeset(repo, &cs_b).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.open_current();
+        assert_eq!(app.current_cs(), 1, "opens on cs-b (its current: true)");
+
+        // Navigate back to the older changeset and load its combined view. Pre-fix this panics at
+        // align.rs:165; post-fix it loads cleanly.
+        app.prev_changeset();
+        assert_eq!(app.current_cs(), 0, "prev lands on cs-a");
+        let view = app.current_view().expect("cs-a's combined view must load");
+
+        assert_eq!(
+            view.new_text(),
+            "one\ntwo\n",
+            "new side must read cs-a's head (mid) blob, not the worktree copy"
+        );
+        assert_ne!(
+            view.new_text(),
+            "one\ntwo\nthree\n",
+            "new side must NOT read the worktree (which holds cs-b's head content)"
+        );
+    }
+
     #[test]
     fn bracket_c_jumps_to_the_adjacent_changesets_first_file() {
         let mut app = two_committed_changesets_two_and_one_files();
@@ -4751,6 +5058,18 @@ mod tests {
             !app.outline_open(),
             "toggling again while open-but-unfocused closes the pane"
         );
+    }
+
+    #[test]
+    fn toggle_help_flips_help_visible() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        assert!(!app.help_visible, "help is closed by default");
+
+        app.toggle_help();
+        assert!(app.help_visible, "toggle_help opens it");
+
+        app.toggle_help();
+        assert!(!app.help_visible, "toggle_help closes it again");
     }
 
     #[test]
@@ -5094,5 +5413,146 @@ mod tests {
         assert!(app.outline_open() && !app.outline_focused());
         app.toggle_outline();
         assert!(!app.outline_open());
+    }
+
+    // ── CS7: view-config (`apply_view_config`) ─────────────────────────────────
+
+    #[test]
+    fn unset_view_config_keeps_current_defaults() {
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
+        assert_eq!(app.outline_mode(), OutlineMode::default());
+        assert_eq!(app.layout, Layout::default());
+        assert_eq!(app.zoom, Zoom::default());
+    }
+
+    #[test]
+    fn outline_width_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.width", "40")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_width(), 40);
+    }
+
+    #[test]
+    fn outline_width_out_of_range_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.width", "9999")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outline.width"));
+    }
+
+    #[test]
+    fn outline_mode_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.mode", "tree")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_mode(), OutlineMode::Tree);
+    }
+
+    #[test]
+    fn outline_mode_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.mode", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.outline_mode(), OutlineMode::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outline.mode"));
+    }
+
+    #[test]
+    fn diff_layout_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.layout", "inline")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.layout, Layout::Inline);
+    }
+
+    #[test]
+    fn diff_layout_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.layout", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.layout, Layout::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("diff.layout"));
+    }
+
+    #[test]
+    fn diff_zoom_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.zoom", "staged")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.zoom, Zoom::Staged);
+    }
+
+    #[test]
+    fn diff_zoom_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.zoom", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.zoom, Zoom::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("diff.zoom"));
     }
 }
