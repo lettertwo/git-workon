@@ -48,6 +48,13 @@ pub enum DiffError {
         #[source]
         source: git2::Error,
     },
+
+    /// [`workon::assemble_changesets`] failed to walk the stack (a broken Graphite metadata
+    /// snapshot, an unresolvable branch, etc.) — surfaced distinctly from
+    /// [`Self::ChangesetDiffFailed`], which is a resolved-but-undiffable rev pair.
+    #[error("failed to assemble the changeset stack")]
+    #[diagnostic(code(workon::review::stack_assembly_failed))]
+    StackAssembly(#[from] workon::WorkonError),
 }
 
 /// Errors synthesizing a [`crate::synthesis::PatchText`] from a [`crate::model::FileChange`].

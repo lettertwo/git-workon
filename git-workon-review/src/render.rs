@@ -17,6 +17,7 @@ use crate::app::{App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role
 use crate::attribute::Attribution;
 use crate::highlight::FgSpan;
 use crate::model::FileStatus;
+use crate::outline::OutlineItem;
 use crate::wordiff::Span as WordSpan;
 
 const BG_DEL_SUBTLE: Color = Color::Rgb(60, 24, 24);
@@ -46,6 +47,19 @@ const BG_CURSOR: Color = Color::Rgb(45, 50, 90);
 /// row. The cursor row inside a selection keeps the cursor tint (cursor wins on its own row — see
 /// [`render_pane_sbs`]).
 const BG_SELECTION: Color = Color::Rgb(30, 66, 66);
+/// Warning tone for the winbar's needs-restack marker (locked decision #9) — an amber, distinct
+/// from [`FG_ERROR`]'s red: a stale-parent changeset is a heads-up to `gt restack`, not a failure.
+const FG_WARN: Color = Color::Rgb(214, 158, 46);
+/// Tone for the outline's "this is the lib-marked `current` changeset" marker (locked decision
+/// #9's outline half) — a green, distinct from every other marker color in this module so
+/// "current" reads unambiguously at a glance.
+const FG_CURRENT: Color = Color::Rgb(96, 200, 128);
+/// Cursor tint for the outline pane while it is OPEN but NOT focused — a dimmer wash than
+/// [`BG_CURSOR`] so the outline's remembered position stays legible without competing with the
+/// diff's own (focused) cursor row for visual weight.
+const BG_OUTLINE_CURSOR_UNFOCUSED: Color = Color::Rgb(35, 38, 55);
+/// Fixed column width of the outline side pane (locked design: "~35 cols").
+const OUTLINE_WIDTH: u16 = 35;
 
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
@@ -176,7 +190,10 @@ enum AttributionMode<'a> {
 /// one file) and always correct even if the index changes between frames (the M4 watcher's
 /// concern, not this one's, but the cost of getting it wrong is a stale color).
 fn combined_attribution(app: &App, idx: usize, role: Role) -> Option<Attribution> {
-    if role != Role::Combined {
+    // A committed changeset's combined role is the whole `base..head` range, not a fusion of
+    // staged/unstaged sets — there's nothing to attribute (locked decision #2's "skip
+    // attribution" guard). Every cell renders as plain, undifferentiated change.
+    if role != Role::Combined || app.is_committed() {
         return None;
     }
     let unstaged = app.role_change(idx, Role::Unstaged);
@@ -184,17 +201,16 @@ fn combined_attribution(app: &App, idx: usize, role: Role) -> Option<Attribution
     Some(Attribution::build(unstaged, staged))
 }
 
-/// Resolve the [`AttributionMode`] to render `role` with, given the (possibly absent, for
-/// non-combined roles) [`Attribution`] built by [`combined_attribution`].
+/// Resolve the [`AttributionMode`] to render `role` with, given the (possibly absent)
+/// [`Attribution`] built by [`combined_attribution`] — absent for a non-combined role, OR for a
+/// committed changeset's combined role (see that function's doc comment), in which case combined
+/// renders [`AttributionMode::Plain`] rather than panicking.
 fn attribution_mode(role: Role, attribution: &Option<Attribution>) -> AttributionMode<'_> {
-    match role {
-        Role::Combined => AttributionMode::Attributed(
-            attribution
-                .as_ref()
-                .expect("combined_attribution always builds one for Role::Combined"),
-        ),
-        Role::Unstaged => AttributionMode::Plain,
-        Role::Staged => AttributionMode::StagedUniform,
+    match (role, attribution) {
+        (Role::Combined, Some(a)) => AttributionMode::Attributed(a),
+        (Role::Combined, None) => AttributionMode::Plain,
+        (Role::Unstaged, _) => AttributionMode::Plain,
+        (Role::Staged, _) => AttributionMode::StagedUniform,
     }
 }
 
@@ -343,13 +359,152 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     render_header(frame, app, header_area);
     render_footer(frame, app, footer_area);
-    render_body(frame, app, body_area);
+
+    if app.outline_open() {
+        let hlayout = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(OUTLINE_WIDTH),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
+            .split(body_area);
+        let outline_area = hlayout[0];
+        let div_area = hlayout[1];
+        let diff_area = hlayout[2];
+        render_outline(frame, app, outline_area);
+        for y in div_area.y..div_area.y + div_area.height {
+            frame
+                .buffer_mut()
+                .set_string(div_area.x, y, "│", Style::default().fg(FG_DIM));
+        }
+        render_body(frame, app, diff_area);
+    } else {
+        // Closed: the diff takes the full body width — the exact M4 look (locked design).
+        render_body(frame, app, body_area);
+    }
 }
 
-fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    let idx = app.current + 1;
-    let n = app.files.len();
-    let label = match app.files.get(app.current) {
+/// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
+/// carry the changeset's position marker (green ● for `cs.current`) and needs-restack glyph
+/// (amber ⚠, [`FG_WARN`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
+/// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
+/// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
+/// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
+/// diff's [`App::cursor`]) gets [`BG_CURSOR`] while the outline has focus, or the dimmer
+/// [`BG_OUTLINE_CURSOR_UNFOCUSED`] while it's merely open (so the remembered position stays
+/// legible even after focus returns to the diff).
+fn render_outline(frame: &mut Frame, app: &App, area: Rect) {
+    let items = app.outline_items();
+    let cursor = app.outline_cursor();
+    let focused = app.outline_focused();
+
+    let visible_h = area.height as usize;
+    let scroll = if visible_h == 0 {
+        0
+    } else if cursor >= visible_h {
+        cursor + 1 - visible_h
+    } else {
+        0
+    };
+
+    let buf = frame.buffer_mut();
+    for row in 0..area.height {
+        let item_idx = scroll + row as usize;
+        let y = area.y + row;
+        let Some(item) = items.get(item_idx) else {
+            continue;
+        };
+        let is_cursor = item_idx == cursor;
+        let line = build_outline_line(item);
+        let line = if is_cursor && focused {
+            apply_cursor_row(line, area.width)
+        } else if is_cursor {
+            apply_row_tint(line, area.width, BG_OUTLINE_CURSOR_UNFOCUSED)
+        } else {
+            line
+        };
+        buf.set_line(area.x, y, &line, area.width);
+    }
+}
+
+/// Render a tree-guide prefix from an [`OutlineItem::Dir`]/[`OutlineItem::File`] `guides`
+/// vector: every element but the last draws a continuing `│` (if that ancestor level was NOT
+/// its parent's last child) or blank space (if it was), and the last element draws the row's own
+/// `└─`/`├─` connector.
+fn tree_prefix(guides: &[bool]) -> String {
+    let mut s = String::new();
+    let Some((&is_last, ancestors)) = guides.split_last() else {
+        return s;
+    };
+    for &last in ancestors {
+        s.push_str(if last { "   " } else { "\u{2502}  " });
+    }
+    s.push_str(if is_last {
+        "\u{2514}\u{2500} "
+    } else {
+        "\u{251C}\u{2500} "
+    });
+    s
+}
+
+/// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
+/// marker rules.
+fn build_outline_line(item: &OutlineItem) -> Line<'static> {
+    match item {
+        OutlineItem::Header {
+            label,
+            current,
+            needs_restack,
+            ..
+        } => {
+            let marker = if *current { "\u{25CF} " } else { "  " };
+            let mut spans = vec![TSpan::styled(
+                marker.to_string(),
+                Style::default().fg(FG_CURRENT),
+            )];
+            spans.push(TSpan::styled(
+                label.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ));
+            if *needs_restack {
+                spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
+            }
+            Line::from(spans)
+        }
+        OutlineItem::Dir { name, guides } => {
+            let text = format!("{}{name}/", tree_prefix(guides));
+            Line::from(TSpan::styled(
+                text,
+                Style::default().fg(FG_DIM).add_modifier(Modifier::ITALIC),
+            ))
+        }
+        OutlineItem::File {
+            path,
+            status,
+            guides,
+            ..
+        } => {
+            let glyph = status.glyph();
+            // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
+            // non-empty `guides` (Tree/StackTree modes) draws tree connectors instead — see
+            // `OutlineItem`'s doc comment for why emptiness is the mode signal.
+            let prefix = if guides.is_empty() {
+                "  ".to_string()
+            } else {
+                tree_prefix(guides)
+            };
+            let text = format!("{prefix}{glyph} {path}");
+            Line::from(TSpan::styled(text, Style::default().fg(FG_DEFAULT)))
+        }
+    }
+}
+
+/// The current file's label for the top status row: its path, or a rename's `old @ base ->
+/// path` form — shared by the lone-changeset header and the multi-changeset winbar (they differ
+/// only in what wraps this).
+fn current_file_label(app: &App) -> String {
+    match app.files().get(app.current) {
         Some(f) if f.status == FileStatus::Renamed || f.status == FileStatus::Copied => {
             format!(
                 "{} @ {} -> {}",
@@ -360,12 +515,58 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         }
         Some(f) => f.path.clone(),
         None => String::new(),
-    };
-    let text = format!("[{idx}/{n}] {label}");
+    }
+}
+
+/// The top status row: `[fidx/nfiles] path` for a lone changeset (the M4 look, unchanged), or the
+/// changeset-aware winbar (locked decision #8) once the stack has more than one changeset — the
+/// winbar's own `[i/n]` is the CHANGESET counter, so showing both here would render two different
+/// counters under the same bracket notation. Never both at once.
+fn render_header(frame: &mut Frame, app: &App, area: Rect) {
+    if app.changeset_count() > 1 {
+        render_winbar(frame, app, area);
+        return;
+    }
+    let idx = app.current + 1;
+    let n = app.files().len();
+    let text = format!("[{idx}/{n}] {}", current_file_label(app));
     frame.render_widget(
         Paragraph::new(text).style(Style::default().add_modifier(Modifier::BOLD)),
         area,
     );
+}
+
+/// The multi-changeset winbar (locked decisions #8 + #9): `[i/n] <title-or-name>
+/// <restack-marker>  —  <path> (fidx/nfiles)`, where `i/n` is the changeset's position in the
+/// stack and `fidx/nfiles` the active file's position within it. Only reached when
+/// [`App::changeset_count`] > 1 (see [`render_header`]) — a lone uncommitted changeset never
+/// shows this, keeping the M4 full-width look.
+fn render_winbar(frame: &mut Frame, app: &App, area: Rect) {
+    let cs = app.current_changeset();
+    let i = app.current_cs() + 1;
+    let n = app.changeset_count();
+    let title = cs.title.as_deref().unwrap_or(cs.name.as_str());
+
+    let mut spans = vec![TSpan::styled(
+        format!("[{i}/{n}] {title}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    // A boolean-driven glyph + color (locked decision #9), not a title-string suffix — distinct
+    // from the plain title so a stale-parent changeset reads as a heads-up at a glance.
+    if cs.needs_restack {
+        spans.push(TSpan::styled(
+            "  ⚠ needs restack",
+            Style::default().fg(FG_WARN).add_modifier(Modifier::BOLD),
+        ));
+    }
+    let fidx = app.current + 1;
+    let nfiles = app.files().len();
+    spans.push(TSpan::styled(
+        format!("  —  {} ({fidx}/{nfiles})", current_file_label(app)),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Footer priority: a pending discard confirm's prompt (warn-toned) wins over a transient notice,
@@ -390,7 +591,18 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             );
         }
         None => {
-            let text = "j/k scroll  v select  s/S stage  d/D discard  z zoom  w focus  q quit";
+            // While the outline has focus, only outline-relevant keys act (locked design) — the
+            // diff-editing hint would be actively misleading, so show the outline's own hint
+            // instead.
+            let text = if app.outline_focused() {
+                "j/k move  Enter jump  i mode  o unfocus  Esc unfocus  q quit"
+            } else if app.is_committed() {
+                // A committed changeset is locked to the combined view (locked decision #2) — `z`
+                // zoom and `w` split-focus have nothing to act on, so drop them from the hint.
+                "j/k scroll  v select  s/S stage  d/D discard  q quit"
+            } else {
+                "j/k scroll  v select  s/S stage  d/D discard  z zoom  w focus  q quit"
+            };
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(FG_DIM)),
                 area,
@@ -424,14 +636,14 @@ fn render_gap_row(
 }
 
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect) {
-    if app.files.is_empty() {
+    if app.files().is_empty() {
         frame.render_widget(Paragraph::new("(no changes)"), area);
         return;
     }
 
     let idx = app.current;
-    if app.files[idx].is_binary {
-        let msg = format!("[Binary file: {}]", app.files[idx].path);
+    if app.files()[idx].is_binary {
+        let msg = format!("[Binary file: {}]", app.files()[idx].path);
         frame.render_widget(Paragraph::new(msg).style(Style::default().fg(FG_DIM)), area);
         return;
     }
@@ -1569,6 +1781,482 @@ mod tests {
         assert!(
             !footer.contains("some earlier notice"),
             "the confirm prompt must take priority over the notice, got: {footer:?}"
+        );
+    }
+
+    // ── M5 CS2: winbar (locked decisions #8 + #9) ─────────────────────────────
+
+    /// Build a two-committed-changeset stack for the winbar tests, hand-built the same way as
+    /// `app.rs`'s M5 CS1 tests (`Changeset` literal + `diff_changeset` +
+    /// `ChangesetView::from_changeset_diff`): `cs-a` (`root..mid`, one file) then `cs-b`
+    /// (`mid..head`, one file, `current` + `needs_restack`).
+    fn two_committed_changesets_app(fixture: &Fixture) -> App {
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSource};
+
+        use crate::app::ChangesetView;
+
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mid = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("mid")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("b.txt", "b\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            source: ChangesetSource::Committed {
+                base: root,
+                head: mid,
+            },
+            title: Some("Add a".to_string()),
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "cs-b".to_string(),
+            source: ChangesetSource::Committed { base: mid, head },
+            title: None,
+            current: true,
+            needs_restack: true,
+        };
+
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::from_changeset_diff(
+            cs_b.clone(),
+            crate::acquire::diff_changeset(repo, &cs_b).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.open_current();
+        app
+    }
+
+    #[test]
+    fn winbar_shows_changeset_position_title_path_and_restack_marker() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+
+        assert!(
+            header.contains("[2/2]"),
+            "expected the changeset position counter, got: {header:?}"
+        );
+        assert!(
+            header.contains("cs-b"),
+            "expected the active changeset's name (no title set), got: {header:?}"
+        );
+        assert!(
+            header.contains("needs restack"),
+            "expected the needs-restack marker, got: {header:?}"
+        );
+        assert!(
+            header.contains("b.txt") && header.contains("(1/1)"),
+            "expected the active file's path and position, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn winbar_restack_marker_carries_the_warning_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        let marker_x = header.find('⚠').expect("restack glyph present") as u16;
+        assert_eq!(
+            buf.cell((marker_x, 0)).unwrap().style().fg,
+            Some(super::FG_WARN),
+            "expected the restack glyph to carry the warning color, not the plain header color"
+        );
+    }
+
+    #[test]
+    fn winbar_uses_title_when_present() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.prev_changeset();
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("Add a"),
+            "expected the changeset's title, not its bare name, got: {header:?}"
+        );
+        assert!(
+            !header.contains("needs restack"),
+            "cs-a is not stale, so no restack marker should show, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn winbar_absent_for_a_lone_changeset() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("[1/1]"),
+            "a lone changeset keeps the M4 `[fidx/nfiles]` file counter, got: {header:?}"
+        );
+        assert!(
+            !header.contains('⚠'),
+            "a lone changeset must not render the winbar chrome, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn committed_changeset_combined_view_skips_attribution_and_renders_plain() {
+        // A committed changeset's combined role has no staged/unstaged split to attribute
+        // against (`DiffState::from_committed` leaves both sub-models empty) — without the
+        // `is_committed` skip in `combined_attribution`, `Attribution::build(None, None)` would
+        // still run and its empty `unstaged_adds` set would make EVERY Add cell read as
+        // "already staged" (the dim pair), which is wrong: nothing here was staged from
+        // anything, it's a committed range. Assert the fix: the Add side renders the plain
+        // (bright) pair.
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSource};
+
+        use crate::app::ChangesetView;
+
+        let committed = "l1\nold word here\nl3\n";
+        let head_content = "l1\nnew word here\nl3\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("f.txt", committed)
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("f.txt", head_content)
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: "main".to_string(),
+            source: ChangesetSource::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        assert!(app.is_committed());
+        // Park the cursor off the changed row so its highlight tint doesn't blend into the Add
+        // cell's background and muddy the color comparison below (same convention as
+        // `combined_view_colors_a_staged_change_dim_and_an_unstaged_change_bright`).
+        app.cursor = 0;
+        app.derive_scroll();
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+        let row_y = content
+            .iter()
+            .position(|line| line.contains("new word here"))
+            .expect("new-side text visible") as u16;
+
+        let left_w = (buf.area.width.saturating_sub(1)) / 2;
+        let new_content_x = left_w + 1 + 4; // divider + gutter width 3 + 1 space
+        let add_bg = buf.cell((new_content_x, row_y)).unwrap().style().bg;
+
+        let bright_adds = [Some(BG_ADD_SUBTLE), Some(BG_ADD_STRONG)];
+        let dim_adds = [Some(BG_ADD_STAGED_SUBTLE), Some(BG_ADD_STAGED_STRONG)];
+        assert!(
+            bright_adds.contains(&add_bg),
+            "expected a committed changeset's Add cell to render the plain (bright) pair, \
+             got {add_bg:?}"
+        );
+        assert!(
+            !dim_adds.contains(&add_bg),
+            "a committed changeset has no staged/unstaged split to color by — it must never \
+             render the dim 'already staged' pair, got {add_bg:?}"
+        );
+    }
+
+    // ── M5 CS3: outline side pane ───────────────────────────────────────────────
+
+    /// Every outline test renders at this width so the pane's fixed 35-col + 1-col-divider
+    /// layout is unambiguous: columns `0..35` are the outline, `35` the divider, `36..` the
+    /// diff.
+    const OUTLINE_TEST_WIDTH: u16 = 80;
+
+    fn outline_row(buf: &Buffer, y: u16) -> String {
+        (0..35).map(|x| cell_text(buf, x, y)).collect()
+    }
+
+    #[test]
+    fn outline_pane_renders_headers_when_open_and_disappears_when_closed() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(
+            app.outline_open(),
+            "a two-changeset stack must default-open the outline"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            content.iter().any(|row| row.contains("Add a")),
+            "expected the outline's Stack-mode header row for cs-a (rendered by its title), \
+             got:\n{}",
+            content.join("\n")
+        );
+
+        // Default state is open+unfocused, so a single `o` closes it (see
+        // `App::toggle_outline`'s cycle).
+        app.toggle_outline();
+        assert!(!app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            !content.iter().any(|row| row.contains("Add a")),
+            "closing the outline must stop rendering its rows, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_absent_for_a_lone_changeset() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        assert!(!app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // The diff's own content (the M4 full-width look) must reach all the way to the left
+        // edge — column 0 — rather than starting past a 36-column outline+divider offset.
+        let row1: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 1)).collect();
+        assert!(
+            row1.contains("a.txt") || row1.trim().is_empty() || row1.contains("one"),
+            "sanity: body row must be diff content, not outline chrome, got: {row1:?}"
+        );
+        assert_ne!(
+            cell_text(&buf, 35, 1),
+            "│",
+            "a closed outline must not draw its divider column"
+        );
+    }
+
+    #[test]
+    fn outline_header_current_marker_uses_the_current_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b is `current`
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .position(|r| r.contains('\u{25CF}'))
+            .expect("current marker present in the outline");
+        let marker_x = content[row].find('\u{25CF}').unwrap() as u16;
+        assert_eq!(
+            buf.cell((marker_x, row as u16)).unwrap().style().fg,
+            Some(super::FG_CURRENT),
+            "expected the outline's current marker to carry FG_CURRENT"
+        );
+    }
+
+    #[test]
+    fn outline_header_restack_marker_carries_the_warning_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b needs_restack: true
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .position(|r| r.contains('\u{26A0}'))
+            .expect("restack marker present in the outline");
+        let marker_x = content[row].find('\u{26A0}').unwrap() as u16;
+        assert_eq!(
+            buf.cell((marker_x, row as u16)).unwrap().style().fg,
+            Some(super::FG_WARN),
+            "expected the outline's restack glyph to carry FG_WARN"
+        );
+    }
+
+    #[test]
+    fn outline_cursor_row_carries_cursor_background_when_focused() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        // Default is open+unfocused; two toggles: close, then reopen (which focuses).
+        app.toggle_outline();
+        app.toggle_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let cursor_y = 1 + app.outline_cursor() as u16;
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        assert_eq!(
+            buf.cell((2, cursor_y)).unwrap().style().bg,
+            Some(super::BG_CURSOR),
+            "expected the outline's cursor row to carry BG_CURSOR while focused"
+        );
+    }
+
+    #[test]
+    fn outline_flat_mode_dedupes_paths_across_the_stack() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.outline_cycle_mode(); // Stack -> Tree
+        app.outline_cycle_mode(); // Tree -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Flat);
+
+        let items = app.outline_items();
+        let paths: Vec<&str> = items
+            .iter()
+            .map(|it| match it {
+                crate::outline::OutlineItem::File { path, .. } => path.as_str(),
+                crate::outline::OutlineItem::Header { .. }
+                | crate::outline::OutlineItem::Dir { .. } => {
+                    panic!("Flat mode must not emit header or dir rows")
+                }
+            })
+            .collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            paths.len(),
+            sorted.len(),
+            "every path must appear exactly once in Flat mode, got: {paths:?}"
+        );
+    }
+
+    /// A single committed changeset touching a nested path (`src/a.txt`) and a top-level path
+    /// (`top.txt`), for the Tree-mode render test — the outline test fixtures above are
+    /// deliberately flat and never produce a directory row.
+    fn changeset_with_nested_paths(fixture: &Fixture) -> App {
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSource};
+
+        use crate::app::ChangesetView;
+
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("top.txt", "t\n")
+            .file("src/a.txt", "a\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: "cs".to_string(),
+            source: ChangesetSource::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        app
+    }
+
+    #[test]
+    fn outline_tree_mode_renders_directory_rows_with_tree_guides() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        // A lone changeset defaults the outline closed (locked design) — force it open so this
+        // render test can inspect its rows.
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> Tree
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        // Row order per the dirs-after-files/alpha-within-group rule, one outline row per
+        // buffer row starting at y=1 (y=0 is the winbar): `top.txt` (file, root, NOT the root's
+        // last child — `src/` follows), `src/` (dir, root, IS the root's last child), then
+        // `a.txt` nested one level under `src/` (the only — hence last — child of `src/`).
+        assert!(
+            content[1].contains('\u{251C}') && content[1].contains("top.txt"),
+            "expected row 1 to be top.txt with a non-last '├─' guide, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content[2].contains('\u{2514}') && content[2].contains("src/"),
+            "expected row 2 to be the src/ directory row with a last-child '└─' guide, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content[3].contains('\u{2514}') && content[3].contains("a.txt"),
+            "expected row 3 to be src/a.txt, indented under src/ with its own last-child '└─' \
+             guide, got:\n{}",
+            content.join("\n")
         );
     }
 }
