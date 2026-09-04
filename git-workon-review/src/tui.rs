@@ -15,6 +15,13 @@
 //! `event::poll`'s timeout to the channel's. The M4 index watcher's *semantics* are exactly
 //! unchanged by this move: it still compares [`workon_review::refresh::IndexSignature`] and
 //! re-diffs in place via [`App::on_tick`] on every `Tick`; only the beat's mechanism moved.
+//!
+//! CS10 turns the mouse on: [`Tui::acquire`] enables capture for the whole session (undone by
+//! [`Tui::restore`] and, unconditionally, the panic hook), and [`map_terminal_event`] maps a
+//! left-click or wheel-scroll into an [`AppEvent::Mouse`] the loop dispatches to
+//! [`workon_review::app::App::handle_click`]/[`workon_review::app::App::handle_wheel`] — every
+//! other mouse kind (drag, move, non-left buttons, button-up) is still dropped, same as key
+//! release/repeat.
 
 use std::fs::File;
 use std::io::{self, Write};
@@ -23,7 +30,10 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -52,6 +62,10 @@ use workon_review::theme::Palette;
 pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
+    /// A left-click or wheel-scroll (CS10) — the only [`MouseEventKind`]s [`map_terminal_event`]
+    /// maps; drag, move, non-left buttons, and up events are dropped at the mapping step, exactly
+    /// like key release/repeat.
+    Mouse(MouseEvent),
     Tick,
     /// One [`LoadRequest`]'s result — ADR-037's loader-result variant. `gen`/`cs_idx`/`file_idx`
     /// echo the request's stamp; `result` is `Err` for a job that panicked or otherwise failed
@@ -78,15 +92,20 @@ pub enum AppEvent {
 
 impl PartialEq for AppEvent {
     /// Manual, deliberately PARTIAL equality (can't derive — `FileReady`'s `LoadedViews` payload
-    /// isn't `PartialEq`, see the enum's doc comment): `Key`/`Resize`/`Tick` compare structurally,
-    /// exactly like the pre-ADR-037 derive did, for the input-thread tests that still assert
-    /// mapped-event shape via `assert_eq!`. Two `FileReady` events are never considered equal —
-    /// there's no sound definition of "the same loader result" once `FileView` can't be compared,
-    /// and nothing needs one; tests that care about a `FileReady`'s fields match on them directly.
+    /// isn't `PartialEq`, see the enum's doc comment): `Key`/`Resize`/`Mouse`/`Tick` compare
+    /// structurally, exactly like the pre-ADR-037 derive did, for the input-thread tests that
+    /// still assert mapped-event shape via `assert_eq!`. Two `FileReady` events are never
+    /// considered equal — there's no sound definition of "the same loader result" once `FileView`
+    /// can't be compared, and nothing needs one; tests that care about a `FileReady`'s fields
+    /// match on them directly. Every fully-comparable variant needs its own arm here: the
+    /// `_ => false` catch-all exists ONLY for `FileReady`/`ChangesetReady`, and letting a
+    /// comparable variant fall into it silently breaks reflexivity (`Mouse` did exactly that
+    /// when CS10 first added it — crossterm's `MouseEvent` derives `PartialEq` fine).
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (AppEvent::Key(a), AppEvent::Key(b)) => a == b,
             (AppEvent::Resize(w1, h1), AppEvent::Resize(w2, h2)) => w1 == w2 && h1 == h2,
+            (AppEvent::Mouse(a), AppEvent::Mouse(b)) => a == b,
             (AppEvent::Tick, AppEvent::Tick) => true,
             _ => false,
         }
@@ -98,15 +117,28 @@ impl PartialEq for AppEvent {
 /// still observable, just relayed rather than swallowed). `Tick` never appears here.
 type InboxMessage = io::Result<AppEvent>;
 
-/// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press and
-/// resize map; key release/repeat, mouse, paste, and focus events are skipped (`None`), exactly
-/// like this module's pre-ADR-037 `next_event`/`drain_pending` read arms did. Pure and
-/// independent of any thread or channel, so it's unit-tested directly; the input thread's loop
-/// body is a thin wrapper around it.
+/// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press,
+/// resize, and (CS10, extended by the mouse h-wheel follow-up) a left-click or vertical/
+/// horizontal wheel-scroll map; key release/repeat, every other mouse kind (drag, move, non-left
+/// buttons, button-up), paste, and focus events are skipped (`None`). Pure and independent of any
+/// thread or channel, so it's unit-tested directly; the input thread's loop body is a thin wrapper
+/// around it.
 fn map_terminal_event(event: Event) -> Option<AppEvent> {
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => Some(AppEvent::Key(key)),
         Event::Resize(w, h) => Some(AppEvent::Resize(w, h)),
+        Event::Mouse(m)
+            if matches!(
+                m.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            ) =>
+        {
+            Some(AppEvent::Mouse(m))
+        }
         _ => None,
     }
 }
@@ -415,6 +447,8 @@ enum Action {
     StartSelection,
     ExpandGap,
     ExpandGapAll,
+    HscrollLeft,
+    HscrollRight,
     ToggleOutline,
     OutlineMoveBy(i64),
     OutlineConfirm,
@@ -425,6 +459,12 @@ enum Action {
     OutlineBottom,
     OutlineStage,
     OutlineDiscard,
+    OutlineHscrollLeft,
+    OutlineHscrollRight,
+    OutlineNextChangeset,
+    OutlinePrevChangeset,
+    OutlineCollapseAll,
+    OutlineExpandAll,
     None,
 }
 
@@ -455,6 +495,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::StartSelection => Action::StartSelection,
         Command::ExpandGap => Action::ExpandGap,
         Command::ExpandGapAll => Action::ExpandGapAll,
+        Command::HscrollLeft => Action::HscrollLeft,
+        Command::HscrollRight => Action::HscrollRight,
         Command::NextFile => Action::NextFile,
         Command::PrevFile => Action::PrevFile,
         Command::NextHunk => Action::NextHunk,
@@ -471,6 +513,12 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::OutlineBottom => Action::OutlineBottom,
         Command::OutlineStage => Action::OutlineStage,
         Command::OutlineDiscard => Action::OutlineDiscard,
+        Command::OutlineHscrollLeft => Action::OutlineHscrollLeft,
+        Command::OutlineHscrollRight => Action::OutlineHscrollRight,
+        Command::OutlineNextChangeset => Action::OutlineNextChangeset,
+        Command::OutlinePrevChangeset => Action::OutlinePrevChangeset,
+        Command::OutlineCollapseAll => Action::OutlineCollapseAll,
+        Command::OutlineExpandAll => Action::OutlineExpandAll,
     }
 }
 
@@ -582,16 +630,36 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::StartSelection => app.start_selection(),
         Action::ExpandGap => app.expand_gap_at_cursor(false),
         Action::ExpandGapAll => app.expand_gap_at_cursor(true),
+        Action::HscrollLeft => app.hscroll_left(),
+        Action::HscrollRight => app.hscroll_right(),
         Action::ToggleOutline => app.toggle_outline(),
         Action::OutlineMoveBy(delta) => app.outline_move_by(delta),
         Action::OutlineConfirm => app.outline_confirm(),
         Action::OutlineCycleMode => app.outline_cycle_mode(),
-        Action::FocusOutline => app.focus_outline(),
+        // `h`/`left` pans the diff back to column 0 first (mirroring the outline's own home
+        // position) and only actually focuses the outline once there — see the handoff's locked
+        // decision #2. Implemented here rather than in `App::focus_outline` itself, since that
+        // method is also called from the outline toggle (`App::toggle_outline`) and the mouse
+        // click/wheel paths (`App::handle_click`/`handle_wheel`), none of which should gain pan
+        // behavior.
+        Action::FocusOutline => {
+            if app.hscroll > 0 {
+                app.hscroll_left();
+            } else {
+                app.focus_outline();
+            }
+        }
         Action::FocusDiff => app.focus_diff(),
         Action::OutlineTop => app.outline_top(),
         Action::OutlineBottom => app.outline_bottom(),
         Action::OutlineStage => app.outline_stage(),
         Action::OutlineDiscard => app.outline_discard(),
+        Action::OutlineHscrollLeft => app.outline_hscroll_left(),
+        Action::OutlineHscrollRight => app.outline_hscroll_right(),
+        Action::OutlineNextChangeset => app.outline_next_changeset(),
+        Action::OutlinePrevChangeset => app.outline_prev_changeset(),
+        Action::OutlineCollapseAll => app.outline_collapse_all(),
+        Action::OutlineExpandAll => app.outline_expand_all(),
         Action::None => {}
     }
     false
@@ -695,6 +763,23 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             KeyOutcome::Handled => false,
             KeyOutcome::Action(action) => apply_action(app, action),
         },
+        // CS10: both modals swallow mouse input exactly like they swallow keys (cases 1-2 above)
+        // — a click/wheel while a discard confirm or the help overlay is up does nothing.
+        AppEvent::Mouse(_) if app.pending_confirm.is_some() || app.help_visible => false,
+        AppEvent::Mouse(m) => {
+            app.clear_notice();
+            match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => app.handle_click(m.column, m.row),
+                MouseEventKind::ScrollDown => app.handle_wheel(m.column, m.row, 3),
+                MouseEventKind::ScrollUp => app.handle_wheel(m.column, m.row, -3),
+                // 4 columns per tick — finer than `HSCROLL_STEP` since trackpads emit streams of
+                // ticks (see `App::handle_hwheel`'s doc comment).
+                MouseEventKind::ScrollRight => app.handle_hwheel(m.column, m.row, 4),
+                MouseEventKind::ScrollLeft => app.handle_hwheel(m.column, m.row, -4),
+                _ => {}
+            }
+            false
+        }
         AppEvent::Tick => {
             app.on_tick();
             false
@@ -878,7 +963,11 @@ fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
         let mut out = terminal_writer();
-        let _ = execute!(out, LeaveAlternateScreen);
+        // CS10: disable mouse capture unconditionally, same as `Tui::restore` — a stray disable
+        // sequence when capture was never enabled (a panic before `Tui::acquire` reaches its own
+        // `EnableMouseCapture`) is harmless, and there's no cheaper way from here to know whether
+        // capture is currently on.
+        let _ = execute!(out, DisableMouseCapture, LeaveAlternateScreen);
         default_hook(info);
     }));
 }
@@ -903,7 +992,10 @@ impl Tui {
         install_panic_hook();
         enable_raw_mode()?;
         let mut out = terminal_writer();
-        execute!(out, EnterAlternateScreen)?;
+        // CS10: capture the mouse for the whole session — `map_terminal_event` only ever lets a
+        // left-click or wheel-scroll through, so this doesn't cost the terminal's normal
+        // text-selection UX beyond what most terminals' shift-click bypass already covers.
+        execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(out);
         let terminal = Terminal::new(backend)?;
         Ok(Self {
@@ -1014,7 +1106,14 @@ impl Tui {
         }
         self.restored = true;
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
+        // CS10: disable mouse capture before leaving the alternate screen — same ordering
+        // convention as the raw-mode/alternate-screen pair, undone in the reverse order acquire
+        // set them up in.
+        execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        )?;
         self.terminal.show_cursor()
     }
 }
@@ -1144,9 +1243,18 @@ mod tests {
         );
     }
 
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 5,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     #[test]
-    fn map_terminal_event_skips_release_repeat_mouse_paste_and_focus() {
-        use crossterm::event::{KeyEventState, MouseEvent, MouseEventKind};
+    fn map_terminal_event_skips_release_repeat_paste_and_focus() {
+        use crossterm::event::KeyEventState;
 
         let release = KeyEvent::new_with_kind(
             KeyCode::Char('q'),
@@ -1163,18 +1271,73 @@ mod tests {
         );
         assert_eq!(map_terminal_event(Event::Key(repeat)), None);
 
-        assert_eq!(
-            map_terminal_event(Event::Mouse(MouseEvent {
-                kind: MouseEventKind::Moved,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            })),
-            None
-        );
         assert_eq!(map_terminal_event(Event::Paste("pasted".to_string())), None);
         assert_eq!(map_terminal_event(Event::FocusGained), None);
         assert_eq!(map_terminal_event(Event::FocusLost), None);
+    }
+
+    /// CS10: `map_terminal_event` maps ONLY a left-click-down or a wheel-scroll to
+    /// `AppEvent::Mouse`; every other mouse kind — drag, move, button-up, and non-left buttons —
+    /// is still dropped, exactly like the pre-CS10 version dropped every mouse event outright.
+    /// This supersedes the old `map_terminal_event_skips_release_repeat_mouse_paste_and_focus`
+    /// pin (split above into the non-mouse skip cases, which are unchanged by CS10).
+    #[test]
+    fn map_terminal_event_maps_left_down_and_scroll_but_drops_other_mouse_kinds() {
+        let left_down = mouse(MouseEventKind::Down(MouseButton::Left));
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(left_down)),
+            Some(AppEvent::Mouse(m)) if m == left_down
+        ));
+
+        let scroll_up = mouse(MouseEventKind::ScrollUp);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_up)),
+            Some(AppEvent::Mouse(m)) if m == scroll_up
+        ));
+
+        let scroll_down = mouse(MouseEventKind::ScrollDown);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_down)),
+            Some(AppEvent::Mouse(m)) if m == scroll_down
+        ));
+
+        // Dropped: drag, move, button-up, and a right-click-down.
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Drag(MouseButton::Left)))),
+            None
+        );
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Moved))),
+            None
+        );
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Up(MouseButton::Left)))),
+            None
+        );
+        assert_eq!(
+            map_terminal_event(Event::Mouse(mouse(MouseEventKind::Down(
+                MouseButton::Right
+            )))),
+            None
+        );
+    }
+
+    /// Mouse h-wheel follow-up: `ScrollLeft`/`ScrollRight` (trackpad h-scroll, or a shift-wheel
+    /// the terminal reports this way) map through exactly like the vertical `ScrollUp`/
+    /// `ScrollDown` pair above.
+    #[test]
+    fn map_terminal_event_maps_scroll_left_and_right() {
+        let scroll_left = mouse(MouseEventKind::ScrollLeft);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_left)),
+            Some(AppEvent::Mouse(m)) if m == scroll_left
+        ));
+
+        let scroll_right = mouse(MouseEventKind::ScrollRight);
+        assert!(matches!(
+            map_terminal_event(Event::Mouse(scroll_right)),
+            Some(AppEvent::Mouse(m)) if m == scroll_right
+        ));
     }
 
     /// `AppEvent` dropped `PartialEq`/`Eq` in ADR-037 (`FileReady`'s `LoadedViews` payload wraps
@@ -1881,6 +2044,50 @@ mod tests {
         repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
     }
 
+    /// CS10: a pending discard confirm swallows a mouse event exactly like it swallows a key —
+    /// mirrors `pending_confirm_captures_y_and_n_and_ignores_other_keys` above. A click inside a
+    /// live hit region must not move the cursor or resolve the confirm.
+    #[test]
+    fn pending_confirm_swallows_a_mouse_click() {
+        use workon_review::app::{PendingOp, Region};
+
+        let fixture = git_workon_fixture::prelude::FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\nthree\n", "one\nCHANGED\nthree\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+
+        app.request_confirm("Discard? (y/n)", PendingOp::DiscardFile { file_idx: 0 });
+        let cursor_before = app.cursor;
+        let quit = update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Mouse(mouse(MouseEventKind::Down(MouseButton::Left))),
+        );
+
+        assert!(!quit);
+        assert!(
+            app.pending_confirm.is_some(),
+            "a mouse event must not resolve the confirm"
+        );
+        assert_eq!(
+            app.cursor, cursor_before,
+            "a swallowed click must not move the cursor"
+        );
+    }
+
     // ── M5 CS3: outline pane key routing ─────────────────────────────────────
 
     /// A two-committed-changeset stack, built the same way as `app.rs`/`render.rs`'s own M5
@@ -2223,15 +2430,26 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
-        // CS3: pin BaseFirst explicitly — this test exercises Enter's header-jump + focus
-        // return, which is orthogonal to display order, but the `-3` row offset below assumes
-        // the base->head row layout.
+        // CS3: pin BaseFirst explicitly — this test exercises Enter's File-row jump + focus
+        // return, which is orthogonal to display order, but the row offset below assumes the
+        // base->head row layout.
         app.set_outline_order(workon_review::outline::OutlineOrder::BaseFirst);
         app.toggle_outline(); // close
         app.toggle_outline(); // open + focus, cursor synced onto cs-b's file row
         assert!(app.outline_focused());
-        // Move the outline cursor up onto cs-a's header row.
-        app.outline_move_by(-3);
+        // Move the outline cursor onto cs-a's FILE row (rows, BaseFirst: [Header a, File a.txt,
+        // Header b, File b.txt] — cursor starts at 3; -2 lands on File a.txt at row 1). CS5
+        // (`outline-fold`) removed Enter's old header-jump behavior — see
+        // `enter_on_a_header_row_toggles_fold_and_keeps_focus` below for that case — so this
+        // keybinding-dispatch test needs a File row to still exercise a real jump+unfocus.
+        app.outline_move_by(-2);
+        assert_eq!(
+            app.current_cs(),
+            0,
+            "sanity: the move itself already landed on cs-a's file (moving onto a File row \
+             always jumps, per `outline_move_by`'s own contract) — Enter below re-confirms the \
+             same jump through the real keybinding-dispatch path"
+        );
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
 
@@ -2245,12 +2463,63 @@ mod tests {
         assert_eq!(
             app.current_cs(),
             0,
-            "Enter on cs-a's header must jump there"
+            "Enter on a File row must (still) land on cs-a"
         );
-        assert_eq!(app.current, 0, "...landing on its first file");
+        assert_eq!(app.current, 0, "...landing on its file");
         assert!(
             !app.outline_focused(),
-            "Enter returns focus to the diff after jumping"
+            "Enter on a File row returns focus to the diff"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_header_row_toggles_fold_and_keeps_focus() {
+        // CS5 (`outline-fold`): Enter on a Header/Dir row no longer jumps+unfocuses — it toggles
+        // that row's fold and deliberately keeps focus. This is the header-row counterpart to
+        // `enter_confirms_an_outline_jump_and_returns_focus_to_the_diff` above, verified through
+        // the same real keybinding-dispatch path (`update`/`map_key`), not a direct
+        // `App::outline_confirm()` call.
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.set_outline_order(workon_review::outline::OutlineOrder::BaseFirst);
+        app.toggle_outline(); // close
+        app.toggle_outline(); // open + focus, cursor synced onto cs-b's file row
+                              // Move the outline cursor onto cs-a's header row (rows, BaseFirst: [Header a, File a.txt,
+                              // Header b, File b.txt] — cursor starts at 3; -3 lands on Header a at row 0, which never
+                              // jumps).
+        app.outline_move_by(-3);
+        let before_cs = app.current_cs();
+        let before_file = app.current;
+        let rows_before = app.outline_items().len();
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        update(
+            &mut app,
+            &km,
+            &mut pending,
+            AppEvent::Key(key(KeyCode::Enter)),
+        );
+
+        assert_eq!(
+            app.current_cs(),
+            before_cs,
+            "Enter on a header must NOT jump the diff (CS5)"
+        );
+        assert_eq!(app.current, before_file);
+        assert!(
+            app.outline_focused(),
+            "Enter on a header toggles its fold and keeps focus (CS5), rather than confirming a \
+             jump"
+        );
+        assert!(
+            app.outline_items().len() < rows_before,
+            "cs-a's file row must now be hidden under its collapsed header"
         );
     }
 
@@ -3087,6 +3356,92 @@ mod tests {
         assert!(
             app.current_view_ref().is_some(),
             "the active file's view must be cached after its FileReady lands"
+        );
+    }
+
+    // ── diff-hscroll: `Action::FocusOutline` pans home before focusing ─────────────
+
+    /// Locked decision #2: `h`/`left` (`Action::FocusOutline`) pans the diff back toward column
+    /// `0` first while panned, and only actually focuses the outline once there — implemented in
+    /// this dispatch arm rather than in `App::focus_outline` itself (see that arm's comment), so
+    /// this is only testable at the `apply_action` layer, not through `App` alone.
+    #[test]
+    fn focus_outline_action_pans_home_before_focusing_when_panned() {
+        use git_workon_fixture::prelude::*;
+
+        let long_line = "x".repeat(200);
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "short\n", &format!("{long_line}\n"))
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.hscroll_right();
+        assert!(
+            app.hscroll > 0,
+            "the long line must give hscroll room to pan"
+        );
+        assert!(!app.outline_focused());
+
+        // Panned: the first press pans back toward column 0 rather than focusing the outline.
+        apply_action(&mut app, Action::FocusOutline);
+        assert_eq!(
+            app.hscroll, 0,
+            "one press from a single hscroll step returns to column 0"
+        );
+        assert!(
+            !app.outline_focused(),
+            "still unfocused — this press only panned"
+        );
+
+        // Already at column 0: the next press focuses the outline as normal.
+        apply_action(&mut app, Action::FocusOutline);
+        assert!(app.outline_focused());
+    }
+
+    /// Mouse h-wheel follow-up: a `ScrollRight` event reaches `App::handle_hwheel` (not the
+    /// vertical `App::handle_wheel`) when dispatched through the full `update` path — mirroring
+    /// how the existing vertical-wheel tests exercise `App::handle_wheel` directly, but this one
+    /// goes through `map_terminal_event` + `update`'s mouse arm to also pin the event mapping.
+    #[test]
+    fn scroll_right_event_reaches_handle_hwheel_via_update() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Region;
+
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(app.hscroll, 0);
+
+        let raw = MouseEvent {
+            kind: MouseEventKind::ScrollRight,
+            column: 10,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Round-trip through the real mapping first, matching how the input thread feeds `update`.
+        let mapped = map_terminal_event(Event::Mouse(raw)).expect("ScrollRight must map");
+        update(&mut app, &km, &mut pending, mapped);
+
+        assert!(
+            app.hscroll > 0,
+            "a ScrollRight event over the diff pane must pan App::hscroll via handle_hwheel"
         );
     }
 }

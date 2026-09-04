@@ -9,10 +9,11 @@
 //! handle so it can lazily read blob/worktree content per file as the user navigates to it,
 //! independent of whatever handle acquired the [`DiffModel`] it was built from.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use git2::Repository;
+use unicode_width::UnicodeWidthStr;
 use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
@@ -23,10 +24,12 @@ use crate::align::{
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
 use crate::highlight::{lang_key_for_ext, FgSpan, TsHighlighter};
-use crate::icons::OutlineIcons;
+use crate::icons::IconMode;
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
-use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder};
+use crate::outline::{
+    self, FoldKey, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder,
+};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::scope::enclosing_scope_lines;
@@ -39,6 +42,10 @@ use crate::wordiff::{word_diff_spans, Span};
 /// Minimum rows kept between the cursor and the top/bottom of the pane while scrolling — see
 /// [`App::derive_scroll`].
 const SCROLLOFF: usize = 2;
+
+/// Display columns panned per `hscroll-left`/`hscroll-right` press — see [`App::hscroll_left`]/
+/// [`App::hscroll_right`].
+const HSCROLL_STEP: usize = 8;
 
 /// Loaded, aligned, highlighted view of one file's combined diff.
 ///
@@ -674,14 +681,14 @@ fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
     }
 }
 
-/// Parse `workon.review.outline.icons` (CS5) into an [`OutlineIcons`]. Canonical strings mirror
+/// Parse `workon.review.icons` (CS5) into an [`IconMode`]. Canonical strings mirror
 /// the variant names, kebab-cased: `nerd`, `none`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`OutlineIcons::default`] (also `none` — CS5's
+/// [`App::apply_view_config`] falls back to [`IconMode::default`] (also `none` — CS5's
 /// no-auto-detection default) and warns.
-fn parse_outline_icons(raw: &str) -> Option<OutlineIcons> {
+fn parse_icon_mode(raw: &str) -> Option<IconMode> {
     match raw {
-        "nerd" => Some(OutlineIcons::Nerd),
-        "none" => Some(OutlineIcons::None),
+        "nerd" => Some(IconMode::Nerd),
+        "none" => Some(IconMode::None),
         _ => None,
     }
 }
@@ -779,6 +786,35 @@ impl OutlineRowIdentity {
     }
 }
 
+/// What "the same changeset" means once a refresh has re-resolved the world: branch name plus
+/// span KIND. Name alone is ambiguous — [`workon::assemble_changesets`]'s uncommitted layer is
+/// named after the current branch, so that branch's committed node and the uncommitted layer
+/// share a name, and a name-only re-find silently lands on the committed node (the "staging
+/// teleports the diff viewer" / "discard does nothing" dogfood bugs). Deliberately NOT the full
+/// [`workon::ChangesetSpan`]: a staging op rewrites the index, and a future stack op rewrites
+/// base/head OIDs, yet the result is still "the same changeset" to the reviewer — identity must
+/// survive exactly the operations that change the span's contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesetIdentity {
+    name: String,
+    uncommitted: bool,
+}
+
+impl ChangesetIdentity {
+    /// Capture `cs`'s identity ahead of an operation that rebuilds [`App::changesets`].
+    fn of(cs: &Changeset) -> Self {
+        Self {
+            name: cs.name.clone(),
+            uncommitted: cs.span == ChangesetSpan::Uncommitted,
+        }
+    }
+
+    /// Whether `cs` is the changeset this identity was captured from, across a rebuild.
+    fn matches(&self, cs: &Changeset) -> bool {
+        cs.name == self.name && (cs.span == ChangesetSpan::Uncommitted) == self.uncommitted
+    }
+}
+
 /// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
 /// than the diff) currently has keyboard focus, its own cursor (an index into
 /// [`App::outline_items`]'s row list — a wholly separate coordinate space from [`App::cursor`]),
@@ -800,10 +836,25 @@ pub struct OutlineState {
     /// Which end of the stack the stack-shaped modes display first — `workon.review.outline.order`
     /// (CS3), defaulting to [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
     pub order: OutlineOrder,
-    /// CS5: opt-in nerd-font file/dir icons — `workon.review.outline.icons`, defaulting to
-    /// [`OutlineIcons::None`] (no auto-detection story exists — a terminal can't report the
-    /// user's font). Read by `render::build_outline_line`.
-    pub icons: OutlineIcons,
+    /// Column pan offset (display columns) for the outline pane — the outline's own analog of
+    /// [`App::hscroll`], since a long path is hard-clipped at the outline's fixed width just like
+    /// a long diff line. Floored at `0` by [`App::outline_hscroll_left`]/
+    /// [`App::outline_hscroll_right`]; the upper clamp is render-side (`render_outline`, mirroring
+    /// [`App::clamp_outline_scroll`]'s own per-frame bounds-clamp under the wheel peek model), not
+    /// here. Reset to `0` by [`App::outline_cycle_mode`] — the row list (and therefore the set of
+    /// paths on screen) changes shape there, the same reason that resyncs the cursor.
+    pub hscroll: usize,
+    /// CS5 (`outline-fold`): per-[`OutlineMode`] sets of collapsed [`FoldKey`]s — a Header row's
+    /// changeset label PLUS its `cs_idx`, or a Dir row's full path (+ owning changeset `cs_idx` in
+    /// `StackTree`) — see [`FoldKey`]'s own doc comment for why `cs_idx` is load-bearing there,
+    /// not decorative (a changeset's `label` alone can collide with its own uncommitted layer's).
+    /// Each mode keeps its own independent set (folding a dir in `Tree` doesn't affect
+    /// `StackTree`'s copy of the same path), survives mode cycling and auto-refresh (this lives on
+    /// `App`, not in the rebuilt-every-call row list), and starts empty — everything expanded by
+    /// default. Mutated only by [`App::outline_toggle_fold`]; never explicitly cleared, so a fold
+    /// outlives its own toggling row's disappearance and reappearance (e.g. a discard-then-recreate
+    /// of the same path) for as long as the session runs.
+    pub folds: HashMap<OutlineMode, HashSet<FoldKey>>,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1053,6 +1104,47 @@ impl ChangesetView {
     }
 }
 
+/// One content region the renderer painted this frame, in terminal cell coordinates (CS10). A
+/// deliberately tiny local shape rather than `ratatui::layout::Rect`: `app.rs` has no ratatui
+/// dependency today, and this keeps it that way — `render.rs` (which already depends on
+/// ratatui) converts a `Rect`'s content area into this when it writes [`App::hit_regions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+impl Region {
+    fn contains(&self, col: u16, row: u16) -> bool {
+        col >= self.x && col < self.x + self.w && row >= self.y && row < self.y + self.h
+    }
+}
+
+/// The content regions the last frame painted (CS10), written by `render::render` (which clears
+/// this to `Default` at the top of every frame first) and read by [`App::handle_click`]/
+/// [`App::handle_wheel`] to hit-test a mouse event's `(col, row)` against the region under the
+/// pointer. A `None` field simply wasn't painted this frame — the outline is closed, or the
+/// current file isn't in [`EffectiveZoom::Split`], etc. — never a stale rect from an earlier
+/// frame's layout.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HitRegions {
+    pub outline: Option<Region>,
+    pub single: Option<Region>,
+    pub unstaged: Option<Region>,
+    pub staged: Option<Region>,
+}
+
+/// Which content region a mouse event hit-tested into (CS10's `App::hit_test`) — the outline,
+/// the single-zoom diff pane, or one half of a split, tagged with which [`SplitPane`] so the
+/// click/wheel handlers know whether to `toggle_split_focus` first.
+enum HitPane {
+    Outline,
+    Single,
+    Split(SplitPane),
+}
+
 /// Review session state: the active changeset's file list, per-file lazily loaded views, and
 /// navigation/scroll state. One long-lived [`TsHighlighter`] lives here (not per file) — its
 /// language-config cache is keyed per-instance, so a fresh highlighter per file would rebuild
@@ -1081,6 +1173,13 @@ pub struct App {
     /// directly by the renderer, but never written except by [`Self::derive_scroll`] — every
     /// cursor-moving method ends by calling it, so `scroll` always reflects the CURRENT `cursor`.
     pub scroll: usize,
+    /// Column pan offset (display columns, not bytes) applied to every diff CONTENT pane — both
+    /// side-by-side halves and both split panes share this one offset; the gutter stays pinned at
+    /// column 0. Panned by [`Self::hscroll_left`]/[`Self::hscroll_right`], clamped against the
+    /// current view's longest row (see those methods), and reset to `0` on file/changeset
+    /// navigation ([`Self::next_file`]/[`Self::prev_file`]/[`Self::next_changeset`]/
+    /// [`Self::prev_changeset`]) — cursor movement within a file leaves it untouched.
+    pub hscroll: usize,
     /// Content height of the focused pane, written by the renderer each frame. In a single-pane
     /// zoom this is the whole body; in a split it's the focused half (see [`Self::alt_height`]).
     pub pane_height: usize,
@@ -1088,12 +1187,16 @@ pub struct App {
     /// [`Self::toggle_split_focus`]). Meaningless outside [`EffectiveZoom::Split`].
     alt: PaneState,
     /// Content height of the unfocused split pane, written by the renderer alongside
-    /// [`Self::pane_height`] — [`Self::derive_alt_scroll`] derives the unfocused pane's scroll
-    /// against THIS, not the focused pane's height.
+    /// [`Self::pane_height`] — the unfocused pane's scroll is clamped/derived against THIS, not
+    /// the focused pane's height (see [`Self::clamp_alt_scroll`]).
     pub(crate) alt_height: usize,
     /// Content height of the outline pane, written by the renderer each frame — same discipline
     /// as [`Self::pane_height`]. Read by [`Self::derive_outline_scroll`].
     pub outline_height: usize,
+    /// The content regions the last frame painted (CS10 mouse support) — see [`HitRegions`]'s
+    /// doc comment. Cleared and re-written by `render::render` every frame; read by
+    /// [`Self::handle_click`]/[`Self::handle_wheel`].
+    pub hit_regions: HitRegions,
     /// Label for the old side of the diff, shown next to a rename's `old_path` in the header.
     /// M4 only reviews the uncommitted (`HEAD` ↔ worktree) diffs, so this is always `"HEAD"`
     /// today; M5's committed-changeset zoom will want the changeset's actual base rev.
@@ -1144,6 +1247,11 @@ pub struct App {
     /// rebuilt-from-scratch — `open`/`focused`/`mode` persist, like [`Self::layout`]/
     /// [`Self::zoom`]) by every diff-initiated nav and by [`Self::refresh`].
     outline: OutlineState,
+    /// Opt-in nerd-font iconography — `workon.review.icons`, defaulting to [`IconMode::None`]
+    /// (no auto-detection story exists — a terminal can't report the user's font). A TUI-wide
+    /// appearance mode like the theme, not an outline view setting: it gates the outline's
+    /// file/dir icons AND the summary panel's and winbar's glyphs (see `render.rs`).
+    icon_mode: IconMode,
     /// Whether the `?` help overlay is showing (CS3). While `true`, `tui::update` intercepts
     /// every key as a modal (mirroring [`Self::pending_confirm`]'s capture) — see its doc comment
     /// for the precedence between the two modals.
@@ -1221,17 +1329,18 @@ pub enum PendingOp {
         file_idx: usize,
         selections: Vec<(usize, LineSelection)>,
     },
-    /// CS7: discard every file in `files` — `(changeset name, file path)` pairs — from the
+    /// CS7: discard every file in `files` — `(changeset identity, file path)` pairs — from the
     /// worktree: an outline File row's single target, or a Dir row's every file under its path.
-    /// Stored by NAME + PATH rather than raw `(cs_idx, file_idx)` indices because the confirm
-    /// modal doesn't stop the tick beat: an external index change (e.g. `git add` from another
-    /// terminal) can run a full refresh between `d` and `y`, rebuilding the per-changeset file
-    /// lists and shifting positions — [`App::resolve_confirm`] re-resolves each pair against the
-    /// LIVE changesets at answer time (silently skipping any that vanished) so a stale index can
-    /// never discard the wrong file. `identity` is the acted-on outline row's
-    /// [`OutlineRowIdentity`], captured at request-time for the post-op outline cursor restore.
+    /// Stored by [`ChangesetIdentity`] + PATH rather than raw `(cs_idx, file_idx)` indices
+    /// because the confirm modal doesn't stop the tick beat: an external index change (e.g.
+    /// `git add` from another terminal) can run a full refresh between `d` and `y`, rebuilding
+    /// the per-changeset file lists and shifting positions — [`App::resolve_confirm`]
+    /// re-resolves each pair against the LIVE changesets at answer time (silently skipping any
+    /// that vanished) so a stale index can never discard the wrong file. `identity` is the
+    /// acted-on outline row's [`OutlineRowIdentity`], captured at request-time for the post-op
+    /// outline cursor restore.
     DiscardOutlineFiles {
-        files: Vec<(String, String)>,
+        files: Vec<(ChangesetIdentity, String)>,
         identity: OutlineRowIdentity,
     },
 }
@@ -1258,6 +1367,20 @@ pub enum Severity {
 pub struct Notice {
     pub text: String,
     pub severity: Severity,
+}
+
+/// The one display-label rule for a changeset, shared by the outline header
+/// ([`App::outline_snapshot`]), the summary panel ([`App::summary_for`]), and the winbar
+/// (`render::render_winbar`): title, falling back to name — except the synthetic uncommitted
+/// worktree layer, which is named after the SAME branch as its committed node (see
+/// `workon::Changeset`'s `insert_uncommitted_layer` / [`crate::acquire::uncommitted_changeset`])
+/// and so renders as "Uncommitted changes" instead of duplicating that label.
+pub(crate) fn display_label(cs: &Changeset) -> String {
+    if cs.span == ChangesetSpan::Uncommitted {
+        "Uncommitted changes".to_string()
+    } else {
+        cs.title.clone().unwrap_or_else(|| cs.name.clone())
+    }
 }
 
 impl App {
@@ -1311,7 +1434,8 @@ impl App {
             width: DEFAULT_OUTLINE_WIDTH,
             scroll: 0,
             order: OutlineOrder::default(),
-            icons: OutlineIcons::default(),
+            hscroll: 0,
+            folds: HashMap::new(),
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -1333,10 +1457,12 @@ impl App {
             current: 0,
             cursor: 0,
             scroll: 0,
+            hscroll: 0,
             pane_height: 20,
             alt: PaneState::default(),
             alt_height: 20,
             outline_height: 20,
+            hit_regions: HitRegions::default(),
             base_label,
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
@@ -1349,6 +1475,7 @@ impl App {
             selection_anchor: None,
             refresh_coordinator,
             outline,
+            icon_mode: IconMode::default(),
             help_visible: false,
             review_source: None,
             defer_loads: false,
@@ -1589,7 +1716,7 @@ impl App {
             return;
         }
 
-        let prev_cs_name = self.cur().cs.name.clone();
+        let prev_cs_id = ChangesetIdentity::of(&self.cur().cs);
         let current_path = self
             .cur()
             .diff
@@ -1636,7 +1763,7 @@ impl App {
 
         self.current_cs = new_views
             .iter()
-            .position(|v| v.cs.name == prev_cs_name)
+            .position(|v| prev_cs_id.matches(&v.cs))
             .unwrap_or_else(|| current_cs_index(&new_views));
         self.base_label = base_label_for(&new_views[self.current_cs].cs);
         self.changesets = new_views;
@@ -2312,6 +2439,7 @@ impl App {
     /// outline-initiated jump (which sets [`OutlineState::cursor`] itself before calling
     /// `switch_changeset`/`goto_changeset` directly) never re-triggers it.
     pub fn next_file(&mut self) {
+        self.hscroll = 0;
         if self.cur().diff.files.is_empty() {
             return;
         }
@@ -2331,6 +2459,7 @@ impl App {
     /// first changeset. See [`Self::next_file`]'s doc comment for why this calls
     /// [`Self::sync_outline_to_current`] at the end.
     pub fn prev_file(&mut self) {
+        self.hscroll = 0;
         if self.cur().diff.files.is_empty() {
             return;
         }
@@ -2359,6 +2488,7 @@ impl App {
     /// DIFF-initiated entry point — see [`Self::next_file`]'s doc comment on the sync-follow
     /// discipline.
     pub fn next_changeset(&mut self) {
+        self.hscroll = 0;
         if self.current_cs + 1 < self.changesets.len() {
             self.goto_changeset(self.current_cs + 1);
         }
@@ -2368,6 +2498,7 @@ impl App {
     /// Jump to the previous changeset's first file (`[c`). A no-op at the first changeset. See
     /// [`Self::next_file`]'s doc comment on the sync-follow discipline.
     pub fn prev_changeset(&mut self) {
+        self.hscroll = 0;
         if self.current_cs > 0 {
             self.goto_changeset(self.current_cs - 1);
         }
@@ -2386,7 +2517,7 @@ impl App {
         self.changesets
             .iter()
             .map(|v| OutlineChangeset {
-                label: v.cs.title.clone().unwrap_or_else(|| v.cs.name.clone()),
+                label: display_label(&v.cs),
                 current: v.cs.current,
                 needs_restack: v.cs.needs_restack,
                 loading: v.is_pending(),
@@ -2405,14 +2536,58 @@ impl App {
             .collect()
     }
 
-    /// Build the current [`OutlineMode`]'s row list — the outline cursor's index space, and the
-    /// source of truth `render.rs` draws from. Rebuilt fresh on every call (cheap: a small stack
-    /// times a handful of files each, no caching, same posture as [`Self::effective_zoom_for`])
-    /// rather than cached on `App`, so it's never stale across a mode toggle, a nav, or a
-    /// refresh.
+    /// Build (via [`outline::fold_outline`]) the current [`OutlineMode`]'s FOLD-FILTERED row list
+    /// — the outline cursor's SINGLE index space, and the source of truth every other outline
+    /// consumer reads: `render.rs`, [`Self::outline_move_by`]/[`Self::outline_move_to`],
+    /// [`Self::outline_confirm`], [`Self::summary_target`], and the staging-verb resolution in
+    /// [`Self::outline_row_targets`] all funnel through this SAME method (CS5, `outline-fold`) —
+    /// so folding a Header/Dir can never silently retarget a cursor move or a stage/discard verb
+    /// onto the wrong row: there is no OTHER row list any of them could accidentally read
+    /// instead. Rebuilt fresh on every call (cheap: a small stack times a handful of files each,
+    /// no caching, same posture as [`Self::effective_zoom_for`]) rather than cached on `App`, so
+    /// it's never stale across a mode toggle, a nav, a fold, or a refresh. `render.rs`'s marker
+    /// needs the per-row hidden-file counts this discards — see
+    /// [`Self::outline_items_with_hidden_counts`].
     pub fn outline_items(&self) -> Vec<OutlineItem> {
+        self.outline_folded().items
+    }
+
+    /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count —
+    /// `render_outline`'s data source. Every OTHER outline consumer uses [`Self::outline_items`]
+    /// instead, which just discards the counts it doesn't need; both funnel through the same
+    /// [`Self::outline_folded`] build, so they can never disagree about which rows are visible.
+    pub fn outline_items_with_hidden_counts(&self) -> (Vec<OutlineItem>, Vec<usize>) {
+        let folded = self.outline_folded();
+        (folded.items, folded.hidden_counts)
+    }
+
+    /// The shared build [`Self::outline_items`]/[`Self::outline_items_with_hidden_counts`]/
+    /// [`Self::outline_target_index`] all read from — [`outline::fold_outline`] applied to the
+    /// current mode/order/fold-set, so there's exactly one place that pairs "which changesets by
+    /// which state" with "the fold set for the CURRENT mode" (`self.outline.folds` is keyed by
+    /// [`OutlineMode`]; a mode with no folds recorded yet reads as "everything expanded", the
+    /// default).
+    fn outline_folded(&self) -> outline::FoldedOutline {
         let snapshot = self.outline_snapshot();
-        outline::build_items(&snapshot, self.outline.mode, self.outline.order)
+        let folds = self.outline.folds.get(&self.outline.mode);
+        outline::fold_outline(&snapshot, self.outline.mode, self.outline.order, |key| {
+            folds.is_some_and(|set| set.contains(key))
+        })
+    }
+
+    /// Resolve a target row matched against the FULL (unfiltered) row list to its position in
+    /// [`Self::outline_items`]'s FILTERED list — its own index if it's visible, or its nearest
+    /// visible (collapsed) ancestor's if a fold hides it (CS5's "`sync_outline_to_current`
+    /// targeting a file hidden under a collapsed node lands on the collapsed ancestor WITHOUT
+    /// auto-expanding" rule — see [`outline::FoldedOutline::visible_index`]'s doc comment). `find`
+    /// matches against the full build (via `outline::build_items` directly, not
+    /// [`Self::outline_items`]) since a fold-hidden target has no index in the filtered list at
+    /// all to match against.
+    fn outline_target_index(&self, find: impl Fn(&OutlineItem) -> bool) -> Option<usize> {
+        let snapshot = self.outline_snapshot();
+        let full = outline::build_items(&snapshot, self.outline.mode, self.outline.order);
+        let full_idx = full.iter().position(find)?;
+        self.outline_folded().visible_index.get(full_idx).copied()
     }
 
     /// CS4: the outline row a Header/Dir cursor selection resolves to — `None` when the outline
@@ -2440,11 +2615,7 @@ impl App {
         match target {
             SummaryTarget::Changeset(cs_idx) => {
                 let view = &self.changesets[cs_idx];
-                let label = view
-                    .cs
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| view.cs.name.clone());
+                let label = display_label(&view.cs);
                 let failure_message = view.failure_message().map(|s| s.to_string());
                 Summary::Changeset(summary::changeset_summary(
                     label,
@@ -2507,6 +2678,14 @@ impl App {
         self.outline.scroll
     }
 
+    /// The outline pane's column pan offset — see [`OutlineState::hscroll`]'s doc comment. Read
+    /// by `render.rs`'s `render_outline`, which also owns the render-side upper clamp (mirroring
+    /// [`Self::clamp_outline_scroll`]'s own per-frame bounds-clamp) via
+    /// [`Self::clamp_outline_hscroll`].
+    pub fn outline_hscroll(&self) -> usize {
+        self.outline.hscroll
+    }
+
     /// The outline pane's column width — `workon.review.outline.width` (CS7), or
     /// [`DEFAULT_OUTLINE_WIDTH`] if never set. Read by `render.rs` in place of the old fixed
     /// const.
@@ -2524,10 +2703,10 @@ impl App {
         self.outline.order
     }
 
-    /// CS5: whether the outline renders nerd-font icons — `workon.review.outline.icons`, or
-    /// [`OutlineIcons::default`] (`None`) if never set.
-    pub fn outline_icons(&self) -> OutlineIcons {
-        self.outline.icons
+    /// The nerd-font iconography mode — `workon.review.icons`, or [`IconMode::default`]
+    /// (`None`) if never set. TUI-wide: read by the outline, summary panel, and winbar renderers.
+    pub fn icon_mode(&self) -> IconMode {
+        self.icon_mode
     }
 
     /// `o`: a pure show/hide toggle — closed -> open+focused (+[`Self::sync_outline_to_current`]),
@@ -2562,6 +2741,196 @@ impl App {
         self.outline.focused = false;
     }
 
+    // ── Mouse (CS10) ─────────────────────────────────────────────────────────────
+
+    /// Hit-test `(col, row)` against [`Self::hit_regions`] — outline first, then the single diff
+    /// pane, then the split's two halves — returning the matched region tagged with which
+    /// [`HitPane`] it was. `None` when the pointer is over a header/footer/divider/caption row
+    /// (recorded regions cover content only).
+    fn hit_test(&self, col: u16, row: u16) -> Option<(HitPane, Region)> {
+        if let Some(region) = self.hit_regions.outline {
+            if region.contains(col, row) {
+                return Some((HitPane::Outline, region));
+            }
+        }
+        if let Some(region) = self.hit_regions.single {
+            if region.contains(col, row) {
+                return Some((HitPane::Single, region));
+            }
+        }
+        if let Some(region) = self.hit_regions.unstaged {
+            if region.contains(col, row) {
+                return Some((HitPane::Split(SplitPane::Unstaged), region));
+            }
+        }
+        if let Some(region) = self.hit_regions.staged {
+            if region.contains(col, row) {
+                return Some((HitPane::Split(SplitPane::Staged), region));
+            }
+        }
+        None
+    }
+
+    /// Focus the diff pane a click/wheel landed in, mirroring the keyboard focus rules: if the
+    /// outline had focus, `focus_diff()` moves focus onto whichever split pane already has it; if
+    /// the event landed in the OTHER split pane, `toggle_split_focus()` flips onto it next (never
+    /// assigning `split_focus` directly — see that method's doc comment). `target` is `None` for
+    /// the single-zoom pane, where there is no second half to flip to.
+    fn focus_diff_pane(&mut self, target: Option<SplitPane>) {
+        if self.outline_focused() {
+            self.focus_diff();
+        }
+        if let Some(target) = target {
+            if self.split_focus != target {
+                self.toggle_split_focus();
+            }
+        }
+    }
+
+    /// Set the (now-focused) pane's cursor to the row under a click, offset from `region`'s top by
+    /// `row` and clamped into the current row list, then re-derive `scroll`. A no-op on an empty
+    /// file list, matching [`Self::move_cursor_by`]'s empty-list behavior.
+    fn set_cursor_from_click(&mut self, region: Region, row: u16) {
+        let rows = self.row_count();
+        if rows == 0 {
+            return;
+        }
+        let offset = (row - region.y) as usize;
+        self.cursor = (self.scroll + offset).min(rows - 1);
+        self.derive_scroll();
+    }
+
+    /// Left-click at terminal `(col, row)` (CS10): focus + select whatever content region the
+    /// click landed in, matching the keyboard-driven equivalent for that region. Outline: focuses
+    /// the outline and jumps the cursor to the clicked row via [`Self::outline_move_to`] — a File
+    /// row jumps the diff there (same single-jump semantics `g`/`G` use), a Header/Dir row just
+    /// selects (the summary panel follows via [`Self::summary_target`]) WITHOUT toggling its fold
+    /// (CS5, `outline-fold`) — a click has always been "move the cursor here", a strictly weaker
+    /// action than `Enter`'s "act on this row" even before folding existed (pre-CS5, `Enter` on a
+    /// Header jumped to its first file; a click on the same row never did), so a click staying
+    /// select-only here keeps that existing asymmetry rather than inventing a new "click mirrors
+    /// Enter" rule this pane never had. Diff pane (single or split): focuses that pane (flipping
+    /// `split_focus` first if the click landed in the unfocused half) and moves its cursor to the
+    /// clicked row. Outside every recorded region (header/footer/divider/captions): no-op.
+    pub fn handle_click(&mut self, col: u16, row: u16) {
+        let Some((pane, region)) = self.hit_test(col, row) else {
+            return;
+        };
+        match pane {
+            HitPane::Outline => {
+                self.focus_outline();
+                let idx = self.outline.scroll + (row - region.y) as usize;
+                self.outline_move_to(idx);
+            }
+            HitPane::Single => {
+                self.focus_diff_pane(None);
+                self.set_cursor_from_click(region, row);
+            }
+            HitPane::Split(target) => {
+                self.focus_diff_pane(Some(target));
+                self.set_cursor_from_click(region, row);
+            }
+        }
+    }
+
+    /// Mouse wheel at terminal `(col, row)` with `delta` = ±3 rows (`tui::update` maps
+    /// `ScrollDown`/`ScrollUp` to +3/-3). Focuses whichever region the pointer sits over first —
+    /// same rule as [`Self::handle_click`] — then scrolls that pane's VIEWPORT by `delta`,
+    /// leaving the cursor exactly where it was (the peek model: a wheel is "look elsewhere",
+    /// never "select elsewhere") — see [`Self::scroll_viewport_by`]. Outside every recorded
+    /// region: no-op.
+    pub fn handle_wheel(&mut self, col: u16, row: u16, delta: i64) {
+        let Some((pane, _region)) = self.hit_test(col, row) else {
+            return;
+        };
+        match pane {
+            HitPane::Outline => {
+                self.focus_outline();
+                self.outline_scroll_viewport_by(delta);
+            }
+            HitPane::Single => {
+                self.focus_diff_pane(None);
+                self.scroll_viewport_by(delta);
+            }
+            HitPane::Split(target) => {
+                self.focus_diff_pane(Some(target));
+                self.scroll_viewport_by(delta);
+            }
+        }
+    }
+
+    /// Horizontal mouse wheel (trackpad h-scroll, or a shift-wheel the terminal reports as
+    /// `ScrollLeft`/`ScrollRight`) at terminal `(col, row)` with `delta` = ±4 columns per tick
+    /// (`tui::map_key`'s caller maps `ScrollLeft`/`ScrollRight` to -4/+4 — finer than
+    /// [`HSCROLL_STEP`] since trackpads emit streams of ticks). Same peek-model framing and
+    /// region-focus rule as [`Self::handle_wheel`] — the difference is WHAT gets panned: unlike
+    /// the vertical wheel (which always scrolls whichever pane's own row-list viewport), this
+    /// pans a COLUMN offset shared per PANE KIND — the outline's own `outline.hscroll` over the
+    /// outline, or the diff panes' shared [`Self::hscroll`] over a diff pane (both halves of a
+    /// split share the one offset, same as [`Self::hscroll_left`]/[`Self::hscroll_right`]).
+    /// Outside every recorded region: no-op.
+    pub fn handle_hwheel(&mut self, col: u16, row: u16, delta: i64) {
+        let Some((pane, _region)) = self.hit_test(col, row) else {
+            return;
+        };
+        match pane {
+            HitPane::Outline => {
+                self.focus_outline();
+                self.outline.hscroll = (self.outline.hscroll as i64 + delta).max(0) as usize;
+                // No upper clamp here — render-side, mirroring `outline_hscroll_right`'s own
+                // doc comment.
+            }
+            HitPane::Single => {
+                self.focus_diff_pane(None);
+                self.pan_hscroll_by(delta);
+            }
+            HitPane::Split(target) => {
+                self.focus_diff_pane(Some(target));
+                self.pan_hscroll_by(delta);
+            }
+        }
+    }
+
+    /// Pan the shared diff [`Self::hscroll`] by `delta` columns (floored at `0`), clamping
+    /// against the current view's longest row on a RIGHTWARD pan only — the same clamp
+    /// [`Self::hscroll_right`] applies, factored out here so [`Self::handle_hwheel`] doesn't
+    /// clamp a leftward pan against a bound that only matters when panning right.
+    fn pan_hscroll_by(&mut self, delta: i64) {
+        self.hscroll = (self.hscroll as i64 + delta).max(0) as usize;
+        if delta > 0 {
+            self.clamp_hscroll();
+        }
+    }
+
+    /// Scroll the focused pane's viewport by `delta` rows (mouse wheel), clamped to the row
+    /// list. The cursor is deliberately NOT touched (the peek model: a wheel is "look
+    /// elsewhere", never "select elsewhere"), so it can sit outside the viewport — the next
+    /// cursor-driven op re-derives the scroll and snaps the view back to it, which is the
+    /// peek model's recovery gesture, not a bug. This is the one place `scroll` is written
+    /// directly rather than derived from the cursor; the renderer's bounds-clamp (see
+    /// [`Self::clamp_scroll`]) is what lets the wheeled position survive frames.
+    fn scroll_viewport_by(&mut self, delta: i64) {
+        let rows = self.row_count();
+        if rows == 0 {
+            return;
+        }
+        let max_scroll = rows.saturating_sub(self.pane_height.max(1)) as i64;
+        self.scroll = (self.scroll as i64 + delta).clamp(0, max_scroll.max(0)) as usize;
+    }
+
+    /// The outline counterpart of [`Self::scroll_viewport_by`] — same peek model: the outline
+    /// cursor never moves (so wheeling past File rows can't jump the diff, and the summary
+    /// panel's target stays put); the next outline cursor op snaps the view back to it.
+    fn outline_scroll_viewport_by(&mut self, delta: i64) {
+        let rows = self.outline_items().len();
+        if rows == 0 {
+            return;
+        }
+        let max_scroll = rows.saturating_sub(self.outline_height.max(1)) as i64;
+        self.outline.scroll =
+            (self.outline.scroll as i64 + delta).clamp(0, max_scroll.max(0)) as usize;
+    }
+
     /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
     /// view currently has keyboard focus (see `render::render_help_overlay`), so there is no
     /// extra state to reposition here, unlike [`Self::toggle_outline`].
@@ -2571,9 +2940,12 @@ impl App {
 
     /// `i` while the outline has focus: cycle [`OutlineMode`], then reposition the cursor onto
     /// the row matching the current diff position in the NEW mode's row list (the row layout
-    /// just changed shape, so the raw index would otherwise point at an unrelated row).
+    /// just changed shape, so the raw index would otherwise point at an unrelated row). Also
+    /// resets [`OutlineState::hscroll`] to `0` — the row list's shape (and therefore its longest
+    /// path) just changed too, so a stale pan offset could easily land past the new mode's content.
     pub fn outline_cycle_mode(&mut self) {
         self.outline.mode = self.outline.mode.cycle();
+        self.outline.hscroll = 0;
         self.sync_outline_to_current();
     }
 
@@ -2602,12 +2974,11 @@ impl App {
         self.outline.order = order;
     }
 
-    /// Set the outline icons setting directly — the config-startup (CS5) counterpart; there is
-    /// no interactive key for this (icons are a static config choice, not something to toggle
-    /// mid-session). Same non-resync posture as [`Self::set_outline_mode`]/
-    /// [`Self::set_outline_order`].
-    pub fn set_outline_icons(&mut self, icons: OutlineIcons) {
-        self.outline.icons = icons;
+    /// Set the icon mode directly — the config-startup counterpart; there is no interactive
+    /// key for this (icons are a static config choice, not something to toggle mid-session).
+    /// Same non-resync posture as [`Self::set_outline_mode`]/[`Self::set_outline_order`].
+    pub fn set_icon_mode(&mut self, icons: IconMode) {
+        self.icon_mode = icons;
     }
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
@@ -2695,30 +3066,116 @@ impl App {
         self.outline_move_to(last);
     }
 
-    /// `Enter` while the outline has focus: jump the diff to the row under the outline cursor (a
-    /// file row jumps straight there; a header row jumps to that changeset's first file — the
-    /// one case [`Self::outline_move_by`] deliberately does NOT do on a bare cursor move), then
-    /// return focus to the diff.
+    /// `n` while the outline has focus: jump the cursor to the next [`OutlineItem::Header`] row
+    /// AFTER the current cursor position, or no-op (no wraparound) when there isn't one. Goes
+    /// through [`Self::outline_move_to`], so — like `g`/`G` — landing on a Header row never jumps
+    /// the diff (only a Header's own `Enter`/fold toggle or a File-row nav does that).
+    pub fn outline_next_changeset(&mut self) {
+        let items = self.outline_items();
+        let cursor = self.outline.cursor;
+        if let Some(off) = items
+            .iter()
+            .skip(cursor + 1)
+            .position(|item| matches!(item, OutlineItem::Header { .. }))
+        {
+            self.outline_move_to(cursor + 1 + off);
+        }
+    }
+
+    /// `p` while the outline has focus: jump the cursor to the next [`OutlineItem::Header`] row
+    /// BEFORE the current cursor position, or no-op (no wraparound) when there isn't one. The
+    /// counterpart to [`Self::outline_next_changeset`] — see its doc comment for the shared
+    /// no-diff-jump invariant.
+    pub fn outline_prev_changeset(&mut self) {
+        let items = self.outline_items();
+        let cursor = self.outline.cursor;
+        if let Some(idx) = items[..cursor]
+            .iter()
+            .rposition(|item| matches!(item, OutlineItem::Header { .. }))
+        {
+            self.outline_move_to(idx);
+        }
+    }
+
+    /// `Enter` while the outline has focus: a FILE row jumps the diff straight there and returns
+    /// focus to the diff (unchanged since CS3). A HEADER or DIR row instead TOGGLES that row's
+    /// fold state (CS5, `outline-fold`) and deliberately does NOT return focus — you're
+    /// manipulating the outline's own structure, not confirming a jump, so there's nothing to
+    /// hand focus back to yet. This REMOVES Enter's pre-CS5 jump-to-changeset-first-file behavior
+    /// on a Header row (still reachable via Enter on any of that changeset's own file rows, or
+    /// `[c`/`]c`) and Dir's pre-CS5 no-op (CS4 shipped Dir rows before any fold state existed to
+    /// toggle).
     pub fn outline_confirm(&mut self) {
         let items = self.outline_items();
         match items.get(self.outline.cursor) {
             Some(OutlineItem::File {
                 cs_idx, file_idx, ..
-            }) => self.switch_changeset(*cs_idx, *file_idx),
-            Some(OutlineItem::Header { cs_idx, .. }) => {
-                let cs_idx = *cs_idx;
-                self.goto_changeset(cs_idx);
-                // `goto_changeset` is the shared outline/diff core and deliberately does not
-                // self-sync (see its doc comment) — this outline-initiated call syncs explicitly
-                // so the cursor follows off the header row onto the file it just jumped to.
-                self.sync_outline_to_current();
+            }) => {
+                self.switch_changeset(*cs_idx, *file_idx);
+                self.outline.focused = false;
             }
-            // A directory row (Tree/StackTree modes) is not a jump target — no expand/collapse
-            // state exists to toggle (CS4 decision), so Enter here is a no-op beyond the
-            // unconditional unfocus below, same as confirming on nothing at all.
-            Some(OutlineItem::Dir { .. }) | None => {}
+            Some(OutlineItem::Header { .. } | OutlineItem::Dir { .. }) => {
+                self.outline_toggle_fold();
+            }
+            None => self.outline.focused = false,
         }
-        self.outline.focused = false;
+    }
+
+    /// `Enter` on a Header/Dir row (CS5, `outline-fold`): flip that row's collapsed state in the
+    /// CURRENT [`OutlineMode`]'s fold set (see [`OutlineState::folds`]), then re-derive the
+    /// outline scroll — the row list's length just changed shape (more/fewer rows), the same
+    /// reason every other row-count-changing op does. The cursor's own INDEX never needs
+    /// re-finding: toggling a row's fold only changes what's visible AFTER it in the list (its
+    /// descendants), never before, so the row under the cursor — the one just toggled — stays
+    /// exactly where it was.
+    fn outline_toggle_fold(&mut self) {
+        let items = self.outline_items();
+        let Some(item) = items.get(self.outline.cursor) else {
+            return;
+        };
+        let Some(key) = FoldKey::for_item(item) else {
+            return;
+        };
+        let set = self.outline.folds.entry(self.outline.mode).or_default();
+        if !set.remove(&key) {
+            set.insert(key);
+        }
+        self.derive_outline_scroll(self.outline_items().len());
+    }
+
+    /// `zM` while the outline has focus: collapse every foldable (Header/Dir) row of the CURRENT
+    /// [`OutlineMode`], unlike [`Self::outline_toggle_fold`]'s single-row flip. Scans the
+    /// UNFOLDED build ([`outline::build_items`] over the current snapshot — the same source
+    /// [`Self::outline_folded`] itself folds) rather than [`Self::outline_items`], so a row
+    /// already hidden under an existing fold still gets its own key recorded (collapsing
+    /// everything must be idempotent regardless of what's already collapsed). Unlike
+    /// [`Self::outline_toggle_fold`], this can hide the row the cursor itself sits on, so it
+    /// re-derives the cursor via [`Self::sync_outline_to_current`] (the same reseat
+    /// [`Self::outline_cycle_mode`] uses for its own row-list reshape) rather than trusting the
+    /// toggle's "only descendants move" invariant, which doesn't hold here.
+    pub fn outline_collapse_all(&mut self) {
+        let snapshot = self.outline_snapshot();
+        let full = outline::build_items(&snapshot, self.outline.mode, self.outline.order);
+        let set = self.outline.folds.entry(self.outline.mode).or_default();
+        for item in &full {
+            if let Some(key) = FoldKey::for_item(item) {
+                set.insert(key);
+            }
+        }
+        self.sync_outline_to_current();
+    }
+
+    /// `zR` while the outline has focus: expand every folded row of the CURRENT [`OutlineMode`] —
+    /// clears that mode's fold set entirely. See [`Self::outline_collapse_all`] for the cursor
+    /// reseat rationale (shared here too, even though expanding can only ever ADD rows, never
+    /// hide the cursor's own).
+    pub fn outline_expand_all(&mut self) {
+        self.outline
+            .folds
+            .entry(self.outline.mode)
+            .or_default()
+            .clear();
+        self.sync_outline_to_current();
     }
 
     // ── Outline staging (CS7) ───────────────────────────────────────────────────
@@ -2896,12 +3353,12 @@ impl App {
                 targets.len()
             ),
         };
-        let files: Vec<(String, String)> = targets
+        let files: Vec<(ChangesetIdentity, String)> = targets
             .iter()
             .filter_map(|&(cs_idx, file_idx)| {
                 let view = self.changesets.get(cs_idx)?;
                 let path = view.files().get(file_idx)?.path.clone();
-                Some((view.cs.name.clone(), path))
+                Some((ChangesetIdentity::of(&view.cs), path))
             })
             .collect();
         self.request_confirm(prompt, PendingOp::DiscardOutlineFiles { files, identity });
@@ -2958,20 +3415,21 @@ impl App {
     }
 
     /// Reposition (never rebuild/refocus) the outline cursor onto the row matching the CURRENT
-    /// diff changeset+file, or clamp it into bounds if no such row exists (e.g. Flat mode
-    /// deduped the current file's changeset out of the list). The sync-follow discipline's echo
-    /// break: called ONLY from the diff-initiated nav entry points (`next_file`/`prev_file`/
-    /// `next_changeset`/`prev_changeset`/`refresh`, plus the two outline actions that explicitly
-    /// opt in after a header jump) — never from `switch_changeset`/`goto_changeset` themselves,
-    /// since those are the shared core an OUTLINE-initiated jump also calls, and an
-    /// outline-initiated jump has already set [`OutlineState::cursor`] to the row the user
-    /// selected. If this ran unconditionally inside `switch_changeset`, an outline `j`/`k` move
-    /// past a HEADER row (which never calls `switch_changeset`, so nothing would resync) would
-    /// be fine, but any accidental future call site wired into the shared core would instantly
-    /// stomp a manually-positioned outline cursor back onto the diff's last position — the exact
-    /// oscillation the prototype's `_suppress_sync` flag existed to prevent. Keeping the sync
-    /// calls only at the diff-facing entry points achieves the same break without needing a
-    /// mutable suppression flag on `App`.
+    /// diff changeset+file — or, if a fold hides that row, its nearest visible (collapsed)
+    /// ancestor instead, WITHOUT auto-expanding it (CS5, `outline-fold` — preserves the user's
+    /// fold intent; see [`Self::outline_target_index`]) — or clamps into bounds if no such row
+    /// exists in the FULL build at all (e.g. Flat mode deduped the current file's changeset out
+    /// of the list entirely). The sync-follow discipline's echo break: called ONLY from the
+    /// diff-initiated nav entry points (`next_file`/`prev_file`/`next_changeset`/`prev_changeset`/
+    /// `refresh`) — never from `switch_changeset`/`goto_changeset` themselves, since those are the
+    /// shared core an OUTLINE-initiated jump also calls, and an outline-initiated jump has already
+    /// set [`OutlineState::cursor`] to the row the user selected. If this ran unconditionally
+    /// inside `switch_changeset`, an outline `j`/`k` move past a HEADER row (which never calls
+    /// `switch_changeset`, so nothing would resync) would be fine, but any accidental future call
+    /// site wired into the shared core would instantly stomp a manually-positioned outline cursor
+    /// back onto the diff's last position — the exact oscillation the prototype's
+    /// `_suppress_sync` flag existed to prevent. Keeping the sync calls only at the diff-facing
+    /// entry points achieves the same break without needing a mutable suppression flag on `App`.
     fn sync_outline_to_current(&mut self) {
         let items = self.outline_items();
         if items.is_empty() {
@@ -2979,11 +3437,13 @@ impl App {
             self.derive_outline_scroll(0);
             return;
         }
-        if let Some(idx) = items.iter().position(|it| {
+        let current_cs = self.current_cs;
+        let current = self.current;
+        if let Some(idx) = self.outline_target_index(|it| {
             matches!(
                 it,
                 OutlineItem::File { cs_idx, file_idx, .. }
-                    if *cs_idx == self.current_cs && *file_idx == self.current
+                    if *cs_idx == current_cs && *file_idx == current
             )
         }) {
             self.outline.cursor = idx;
@@ -3038,13 +3498,125 @@ impl App {
     }
 
     /// Re-derive the UNFOCUSED split pane's scroll against its own cursor, row count, and
-    /// [`Self::alt_height`] — called by the renderer each split frame, after the pane heights are
-    /// known.
+    /// [`Self::alt_height`]. Test-only since the wheel's peek model (CS10): the renderer now
+    /// bounds-clamps instead of deriving (see [`Self::clamp_alt_scroll`]), and no production
+    /// path derives the unfocused pane's scroll — the pair re-derives naturally once focus
+    /// swaps back onto it and a cursor op runs.
+    #[cfg(test)]
     pub(crate) fn derive_alt_scroll(&mut self) {
         let role = self.unfocused_split_role();
         let rows = self.role_row_count(self.current, role);
         self.alt.scroll =
             derive_scroll_value(self.alt.cursor, self.alt.scroll, rows, self.alt_height);
+    }
+
+    /// Bounds-only clamp of the focused pane's scroll — the renderer's per-frame check under
+    /// the wheel's peek model (CS10). Unlike [`Self::derive_scroll`] it does NOT follow the
+    /// cursor, so a wheel-scrolled viewport (cursor possibly outside it) survives frames; it
+    /// only keeps `scroll` inside the row list when a resize/zoom shrinks it.
+    pub(crate) fn clamp_scroll(&mut self) {
+        let rows = self.row_count();
+        self.scroll = self
+            .scroll
+            .min(rows.saturating_sub(self.pane_height.max(1)));
+    }
+
+    /// [`Self::clamp_scroll`] for the unfocused split pane.
+    pub(crate) fn clamp_alt_scroll(&mut self) {
+        let role = self.unfocused_split_role();
+        let rows = self.role_row_count(self.current, role);
+        self.alt.scroll = self
+            .alt
+            .scroll
+            .min(rows.saturating_sub(self.alt_height.max(1)));
+    }
+
+    /// [`Self::clamp_scroll`] for the outline pane.
+    pub(crate) fn clamp_outline_scroll(&mut self, rows: usize) {
+        self.outline.scroll = self
+            .outline
+            .scroll
+            .min(rows.saturating_sub(self.outline_height.max(1)));
+    }
+
+    /// Render-side upper clamp for [`OutlineState::hscroll`] — the outline analog of
+    /// [`Self::clamp_hscroll`], but taken from the caller rather than computed here:
+    /// `render_outline` already builds every item's line to paint it, so it's cheaper for it to
+    /// pass the max width it just measured than for this method to rebuild the whole outline a
+    /// second time. `max_line_width` is the widest rendered outline row's display-column width;
+    /// the `-1` keeps at least one column of the longest row visible, same as
+    /// [`Self::clamp_hscroll`].
+    pub(crate) fn clamp_outline_hscroll(&mut self, max_line_width: usize) {
+        self.outline.hscroll = self.outline.hscroll.min(max_line_width.saturating_sub(1));
+    }
+
+    /// The widest display-column row currently in the active file's view(s) — both roles when
+    /// split, since [`Self::hscroll`] pans every content pane together (locked decision #1).
+    /// Walks the already-built [`FileView::display`] row list (shared by both the SBS and inline
+    /// layouts — inline just re-derives its own row list from the same text), so this is a pure
+    /// lookup over rows the renderer rebuilds every frame anyway, not a fresh scan of the file.
+    /// Used only by [`Self::clamp_hscroll`] to keep at least one column of the longest line
+    /// reachable; computed on demand rather than cached (cheap — see that method's doc comment).
+    fn max_row_width(&self) -> usize {
+        let idx = self.current;
+        let roles: Vec<Role> = match self.effective_zoom_for(idx) {
+            EffectiveZoom::Single(role) => vec![role],
+            EffectiveZoom::Split => vec![Role::Unstaged, Role::Staged],
+        };
+        let mut max = 0;
+        for role in roles {
+            let Some(view) = self.role_view_ref(idx, role) else {
+                continue;
+            };
+            for row in &view.display {
+                let DisplayRow::Row(r) = row else { continue };
+                if let Row::Line(n) = r.old {
+                    max = max.max(UnicodeWidthStr::width(view.old_line(n)));
+                }
+                if let Row::Line(n) = r.new {
+                    max = max.max(UnicodeWidthStr::width(view.new_line(n)));
+                }
+            }
+        }
+        max
+    }
+
+    /// Clamp [`Self::hscroll`] into `[0, max_row_width().saturating_sub(1)]` — the `-1` keeps at
+    /// least one column of the longest line visible (locked decision #4) rather than letting the
+    /// pan run all the way to a blank viewport.
+    fn clamp_hscroll(&mut self) {
+        let max = self.max_row_width().saturating_sub(1);
+        self.hscroll = self.hscroll.min(max);
+    }
+
+    /// `hscroll-left`: pan the diff content panes left by [`HSCROLL_STEP`] columns (floored at
+    /// `0`).
+    pub fn hscroll_left(&mut self) {
+        self.hscroll = self.hscroll.saturating_sub(HSCROLL_STEP);
+    }
+
+    /// `hscroll-right`: pan the diff content panes right by [`HSCROLL_STEP`] columns, clamped so
+    /// at least one column of the current view's longest row stays visible (see
+    /// [`Self::clamp_hscroll`]).
+    pub fn hscroll_right(&mut self) {
+        self.hscroll = self.hscroll.saturating_add(HSCROLL_STEP);
+        self.clamp_hscroll();
+    }
+
+    /// `outline-hscroll-left`: pan the outline pane left by [`HSCROLL_STEP`] columns (floored at
+    /// `0`) — the outline's own analog of [`Self::hscroll_left`].
+    pub fn outline_hscroll_left(&mut self) {
+        self.outline.hscroll = self.outline.hscroll.saturating_sub(HSCROLL_STEP);
+    }
+
+    /// `outline-hscroll-right`: pan the outline pane right by [`HSCROLL_STEP`] columns. Unlike
+    /// [`Self::hscroll_right`] this has NO upper clamp here — the outline's row list (every
+    /// item's rendered line, built by `render.rs`'s `build_outline_line`) isn't cheaply available
+    /// to `App` the way a [`FileView`]'s rows are, so the clamp is render-side instead
+    /// (`render::render_outline`, mirroring how [`Self::clamp_outline_scroll`] already
+    /// bounds-clamps `outline.scroll` once per frame under the wheel peek model).
+    pub fn outline_hscroll_right(&mut self) {
+        self.outline.hscroll = self.outline.hscroll.saturating_add(HSCROLL_STEP);
     }
 
     /// Re-derive the outline pane's `scroll` from its `cursor` — the outline's counterpart to
@@ -3314,16 +3886,16 @@ impl App {
         };
         self.set_outline_order(order);
 
-        let icons = match &raw.outline_icons {
-            Some(i) => parse_outline_icons(i).unwrap_or_else(|| {
+        let icons = match &raw.icons {
+            Some(i) => parse_icon_mode(i).unwrap_or_else(|| {
                 warnings.push(format!(
-                    "workon.review.outline.icons = '{i}' unrecognized; using default"
+                    "workon.review.icons = '{i}' unrecognized; using default"
                 ));
-                OutlineIcons::default()
+                IconMode::default()
             }),
-            None => OutlineIcons::default(),
+            None => IconMode::default(),
         };
-        self.set_outline_icons(icons);
+        self.set_icon_mode(icons);
 
         let layout = match &raw.diff_layout {
             Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
@@ -3578,14 +4150,14 @@ impl App {
                 self.run_op(LineSelectionOp::new(file, selections, StageVerb::Discard));
             }
             PendingOp::DiscardOutlineFiles { files, identity } => {
-                // Re-resolve each (changeset name, path) pair against the LIVE changesets — an
+                // Re-resolve each (changeset identity, path) pair against the LIVE changesets — an
                 // intervening tick refresh may have shifted every index since `d` was pressed
                 // (see the variant's doc); a pair that no longer resolves is silently skipped
                 // (its file already left the diff, so there's nothing left to discard).
                 let ops: Vec<Box<dyn StagingOp>> = files
                     .iter()
-                    .filter_map(|(cs_name, path)| {
-                        let view = self.changesets.iter().find(|v| v.cs.name == *cs_name)?;
+                    .filter_map(|(cs_id, path)| {
+                        let view = self.changesets.iter().find(|v| cs_id.matches(&v.cs))?;
                         let file = view.files().iter().find(|f| f.path == *path)?.clone();
                         Some(Box::new(FileStagingOp::file(file, StageVerb::Discard))
                             as Box<dyn StagingOp>)
@@ -4374,12 +4946,12 @@ mod tests {
     use super::test_support::app_from_fixture;
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        EffectiveZoom, Layout, LoadedViews, Role, Severity, Summary, SummaryTarget, Zoom,
-        DEFAULT_OUTLINE_WIDTH,
+        EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity, Summary,
+        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
-    use crate::icons::OutlineIcons;
+    use crate::icons::IconMode;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
 
@@ -4443,6 +5015,62 @@ mod tests {
         let view = app.current_view_ref().unwrap();
         assert_eq!(view.old_text(), "bye\n");
         assert_eq!(view.new_text(), "");
+    }
+
+    // ── diff-hscroll: pan clamping ──────────────────────────────────────────────
+
+    #[test]
+    fn hscroll_left_floors_at_zero() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.hscroll, 0);
+        app.hscroll_left();
+        assert_eq!(app.hscroll, 0, "cannot pan left of column 0");
+    }
+
+    #[test]
+    fn hscroll_right_clamps_to_the_longest_row_leaving_one_column_visible() {
+        // A line well over a terminal width, so repeated `hscroll-right` presses hit the clamp
+        // rather than running out of steps first.
+        let long_line = "x".repeat(200);
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "short\n", &format!("{long_line}\n"))
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        for _ in 0..100 {
+            app.hscroll_right();
+        }
+        // `max_row_width` is 200 (the long line); the clamp keeps one column of it reachable.
+        assert_eq!(app.hscroll, 199);
+    }
+
+    #[test]
+    fn hscroll_right_on_a_file_with_no_long_rows_clamps_to_zero() {
+        // Every row is a single column wide, so `max_row_width` (1) leaves nothing to pan into —
+        // the clamp (`max_row_width - 1`) is `0`.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "a\n", "a\nb\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.hscroll_right();
+        assert_eq!(
+            app.hscroll, 0,
+            "every row already fits, so there is nothing to pan into"
+        );
     }
 
     #[test]
@@ -7693,6 +8321,53 @@ mod tests {
         assert_eq!(app.current, 0);
     }
 
+    // ── diff-hscroll: reset on file/changeset nav, preserved across cursor movement ──────
+
+    #[test]
+    fn next_file_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.hscroll = 5;
+        app.next_file();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn prev_file_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.goto_changeset(1);
+        app.hscroll = 5;
+        app.prev_file();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn next_changeset_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.hscroll = 5;
+        app.next_changeset();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn prev_changeset_resets_hscroll_to_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.goto_changeset(1);
+        app.hscroll = 5;
+        app.prev_changeset();
+        assert_eq!(app.hscroll, 0);
+    }
+
+    #[test]
+    fn cursor_movement_within_a_file_preserves_hscroll() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.hscroll = 5;
+        app.move_cursor_by(1);
+        assert_eq!(
+            app.hscroll, 5,
+            "plain cursor movement must not reset the horizontal pan"
+        );
+    }
+
     /// Regression: navigating to an OLDER committed changeset and loading its combined view must
     /// source the new side from that changeset's `head` commit tree, not the current worktree. The
     /// same file `f.txt` is touched by both changesets, so `cs-a`'s head (`mid`) content differs
@@ -8096,6 +8771,38 @@ mod tests {
     }
 
     #[test]
+    fn outline_cycle_mode_resets_outline_hscroll() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.hscroll = 5;
+        app.outline_cycle_mode();
+        assert_eq!(
+            app.outline_hscroll(),
+            0,
+            "a mode cycle reshapes the row list, so a stale pan offset must reset"
+        );
+    }
+
+    #[test]
+    fn outline_hscroll_left_floors_at_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        assert_eq!(app.outline_hscroll(), 0);
+        app.outline_hscroll_left();
+        assert_eq!(app.outline_hscroll(), 0, "cannot pan left of column 0");
+    }
+
+    #[test]
+    fn outline_hscroll_right_has_no_upper_clamp_in_the_method_itself() {
+        // Locked decision #2: `outline_hscroll_right` floors at 0 but does NOT clamp against the
+        // outline's content width — that clamp is render-side (`render_outline`), covered in
+        // `render.rs`'s tests.
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline_hscroll_right();
+        assert_eq!(app.outline_hscroll(), HSCROLL_STEP);
+        app.outline_hscroll_right();
+        assert_eq!(app.outline_hscroll(), HSCROLL_STEP * 2);
+    }
+
+    #[test]
     fn stack_mode_outline_items_carry_current_and_restack_markers() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -8155,6 +8862,7 @@ mod tests {
             items[0],
             OutlineItem::Header {
                 cs_idx: 0,
+                n: 2,
                 label: "cs-a".to_string(),
                 current: false,
                 needs_restack: false,
@@ -8170,6 +8878,7 @@ mod tests {
             header_b,
             &OutlineItem::Header {
                 cs_idx: 1,
+                n: 2,
                 label: "cs-b".to_string(),
                 current: true,
                 needs_restack: true,
@@ -8183,11 +8892,15 @@ mod tests {
 
     /// A minimal [`Changeset`] descriptor for the slot tests below — the slot model only cares
     /// about the metadata `ChangesetView::pending`/`failed` carry alongside a diff-free
-    /// [`DiffState`], not any real git content.
+    /// [`DiffState`], not any real git content. The span must be a committed variant (zero OID
+    /// is fine, nothing diffs it) so the outline labels these by name rather than as the
+    /// "Uncommitted changes" layer.
     fn bare_changeset(name: &str, current: bool) -> Changeset {
         Changeset {
             name: name.to_string(),
-            span: ChangesetSpan::Uncommitted,
+            span: ChangesetSpan::CommittedRoot {
+                head: git2::Oid::ZERO_SHA1,
+            },
             title: None,
             current,
             needs_restack: false,
@@ -8265,6 +8978,7 @@ mod tests {
             vec![
                 OutlineItem::Header {
                     cs_idx: 0,
+                    n: 2,
                     label: "cs-pending".to_string(),
                     current: true,
                     needs_restack: false,
@@ -8273,6 +8987,7 @@ mod tests {
                 },
                 OutlineItem::Header {
                     cs_idx: 1,
+                    n: 2,
                     label: "cs-failed".to_string(),
                     current: false,
                     needs_restack: false,
@@ -8445,6 +9160,7 @@ mod tests {
             items_after[app.outline_cursor()],
             OutlineItem::Header {
                 cs_idx: 1,
+                n: 2,
                 label: "cs-b".to_string(),
                 current: true,
                 needs_restack: false,
@@ -8513,6 +9229,86 @@ mod tests {
         };
         assert_eq!(change_for("c1.txt"), FileStatus::Added);
         assert_eq!(change_for("u1.txt"), FileStatus::Untracked);
+    }
+
+    /// `outline_snapshot`'s label fallback (`title` else `name`) used to render the SAME label
+    /// for a branch's committed node and its own uncommitted worktree layer — both are named
+    /// after the same branch, no title on either (see `FoldKey`'s doc comment, outline.rs). The
+    /// uncommitted layer must instead say "Uncommitted changes", so the branch name appears
+    /// exactly once (on the committed node).
+    #[test]
+    fn outline_snapshot_labels_the_uncommitted_layer_uncommitted_changes_not_the_branch_name() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("base.txt", "b\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("c1.txt", "c1\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        std::fs::write(repo.workdir().unwrap().join("u1.txt"), "u1\n").unwrap();
+
+        let committed = Changeset {
+            name: "feature".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let uncommitted = Changeset {
+            name: "feature".to_string(),
+            span: ChangesetSpan::Uncommitted,
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_c = ChangesetView::from_changeset_diff(
+            committed.clone(),
+            crate::acquire::diff_changeset(repo, &committed).unwrap(),
+        );
+        let view_u = ChangesetView::from_changeset_diff(
+            uncommitted.clone(),
+            crate::acquire::diff_changeset(repo, &uncommitted).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_c, view_u]);
+        app.open_current();
+        app.outline.mode = OutlineMode::Stack;
+        // Pin BaseFirst: this asserts an exact label vec, and display order is incidental here.
+        app.outline.order = OutlineOrder::BaseFirst;
+
+        let labels: Vec<String> = app
+            .outline_items()
+            .into_iter()
+            .filter_map(|it| match it {
+                OutlineItem::Header { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["feature", "Uncommitted changes"],
+            "the committed node keeps the branch name; the uncommitted layer must say \
+             \"Uncommitted changes\" instead of duplicating it"
+        );
+
+        // Label parity: the summary panel (and the winbar, which reads the same
+        // `display_label` helper) must agree with the outline header — the uncommitted layer
+        // is `current: true` in this fixture, so both non-outline surfaces target it.
+        let Summary::Changeset(summary) = app.summary_for(SummaryTarget::Changeset(1)) else {
+            panic!("expected a changeset summary for the uncommitted layer");
+        };
+        assert_eq!(
+            summary.label, "Uncommitted changes",
+            "the summary panel must use the same display-label rule as the outline header"
+        );
     }
 
     #[test]
@@ -8600,28 +9396,48 @@ mod tests {
     }
 
     #[test]
-    fn outline_confirm_on_a_header_row_jumps_to_its_first_file_and_returns_focus() {
+    fn outline_confirm_on_a_header_row_toggles_fold_instead_of_jumping_and_keeps_focus() {
+        // CS5 (`outline-fold`) removes Enter's pre-CS5 jump-to-changeset-first-file behavior on a
+        // Header row — it now toggles that row's fold instead, and deliberately does NOT return
+        // focus (you're manipulating the outline, not confirming a jump).
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
         // CS3: pin BaseFirst explicitly — cursor 3 is hardcoded to cs-b's header under base ->
-        // head row order; the confirm mechanic under test is order-agnostic.
+        // head row order; the toggle mechanic under test is order-agnostic.
         app.outline.order = OutlineOrder::BaseFirst;
         app.outline.open = true;
         app.outline.focused = true;
         app.outline.cursor = 3; // cs-b's header row
+        let before_cs = app.current_cs();
+        let before_file = app.current;
+        let rows_before = app.outline_items().len();
 
         app.outline_confirm();
 
         assert_eq!(
             app.current_cs(),
-            1,
-            "Enter on a header must jump to that changeset"
+            before_cs,
+            "Enter on a header must NOT jump the diff (CS5)"
         );
-        assert_eq!(app.current, 0, "...landing on its FIRST file");
+        assert_eq!(app.current, before_file);
         assert!(
-            !app.outline_focused(),
-            "confirming returns focus to the diff"
+            app.outline_focused(),
+            "toggling a fold must NOT return focus to the diff"
         );
+        assert_eq!(
+            app.outline_items().len(),
+            rows_before - 1,
+            "cs-b's single file row is now hidden under its collapsed header"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            3,
+            "the cursor stays on the header row it just toggled"
+        );
+
+        // Toggling again expands it back.
+        app.outline_confirm();
+        assert_eq!(app.outline_items().len(), rows_before);
     }
 
     #[test]
@@ -8685,10 +9501,13 @@ mod tests {
         app.outline.mode = OutlineMode::Stack;
 
         app.outline_cycle_mode();
-        assert_eq!(app.outline_mode(), OutlineMode::Tree);
+        assert_eq!(app.outline_mode(), OutlineMode::StackTree);
 
         app.outline_cycle_mode();
-        assert_eq!(app.outline_mode(), OutlineMode::StackTree);
+        assert_eq!(app.outline_mode(), OutlineMode::Flat);
+
+        app.outline_cycle_mode();
+        assert_eq!(app.outline_mode(), OutlineMode::Tree);
     }
 
     /// A single committed changeset touching two files under `src/`, for the Dir-row no-op
@@ -8753,6 +9572,7 @@ mod tests {
 
         app.outline.cursor = dir_idx;
         app.outline.focused = true;
+        let rows_before = app.outline_items().len();
         app.outline_confirm();
         assert_eq!(app.current_cs(), before_cs);
         assert_eq!(
@@ -8760,8 +9580,12 @@ mod tests {
             "confirming a Dir row must not jump the diff"
         );
         assert!(
-            !app.outline_focused(),
-            "confirm still returns focus to the diff, even as a no-op"
+            app.outline_focused(),
+            "confirming a Dir row toggles its fold (CS5) rather than returning focus"
+        );
+        assert!(
+            app.outline_items().len() < rows_before,
+            "src/'s files must now be hidden under its collapsed row"
         );
     }
 
@@ -8959,7 +9783,7 @@ mod tests {
             "precondition: scrolled away from the top"
         );
 
-        app.outline_cycle_mode(); // -> Tree
+        app.outline_cycle_mode(); // -> StackTree
         let cursor = app.outline_cursor();
         let scroll = app.outline_scroll();
         assert!(
@@ -8990,7 +9814,7 @@ mod tests {
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(app.outline_mode(), OutlineMode::default());
         assert_eq!(app.outline_order(), OutlineOrder::default());
-        assert_eq!(app.outline_icons(), OutlineIcons::default());
+        assert_eq!(app.icon_mode(), IconMode::default());
         assert_eq!(app.layout, Layout::default());
         assert_eq!(app.zoom, Zoom::default());
     }
@@ -9089,9 +9913,9 @@ mod tests {
     }
 
     #[test]
-    fn outline_icons_overrides_default_when_set() {
+    fn icon_mode_overrides_default_when_set() {
         let fixture = FixtureBuilder::new()
-            .config("workon.review.outline.icons", "nerd")
+            .config("workon.review.icons", "nerd")
             .build()
             .unwrap();
         let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
@@ -9100,13 +9924,13 @@ mod tests {
         let warnings = app.apply_view_config(&config);
 
         assert!(warnings.is_empty());
-        assert_eq!(app.outline_icons(), OutlineIcons::Nerd);
+        assert_eq!(app.icon_mode(), IconMode::Nerd);
     }
 
     #[test]
-    fn outline_icons_invalid_falls_back_to_default_with_warning() {
+    fn icon_mode_invalid_falls_back_to_default_with_warning() {
         let fixture = FixtureBuilder::new()
-            .config("workon.review.outline.icons", "bogus")
+            .config("workon.review.icons", "bogus")
             .build()
             .unwrap();
         let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
@@ -9114,9 +9938,9 @@ mod tests {
 
         let warnings = app.apply_view_config(&config);
 
-        assert_eq!(app.outline_icons(), OutlineIcons::default());
+        assert_eq!(app.icon_mode(), IconMode::default());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("outline.icons"));
+        assert!(warnings[0].contains("workon.review.icons"));
     }
 
     #[test]
@@ -9591,6 +10415,100 @@ mod tests {
         ));
     }
 
+    /// A Graphite stack whose current branch `b` has BOTH a committed changeset and the
+    /// uncommitted layer — [`workon::assemble_changesets`]'s `insert_uncommitted_layer` names
+    /// the layer after the current branch, so two changesets share the name "b". Built through
+    /// the production resolve path ([`crate::acquire::resolve_changesets`]) so `App::refresh`
+    /// re-resolves the same shape.
+    fn graphite_stack_app_on_uncommitted_layer() -> (Fixture, App) {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .branch_metadata("b", "a")
+            .untracked_file("scratch.txt", "hi\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        repo.set_head("refs/heads/b").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let changesets = crate::acquire::resolve_changesets(repo, "b").expect("resolve");
+        assert!(
+            changesets
+                .iter()
+                .any(|cs| cs.name == "b" && cs.span != ChangesetSpan::Uncommitted),
+            "precondition: a committed changeset named after the current branch"
+        );
+        assert!(
+            changesets
+                .iter()
+                .any(|cs| cs.name == "b" && cs.span == ChangesetSpan::Uncommitted),
+            "precondition: the uncommitted layer shares that name"
+        );
+        let mut views = Vec::with_capacity(changesets.len());
+        for cs in changesets {
+            let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+            views.push(ChangesetView::from_changeset_diff(cs, diff));
+        }
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.open_current();
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Uncommitted,
+            "precondition: the review opens on the uncommitted layer"
+        );
+        (fixture, app)
+    }
+
+    /// Refresh re-finds the current changeset by NAME alone — with the uncommitted layer named
+    /// after its branch, the first name match is the committed "b" changeset, and the reviewer
+    /// is silently teleported off the uncommitted layer. Every staging op refreshes, so this is
+    /// the "stage a file and the diff viewer jumps to another changeset" dogfood bug.
+    #[test]
+    fn refresh_stays_on_the_uncommitted_layer_despite_a_same_named_committed_changeset() {
+        let (_fixture, mut app) = graphite_stack_app_on_uncommitted_layer();
+
+        app.refresh();
+
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Uncommitted,
+            "refresh must keep the reviewer on the uncommitted layer, not its same-named \
+             committed changeset"
+        );
+    }
+
+    /// The confirm-time re-resolve for an outline discard looks the changeset up by NAME alone
+    /// (`resolve_confirm`'s `DiscardOutlineFiles` arm) — the first match is the committed "b"
+    /// changeset, the file isn't in ITS diff, and the pair is silently dropped: `y` does
+    /// nothing. This is the "discard from the outline has no effect" dogfood bug.
+    #[test]
+    fn outline_discard_still_applies_when_a_committed_changeset_shares_the_layers_name() {
+        let (fixture, mut app) = graphite_stack_app_on_uncommitted_layer();
+        // Set mode/order BEFORE the row lookup — the index is only valid in the build it was
+        // found in.
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        app.outline.cursor = outline_file_row(&app, "scratch.txt");
+
+        app.outline_discard();
+        assert!(
+            app.pending_confirm.is_some(),
+            "discard must request confirm; notice: {:?}",
+            app.notice
+        );
+        app.resolve_confirm(true);
+
+        let repo = fixture.repo().unwrap();
+        let scratch = repo.workdir().unwrap().join("scratch.txt");
+        // No absence predicate exists yet; a direct existence check keeps the assertion honest.
+        assert!(
+            !scratch.exists(),
+            "y must discard the untracked file from the worktree"
+        );
+    }
+
     #[test]
     fn outline_discard_confirm_n_cancels_and_leaves_the_worktree_unchanged() {
         let fixture = FixtureBuilder::new()
@@ -9685,6 +10603,398 @@ mod tests {
             }
             other => panic!("expected the cursor on b.txt's File row, got {other:?}"),
         }
+    }
+
+    // ── CS5 (`outline-fold`): collapse/expand ───────────────────────────────────
+
+    #[test]
+    fn outline_toggle_fold_hides_the_headers_files_and_move_by_skips_them() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        // Row order (BaseFirst): [Header cs-a, File a1, File a2, Header cs-b, File b1].
+        let rows_before = app.outline_items().len();
+        assert_eq!(rows_before, 5);
+
+        app.outline.cursor = 3; // cs-b's header
+        app.outline_confirm(); // toggle fold
+        let items = app.outline_items();
+        assert_eq!(items.len(), 4, "cs-b's single file row is now hidden");
+        assert!(
+            items
+                .iter()
+                .all(|it| !matches!(it, OutlineItem::File { cs_idx: 1, .. })),
+            "no cs-b file row should be reachable while its header is collapsed"
+        );
+
+        // `j` from the last visible row (now the folded header, index 3) must clamp there — there
+        // is nothing further to move onto.
+        app.outline.cursor = 3;
+        app.outline_move_by(5);
+        assert_eq!(
+            app.outline.cursor, 3,
+            "the cursor clamps at the collapsed header — b1.txt's row isn't in the index space \
+             to land on at all"
+        );
+    }
+
+    #[test]
+    fn outline_toggle_fold_expanding_again_restores_every_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        let rows_before = app.outline_items().len();
+
+        app.outline.cursor = 3;
+        app.outline_confirm(); // collapse
+        assert!(app.outline_items().len() < rows_before);
+        app.outline_confirm(); // expand again
+        assert_eq!(
+            app.outline_items(),
+            {
+                app.outline.folds.clear();
+                app.outline_items()
+            },
+            "re-expanding must reproduce exactly the same rows an empty fold set would"
+        );
+    }
+
+    #[test]
+    fn outline_fold_state_is_independent_per_mode() {
+        // Folding cs-b's header in Stack mode must not affect StackTree's own (separate) fold
+        // set, even though both modes emit a Header row keyed by the SAME label.
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 3; // cs-b's header in Stack mode
+        app.outline_confirm();
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::Stack)
+                .is_some_and(|s| !s.is_empty()),
+            "Stack mode's own fold set recorded the toggle"
+        );
+
+        app.outline.mode = OutlineMode::StackTree;
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::StackTree)
+                .is_none_or(|s| s.is_empty()),
+            "StackTree mode must start with its OWN empty fold set, untouched by Stack mode's"
+        );
+        let stack_tree_items = app.outline_items();
+        assert!(
+            stack_tree_items
+                .iter()
+                .any(|it| matches!(it, OutlineItem::File { cs_idx: 1, .. })),
+            "cs-b's file row must still be visible in StackTree mode — Stack mode's fold doesn't \
+             leak across modes"
+        );
+    }
+
+    #[test]
+    fn sync_outline_to_current_lands_on_the_collapsed_ancestor_without_auto_expanding() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        let header_b = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header present");
+        app.outline.cursor = header_b;
+        app.outline_confirm(); // collapse cs-b's header
+        assert!(
+            app.outline_focused(),
+            "toggling a fold keeps focus (CS5) — sanity for the nav below"
+        );
+
+        // A diff-initiated nav lands the diff on cs-b's (now-hidden) first file.
+        app.next_changeset();
+        assert_eq!(app.current_cs(), 1, "the diff itself did jump to cs-b");
+
+        let folded_header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's collapsed header row still present");
+        assert_eq!(
+            app.outline_cursor(),
+            folded_header_idx,
+            "the outline cursor must land on cs-b's collapsed header row, not an arbitrary clamp"
+        );
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::Stack)
+                .is_some_and(|s| !s.is_empty()),
+            "landing on the collapsed ancestor must NOT auto-expand it"
+        );
+    }
+
+    // ── n/p (outline changeset nav) + zM/zR (collapse/expand all) ──────────────
+
+    #[test]
+    fn outline_next_changeset_jumps_to_the_next_header_without_jumping_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        // Row order (BaseFirst): [Header cs-a, File a1, File a2, Header cs-b, File b1].
+        app.outline.cursor = 1; // a1's row
+        let cursor_before = (app.current_cs(), app.current);
+
+        app.outline_next_changeset();
+        assert_eq!(app.outline.cursor, 3, "must land on cs-b's header row");
+        assert_eq!(
+            (app.current_cs(), app.current),
+            cursor_before,
+            "a header landing must not jump the diff"
+        );
+    }
+
+    #[test]
+    fn outline_next_changeset_does_not_wrap_past_the_last_header() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 3; // cs-b's header, the LAST header row
+
+        app.outline_next_changeset();
+        assert_eq!(
+            app.outline.cursor, 3,
+            "no next header to jump to — the cursor must not move"
+        );
+    }
+
+    #[test]
+    fn outline_prev_changeset_jumps_to_the_previous_header_without_jumping_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 4; // b1's row
+        let cursor_before = (app.current_cs(), app.current);
+
+        app.outline_prev_changeset();
+        assert_eq!(app.outline.cursor, 3, "must land on cs-b's own header row");
+        assert_eq!(
+            (app.current_cs(), app.current),
+            cursor_before,
+            "a header landing must not jump the diff"
+        );
+
+        app.outline_prev_changeset();
+        assert_eq!(app.outline.cursor, 0, "must land on cs-a's header row");
+    }
+
+    #[test]
+    fn outline_prev_changeset_does_not_wrap_past_the_first_header() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 0; // cs-a's header, the FIRST header row
+
+        app.outline_prev_changeset();
+        assert_eq!(
+            app.outline.cursor, 0,
+            "no previous header to jump to — the cursor must not move"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_folds_every_header_leaving_only_header_rows() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        assert_eq!(app.outline_items().len(), 5, "sanity: both stacks expanded");
+
+        app.outline_collapse_all();
+        let items = app.outline_items();
+        assert_eq!(
+            items.len(),
+            2,
+            "only the two Header rows remain once every changeset is collapsed"
+        );
+        assert!(
+            items
+                .iter()
+                .all(|it| matches!(it, OutlineItem::Header { .. })),
+            "every remaining row must be a Header row: {items:?}"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_is_idempotent_when_a_header_is_already_folded() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 3; // cs-b's header
+        app.outline_confirm(); // pre-collapse cs-b only
+
+        app.outline_collapse_all();
+        assert_eq!(
+            app.outline_items().len(),
+            2,
+            "collapse-all must still fold cs-a even though cs-b was already folded"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_reseats_a_cursor_on_a_row_that_just_got_hidden() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.cursor = 1; // a1's row — about to be hidden under cs-a's header
+
+        app.outline_collapse_all();
+        let items = app.outline_items();
+        assert!(
+            app.outline.cursor < items.len(),
+            "the cursor must land inside the shrunk row list, not stay at a now-invalid index"
+        );
+        assert!(
+            matches!(
+                items[app.outline.cursor],
+                OutlineItem::Header { cs_idx: 0, .. }
+            ),
+            "the cursor must reseat onto cs-a's collapsed header, the ancestor of the hidden row \
+             it was on"
+        );
+    }
+
+    #[test]
+    fn outline_expand_all_restores_every_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+        let rows_before = app.outline_items().len();
+
+        app.outline_collapse_all();
+        assert!(app.outline_items().len() < rows_before);
+
+        app.outline_expand_all();
+        assert_eq!(
+            app.outline_items().len(),
+            rows_before,
+            "expand-all must restore every row collapse-all hid"
+        );
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::Stack)
+                .is_none_or(|s| s.is_empty()),
+            "expand-all must clear the CURRENT mode's fold set"
+        );
+    }
+
+    #[test]
+    fn outline_collapse_all_and_expand_all_are_scoped_to_the_current_mode() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+
+        app.outline_collapse_all();
+        assert!(app
+            .outline
+            .folds
+            .get(&OutlineMode::Stack)
+            .is_some_and(|s| !s.is_empty()));
+
+        app.outline.mode = OutlineMode::StackTree;
+        assert!(
+            app.outline
+                .folds
+                .get(&OutlineMode::StackTree)
+                .is_none_or(|s| s.is_empty()),
+            "Stack's collapse-all must not leak into StackTree's own fold set"
+        );
+    }
+
+    #[test]
+    fn outline_stage_targets_the_correct_row_when_an_unrelated_header_is_folded() {
+        // The highest-risk CS5 interaction: folding one changeset's header shifts every LATER
+        // row's index in `outline_items()` — a stage/discard verb resolved against a stale
+        // (unfiltered) index space would silently act on the wrong file. `outline_stage` reads
+        // `outline_row_targets`, which reads `outline_items()` at the CURSOR's own index — the
+        // same fold-filtered list the cursor itself was placed against — so it must stay correct.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .unstaged_file("dirty.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        repo.set_head("refs/heads/a").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let changesets = crate::acquire::resolve_changesets(repo, "a").unwrap();
+        assert_eq!(
+            changesets.len(),
+            2,
+            "expected the 'a' Graphite node plus the dirty tree's uncommitted layer"
+        );
+        let diffs = crate::acquire::diff_changesets(repo, &changesets).unwrap();
+        let views: Vec<ChangesetView> = changesets
+            .into_iter()
+            .zip(diffs)
+            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+            .collect();
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline.open = true;
+        app.outline.focused = true;
+
+        // Fold the committed "a" node's header — hides its own file row, shifting dirty.txt's
+        // row index one earlier in the filtered list.
+        let header_a = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 0, .. }))
+            .expect("'a's header present");
+        app.outline.cursor = header_a;
+        app.outline_confirm();
+
+        let dirty_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path, .. } if path == "dirty.txt"))
+            .expect("dirty.txt's row is still visible — its own header isn't folded");
+        app.outline.cursor = dirty_idx;
+
+        app.outline_stage();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        repo.assert(predicate::repo::has_staged_file("dirty.txt"));
     }
 
     // ── CS8: progressive gap expansion ──────────────────────────────────────
@@ -10056,5 +11366,384 @@ mod tests {
             "E must fully expand the gap: {:?}",
             view.display
         );
+    }
+
+    // ── CS10: mouse (click-to-focus, wheel scrolling) ────────────────────────────
+
+    #[test]
+    fn click_on_an_outline_file_row_focuses_selects_and_jumps_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        // BaseFirst Stack order: header(cs-a)=0, a1.txt=1, a2.txt=2, header(cs-b)=3, b1.txt=4.
+        app.outline_height = 10;
+        app.derive_outline_scroll(app.outline_items().len());
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        });
+        assert!(!app.outline_focused(), "starts unfocused (locked default)");
+
+        // Row 2 (a2.txt) at the outline's top-of-viewport (scroll 0) is screen row 2.
+        app.handle_click(5, 2);
+
+        assert!(app.outline_focused(), "a click on the outline focuses it");
+        assert_eq!(app.outline_cursor(), 2);
+        assert_eq!(app.current_cs(), 0);
+        assert_eq!(
+            app.files()[app.current].path,
+            "a2.txt",
+            "a File row's click must jump the diff there, like outline_move_to"
+        );
+    }
+
+    #[test]
+    fn click_on_an_outline_header_row_selects_without_jumping_the_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.order = OutlineOrder::BaseFirst;
+        app.outline_height = 10;
+        app.derive_outline_scroll(app.outline_items().len());
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        });
+        let before_cs = app.current_cs();
+        let before_file = app.current;
+
+        // Row 3 is cs-b's header.
+        app.handle_click(5, 3);
+
+        assert!(app.outline_focused());
+        assert_eq!(app.outline_cursor(), 3);
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (before_cs, before_file),
+            "a Header row's click must not jump the diff"
+        );
+        assert!(
+            app.summary_target().is_some(),
+            "selecting a Header row (outline open + focused) must surface the summary panel"
+        );
+    }
+
+    #[test]
+    fn click_in_the_single_diff_pane_focuses_it_and_moves_the_cursor_to_the_clicked_row() {
+        // 40 single-line rows (mirrors `derive_scroll_keeps_scrolloff_margin_and_slides_minimally`
+        // above) — long enough that clicking row 4 lands there without clamping against a tiny
+        // real diff.
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.focus_outline();
+        assert!(app.outline_focused());
+        app.pane_height = 10;
+        app.cursor = 0;
+        app.scroll = 0;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+
+        app.handle_click(10, 4);
+
+        assert!(
+            !app.outline_focused(),
+            "a click in the diff pane must return focus to the diff"
+        );
+        assert_eq!(
+            app.cursor, 4,
+            "the cursor must land on the clicked row (scroll 0 + offset 4)"
+        );
+    }
+
+    #[test]
+    fn click_in_the_unfocused_split_pane_flips_split_focus_and_moves_its_cursor() {
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Split; focused pane defaults to Unstaged
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert_eq!(app.split_focus_role(), Role::Unstaged);
+
+        app.pane_height = 5;
+        app.alt_height = 5;
+        app.derive_scroll();
+        app.derive_alt_scroll();
+        app.hit_regions.unstaged = Some(Region {
+            x: 0,
+            y: 1,
+            w: 40,
+            h: 5,
+        });
+        app.hit_regions.staged = Some(Region {
+            x: 0,
+            y: 7,
+            w: 40,
+            h: 5,
+        });
+
+        // Row 1 inside the staged region (y=7, height 5) — the currently UNFOCUSED pane. `f.txt`
+        // is a 3-line file (alpha/beta/gamma), so offset 1 stays within its row count either way.
+        app.handle_click(3, 8);
+
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Staged,
+            "a click in the unfocused pane must flip split_focus onto it"
+        );
+        let (_, cursor) = app.pane_render_state(Role::Staged);
+        assert_eq!(
+            cursor,
+            Some(1),
+            "the newly-focused pane's cursor must land on the clicked row (offset 1 into the region)"
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_outline_scrolls_the_viewport_without_moving_cursor_or_diff() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5;
+        app.outline.cursor = 0;
+        app.derive_outline_scroll(app.outline_items().len());
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 5,
+        });
+        assert!(!app.outline_focused());
+        let (cs_before, file_before) = (app.current_cs(), app.current);
+
+        app.handle_wheel(5, 2, 3);
+
+        assert!(app.outline_focused(), "a wheel event focuses its pane");
+        assert_eq!(
+            app.outline_scroll(),
+            3,
+            "the wheel moves the VIEWPORT by delta"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            0,
+            "peek model: the cursor never moves with the wheel, even out of the viewport"
+        );
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (cs_before, file_before),
+            "no cursor move means no diff jump, ever"
+        );
+
+        // The recovery gesture: the next cursor op re-derives the scroll and snaps the view
+        // back to the (wheel-abandoned) cursor.
+        app.outline_move_by(1);
+        assert_eq!(app.outline_cursor(), 1);
+        assert_eq!(
+            app.outline_scroll(),
+            0,
+            "a cursor op after a wheel peek snaps the viewport back to the cursor"
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_focused_diff_pane_scrolls_the_viewport_and_leaves_the_cursor() {
+        // Same 40-line fixture as the click test above — enough rows that a ±3 wheel move never
+        // clamps against a tiny real diff.
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.cursor = 8;
+        app.scroll = 0;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+
+        app.handle_wheel(10, 3, 3);
+        app.handle_wheel(10, 3, 3);
+        app.handle_wheel(10, 3, 3);
+        assert_eq!(app.scroll, 9, "three wheel presses move the viewport 3x3");
+        assert_eq!(
+            app.cursor, 8,
+            "peek model: the cursor stays put even once the viewport has scrolled past it"
+        );
+
+        // The recovery gesture: any cursor op re-derives and snaps the view back.
+        app.move_cursor_by(1);
+        assert_eq!(app.cursor, 9);
+        assert_eq!(
+            app.scroll,
+            9 - SCROLLOFF,
+            "a cursor op after a wheel peek snaps the viewport back to the cursor's window"
+        );
+    }
+
+    // ── mouse h-wheel + outline hscroll follow-up ─────────────────────────────────
+
+    #[test]
+    fn handle_hwheel_over_the_outline_pans_outline_hscroll_not_diff() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5;
+        app.derive_outline_scroll(app.outline_items().len());
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 5,
+        });
+        assert_eq!(app.outline_hscroll(), 0);
+        assert_eq!(app.hscroll, 0);
+
+        app.handle_hwheel(5, 2, 4);
+
+        assert!(
+            app.outline_focused(),
+            "an h-wheel event over the outline focuses it, like the vertical wheel"
+        );
+        assert_eq!(
+            app.outline_hscroll(),
+            4,
+            "the outline's own pan offset must move"
+        );
+        assert_eq!(app.hscroll, 0, "the diff's shared pan offset must not move");
+    }
+
+    #[test]
+    fn handle_hwheel_over_the_diff_pane_pans_app_hscroll_not_outline() {
+        // "l1".."l40" — the widest rows ("l10".."l40") are 3 columns, so the clamp
+        // (`max_row_width - 1`) is 2.
+        let lines: String = (1..=40).map(|n| format!("l{n}\n")).collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("big.txt", &lines)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.pane_height = 10;
+        app.hit_regions.single = Some(Region {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        });
+        assert_eq!(app.hscroll, 0);
+
+        app.handle_hwheel(10, 3, 4);
+
+        assert_eq!(
+            app.hscroll, 2,
+            "the diff's shared pan offset moves, clamped like `hscroll_right`"
+        );
+        assert_eq!(
+            app.outline_hscroll(),
+            0,
+            "the outline's own pan offset must not move"
+        );
+    }
+
+    #[test]
+    fn handle_hwheel_floors_at_zero() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5;
+        app.derive_outline_scroll(app.outline_items().len());
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 5,
+        });
+
+        app.handle_hwheel(5, 2, -4);
+
+        assert_eq!(app.outline_hscroll(), 0, "cannot pan left of column 0");
+    }
+
+    #[test]
+    fn handle_hwheel_outside_every_region_is_a_no_op() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline_height = 10;
+        app.pane_height = 10;
+        app.hit_regions = HitRegions {
+            outline: Some(Region {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 10,
+            }),
+            single: Some(Region {
+                x: 21,
+                y: 0,
+                w: 40,
+                h: 10,
+            }),
+            unstaged: None,
+            staged: None,
+        };
+        let outline_focused_before = app.outline_focused();
+        let hscroll_before = app.hscroll;
+        let outline_hscroll_before = app.outline_hscroll();
+
+        // On the divider, outside both recorded regions — same column CS10's click no-op test
+        // uses.
+        app.handle_hwheel(20, 0, 4);
+
+        assert_eq!(app.outline_focused(), outline_focused_before);
+        assert_eq!(app.hscroll, hscroll_before);
+        assert_eq!(app.outline_hscroll(), outline_hscroll_before);
+    }
+
+    #[test]
+    fn click_outside_every_hit_region_is_a_no_op() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline_height = 10;
+        app.pane_height = 10;
+        app.hit_regions = HitRegions {
+            outline: Some(Region {
+                x: 0,
+                y: 0,
+                w: 20,
+                h: 10,
+            }),
+            single: Some(Region {
+                x: 21,
+                y: 0,
+                w: 40,
+                h: 10,
+            }),
+            unstaged: None,
+            staged: None,
+        };
+        let outline_focused_before = app.outline_focused();
+        let cursor_before = app.cursor;
+        let outline_cursor_before = app.outline_cursor();
+        let current_before = (app.current_cs(), app.current);
+
+        // Row 0 sits above both content regions (a header row at y=0 in either would collide —
+        // pick a column between the two panes' widths, on the divider itself).
+        app.handle_click(20, 0);
+
+        assert_eq!(app.outline_focused(), outline_focused_before);
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(app.outline_cursor(), outline_cursor_before);
+        assert_eq!((app.current_cs(), app.current), current_before);
     }
 }

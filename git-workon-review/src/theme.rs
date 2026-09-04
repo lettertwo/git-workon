@@ -6,7 +6,7 @@
 //! CS5 adds [`Palette::light`] and wires [`crate::config::Theme`] to pick between them; CS6 adds the
 //! terminal-derivation probe for `auto`.
 //!
-//! ## Hybrid boundary (ADR-035, revised)
+//! ## Hybrid boundary (ADR-035, twice-revised)
 //! Colors that sit ON a tinted background — the diff add/del gradient, its staged variants, the
 //! cursor/selection washes, and syntax foreground — are theme-controlled base16 truecolor and live
 //! here, as before. The canvas background and chrome FOREGROUND (default text, dim labels, the
@@ -15,9 +15,29 @@
 //! look instead of bleeding the terminal's own bg/fg through. `auto` ([`Palette::from_terminal`])
 //! still derives these four from the probed terminal colors — so it matches the terminal exactly —
 //! and leaves [`Palette::paint_canvas`] `false` so a transparent/backgrounded terminal isn't
-//! painted over; the curated schemes and the probe's curated fallback set it `true`. Semantic
-//! chrome that is never on a tint and never a theme knob — error/warn/current-marker colors — stays
-//! ANSI/const in [`crate::render`] (`FG_ERROR`/`FG_WARN`/`FG_CURRENT`), unaffected by this boundary.
+//! painted over; the curated schemes and the probe's curated fallback set it `true`.
+//!
+//! **CS2 revision:** semantic chrome — error/warn/current-marker colors — was previously ANSI/const
+//! in `crate::render` (`FG_ERROR`/`FG_WARN`/`FG_CURRENT`), deliberately excluded from the palette on
+//! the reasoning that these colors never sit on a tint and are never a theme knob. That boundary is
+//! now revised: they ARE palette knobs ([`Palette::error_fg`]/[`Palette::warn_fg`]/
+//! [`Palette::current_fg`], mapped to base08/base0A/base0B), so a curated or probed theme can shift
+//! them too. `dark()` keeps the three shipped RGB values verbatim (the same pixel-identity
+//! precedent as its diff/cursor tints); `light()` takes `ONE_LIGHT`'s base08/base0A/base0B;
+//! `from_terminal()` takes the probed scheme's base08/base0A/base0B directly (matching the syntax
+//! slots' reasoning, not the curated-tint-borrowing the diff/cursor washes use).
+//!
+//! **CS1 addition (`outline-header-polish`):** [`Palette::heading_fg`] (base0C, cyan) is a fourth
+//! semantic-chrome field, same reasoning and same three-scheme mapping as the CS2 trio above —
+//! it's the outline's changeset-header-row accent, used only there (see
+//! `render::changeset_title_spans`'s doc comment for the outline-only gating).
+//!
+//! **CS3 addition (`outline-status-xy`):** [`Palette::modified_fg`] (base09, orange/amber) is a
+//! fifth semantic-chrome field, same three-scheme mapping again — the outline's committed-file
+//! "modified" tint (M/R/C letters). Deliberately a NEW field rather than reusing
+//! [`Palette::warn_fg`]: "this changeset needs restacking" and "this file was modified" are
+//! unrelated facts that happen to both want an amber tone, and collapsing them onto one field
+//! would make them un-independently themeable.
 
 use ratatui::style::Color;
 
@@ -202,6 +222,32 @@ pub struct Palette {
     pub dim: Color,
     /// Gutter/divider foreground (base04) — line-number gutters and pane dividers.
     pub gutter: Color,
+    /// Footer text color for an [`crate::app::Severity::Error`] notice, a pending-discard confirm
+    /// prompt, and a Failed changeset's marker/message — a clearly-red tone (base08). Promoted
+    /// from `render.rs`'s `FG_ERROR` const (CS2, revising ADR-035's hybrid boundary — see this
+    /// module's doc comment).
+    pub error_fg: Color,
+    /// Warning tone for a needs-restack marker (locked decision #9) — an amber (base0A), distinct
+    /// from [`Palette::error_fg`]'s red: a stale-parent changeset is a heads-up to `gt restack`,
+    /// not a failure. Promoted from `render.rs`'s `FG_WARN` const (CS2).
+    pub warn_fg: Color,
+    /// Tone for the outline's "this is the lib-marked `current` changeset" marker (locked
+    /// decision #9's outline half) — a green (base0B), distinct from every other marker color so
+    /// "current" reads unambiguously at a glance. Promoted from `render.rs`'s `FG_CURRENT` const
+    /// (CS2).
+    pub current_fg: Color,
+    /// Accent tone for a changeset header row's label (CS1, `outline-header-polish`) — a cyan
+    /// (base0C), distinct from [`Palette::current_fg`]'s green so "this is a section heading"
+    /// reads independently of "this is the current changeset." Used ONLY by the outline's Header
+    /// rows (`render::changeset_title_spans`'s `counter` param gates it) — the summary panel's
+    /// changeset title keeps the plain [`Palette::foreground`] look.
+    pub heading_fg: Color,
+    /// Tone for a committed changeset's Modified/Renamed/Copied outline file-status letter (CS3,
+    /// `outline-status-xy`) — an amber (base09), distinct from [`Palette::warn_fg`]'s amber
+    /// (base0A) so "needs restack" and "modified" stay independently themeable even though both
+    /// default to the same amber family. Used ONLY by the outline's committed-file status column
+    /// (`render::committed_letter_color`).
+    pub modified_fg: Color,
     /// Whether [`crate::render::render`] should paint the whole frame with [`Palette::background`]
     /// before drawing panes. `true` for the curated [`Palette::dark`]/[`Palette::light`] schemes
     /// (and the probe's curated fallback); `false` for [`Palette::from_terminal`], so `auto`
@@ -237,6 +283,17 @@ impl Palette {
             foreground: base.slot(5),
             dim: base.slot(3),
             gutter: base.slot(4),
+            // The shipped M3–M5 semantic-chrome colors, reproduced verbatim (the pixel-identity
+            // gate — CS2 promotes these from `render.rs` consts without changing a single value).
+            error_fg: Color::Rgb(220, 60, 60),
+            warn_fg: Color::Rgb(214, 158, 46),
+            current_fg: Color::Rgb(96, 200, 128),
+            // CS1: brand new (no historical `render.rs` const to reproduce), so this takes the
+            // scheme's base0C directly rather than an authored literal.
+            heading_fg: base.slot(12),
+            // CS3: brand new, same reasoning as `heading_fg` above — takes the scheme's base09
+            // directly rather than an authored literal.
+            modified_fg: base.slot(9),
             paint_canvas: true,
         }
     }
@@ -286,6 +343,11 @@ impl Palette {
             foreground: base.slot(5),
             dim: base.slot(3),
             gutter: base.slot(4),
+            error_fg: red,
+            warn_fg: base.slot(10), // base0A
+            current_fg: green,
+            heading_fg: cyan,
+            modified_fg: base.slot(9), // base09
             paint_canvas: true,
         }
     }
@@ -324,6 +386,13 @@ impl Palette {
             foreground: base.slot(5),
             dim: base.slot(3),
             gutter: base.slot(4),
+            // Semantic chrome also matches the terminal — probed base08/base0A/base0B, not the
+            // curated fallback's (mirrors the syntax slots' reasoning just above).
+            error_fg: base.slot(8),
+            warn_fg: base.slot(10),
+            current_fg: base.slot(11),
+            heading_fg: base.slot(12),
+            modified_fg: base.slot(9),
             // Unlike the curated schemes, `auto` must NOT paint over the terminal's own
             // background — base00 here IS the probed terminal bg, so painting a solid canvas
             // would defeat terminal transparency/background images for no benefit (the probed
@@ -395,6 +464,37 @@ mod tests {
         assert_eq!(t.cursor_bg, Color::Rgb(45, 50, 90));
         assert_eq!(t.selection_bg, Color::Rgb(30, 66, 66));
         assert_eq!(t.outline_cursor_unfocused_bg, Color::Rgb(35, 38, 55));
+    }
+
+    #[test]
+    fn dark_semantic_fg_matches_the_historical_render_rs_constants() {
+        // CS2's pixel-identity gate for the promoted `FG_ERROR`/`FG_WARN`/`FG_CURRENT` consts.
+        let t = Palette::dark();
+        assert_eq!(t.error_fg, Color::Rgb(220, 60, 60));
+        assert_eq!(t.warn_fg, Color::Rgb(214, 158, 46));
+        assert_eq!(t.current_fg, Color::Rgb(96, 200, 128));
+    }
+
+    #[test]
+    fn dark_heading_fg_takes_the_eighties_dark_cyan_accent() {
+        // CS1: no historical constant to reproduce (this field is new) — unlike
+        // `dark_semantic_fg_matches_the_historical_render_rs_constants` above, it takes base0C
+        // straight from the scheme.
+        let t = Palette::dark();
+        assert_eq!(t.heading_fg, Color::Rgb(0x66, 0xcc, 0xcc)); // base0C
+    }
+
+    #[test]
+    fn dark_modified_fg_takes_the_eighties_dark_orange_accent() {
+        // CS3: no historical constant to reproduce (this field is new, same reasoning as
+        // `dark_heading_fg_takes_the_eighties_dark_cyan_accent` above) — takes base09 straight
+        // from the scheme.
+        let t = Palette::dark();
+        assert_eq!(t.modified_fg, Color::Rgb(0xf9, 0x91, 0x57)); // base09
+        assert_ne!(
+            t.modified_fg, t.warn_fg,
+            "modified_fg must stay independently themeable from warn_fg"
+        );
     }
 
     #[test]
@@ -502,6 +602,30 @@ mod tests {
         assert_eq!(color("variable"), Color::Rgb(0x38, 0x3a, 0x42)); // base05 fg
     }
 
+    #[test]
+    fn light_semantic_fg_takes_one_lights_base08_base0a_base0b() {
+        let t = Palette::light();
+        assert_eq!(t.error_fg, Color::Rgb(0xca, 0x12, 0x43)); // base08
+        assert_eq!(t.warn_fg, Color::Rgb(0xc1, 0x84, 0x01)); // base0A
+        assert_eq!(t.current_fg, Color::Rgb(0x50, 0xa1, 0x4f)); // base0B
+    }
+
+    #[test]
+    fn light_heading_fg_takes_one_lights_cyan_accent() {
+        let t = Palette::light();
+        assert_eq!(t.heading_fg, Color::Rgb(0x01, 0x84, 0xbc)); // base0C
+    }
+
+    #[test]
+    fn light_modified_fg_takes_one_lights_orange_accent() {
+        let t = Palette::light();
+        assert_eq!(t.modified_fg, Color::Rgb(0xd7, 0x5f, 0x00)); // base09
+        assert_ne!(
+            t.modified_fg, t.warn_fg,
+            "modified_fg must stay independently themeable from warn_fg"
+        );
+    }
+
     /// A synthetic probed scheme with a distinct value in every slot and the given `base00`, so a
     /// test can assert `from_terminal`'s syntax slots came from the probed scheme (not a curated
     /// one) and read the base00 luminance branch.
@@ -572,6 +696,21 @@ mod tests {
         assert_eq!(palette.dim, probed.slot(3));
         assert_eq!(palette.gutter, probed.slot(4));
         assert!(!palette.paint_canvas);
+    }
+
+    #[test]
+    fn from_terminal_takes_semantic_fg_from_the_probed_scheme_not_the_curated_fallback() {
+        // Same reasoning as syntax/chrome: `auto`'s error/warn/current colors should match the
+        // terminal, not borrow the curated dark/light fallback's (unlike the diff/cursor tints,
+        // which DO borrow — see `from_terminal_with_a_dark_background_borrows_darks_curated_tints`).
+        let probed = probed_base16(Color::Rgb(0x1a, 0x1a, 0x1a));
+        let palette = Palette::from_terminal(probed);
+        assert_eq!(palette.error_fg, probed.slot(8));
+        assert_eq!(palette.warn_fg, probed.slot(10));
+        assert_eq!(palette.current_fg, probed.slot(11));
+        assert_eq!(palette.heading_fg, probed.slot(12));
+        assert_eq!(palette.modified_fg, probed.slot(9));
+        assert_ne!(palette.error_fg, Palette::dark().error_fg);
     }
 
     #[test]

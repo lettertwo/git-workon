@@ -11,15 +11,16 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span as TSpan};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{
-    App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Role, Severity, Summary,
+    App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role, Severity, Summary,
 };
 use crate::attribute::Attribution;
 use crate::config::View;
 use crate::highlight::FgSpan;
-use crate::icons::OutlineIcons;
+use crate::icons::IconMode;
 use crate::keymap::{footer_hint, help_sections, Keymap};
 use crate::model::FileStatus;
 use crate::outline::OutlineItem;
@@ -30,20 +31,136 @@ use crate::wordiff::Span as WordSpan;
 // The on-tint colors (diff add/del gradient + staged variants, cursor/selection washes, and syntax
 // foreground) come from a [`Palette`] threaded through render (ADR-035). The canvas background and
 // default/dim/gutter chrome foreground ALSO now come from the palette (`theme.background`/
-// `theme.foreground`/`theme.dim`/`theme.gutter`) — see the theme module's revised hybrid-boundary
-// doc comment — so a curated theme fully controls the look. Only semantic chrome that is never a
-// theme knob (error/warn/current-marker) stays ANSI-named / const below.
+// `theme.foreground`/`theme.dim`/`theme.gutter`), as does the semantic chrome that used to be
+// const here — error/warn/current-marker are now `theme.error_fg`/`theme.warn_fg`/
+// `theme.current_fg` (CS2, revising ADR-035's hybrid boundary) — see the theme module's revised
+// hybrid-boundary doc comment. A curated theme now fully controls the look; nothing in this
+// module hardcodes a semantic color anymore.
 
-/// Footer text color for an [`Severity::Error`] [`Notice`] — a clearly-red tone that reads on
-/// both light and dark terminal themes.
-const FG_ERROR: Color = Color::Rgb(220, 60, 60);
-/// Warning tone for the winbar's needs-restack marker (locked decision #9) — an amber, distinct
-/// from [`FG_ERROR`]'s red: a stale-parent changeset is a heads-up to `gt restack`, not a failure.
-const FG_WARN: Color = Color::Rgb(214, 158, 46);
-/// Tone for the outline's "this is the lib-marked `current` changeset" marker (locked decision
-/// #9's outline half) — a green, distinct from every other marker color in this module so
-/// "current" reads unambiguously at a glance.
-const FG_CURRENT: Color = Color::Rgb(96, 200, 128);
+// CS3's nerd-mode status/header/summary glyphs (gated on `IconMode::Nerd`; the plain unicode
+// defaults below stay byte-identical when `icons = none` — see icons.rs's module doc for why no
+// auto-detection ever picks Nerd for the user). Picked from the classic BMP nerd-font sets
+// (`fa`/`oct`) rather than devicons' broader (partly supplementary-plane) table, for wider
+// font compatibility — see `icons.rs`'s v3 doc note.
+/// Nerd-mode "this is the current changeset" marker, replacing the plain `•` (U+2022).
+const NERD_CURRENT_MARKER: char = '\u{f444}'; // nf-oct-dot-fill
+/// Nerd-mode needs-restack marker, replacing the plain `⚠` (U+26A0).
+const NERD_WARN_MARKER: char = '\u{f071}'; // nf-fa-warning
+/// Nerd-mode failed-changeset marker, replacing the plain `✗` (U+2717).
+const NERD_ERROR_MARKER: char = '\u{f00d}'; // nf-fa-times
+/// Nerd-mode loading marker, replacing the plain `…` (U+2026).
+const NERD_LOADING_MARKER: char = '\u{f141}'; // nf-fa-ellipsis-h
+/// Nerd-mode branch glyph prepended to a changeset header row's title (both the outline's Header
+/// row and the summary panel's changeset title) — purely decorative (dim-colored), so it carries
+/// no semantic color of its own.
+const NERD_BRANCH_ICON: char = '\u{f418}'; // nf-oct-git-branch
+/// Nerd-mode diffstat glyph for the summary panel's added-lines count, replacing the plain `+`.
+const NERD_DIFF_ADDED: char = '\u{f457}'; // nf-oct-diff-added
+/// Nerd-mode diffstat glyph for the summary panel's deleted-lines count, replacing the plain `-`.
+const NERD_DIFF_REMOVED: char = '\u{f458}'; // nf-oct-diff-removed
+
+/// The current-changeset marker for the active icon strategy. These four one-switch helpers are
+/// the single source of each semantic marker's glyph pair — the outline's Header arm and the
+/// summary panel (and, upstack, the winbar) deliberately draw the SAME markers, so the selection
+/// lives in one place instead of a hand-synced `match` per call site.
+fn current_marker(icons: IconMode) -> char {
+    match icons {
+        IconMode::Nerd => NERD_CURRENT_MARKER,
+        IconMode::None => '\u{2022}',
+    }
+}
+
+/// The needs-restack marker for the active icon strategy (see [`current_marker`]).
+fn warn_marker(icons: IconMode) -> char {
+    match icons {
+        IconMode::Nerd => NERD_WARN_MARKER,
+        IconMode::None => '\u{26A0}',
+    }
+}
+
+/// The failed-changeset marker for the active icon strategy (see [`current_marker`]).
+fn error_marker(icons: IconMode) -> char {
+    match icons {
+        IconMode::Nerd => NERD_ERROR_MARKER,
+        IconMode::None => '\u{2717}',
+    }
+}
+
+/// The loading marker for the active icon strategy (see [`current_marker`]).
+fn loading_marker(icons: IconMode) -> char {
+    match icons {
+        IconMode::Nerd => NERD_LOADING_MARKER,
+        IconMode::None => '\u{2026}',
+    }
+}
+
+/// The diffstat `+`/`-` prefixes for the active icon strategy (nerd: the oct diff glyphs) —
+/// shared by the summary panel's totals line and any other diffstat surface.
+fn diffstat_prefixes(icons: IconMode) -> (String, String) {
+    match icons {
+        IconMode::Nerd => (
+            format!("{NERD_DIFF_ADDED} "),
+            format!("{NERD_DIFF_REMOVED} "),
+        ),
+        IconMode::None => ("+".to_string(), "-".to_string()),
+    }
+}
+
+/// The shared changeset-title span run — `[current-marker] [branch-icon] ([i/n] )label
+/// [warn-marker]` — drawn by both `build_outline_line`'s Header arm and
+/// [`changeset_summary_lines`]. **The two call sites no longer render identically** (CS1,
+/// `outline-header-polish`): `counter` is `Some((cs_idx + 1, n))` for the outline's Header row
+/// only, and its presence ALSO switches the label from the plain [`Palette::foreground`] look to
+/// [`Palette::heading_fg`] + bold — the summary panel passes `None` and keeps the original
+/// foreground-bold label with no counter, matching its pre-CS1 appearance exactly. Failed/loading
+/// markers are still NOT included: the two call sites place them differently (trailing spans on
+/// the header row vs. a line of their own in the summary).
+fn changeset_title_spans(
+    label: &str,
+    current: bool,
+    needs_restack: bool,
+    theme: &Palette,
+    icons: IconMode,
+    counter: Option<(usize, usize)>,
+) -> Vec<TSpan<'static>> {
+    let mut spans = Vec::new();
+    if current {
+        spans.push(TSpan::styled(
+            format!("{} ", current_marker(icons)),
+            Style::default().fg(theme.current_fg),
+        ));
+    }
+    if icons == IconMode::Nerd {
+        spans.push(TSpan::styled(
+            format!("{NERD_BRANCH_ICON} "),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    // The `[i/n]` counter and the accented label are outline-only (`counter.is_some()`) — see
+    // this fn's doc comment for why the summary panel's `None` call site is unaffected.
+    let label_fg = if counter.is_some() {
+        theme.heading_fg
+    } else {
+        theme.foreground
+    };
+    if let Some((i, n)) = counter {
+        spans.push(TSpan::styled(
+            format!("[{i}/{n}] "),
+            Style::default().fg(theme.dim),
+        ));
+    }
+    spans.push(TSpan::styled(
+        label.to_string(),
+        Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
+    ));
+    if needs_restack {
+        spans.push(TSpan::styled(
+            format!(" {}", warn_marker(icons)),
+            Style::default().fg(theme.warn_fg),
+        ));
+    }
+    spans
+}
 
 /// Blend the cursor row's tint into an existing background, so the cursor highlight composites
 /// with (rather than replaces) del/add/word-diff emphasis on the same row — the row highlight is
@@ -92,6 +209,30 @@ fn apply_cursor_row(line: Line<'static>, width: u16, theme: &Palette) -> Line<'s
 /// Wash a selected (line-selection) row with the theme's selection tint.
 fn apply_selection_row(line: Line<'static>, width: u16, theme: &Palette) -> Line<'static> {
     apply_row_tint(line, width, theme.selection_bg)
+}
+
+/// Horizontal-scroll right-edge marker (decision #7): if `line` (as already blitted into `area`
+/// by the caller's `set_line`) is wider than `area`'s content width, overwrite the pane's last
+/// cell with a dim `…` so a panned-right line still signals there's more to the right. Applied
+/// AFTER `set_line` (and after any cursor/selection wash, which paints its own background first)
+/// so the marker survives on a cursor row — `Buffer::set_string`'s `Cell::set_style` only
+/// overwrites `fg` when the given style sets it (leaves `bg` untouched when it doesn't, per
+/// ratatui's `Style::patch` semantics), so this only ever changes the glyph + foreground, never
+/// erasing the wash underneath.
+fn apply_right_edge_marker(
+    buf: &mut Buffer,
+    area: Rect,
+    y: u16,
+    line: &Line<'static>,
+    theme: &Palette,
+) {
+    if area.width == 0 {
+        return;
+    }
+    if line.width() > area.width as usize {
+        let x = area.x + area.width - 1;
+        buf.set_string(x, y, HSCROLL_MARKER, Style::default().fg(theme.dim));
+    }
 }
 
 /// One resolved (bg, fg) pair for a byte range of a line.
@@ -245,6 +386,104 @@ enum Side {
     New,
 }
 
+/// Horizontal-scroll left-edge marker (decision #7): replaces the first visible content column
+/// whenever a line actually had content panned off to the left. Dim-styled like the gap-row/
+/// filler markers — no new color, just `theme.dim` on the existing `…` glyph.
+const HSCROLL_MARKER: &str = "…";
+
+/// Find the byte offset that cuts `text` at display column `col` (0 for `col == 0`), for
+/// [`content_spans`]'s horizontal-scroll slicing. Column, not byte, is the unit `App::hscroll`
+/// counts in, so this walks chars accumulating [`UnicodeWidthChar`] widths rather than indexing
+/// `text` directly — indexing by column count would panic on a non-char-boundary byte offset for
+/// any multibyte UTF-8 line.
+///
+/// Returns `(byte_offset, pad)`: `pad` is `true` when a wide (2-column) char straddles the cut —
+/// e.g. `col` lands mid-CJK-glyph — in which case that char is dropped entirely (skipping it
+/// half-visible would misalign every column after it) and the caller should prepend a one-column
+/// space to keep alignment. `col` at or beyond the line's total width returns `(text.len(), false)`
+/// (nothing left to show).
+fn hscroll_cut(text: &str, col: usize) -> (usize, bool) {
+    if col == 0 {
+        return (0, false);
+    }
+    let mut acc = 0usize;
+    for (i, c) in text.char_indices() {
+        if acc >= col {
+            return (i, false);
+        }
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if acc + w > col {
+            return (i + c.len_utf8(), true);
+        }
+        acc += w;
+    }
+    (text.len(), false)
+}
+
+/// Pan an already-built line of styled spans (diff content, or — as of the mouse/outline
+/// follow-up — an outline row) `cols` display columns to the left. The shared core
+/// [`content_spans`]/`render::render_outline` both build their spans at FULL width first, then
+/// apply this — never the other way around — so every existing style/segment computation
+/// (word-diff spans, syntax highlight, outline icon/label coloring) stays untouched by hscroll;
+/// this function only ever drops or re-slices spans, never recolors one.
+///
+/// Walks `spans` in order with a running column budget (`cols`, plus one extra reserved for the
+/// left-edge marker below): a per-span [`hscroll_cut`] call consumes as much of that budget as
+/// the span's own display width allows, carrying any remainder into the next span — exactly as
+/// if `hscroll_cut` had been called once over the whole line's concatenated text, since spans
+/// partition that text contiguously and in original order. A wide char straddling the cut is
+/// dropped whole (never half-rendered) and compensated with a one-column space pad, same as
+/// [`hscroll_cut`]'s own doc comment describes for a single string. Once the budget reaches `0`,
+/// every remaining span is pushed through unchanged.
+///
+/// When `cols == 0`, or the line has no content at all to cut, `spans` passes through unchanged
+/// (no marker, no pad) — matching [`hscroll_cut`]'s own "nothing to show" cases.
+fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TSpan<'static>> {
+    if cols == 0 {
+        return spans;
+    }
+    if spans.iter().all(|s| s.content.is_empty()) {
+        return spans;
+    }
+
+    // Reserve one extra column for the left-edge marker (decision #7's affordance) — mirrors the
+    // pre-refactor `content_spans`' own "cut at `hscroll`, then one column further for the
+    // marker" two-step.
+    let mut skip = cols + 1;
+    let mut out = Vec::with_capacity(spans.len() + 2);
+    out.push(TSpan::styled(
+        HSCROLL_MARKER.to_string(),
+        Style::default().fg(theme.dim),
+    ));
+
+    for span in spans {
+        if skip == 0 {
+            out.push(span);
+            continue;
+        }
+        let text = span.content.as_ref();
+        let (cut, straddled) = hscroll_cut(text, skip);
+        if straddled || cut < text.len() {
+            // The remaining budget was fully spent inside this span — everything from `cut`
+            // onward (possibly nothing) survives, unchanged in style.
+            skip = 0;
+            if straddled {
+                out.push(TSpan::styled(
+                    " ".to_string(),
+                    Style::default().fg(theme.foreground),
+                ));
+            }
+            if cut < text.len() {
+                out.push(TSpan::styled(text[cut..].to_string(), span.style));
+            }
+        } else {
+            // The whole span fit inside the remaining budget — drop it and keep consuming.
+            skip = skip.saturating_sub(UnicodeWidthStr::width(text));
+        }
+    }
+    out
+}
+
 /// Build the styled content spans (everything after the gutter) for one line of text, shared by
 /// [`build_pane_line`] (SBS) and [`build_inline_line`] (inline) — the two differ only in how they
 /// resolve `text`/`hl`/`emphasis` from a [`Row`] vs an [`InlineRow`] and in their gutter, not in
@@ -253,6 +492,11 @@ enum Side {
 /// `emphasis` is `Some((subtle, strong))` for a `Del`/`Add` line (whole-line subtle background,
 /// plus per-`word_spans` strong background when `is_word_pair`; whole-line strong when not paired
 /// — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at all).
+///
+/// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans via [`pan_spans`] — the
+/// segments below are always composed over the FULL, unsliced `text` first (byte-identical to the
+/// pre-hscroll behavior), and [`pan_spans`] applies the cut/pad/marker afterward.
+#[allow(clippy::too_many_arguments)]
 fn content_spans(
     text: &str,
     hl: Option<&Vec<FgSpan>>,
@@ -260,6 +504,7 @@ fn content_spans(
     word_spans: &[WordSpan],
     is_word_pair: bool,
     theme: &Palette,
+    hscroll: usize,
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
     if let Some((subtle_bg, strong_bg)) = emphasis {
@@ -289,7 +534,7 @@ fn content_spans(
         }
         spans.push(TSpan::styled(text[seg.start..seg.end].to_string(), style));
     }
-    spans
+    pan_spans(spans, hscroll, theme)
 }
 
 /// Build a single rendered line for one pane at a display row's resolved [`Row`]/[`CellKind`].
@@ -305,6 +550,7 @@ fn build_pane_line(
     gutter_w: usize,
     content_w: usize,
     theme: &Palette,
+    hscroll: usize,
 ) -> Line<'static> {
     match row {
         Row::Filler => {
@@ -337,6 +583,7 @@ fn build_pane_line(
                 word_spans,
                 is_word_pair,
                 theme,
+                hscroll,
             ));
             Line::from(spans)
         }
@@ -352,6 +599,11 @@ fn build_pane_line(
 /// default/dim/gutter chrome foreground (ADR-035, revised).
 pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette) {
     let area = frame.area();
+
+    // CS10: reset every recorded hit region at the start of the frame — a region only survives
+    // this frame if one of the panes below actually painted it again. Prevents a stale rect from
+    // an earlier frame's layout (e.g. the outline just closed) from staying hit-testable.
+    app.hit_regions = Default::default();
 
     // Paint the whole screen with the theme's background FIRST — a curated theme (light/dark)
     // controls the canvas outright; `auto` leaves `paint_canvas` false so the terminal's own
@@ -407,6 +659,17 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
 
     if app.help_visible {
         render_help_overlay(frame, app, keymap, area);
+    }
+}
+
+/// Convert a ratatui [`Rect`] into the [`Region`] shape [`App::hit_regions`] stores (CS10) —
+/// `app.rs` has no ratatui dependency, so every write into `hit_regions` goes through this.
+fn region_from(area: Rect) -> Region {
+    Region {
+        x: area.x,
+        y: area.y,
+        w: area.width,
+        h: area.height,
     }
 }
 
@@ -469,11 +732,18 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 }
 
 /// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
-/// carry the changeset's position marker (green ● for `cs.current`) and needs-restack glyph
-/// (amber ⚠, [`FG_WARN`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
-/// indent, a one-character staged-ness glyph (blank for a committed changeset's files — see
-/// [`crate::outline::StagedStatus`]'s doc comment for why no special-casing is needed here), and
-/// the path. The cursor row (the outline's OWN cursor — a separate coordinate space from the
+/// carry the changeset's position marker (green • for `cs.current`), a `[i/n]` TRUE-stack-position
+/// counter, an accented ([`Palette::heading_fg`]) bold label (CS1, `outline-header-polish` — see
+/// [`changeset_title_spans`]'s doc comment), and needs-restack glyph (amber ⚠,
+/// [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
+/// indent, a two-column git-porcelain-style status matrix (CS3, `outline-status-xy` — see
+/// [`outline_status_spans`]'s doc comment for the X/Y-vs-single-letter split), and
+/// the path — Flat/Stack rows (CS2) split it into `basename  dim/dirname` (no suffix for a
+/// root-level file); Tree/StackTree rows already carry the directory via ancestor Dir rows, so
+/// `path` there is just the bare basename. A COLLAPSED [`OutlineItem::Header`]/[`OutlineItem::Dir`]
+/// row (CS5, `outline-fold`) additionally carries a trailing dim ` ▸ N` (`N` = hidden FILE rows
+/// only), from [`App::outline_items_with_hidden_counts`]'s per-row marker count — an expanded row
+/// gets no chevron at all. The cursor row (the outline's OWN cursor — a separate coordinate space from the
 /// diff's [`App::cursor`]) gets the theme's cursor tint while the outline has focus, or the dimmer
 /// [`Palette::outline_cursor_unfocused_bg`] while it's merely open (so the remembered position stays
 /// legible even after focus returns to the diff). `&mut App` (CS2, precedent: [`render_body`]
@@ -483,13 +753,28 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// transient bottom-anchor scroll computed fresh each frame.
 fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     app.outline_height = area.height as usize;
-    let items = app.outline_items();
-    app.derive_outline_scroll(items.len());
+    app.hit_regions.outline = Some(region_from(area));
+    let (items, hidden_counts) = app.outline_items_with_hidden_counts();
+    // Bounds-clamp only — NOT a cursor-following derive: under the wheel's peek model a
+    // scrolled-away viewport must survive the frame; cursor ops re-derive on their own.
+    app.clamp_outline_scroll(items.len());
 
     let cursor = app.outline_cursor();
     let focused = app.outline_focused();
     let scroll = app.outline_scroll();
-    let icons = app.outline_icons();
+    let icons = app.icon_mode();
+
+    // Render-side upper clamp of the outline's own pan offset (mirroring `clamp_outline_scroll`
+    // just above) — from EVERY item's built line width, not just the visible rows: outlines are
+    // small (file trees, not file contents), so re-measuring the whole thing here is cheap.
+    let max_line_width = items
+        .iter()
+        .zip(&hidden_counts)
+        .map(|(item, &hidden)| build_outline_line(item, theme, icons, hidden).width())
+        .max()
+        .unwrap_or(0);
+    app.clamp_outline_hscroll(max_line_width);
+    let hscroll = app.outline_hscroll();
 
     let buf = frame.buffer_mut();
     for row in 0..area.height {
@@ -498,8 +783,10 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
         let Some(item) = items.get(item_idx) else {
             continue;
         };
+        let hidden = hidden_counts.get(item_idx).copied().unwrap_or(0);
         let is_cursor = item_idx == cursor;
-        let line = build_outline_line(item, theme, icons);
+        let line = build_outline_line(item, theme, icons, hidden);
+        let line = Line::from(pan_spans(line.spans, hscroll, theme));
         let line = if is_cursor && focused {
             apply_cursor_row(line, area.width, theme)
         } else if is_cursor {
@@ -508,93 +795,188 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
             line
         };
         buf.set_line(area.x, y, &line, area.width);
+        apply_right_edge_marker(buf, area, y, &line, theme);
     }
 }
 
 /// Render a tree-guide prefix from an [`OutlineItem::Dir`]/[`OutlineItem::File`] `guides`
 /// vector: every element but the last draws a continuing `│` (if that ancestor level was NOT
 /// its parent's last child) or blank space (if it was), and the last element draws the row's own
-/// `└─`/`├─` connector.
+/// `╰─`/`├─` connector — CS4 rounds the last-child corner (`╰`, U+2570) from the square `└`
+/// (U+2514); there's no widely-supported rounded "tee" glyph, so the non-last `├─` connector is
+/// unchanged. CS2 tightens indent to 2 cols/level: continuation is `│ ` (bar + space, no third
+/// column), and connectors (`├─`/`╰─`) carry no trailing space — the glyph that follows hugs the
+/// connector directly.
 fn tree_prefix(guides: &[bool]) -> String {
     let mut s = String::new();
     let Some((&is_last, ancestors)) = guides.split_last() else {
         return s;
     };
     for &last in ancestors {
-        s.push_str(if last { "   " } else { "\u{2502}  " });
+        s.push_str(if last { "  " } else { "\u{2502} " });
     }
     s.push_str(if is_last {
-        "\u{2514}\u{2500} "
+        "\u{2570}\u{2500}"
     } else {
-        "\u{251C}\u{2500} "
+        "\u{251C}\u{2500}"
     });
     s
 }
 
-/// The [`FileStatus`] change-letter's foreground color (CS5): a create-like status (Added/
-/// Untracked) reuses the theme's `add_strong` tint, a destroy-like status (Deleted) reuses
-/// `del_strong`, and everything else (Modified/Renamed/Copied/Unmerged — a change to EXISTING
-/// content, not a create/destroy) gets the theme's neutral `foreground`. No new [`Palette`]
-/// fields — this is deliberately just a remap of tints CS4's summary rows already use.
-fn change_letter_color(change: FileStatus, theme: &Palette) -> Color {
+/// Placeholder glyph for an empty XY status column (CS3, `outline-status-xy`) — U+00B7 middle
+/// dot, always `theme.dim`, standing in for "nothing to report on this axis." Deliberately not a
+/// space: the two-column matrix should read as a grid even when one side is empty, not look like
+/// a ragged single-letter row.
+const STATUS_PLACEHOLDER: char = '\u{b7}';
+
+/// A committed changeset's single-letter status color (CS3): A green (`add_strong`), D red
+/// (`del_strong`), M/R/C (a change to EXISTING content, not a create/destroy) the dedicated amber
+/// [`Palette::modified_fg`], and `?`/`U` dim (Untracked never reaches here — see
+/// [`outline_status_spans`]'s doc comment — and Unmerged is a worktree-only conflict state a
+/// committed changeset can't carry; both fold to `dim` only so this match stays exhaustive).
+fn committed_letter_color(change: FileStatus, theme: &Palette) -> Color {
     match change {
-        FileStatus::Added | FileStatus::Untracked => theme.add_strong,
+        FileStatus::Added => theme.add_strong,
         FileStatus::Deleted => theme.del_strong,
-        FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied | FileStatus::Unmerged => {
-            theme.foreground
+        FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => theme.modified_fg,
+        FileStatus::Untracked | FileStatus::Unmerged => theme.dim,
+    }
+}
+
+/// Build a file row's two-column status matrix (CS3, `outline-status-xy`) — always exactly 2
+/// [`TSpan`]s' worth of display columns, in every mode, so committed and uncommitted rows stay
+/// aligned (the changeset's Gotcha).
+///
+/// - `change == FileStatus::Untracked` wins over everything else and renders a dim `??` — noise,
+///   not danger, regardless of `status` (see [`crate::outline::StagedStatus`]'s doc comment: an
+///   untracked worktree file is always `Unstaged`, but git's own convention for untracked is `??`,
+///   not a staged-ness-derived letter).
+/// - `StagedStatus::None` is the committed-changeset case (see that type's doc comment for why no
+///   special-casing is needed to detect it): a single [`FileStatus::letter`] colored by
+///   [`committed_letter_color`], plus a blank pad column.
+/// - `Unstaged`/`Staged`/`Partial` render the git-porcelain X/Y matrix: `letter` (from the SAME
+///   underlying [`FileStatus`] — there's only one change kind per file, not separate staged/
+///   unstaged kinds) in whichever column(s) that axis has a change, [`STATUS_PLACEHOLDER`] in the
+///   other; X (staged/index) is `add_strong` green, Y (worktree) is `del_strong` red, matching
+///   git's own status convention.
+fn outline_status_spans(
+    status: crate::outline::StagedStatus,
+    change: FileStatus,
+    theme: &Palette,
+) -> Vec<TSpan<'static>> {
+    use crate::outline::StagedStatus;
+
+    if change == FileStatus::Untracked {
+        return vec![TSpan::styled(
+            "??".to_string(),
+            Style::default().fg(theme.dim),
+        )];
+    }
+    match status {
+        StagedStatus::None => {
+            let letter = change.letter();
+            vec![
+                TSpan::styled(
+                    letter.to_string(),
+                    Style::default().fg(committed_letter_color(change, theme)),
+                ),
+                TSpan::styled(" ".to_string(), Style::default().fg(theme.foreground)),
+            ]
+        }
+        StagedStatus::Unstaged | StagedStatus::Staged | StagedStatus::Partial => {
+            let letter = change.letter();
+            let staged = matches!(status, StagedStatus::Staged | StagedStatus::Partial);
+            let unstaged = matches!(status, StagedStatus::Unstaged | StagedStatus::Partial);
+            let x_char = if staged { letter } else { STATUS_PLACEHOLDER };
+            let y_char = if unstaged { letter } else { STATUS_PLACEHOLDER };
+            let x_color = if staged { theme.add_strong } else { theme.dim };
+            let y_color = if unstaged {
+                theme.del_strong
+            } else {
+                theme.dim
+            };
+            vec![
+                TSpan::styled(x_char.to_string(), Style::default().fg(x_color)),
+                TSpan::styled(y_char.to_string(), Style::default().fg(y_color)),
+            ]
         }
     }
 }
 
+/// CS5 (`outline-fold`): a collapsed Header/Dir row's trailing marker — dim ` ▸ N`, `N` being the
+/// count of hidden FILE rows (not dirs) [`App::outline_items_with_hidden_counts`] attached to that
+/// row. `None` for `hidden == 0` (an EXPANDED Header/Dir — or a File row, which never carries a
+/// hidden count at all) — the locked "no chevron when expanded" rule reads a zero count as "don't
+/// draw a marker" rather than "draw ` ▸ 0`".
+fn fold_marker(hidden: usize, theme: &Palette) -> Option<TSpan<'static>> {
+    (hidden > 0).then(|| {
+        TSpan::styled(
+            format!(" \u{25b8} {hidden}"),
+            Style::default().fg(theme.dim),
+        )
+    })
+}
+
 /// Build one outline row's rendered [`Line`] — see [`render_outline`]'s doc comment for the
-/// marker rules. `icons` (CS5, `workon.review.outline.icons`) is [`OutlineIcons::None`] by
+/// marker rules. `icons` (CS5, `workon.review.icons`) is [`IconMode::None`] by
 /// default, which reproduces the pre-CS5 row text exactly (no icon glyph, no extra space); only
-/// [`OutlineIcons::Nerd`] inserts an icon before the name/path.
-fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) -> Line<'static> {
+/// [`IconMode::Nerd`] inserts an icon before the name/path. `hidden` (CS5, `outline-fold`) is the
+/// row's collapsed hidden-file count from [`App::outline_items_with_hidden_counts`] — `0` for
+/// every row that isn't a collapsed Header/Dir; see [`fold_marker`].
+fn build_outline_line(
+    item: &OutlineItem,
+    theme: &Palette,
+    icons: IconMode,
+    hidden: usize,
+) -> Line<'static> {
     match item {
         OutlineItem::Header {
+            cs_idx,
+            n,
             label,
             current,
             needs_restack,
             loading,
             failed,
-            ..
         } => {
-            let marker = if *current { "\u{25CF} " } else { "  " };
-            let mut spans = vec![TSpan::styled(
-                marker.to_string(),
-                Style::default().fg(FG_CURRENT),
-            )];
-            spans.push(TSpan::styled(
-                label.clone(),
-                Style::default()
-                    .fg(theme.foreground)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            if *needs_restack {
-                spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
-            }
+            let mut spans = changeset_title_spans(
+                label,
+                *current,
+                *needs_restack,
+                theme,
+                icons,
+                Some((cs_idx + 1, *n)),
+            );
             // ADR-037: a Failed changeset's marker wins over Pending's (a slot is never both,
             // but Failed is the more actionable state to surface if it somehow were).
             if *failed {
-                spans.push(TSpan::styled(" \u{2717}", Style::default().fg(FG_ERROR)));
+                spans.push(TSpan::styled(
+                    format!(" {}", error_marker(icons)),
+                    Style::default().fg(theme.error_fg),
+                ));
             } else if *loading {
-                spans.push(TSpan::styled(" \u{2026}", Style::default().fg(theme.dim)));
+                spans.push(TSpan::styled(
+                    format!(" {}", loading_marker(icons)),
+                    Style::default().fg(theme.dim),
+                ));
             }
+            spans.extend(fold_marker(hidden, theme));
             Line::from(spans)
         }
         OutlineItem::Dir { name, guides, .. } => {
             let icon = match icons {
-                OutlineIcons::Nerd => format!("{} ", crate::icons::DIR_ICON),
-                OutlineIcons::None => String::new(),
+                IconMode::Nerd => format!("{} ", crate::icons::DIR_ICON),
+                IconMode::None => String::new(),
             };
             let text = format!("{}{icon}{name}/", tree_prefix(guides));
-            Line::from(TSpan::styled(
+            let mut spans = vec![TSpan::styled(
                 text,
                 Style::default()
                     .fg(theme.dim)
                     .add_modifier(Modifier::ITALIC),
-            ))
+            )];
+            spans.extend(fold_marker(hidden, theme));
+            Line::from(spans)
         }
         OutlineItem::File {
             path,
@@ -603,34 +985,70 @@ fn build_outline_line(item: &OutlineItem, theme: &Palette, icons: OutlineIcons) 
             guides,
             ..
         } => {
-            let glyph = status.glyph();
-            let letter = change.letter();
             // Empty `guides` (Flat/Stack modes) keeps the original two-space indent; a
             // non-empty `guides` (Tree/StackTree modes) draws tree connectors instead — see
-            // `OutlineItem`'s doc comment for why emptiness is the mode signal.
-            let prefix = if guides.is_empty() {
-                "  ".to_string()
+            // `OutlineItem`'s doc comment for why emptiness is the mode signal. CS4: a non-empty
+            // prefix (real tree connectors) gets its own `theme.dim`-styled span — matching the
+            // Dir row's already-dim guides — so the guide lines read as quiet structure, not part
+            // of the file's own status column. The status matrix itself (CS3,
+            // `outline_status_spans`) is always exactly 2 display columns, same width the old
+            // glyph+letter pair occupied, so this swap doesn't shift anything after it.
+            let mut spans = Vec::new();
+            if guides.is_empty() {
+                spans.push(TSpan::styled(
+                    "  ".to_string(),
+                    Style::default().fg(theme.foreground),
+                ));
             } else {
-                tree_prefix(guides)
-            };
-            let icon = match icons {
-                OutlineIcons::Nerd => format!("{} ", crate::icons::icon_for_path(path)),
-                OutlineIcons::None => String::new(),
-            };
-            Line::from(vec![
-                TSpan::styled(
-                    format!("{prefix}{glyph}"),
+                spans.push(TSpan::styled(
+                    tree_prefix(guides),
+                    Style::default().fg(theme.dim),
+                ));
+            }
+            spans.extend(outline_status_spans(*status, *change, theme));
+            spans.push(TSpan::styled(
+                " ".to_string(),
+                Style::default().fg(theme.foreground),
+            ));
+            if icons == IconMode::Nerd {
+                let (icon, color) = crate::icons::icon_for_path(
+                    path,
+                    crate::theme::is_light_background(theme.background),
+                );
+                spans.push(TSpan::styled(
+                    format!("{icon} "),
+                    Style::default().fg(color.unwrap_or(theme.foreground)),
+                ));
+            }
+            // Flat/Stack rows (empty `guides`) split `path` at render time into `basename  dim/
+            // dirname` — basename first (bright, matching the tree modes' bare-name leaves) so
+            // truncation eats the dim dirname before the name a user is scanning for (CS2
+            // gotcha). Tree/StackTree rows (non-empty `guides`) already carry the path via
+            // ancestor Dir rows, so `path` there is already just the basename — render it as-is.
+            if guides.is_empty() {
+                match path.rsplit_once('/') {
+                    Some((dir, base)) => {
+                        spans.push(TSpan::styled(
+                            base.to_string(),
+                            Style::default().fg(theme.foreground),
+                        ));
+                        spans.push(TSpan::styled(
+                            format!("  {dir}"),
+                            Style::default().fg(theme.dim),
+                        ));
+                    }
+                    None => spans.push(TSpan::styled(
+                        path.clone(),
+                        Style::default().fg(theme.foreground),
+                    )),
+                }
+            } else {
+                spans.push(TSpan::styled(
+                    path.clone(),
                     Style::default().fg(theme.foreground),
-                ),
-                TSpan::styled(
-                    letter.to_string(),
-                    Style::default().fg(change_letter_color(*change, theme)),
-                ),
-                TSpan::styled(
-                    format!(" {icon}{path}"),
-                    Style::default().fg(theme.foreground),
-                ),
-            ])
+                ));
+            }
+            Line::from(spans)
         }
     }
 }
@@ -665,26 +1083,48 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     let idx = app.current + 1;
     let n = app.files().len();
     let text = format!("[{idx}/{n}] {}", current_file_label(app));
-    frame.render_widget(
-        Paragraph::new(text).style(
-            Style::default()
-                .fg(theme.foreground)
-                .add_modifier(Modifier::BOLD),
-        ),
-        area,
-    );
+    let mut spans = vec![TSpan::styled(
+        text,
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if let Some(span) = hscroll_indicator_span(app, theme) {
+        spans.push(span);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// While [`App::hscroll`] is panned, a small dim `»42` (the column offset) appended to the header/
+/// winbar (locked decision #8) — `None` at column `0`, matching the diffstat span's own
+/// present-or-absent pattern above/below.
+fn hscroll_indicator_span(app: &App, theme: &Palette) -> Option<TSpan<'static>> {
+    if app.hscroll == 0 {
+        return None;
+    }
+    Some(TSpan::styled(
+        format!("  »{}", app.hscroll),
+        Style::default().fg(theme.dim),
+    ))
 }
 
 /// The multi-changeset winbar (locked decisions #8 + #9): `[i/n] <title-or-name>
-/// <restack-marker>  —  <path> (fidx/nfiles)`, where `i/n` is the changeset's position in the
-/// stack and `fidx/nfiles` the active file's position within it. Only reached when
+/// <restack-marker>  <diffstat>  —  <path> (fidx/nfiles)`, where `i/n` is the changeset's position
+/// in the stack and `fidx/nfiles` the active file's position within it. Only reached when
 /// [`App::changeset_count`] > 1 (see [`render_header`]) — a lone uncommitted changeset never
 /// shows this, keeping the M4 full-width look.
+///
+/// CS4 polish: a tight `+A -D` diffstat for the ACTIVE changeset (there wasn't one before),
+/// tinted with the same [`Palette::add_strong`]/[`Palette::del_strong`] the summary panel's own
+/// totals line uses; in [`IconMode::Nerd`] mode the restack marker and diffstat prefixes swap
+/// to their nerd glyphs (same consts `build_outline_line`/`push_summary_body` use), and the
+/// active file's path gets its devicons file icon.
 fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
-    let title = cs.title.as_deref().unwrap_or(cs.name.as_str());
+    let title = crate::app::display_label(cs);
+    let icons = app.icon_mode();
 
     let mut spans = vec![TSpan::styled(
         format!("[{i}/{n}] {title}"),
@@ -696,18 +1136,67 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
     // from the plain title so a stale-parent changeset reads as a heads-up at a glance.
     if cs.needs_restack {
         spans.push(TSpan::styled(
-            "  ⚠ needs restack",
-            Style::default().fg(FG_WARN).add_modifier(Modifier::BOLD),
+            format!("  {} needs restack", warn_marker(icons)),
+            Style::default()
+                .fg(theme.warn_fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // A pending/failed changeset's `files()` is always empty (ADR-037) — skip the diffstat
+    // segment entirely rather than show a misleading "+0 -0".
+    if !app.files().is_empty() {
+        let (adds, dels) = app
+            .files()
+            .iter()
+            .map(crate::summary::file_diffstat)
+            .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
+        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
+        spans.push(TSpan::raw("  "));
+        spans.push(TSpan::styled(
+            format!("{added_prefix}{adds}"),
+            Style::default()
+                .fg(theme.add_strong)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(TSpan::raw(" "));
+        spans.push(TSpan::styled(
+            format!("{removed_prefix}{dels}"),
+            Style::default()
+                .fg(theme.del_strong)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     let fidx = app.current + 1;
     let nfiles = app.files().len();
     spans.push(TSpan::styled(
-        format!("  —  {} ({fidx}/{nfiles})", current_file_label(app)),
+        "  —  ".to_string(),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
     ));
+    if icons == IconMode::Nerd {
+        if let Some(f) = app.files().get(app.current) {
+            let (icon, color) = crate::icons::icon_for_path(
+                &f.path,
+                crate::theme::is_light_background(theme.background),
+            );
+            spans.push(TSpan::styled(
+                format!("{icon} "),
+                Style::default()
+                    .fg(color.unwrap_or(theme.foreground))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+    spans.push(TSpan::styled(
+        format!("{} ({fidx}/{nfiles})", current_file_label(app)),
+        Style::default()
+            .fg(theme.foreground)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if let Some(span) = hscroll_indicator_span(app, theme) {
+        spans.push(span);
+    }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -718,7 +1207,7 @@ fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
 fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, theme: &Palette) {
     if let Some(confirm) = &app.pending_confirm {
         frame.render_widget(
-            Paragraph::new(confirm.prompt.as_str()).style(Style::default().fg(FG_ERROR)),
+            Paragraph::new(confirm.prompt.as_str()).style(Style::default().fg(theme.error_fg)),
             area,
         );
         return;
@@ -726,7 +1215,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
     match &app.notice {
         Some(Notice { text, severity }) => {
             let fg = match severity {
-                Severity::Error => FG_ERROR,
+                Severity::Error => theme.error_fg,
                 Severity::Info => theme.foreground,
             };
             frame.render_widget(
@@ -744,7 +1233,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
             } else {
                 View::Diff
             };
-            let text = footer_hint(keymap, focused);
+            let text = footer_hint(keymap, focused, app.outline_mode());
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(theme.dim)),
                 area,
@@ -875,11 +1364,13 @@ fn push_summary_body(
     total_dels: usize,
     height: usize,
     theme: &Palette,
+    icons: IconMode,
 ) {
     lines.push(Line::from(""));
     let footer_budget = 1; // the totals line always shows
     let file_budget = height.saturating_sub(lines.len() + footer_budget);
     push_summary_file_rows(lines, files, file_budget, theme);
+    let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
     lines.push(Line::from(vec![
         TSpan::styled(
             format!("{} files", files.len()),
@@ -887,41 +1378,38 @@ fn push_summary_body(
         ),
         TSpan::raw("  "),
         TSpan::styled(
-            format!("+{total_adds}"),
+            format!("{added_prefix}{total_adds}"),
             Style::default().fg(theme.add_strong),
         ),
         TSpan::raw(" "),
         TSpan::styled(
-            format!("-{total_dels}"),
+            format!("{removed_prefix}{total_dels}"),
             Style::default().fg(theme.del_strong),
         ),
     ]));
 }
 
-/// Build a [`ChangesetSummary`]'s lines: title line (carrying the same current/needs-restack/
-/// failed markers `build_outline_line`'s Header arm draws), a loading/failed line OR the per-file
-/// list + totals line.
+/// Build a [`ChangesetSummary`]'s lines: title line (the same current/needs-restack markers
+/// `build_outline_line`'s Header arm draws, structurally shared via [`changeset_title_spans`] —
+/// but passing `None` for that fn's `counter` param, so this title keeps its pre-CS1 plain-
+/// foreground look with no `[i/n]` counter; see [`changeset_title_spans`]'s doc comment), a
+/// loading/failed line OR the per-file list + totals line.
 fn changeset_summary_lines(
     summary: &ChangesetSummary,
     height: usize,
     theme: &Palette,
+    icons: IconMode,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
-    let mut title_spans = vec![TSpan::styled(
-        if summary.current { "\u{25CF} " } else { "  " },
-        Style::default().fg(FG_CURRENT),
-    )];
-    title_spans.push(TSpan::styled(
-        summary.label.clone(),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
-    ));
-    if summary.needs_restack {
-        title_spans.push(TSpan::styled(" \u{26A0}", Style::default().fg(FG_WARN)));
-    }
-    lines.push(Line::from(title_spans));
+    lines.push(Line::from(changeset_title_spans(
+        &summary.label,
+        summary.current,
+        summary.needs_restack,
+        theme,
+        icons,
+        None,
+    )));
 
     if summary.failed {
         let msg = summary
@@ -929,14 +1417,14 @@ fn changeset_summary_lines(
             .as_deref()
             .unwrap_or("(no error message)");
         lines.push(Line::from(TSpan::styled(
-            format!("\u{2717} {msg}"),
-            Style::default().fg(FG_ERROR),
+            format!("{} {msg}", error_marker(icons)),
+            Style::default().fg(theme.error_fg),
         )));
         return lines;
     }
     if summary.loading {
         lines.push(Line::from(TSpan::styled(
-            "Loading\u{2026}",
+            format!("Loading{}", loading_marker(icons)),
             Style::default().fg(theme.dim),
         )));
         return lines;
@@ -949,15 +1437,27 @@ fn changeset_summary_lines(
         summary.total_dels,
         height,
         theme,
+        icons,
     );
     lines
 }
 
 /// Build a [`DirSummary`]'s lines: a bold path title, a blank line, the per-file list, and the
 /// totals line — no current/restack/loading/failed markers (a directory carries none of those).
-fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Vec<Line<'static>> {
+/// The title gets [`crate::icons::DIR_ICON`] in [`IconMode::Nerd`] mode, matching the
+/// outline's own [`OutlineItem::Dir`] row (`build_outline_line`).
+fn dir_summary_lines(
+    summary: &DirSummary,
+    height: usize,
+    theme: &Palette,
+    icons: IconMode,
+) -> Vec<Line<'static>> {
+    let dir_icon = match icons {
+        IconMode::Nerd => format!("{} ", crate::icons::DIR_ICON),
+        IconMode::None => String::new(),
+    };
     let mut lines = vec![Line::from(TSpan::styled(
-        format!("{}/", summary.path),
+        format!("{dir_icon}{}/", summary.path),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
@@ -969,6 +1469,7 @@ fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Ve
         summary.total_dels,
         height,
         theme,
+        icons,
     );
     lines
 }
@@ -978,11 +1479,17 @@ fn dir_summary_lines(summary: &DirSummary, height: usize, theme: &Palette) -> Ve
 /// line, per-file `"path  +N -M"` rows (truncated to the pane height), and a totals line. A
 /// loading/failed Header shows its own inline state instead of a file list (see
 /// [`changeset_summary_lines`]).
-fn render_summary(frame: &mut Frame, summary: &Summary, area: Rect, theme: &Palette) {
+fn render_summary(
+    frame: &mut Frame,
+    summary: &Summary,
+    area: Rect,
+    theme: &Palette,
+    icons: IconMode,
+) {
     let height = area.height as usize;
     let lines = match summary {
-        Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme),
-        Summary::Dir(dir) => dir_summary_lines(dir, height, theme),
+        Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme, icons),
+        Summary::Dir(dir) => dir_summary_lines(dir, height, theme, icons),
     };
     frame.render_widget(Paragraph::new(lines), area);
 }
@@ -994,7 +1501,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     // diff-body rendering; `summary_target` returns `None` in both cases).
     if let Some(target) = app.summary_target() {
         let summary = app.summary_for(target);
-        render_summary(frame, &summary, area, theme);
+        render_summary(frame, &summary, area, theme, app.icon_mode());
         return;
     }
     // ADR-037: the active changeset's diff hasn't been acquired (or failed to acquire) yet —
@@ -1004,7 +1511,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     if let Some(message) = app.current_failure() {
         let msg = format!("Failed to load this changeset: {message}");
         frame.render_widget(
-            Paragraph::new(msg).style(Style::default().fg(FG_ERROR)),
+            Paragraph::new(msg).style(Style::default().fg(theme.error_fg)),
             area,
         );
         return;
@@ -1048,6 +1555,7 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
     match app.effective_zoom_for(idx) {
         EffectiveZoom::Single(role) => {
             app.pane_height = area.height as usize;
+            app.hit_regions.single = Some(region_from(area));
             let scroll = app.scroll;
             let cursor = Some(app.cursor);
             // The single pane is the focused one, so it shows any active selection.
@@ -1107,8 +1615,12 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     };
     app.pane_height = focused_h as usize;
     app.alt_height = unfocused_h as usize;
-    app.derive_scroll();
-    app.derive_alt_scroll();
+    app.hit_regions.unstaged = Some(region_from(unstaged_content));
+    app.hit_regions.staged = Some(region_from(staged_content));
+    // Bounds-clamp only (peek model — see render_outline's identical note); this also brings
+    // the split arm in line with the Single arm, which never re-derived at render time.
+    app.clamp_scroll();
+    app.clamp_alt_scroll();
 
     render_caption(frame.buffer_mut(), unstaged_caption, "UNSTAGED", theme);
     render_caption(frame.buffer_mut(), staged_caption, "STAGED", theme);
@@ -1208,6 +1720,9 @@ fn render_pane_sbs(
     let old_area = hlayout[0];
     let div_area = hlayout[1];
     let new_area = hlayout[2];
+    // One offset shared by every content pane (locked decision #1) — read once, before any of
+    // the `app` borrows below.
+    let hscroll = app.hscroll;
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), old_area);
@@ -1283,6 +1798,7 @@ fn render_pane_sbs(
                     old_gutter_w,
                     old_area.width as usize,
                     theme,
+                    hscroll,
                 );
                 let new_line = build_pane_line(
                     view,
@@ -1295,6 +1811,7 @@ fn render_pane_sbs(
                     new_gutter_w,
                     new_area.width as usize,
                     theme,
+                    hscroll,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
@@ -1316,6 +1833,12 @@ fn render_pane_sbs(
                 frame
                     .buffer_mut()
                     .set_line(new_area.x, y, &new_line, new_area.width);
+                // Right-edge hscroll marker (decision #7) — applied AFTER `set_line` (and thus
+                // after the cursor/selection wash above, which already painted the background)
+                // so it survives on a cursor/selected row; `apply_right_edge_marker` only sets
+                // `fg`, leaving whatever background the wash left in place.
+                apply_right_edge_marker(frame.buffer_mut(), old_area, y, &old_line, theme);
+                apply_right_edge_marker(frame.buffer_mut(), new_area, y, &new_line, theme);
                 // The divider column was painted once for the whole pane height above, with the
                 // default background; re-tint just this row's divider cell so the cursor wash
                 // covers the full width (panes AND the `│` between them), like `render_gap_row`.
@@ -1348,6 +1871,7 @@ fn gutter_field(n: Option<usize>, w: usize) -> String {
 /// rows show only the old-side column, `Add` rows only the new-side column — the other column is
 /// blank rather than reused for anything, so a scan down the gutter reads as two honest,
 /// independent line-number tracks.
+#[allow(clippy::too_many_arguments)]
 fn build_inline_line(
     view: &FileView,
     row: &InlineRow,
@@ -1356,6 +1880,7 @@ fn build_inline_line(
     old_gutter_w: usize,
     new_gutter_w: usize,
     theme: &Palette,
+    hscroll: usize,
 ) -> Line<'static> {
     let (old_opt, new_opt, text, hl, kind) = match *row {
         InlineRow::Context { old, new } => (
@@ -1406,6 +1931,7 @@ fn build_inline_line(
         word_spans,
         is_word_pair,
         theme,
+        hscroll,
     ));
     Line::from(spans)
 }
@@ -1425,6 +1951,10 @@ fn render_pane_inline(
     selection: Option<(usize, usize)>,
     theme: &Palette,
 ) {
+    // One offset shared by every content pane (locked decision #1) — read once, before any of
+    // the `app` borrows below.
+    let hscroll = app.hscroll;
+
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
         return;
@@ -1486,6 +2016,7 @@ fn render_pane_inline(
                     old_gutter_w,
                     new_gutter_w,
                     theme,
+                    hscroll,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let line = if is_cursor {
@@ -1496,6 +2027,9 @@ fn render_pane_inline(
                     line
                 };
                 frame.buffer_mut().set_line(area.x, y, &line, area.width);
+                // Right-edge hscroll marker (decision #7) — see `render_pane_sbs`'s identical
+                // comment on ordering relative to the cursor/selection wash above.
+                apply_right_edge_marker(frame.buffer_mut(), area, y, &line, theme);
             }
         }
     }
@@ -1505,11 +2039,14 @@ fn render_pane_inline(
 mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+    use ratatui::style::Style;
+    use ratatui::text::Span as TSpan;
     use ratatui::Terminal;
 
     use git_workon_fixture::prelude::*;
+    use unicode_width::UnicodeWidthChar;
 
-    use super::render;
+    use super::{hscroll_cut, pan_spans, render, STATUS_PLACEHOLDER};
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::App;
@@ -2226,8 +2763,48 @@ mod tests {
             .map(|x| cell_text(&buf, x, footer_y))
             .collect();
         assert!(
-            footer.contains("open") && footer.contains("mode") && footer.contains("? help"),
-            "expected the curated outline hint string in the footer, got: {footer:?}"
+            footer.contains("open")
+                && footer.contains(&format!(
+                    "i \u{2192}{}",
+                    crate::outline::OutlineMode::StackTree.label()
+                ))
+                && footer.contains("? help"),
+            "expected the curated outline hint string, with CS4's dynamic next-mode label \
+             (Stack's default -> StackTree), in the footer, got: {footer:?}"
+        );
+    }
+
+    #[test]
+    fn footer_outline_hint_next_mode_label_updates_as_the_mode_cycles() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.toggle_outline();
+        assert!(app.outline_focused());
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Stack);
+
+        let footer_text = |app: &mut App| {
+            let buf = render_once(app, 80, 10);
+            let footer_y = buf.area.height - 1;
+            (0..buf.area.width)
+                .map(|x| cell_text(&buf, x, footer_y))
+                .collect::<String>()
+        };
+
+        let footer = footer_text(&mut app);
+        assert!(
+            footer.contains("i \u{2192}stack-tree"),
+            "Stack's next mode is StackTree; got: {footer:?}"
+        );
+
+        app.outline_cycle_mode();
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::StackTree);
+        let footer = footer_text(&mut app);
+        assert!(
+            footer.contains("i \u{2192}flat"),
+            "StackTree's next mode is Flat; got: {footer:?}"
         );
     }
 
@@ -2290,7 +2867,7 @@ mod tests {
         );
         assert_eq!(
             buf.cell((0, footer_y)).unwrap().style().fg,
-            Some(super::FG_ERROR),
+            Some(Palette::dark().error_fg),
             "expected the error notice to render in the error fg color"
         );
     }
@@ -2430,8 +3007,51 @@ mod tests {
         let marker_x = header.find('⚠').expect("restack glyph present") as u16;
         assert_eq!(
             buf.cell((marker_x, 0)).unwrap().style().fg,
-            Some(super::FG_WARN),
+            Some(Palette::dark().warn_fg),
             "expected the restack glyph to carry the warning color, not the plain header color"
+        );
+    }
+
+    #[test]
+    fn winbar_shows_a_tight_diffstat_for_the_active_changeset() {
+        // CS4: the winbar previously showed no diffstat at all — cs-b adds a single line
+        // (`b.txt`, one-line file, committed with no prior content) with nothing deleted.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected a tight '+N -M' diffstat fragment for cs-b's single added file, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn winbar_nerd_mode_swaps_the_restack_marker_and_diffstat_glyphs_and_shows_a_file_icon() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains(super::NERD_WARN_MARKER) && !header.contains('\u{26A0}'),
+            "expected the nerd restack marker, not the plain unicode one, got: {header:?}"
+        );
+        assert!(
+            header.contains(super::NERD_DIFF_ADDED) && header.contains(super::NERD_DIFF_REMOVED),
+            "expected nerd diffstat glyphs in the winbar, got: {header:?}"
+        );
+        assert!(
+            header.contains(crate::icons::icon_for_path("b.txt", false).0),
+            "expected the active file's (b.txt) devicons icon in the winbar, got: {header:?}"
         );
     }
 
@@ -2554,6 +3174,228 @@ mod tests {
         );
     }
 
+    // ── diff-hscroll ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn hscroll_cut_ascii() {
+        // "hello world" — cutting at column 6 lands right after the space, before "world".
+        assert_eq!(hscroll_cut("hello world", 6), (6, false));
+        assert_eq!(hscroll_cut("hello world", 0), (0, false));
+    }
+
+    #[test]
+    fn hscroll_cut_multibyte_narrow() {
+        // "café" — 'é' is a single (narrow, non-ASCII) column, so cutting at column 3 lands
+        // exactly at its 2-byte UTF-8 start.
+        let text = "café";
+        assert_eq!(UnicodeWidthChar::width('é'), Some(1));
+        let (cut, pad) = hscroll_cut(text, 3);
+        assert_eq!(&text[cut..], "é");
+        assert!(!pad);
+    }
+
+    #[test]
+    fn hscroll_cut_wide_cjk_straddling_the_cut_skips_it_and_pads() {
+        // "a漢b" — 'a' (col 0), '漢' (cols 1-2, a wide CJK glyph), 'b' (col 3). Cutting at column
+        // 2 lands mid-glyph: the whole wide char is dropped and `pad` signals the caller to
+        // insert a one-column space to keep the remaining columns aligned.
+        let text = "a漢b";
+        assert_eq!(UnicodeWidthChar::width('漢'), Some(2));
+        let (cut, pad) = hscroll_cut(text, 2);
+        assert!(
+            pad,
+            "a wide char straddling the cut must request a pad column"
+        );
+        assert_eq!(&text[cut..], "b");
+    }
+
+    #[test]
+    fn hscroll_cut_emoji() {
+        // Most terminal-emulator-relevant emoji are wide (2 columns), like CJK.
+        let text = "a🎉b";
+        let w = UnicodeWidthChar::width('🎉').unwrap_or(0);
+        let (cut, _pad) = hscroll_cut(text, 1 + w);
+        assert_eq!(&text[cut..], "b");
+    }
+
+    #[test]
+    fn hscroll_cut_beyond_line_width_yields_empty() {
+        let (cut, pad) = hscroll_cut("short", 100);
+        assert_eq!(cut, "short".len());
+        assert!(!pad);
+        assert_eq!(&"short"[cut..], "");
+    }
+
+    // ── mouse h-wheel + outline hscroll follow-up: `pan_spans` ─────────────────────
+
+    fn spans_text(spans: &[TSpan<'static>]) -> String {
+        spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn span(text: &str) -> TSpan<'static> {
+        TSpan::styled(text.to_string(), Style::default())
+    }
+
+    #[test]
+    fn pan_spans_at_zero_columns_is_a_pass_through() {
+        let theme = Palette::dark();
+        let spans = vec![span("hello "), span("world")];
+        let panned = pan_spans(spans.clone(), 0, &theme);
+        assert_eq!(spans_text(&panned), "hello world");
+        assert_eq!(panned.len(), spans.len(), "unchanged, span for span");
+    }
+
+    #[test]
+    fn pan_spans_cuts_mid_span() {
+        // "hello world" panned 3 columns — the cut (plus the marker's reserved column) lands
+        // inside the FIRST span ("hello "), leaving its tail attached to the second span.
+        let theme = Palette::dark();
+        let spans = vec![span("hello "), span("world")];
+        let panned = pan_spans(spans, 3, &theme);
+        assert_eq!(spans_text(&panned), "…o world");
+    }
+
+    #[test]
+    fn pan_spans_cuts_exactly_at_a_span_boundary() {
+        // "abcdef" as three 2-char spans, panned 2 columns — the cut (plus the marker's reserved
+        // column) lands exactly on the boundary between the first and second span.
+        let theme = Palette::dark();
+        let spans = vec![span("ab"), span("cd"), span("ef")];
+        let panned = pan_spans(spans, 2, &theme);
+        assert_eq!(spans_text(&panned), "…def");
+    }
+
+    #[test]
+    fn pan_spans_wide_char_straddling_a_span_edge_drops_and_pads() {
+        // "a漢b" as two spans ("a", "漢b"), panned 1 column — the cut (plus the marker's reserved
+        // column) straddles the wide CJK glyph at the start of the second span: it's dropped
+        // whole and compensated with a one-column space.
+        let theme = Palette::dark();
+        assert_eq!(UnicodeWidthChar::width('漢'), Some(2));
+        let spans = vec![span("a"), span("漢b")];
+        let panned = pan_spans(spans, 1, &theme);
+        assert_eq!(spans_text(&panned), "… b");
+    }
+
+    #[test]
+    fn pan_spans_beyond_total_width_yields_just_the_marker() {
+        let theme = Palette::dark();
+        let spans = vec![span("ab"), span("cd")];
+        let panned = pan_spans(spans, 100, &theme);
+        assert_eq!(spans_text(&panned), "…");
+    }
+
+    #[test]
+    fn pan_spans_on_empty_content_is_a_pass_through() {
+        let theme = Palette::dark();
+        let spans = vec![span("")];
+        let panned = pan_spans(spans, 5, &theme);
+        assert_eq!(
+            spans_text(&panned),
+            "",
+            "an empty line has nothing to cut, so no marker either"
+        );
+    }
+
+    /// Build a single unstaged-file `App` with one long line, for the hscroll rendering tests —
+    /// long enough that panning by [`crate::app::HSCROLL_STEP`]-sized steps has real room to move
+    /// (the tests don't reference that constant directly since it's private to `app.rs`; `200`
+    /// just needs to comfortably exceed a test pane's width either way).
+    fn app_with_a_long_line() -> App {
+        let long_line = "x".repeat(200);
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("long.txt", "short\n", &format!("{long_line}\n"))
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app
+    }
+
+    #[test]
+    fn panning_right_shows_the_left_edge_marker_and_shifted_content() {
+        let mut app = app_with_a_long_line();
+        app.hscroll_right();
+        assert!(
+            app.hscroll > 0,
+            "the long line must give hscroll room to pan"
+        );
+
+        let buf = render_once(&mut app, 60, 20);
+        // divider (1) + new-side gutter ("{n:>3} ", 4 chars) — the new pane's first content
+        // column.
+        let left_w = buf.area.width.saturating_sub(1) / 2;
+        let content_x = left_w + 1 + 4;
+        let row_y = (0..buf.area.height)
+            .find(|&y| cell_text(&buf, content_x, y) == "…")
+            .expect("the panned long line's first visible content column must show the marker");
+        assert_eq!(
+            cell_text(&buf, content_x + 1, row_y),
+            "x",
+            "content immediately after the marker must be the (shifted) line body"
+        );
+    }
+
+    #[test]
+    fn a_line_wider_than_the_pane_shows_the_right_edge_marker() {
+        let mut app = app_with_a_long_line();
+        // At `hscroll == 0` the long line already overflows a narrow pane's content width.
+        assert_eq!(app.hscroll, 0);
+
+        let buf = render_once(&mut app, 60, 20);
+        let right_x = buf.area.width - 1;
+        assert!(
+            (0..buf.area.height).any(|y| cell_text(&buf, right_x, y) == "…"),
+            "a line wider than the pane must show the right-edge marker"
+        );
+    }
+
+    #[test]
+    fn winbar_shows_the_pan_offset_indicator_once_panned() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert_eq!(app.hscroll, 0);
+
+        let buf_unpanned = render_once(&mut app, 80, 20);
+        let header_unpanned: String = (0..buf_unpanned.area.width)
+            .map(|x| cell_text(&buf_unpanned, x, 0))
+            .collect();
+        assert!(
+            !header_unpanned.contains('»'),
+            "no indicator at column 0, got: {header_unpanned:?}"
+        );
+
+        // The winbar test's fixture files are tiny (`a\n`/`b\n`) — nowhere near wide enough for
+        // `hscroll_right` to actually move `hscroll` off `0`. This checks the indicator's own
+        // render logic, not the pan mechanics (covered separately in `app.rs`), so setting the
+        // field directly is the more honest test: the indicator must key off `App::hscroll`
+        // exactly, with no dependency on how it got there.
+        app.hscroll = 42;
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("»42"),
+            "expected the pan offset indicator, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn single_changeset_header_shows_the_pan_offset_indicator_once_panned() {
+        let mut app = app_with_a_long_line();
+        app.hscroll_right();
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains(&format!("»{}", app.hscroll)),
+            "expected the pan offset indicator on the lone-changeset header, got: {header:?}"
+        );
+    }
+
     // ── M5 CS3: outline side pane ───────────────────────────────────────────────
 
     /// Every outline test renders at this width so the pane's fixed 35-col + 1-col-divider
@@ -2637,13 +3479,13 @@ mod tests {
         let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
         let row = content
             .iter()
-            .position(|r| r.contains('\u{25CF}'))
+            .position(|r| r.contains('\u{2022}'))
             .expect("current marker present in the outline");
-        let marker_x = content[row].find('\u{25CF}').unwrap() as u16;
+        let marker_x = content[row].find('\u{2022}').unwrap() as u16;
         assert_eq!(
             buf.cell((marker_x, row as u16)).unwrap().style().fg,
-            Some(super::FG_CURRENT),
-            "expected the outline's current marker to carry FG_CURRENT"
+            Some(Palette::dark().current_fg),
+            "expected the outline's current marker to carry Palette::dark().current_fg"
         );
     }
 
@@ -2664,8 +3506,177 @@ mod tests {
         let marker_x = content[row].find('\u{26A0}').unwrap() as u16;
         assert_eq!(
             buf.cell((marker_x, row as u16)).unwrap().style().fg,
-            Some(super::FG_WARN),
-            "expected the outline's restack glyph to carry FG_WARN"
+            Some(Palette::dark().warn_fg),
+            "expected the outline's restack glyph to carry Palette::dark().warn_fg"
+        );
+    }
+
+    #[test]
+    fn outline_header_shows_true_position_counter_regardless_of_display_order() {
+        // CS1 (`outline-header-polish`): the `[i/n]` counter is the TRUE stack position
+        // (`cs_idx + 1`), never a display-order index — HeadFirst (the default) paints cs-b
+        // (true index 1) before cs-a (true index 0), so the counter must read `[2/2]` on cs-b's
+        // row and `[1/2]` on cs-a's, in that display order, not `[1/2]` then `[2/2]`.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        // Skip y=0: the full-width winbar also renders a `[i/n] <title-or-name>` fragment for the
+        // CURRENT changeset (cs-b) — an unskipped search for "[2/2]" would false-positive on it.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_b = content
+            .iter()
+            .position(|r| r.contains("[2/2]"))
+            .expect("cs-b (true index 1) must show counter [2/2]");
+        let row_a = content
+            .iter()
+            .position(|r| r.contains("[1/2]"))
+            .expect("cs-a (true index 0) must show counter [1/2]");
+        assert!(
+            row_b < row_a,
+            "HeadFirst shows cs-b's header before cs-a's, but the counter stays the true stack \
+             position, not a display-order index — got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_header_label_carries_the_heading_accent_color() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        // Skip y=0: the full-width winbar ALSO names cs-b (it's `current`) via its own
+        // `[i/n] <title-or-name>` fragment — in plain foreground, not the outline's heading
+        // accent — so an unskipped search for "cs-b" would false-positive onto the winbar's own
+        // label instead of the outline header row this test means to inspect. `content`'s index
+        // `i` is buffer row `i + 1` (the skip), so every `buf` query below adds 1 back.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .position(|r| r.contains("cs-b"))
+            .expect("cs-b's header row present (it has no title, so falls back to its name)");
+        // `String::find` returns a BYTE offset, not a display column — the row has multi-byte
+        // glyphs (`•`/`⚠`) ahead of/around the label, so a byte offset would target the wrong
+        // cell. Every rendered cell here is exactly one column wide, so a `chars()` (not byte)
+        // position IS the display column.
+        let label_chars: Vec<char> = "cs-b".chars().collect();
+        let row_chars: Vec<char> = content[row].chars().collect();
+        let label_x = row_chars
+            .windows(label_chars.len())
+            .position(|w| w == label_chars.as_slice())
+            .expect("cs-b's label text present in its own header row") as u16;
+        assert_eq!(
+            buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
+            Some(Palette::dark().heading_fg),
+            "expected the outline header's label to carry Palette::dark().heading_fg"
+        );
+    }
+
+    #[test]
+    fn summary_panel_title_has_no_counter_and_keeps_the_plain_foreground_look() {
+        // CS1's Gotcha: the counter + accent are outline-only — the summary panel's title (shared
+        // via `changeset_title_spans`, `counter: None`) must render exactly as it did pre-CS1.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline();
+        app.toggle_outline();
+        let header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header row present in Stack mode") as i64;
+        let delta = header_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        app.focus_outline();
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: the full-width winbar spans every column (including the body's 36.. slice),
+        // and it too names the current changeset (cs-b) — same false-positive risk as the outline
+        // tests above. `body_rows`' index `i` is buffer row `i + 1` (the skip), so every `buf`
+        // query below adds 1 back.
+        let body_rows: Vec<String> = (1..buf.area.height)
+            .map(|y| {
+                (36..buf.area.width)
+                    .map(|x| cell_text(&buf, x, y))
+                    .collect::<String>()
+            })
+            .collect();
+        let joined = body_rows.join("\n");
+        assert!(
+            !joined.contains("[2/2]") && !joined.contains("[1/2]"),
+            "the outline-only counter must not leak into the summary panel's title, got:\n{joined}"
+        );
+        let row = body_rows
+            .iter()
+            .position(|r| r.contains("cs-b"))
+            .expect("summary panel's title (cs-b's label) present");
+        // `String::find` is a BYTE offset, not a display column (the title carries a multi-byte
+        // `•` marker ahead of the label, since cs-b is `current`) — a `chars()` position over the
+        // 36.. slice IS the column offset within that slice (every cell here is one column wide),
+        // so add the slice's own start column (36) back to get the absolute buffer column.
+        let label_chars: Vec<char> = "cs-b".chars().collect();
+        let row_chars: Vec<char> = body_rows[row].chars().collect();
+        let label_x = row_chars
+            .windows(label_chars.len())
+            .position(|w| w == label_chars.as_slice())
+            .expect("cs-b's label text present in the summary panel's title")
+            as u16
+            + 36;
+        assert_eq!(
+            buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
+            Some(Palette::dark().foreground),
+            "the summary panel's title must keep its plain foreground look, not the outline's \
+             heading accent"
+        );
+    }
+
+    #[test]
+    fn render_preserves_a_wheel_scrolled_outline_viewport() {
+        // The peek model's load-bearing render change: `render_outline` bounds-CLAMPS the
+        // outline scroll instead of re-deriving it from the cursor, so a wheel-scrolled
+        // viewport (cursor left outside it) survives the frame instead of snapping back.
+        use crate::app::Region;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open());
+        // A 5-row frame leaves a 3-row outline viewport over this fixture's 4 outline rows
+        // (2 headers + 2 files): max scroll = 1.
+        app.outline_height = 3;
+        app.hit_regions.outline = Some(Region {
+            x: 0,
+            y: 1,
+            w: 34,
+            h: 3,
+        });
+        let cursor_before = app.outline_cursor();
+
+        app.handle_wheel(2, 2, 3); // clamps to max scroll = 1
+        assert_eq!(app.outline_scroll(), 1, "the wheel scrolled the viewport");
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before,
+            "peek model: the wheel never moves the outline cursor"
+        );
+
+        render_once(&mut app, OUTLINE_TEST_WIDTH, 5);
+        assert_eq!(
+            app.outline_scroll(),
+            1,
+            "a frame must not re-derive the wheeled scroll back to the cursor"
         );
     }
 
@@ -2697,8 +3708,7 @@ mod tests {
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
-        app.outline_cycle_mode(); // Stack -> Tree
-        app.outline_cycle_mode(); // Tree -> StackTree
+        app.outline_cycle_mode(); // Stack -> StackTree
         app.outline_cycle_mode(); // StackTree -> Flat
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Flat);
 
@@ -2775,7 +3785,9 @@ mod tests {
         if !app.outline_open() {
             app.toggle_outline();
         }
-        app.outline_cycle_mode(); // Stack -> Tree
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
@@ -2785,68 +3797,720 @@ mod tests {
         // buffer row starting at y=1 (y=0 is the winbar): `src/` (dir, root, NOT the root's last
         // child — `top.txt` follows), `a.txt` nested one level under `src/` (the only — hence
         // last — child of `src/`), then `top.txt` (file, root, IS the root's last child).
-        assert!(
-            content[1].contains('\u{251C}') && content[1].contains("src/"),
-            "expected row 1 to be the src/ directory row with a non-last '├─' guide, got:\n{}",
+        //
+        // CS2 tightens `tree_prefix` to 2 cols/level with no trailing space on the connector, so
+        // these are exact-column checks (not just `contains`) — every rendered cell here is one
+        // column wide, so `chars()` (not byte) indexing IS the display column (the guide glyphs
+        // themselves are multi-byte, which is exactly why byte indexing would be wrong).
+        let row1: Vec<char> = content[1].chars().collect();
+        assert_eq!(
+            row1[0..6],
+            ['\u{251C}', '\u{2500}', 's', 'r', 'c', '/'],
+            "expected row 1 to be a tight '├─src/' (2-col connector, no trailing space), got:\n{}",
             content.join("\n")
         );
-        assert!(
-            content[2].contains('\u{2514}') && content[2].contains("a.txt"),
-            "expected row 2 to be src/a.txt, indented under src/ with its own last-child '└─' \
-             guide, got:\n{}",
+        let row2: Vec<char> = content[2].chars().collect();
+        assert_eq!(
+            row2[0..4],
+            ['\u{2502}', ' ', '\u{2570}', '\u{2500}'],
+            "expected row 2's guide to be a tight '│ ╰─' (continuation + last-child connector, \
+             both 2 cols), got:\n{}",
             content.join("\n")
         );
-        assert!(
-            content[3].contains('\u{2514}') && content[3].contains("top.txt"),
-            "expected row 3 to be top.txt with a last-child '└─' guide, got:\n{}",
+        assert_eq!(
+            row2[7..12],
+            ['a', '.', 't', 'x', 't'],
+            "expected src/a.txt's basename to start immediately after the 4-col guide + 1-col \
+             glyph + 1-col letter + 1-col space, got:\n{}",
+            content.join("\n")
+        );
+        let row3: Vec<char> = content[3].chars().collect();
+        assert_eq!(
+            row3[0..2],
+            ['\u{2570}', '\u{2500}'],
+            "expected row 3's guide to be a tight '╰─' (root-level last-child, 2 cols, no \
+             trailing space), got:\n{}",
+            content.join("\n")
+        );
+        assert_eq!(
+            row3[5..12],
+            ['t', 'o', 'p', '.', 't', 'x', 't'],
+            "expected top.txt to start immediately after the 2-col guide + 1-col glyph + 1-col \
+             letter + 1-col space, got:\n{}",
             content.join("\n")
         );
     }
 
-    // ── CS5: file status letter + opt-in nerd-font icons ───────────────────────────
-
     #[test]
-    fn outline_file_row_shows_the_modified_change_letter_in_its_own_color() {
+    fn outline_file_row_tree_guide_carries_the_dim_color() {
+        // CS4: a File row's tree-guide connector (distinct from its status glyph, which keeps
+        // `theme.foreground`) is styled `theme.dim`, matching the Dir row's already-dim guides.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
-            .unstaged_file("a.rs", "one\n", "one\nCHANGED\n")
             .build()
             .unwrap();
-        let mut app = app_from_fixture(&fixture);
-        // A lone changeset defaults the outline closed — force it open so this render test can
-        // inspect its rows (same pattern as `outline_tree_mode_renders_directory_rows_with_tree_guides`).
+        let mut app = changeset_with_nested_paths(&fixture);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Row 3 is top.txt (see the test above) — a File row with a non-empty guide vector.
+        let row = outline_row(&buf, 3);
+        // `String::find` returns a BYTE offset, not a display column — the rounded guide glyph is
+        // multi-byte, so a `chars()` (not byte) position is what actually lines up with the
+        // column-indexed `buf.cell` lookup below (every rendered cell here is one column wide).
+        let row_chars: Vec<char> = row.chars().collect();
+        let guide_x = row_chars
+            .iter()
+            .position(|&c| c == '\u{2570}')
+            .expect("rounded guide present") as u16;
+        assert_eq!(
+            buf.cell((guide_x, 3)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the File row's tree-guide connector to carry theme.dim, got: {row:?}"
+        );
+    }
+
+    // ── CS5 (`outline-fold`): collapse/expand marker ────────────────────────────────
+
+    #[test]
+    fn outline_collapsed_header_renders_a_trailing_dim_hidden_file_marker() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.set_outline_order(crate::outline::OutlineOrder::BaseFirst);
+        app.focus_outline();
+        app.outline_top(); // cs-a's header row (BaseFirst: cs-a's header renders first)
+        app.outline_confirm(); // toggle fold — collapses cs-a, hiding its single file (a.txt)
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0 (the winbar) — it names the current file too (e.g. `[i/n] path`), which can
+        // false-positive a bare `contains` search, same gotcha `render_outline_file_row` already
+        // documents.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let (row_idx, header_row) = content
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains("Add a"))
+            .map(|(i, r)| (i, r.clone()))
+            .expect("cs-a's header row present");
+        let y = row_idx as u16 + 1; // +1 to undo the y=0 skip above.
+        assert!(
+            header_row.contains("\u{25b8} 1"),
+            "collapsed header must show its 1 hidden file, got: {header_row:?}"
+        );
+        assert!(
+            !content.iter().any(|r| r.contains("a.txt")),
+            "a.txt's row must be hidden while its header is collapsed, got:\n{}",
+            content.join("\n")
+        );
+
+        let row_chars: Vec<char> = header_row.chars().collect();
+        let marker_x = row_chars
+            .iter()
+            .position(|&c| c == '\u{25b8}')
+            .expect("marker glyph present") as u16;
+        assert_eq!(
+            buf.cell((marker_x, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the collapsed marker to carry theme.dim, got: {header_row:?}"
+        );
+    }
+
+    #[test]
+    fn outline_expanded_header_renders_no_chevron_marker() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0 (the winbar) — see the gotcha noted above.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        assert!(
+            !content.iter().any(|r| r.contains('\u{25b8}')),
+            "no row should carry the collapsed marker while every Header/Dir is expanded, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    #[test]
+    fn outline_collapsed_dir_renders_a_trailing_dim_hidden_file_marker() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+
+        app.focus_outline();
+        app.outline_top(); // src/ (dirs-before-files root ordering — see the tree-guide test above)
+        app.outline_confirm(); // toggle fold — collapses src/, hiding its one file (a.txt)
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0 (the winbar) — its OWN current-file label can itself contain `src/` (e.g.
+        // `[1/1] src/a.txt`) and false-positive the `contains("src/")` search below if included.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let dir_row = content
+            .iter()
+            .find(|r| r.contains("src/"))
+            .expect("src/ row present");
+        assert!(
+            dir_row.contains("\u{25b8} 1"),
+            "collapsed src/ must show its 1 hidden file, got: {dir_row:?}"
+        );
+        assert!(
+            !content.iter().any(|r| r.contains("a.txt")),
+            "a.txt must be hidden under collapsed src/, got:\n{}",
+            content.join("\n")
+        );
+        assert!(
+            content.iter().any(|r| r.contains("top.txt")),
+            "top.txt (a sibling, not nested under src/) must remain visible, got:\n{}",
+            content.join("\n")
+        );
+    }
+
+    // ── CS2 (outline-row-shape): smart path render ─────────────────────────────────
+
+    #[test]
+    fn outline_stack_mode_file_row_splits_basename_and_dim_dirname() {
+        // Stack mode keeps `guides` empty, so a nested path (`src/a.txt`) must split at render
+        // time into basename-first, then the dirname in `theme.dim` — ancestors don't carry the
+        // path here (unlike Tree mode), so the row has to spell it out itself.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        assert_eq!(
+            app.outline_mode(),
+            crate::outline::OutlineMode::Stack,
+            "sanity: default mode is Stack, so guides stay empty and this exercises CS2's split"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: the full-width winbar also names the current file (possibly `src/a.txt`
+        // itself), so an unskipped search could false-positive onto it instead of the outline's
+        // own row below it. `content`'s index `i` is buffer row `i + 1` (the skip), so every
+        // `buf` query below adds 1 back.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_idx = content
+            .iter()
+            .position(|r| r.contains("a.txt") && r.contains("src"))
+            .expect("src/a.txt's split row present");
+        let row_chars: Vec<char> = content[row_idx].chars().collect();
+        let buf_y = row_idx as u16 + 1;
+
+        let basename_x = row_chars
+            .windows(5)
+            .position(|w| w == ['a', '.', 't', 'x', 't'])
+            .expect("basename 'a.txt' present in its own row") as u16;
+        assert_eq!(
+            buf.cell((basename_x, buf_y)).unwrap().style().fg,
+            Some(Palette::dark().foreground),
+            "expected the basename to carry the plain (bright) foreground, got:\n{}",
+            content[row_idx]
+        );
+
+        // Two blank columns separate the basename from the dirname (CS2: "basename  dim/
+        // dirname"), so the dirname starts right after them.
+        let dirname_x = basename_x + 5 + 2;
+        assert_eq!(
+            row_chars[dirname_x as usize], 's',
+            "expected the dirname 'src' to start two columns after the basename, got:\n{}",
+            content[row_idx]
+        );
+        assert_eq!(
+            buf.cell((dirname_x, buf_y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the dirname to carry theme.dim, got:\n{}",
+            content[row_idx]
+        );
+        assert!(
+            basename_x < dirname_x,
+            "basename must render BEFORE the dim dirname (basename-first ordering is what makes \
+             truncation eat the dirname first), got:\n{}",
+            content[row_idx]
+        );
+    }
+
+    #[test]
+    fn outline_root_level_file_gets_no_dirname_suffix() {
+        // A root-level file (no `/` in its path) gets no suffix at all — no "(root)"
+        // placeholder, just the bare basename.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture); // top.txt is root-level
         if !app.outline_open() {
             app.toggle_outline();
         }
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
-        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
-        // Skip y=0: the full-width winbar also names the file ("[1/1] a.rs"), so an unskipped
-        // search would match it instead of the outline's own row below it.
+        // Skip y=0: see the split test above — the winbar also names the current file.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
         let row = content
             .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, r)| r.contains("a.rs"))
-            .map(|(i, _)| i)
-            .expect("a.rs's file row present");
+            .find(|r| r.contains("top.txt"))
+            .expect("top.txt's row present");
         assert!(
-            content[row].contains('M'),
-            "expected the Modified change letter 'M' in a.rs's row, got: {:?}",
-            content[row]
-        );
-
-        let letter_x = content[row].find('M').unwrap() as u16;
-        assert_eq!(
-            buf.cell((letter_x, row as u16)).unwrap().style().fg,
-            Some(Palette::dark().foreground),
-            "Modified is a change-to-existing-content status, so its letter must carry the \
-             theme's neutral foreground, not an add/del tint"
+            row.trim_end().ends_with("top.txt"),
+            "a root-level file must render with no trailing suffix after its basename, got: \
+             {row:?}"
         );
     }
 
     #[test]
-    fn outline_icons_nerd_renders_the_rust_file_icon_and_the_dir_icon() {
+    fn outline_flat_row_truncation_eats_the_dim_dirname_first() {
+        // A pane-width-exceeding Flat-mode row must truncate the (later, dim) dirname before it
+        // ever touches the (earlier, bright) basename — that ordering is the whole point of
+        // basename-first rendering (CS2 gotcha).
+        let long_dir = "reallyquiteverbosedirectoryname";
+        let path = format!("{long_dir}/x.txt");
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file(&path, "content\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: see the split test above — the winbar also names the current file (the long
+        // path itself here), so an unskipped search would false-positive onto it.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_idx = content
+            .iter()
+            .position(|r| r.contains("x.txt"))
+            .expect("x.txt's row present");
+        assert!(
+            !content[row_idx].contains(long_dir),
+            "the full dirname must NOT fit/appear — truncation should have eaten part of it, \
+             got: {:?}",
+            content[row_idx]
+        );
+        // Column 34 is the outline's last column before the divider at 35 (see
+        // `OUTLINE_TEST_WIDTH`'s doc comment). `content`'s index is buffer row `+ 1` (the y=0
+        // skip above).
+        assert_eq!(
+            cell_text(&buf, 34, row_idx as u16 + 1),
+            "\u{2026}",
+            "the truncated row must show the right-edge marker at the pane's last column"
+        );
+    }
+
+    // ── mouse h-wheel + outline hscroll follow-up: outline panning ─────────────────
+
+    /// A single-changeset `App` with one file whose path is far wider than the outline's fixed
+    /// 35-column width, focused into the outline — for the outline hscroll rendering tests.
+    fn app_with_a_long_outline_path() -> App {
+        let long_path = format!("{}.txt", "a".repeat(80));
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file(&long_path, "content\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.focus_outline(); // opens (a lone changeset defaults closed) and focuses.
+        app
+    }
+
+    #[test]
+    fn outline_panning_shows_the_left_marker_shifted_text_and_the_right_edge_marker() {
+        let mut app = app_with_a_long_outline_path();
+        app.outline_hscroll_right();
+        assert!(
+            app.outline_hscroll() > 0,
+            "the long path must give outline hscroll room to pan"
+        );
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        // The header row's own label is short, but CS1's `[i/n] ` counter widens it enough that a
+        // single hscroll step no longer pans it fully off — it can now ALSO show a lone marker
+        // plus a stray `a` (from a branch name like `main`), so a bare "contains 'a'" check no
+        // longer picks out the PATH row unambiguously. Look for a run of the synthetic path's
+        // repeated `a`s instead (`app_with_a_long_outline_path`'s path is 80 `a`s + `.txt`) — no
+        // header label plausibly contains four `a`s in a row.
+        let row = content
+            .iter()
+            .position(|r| r.contains('…') && r.contains("aaaa"))
+            .expect("the panned path row must show the left-edge marker plus shifted content");
+        // Column 34 is the outline's last column before the divider at 35 (see
+        // `OUTLINE_TEST_WIDTH`'s doc comment).
+        assert_eq!(
+            cell_text(&buf, 34, row as u16),
+            "…",
+            "a row wider than the outline pane must show the right-edge marker too"
+        );
+    }
+
+    #[test]
+    fn outline_render_side_clamp_caps_a_huge_pan_offset() {
+        let mut app = app_with_a_long_outline_path();
+        for _ in 0..1000 {
+            app.outline_hscroll_right();
+        }
+        assert!(
+            app.outline_hscroll() > 1000,
+            "sanity: `outline_hscroll_right` itself has no upper clamp"
+        );
+
+        render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        assert!(
+            app.outline_hscroll() < 1000,
+            "render_outline must clamp the huge offset down to the content width, got {}",
+            app.outline_hscroll()
+        );
+    }
+
+    // ── CS3 (`outline-status-xy`): git-style X/Y status matrix ─────────────────────
+
+    /// Render `fixture` (a lone uncommitted changeset with one file at `path`) and return the
+    /// buffer row + its char cells for the file row matching `path`. Skips y=0 (the winbar also
+    /// names the current file, which can false-positive a `contains(path)` search).
+    fn render_outline_file_row(fixture: &Fixture, path: &str) -> (Buffer, u16, Vec<char>) {
+        let mut app = app_from_fixture(fixture);
+        // A lone changeset defaults the outline closed — force it open so this render test can
+        // inspect its rows (same pattern as `outline_tree_mode_renders_directory_rows_with_tree_guides`).
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let (row_idx, row) = content
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.contains(path))
+            .map(|(i, r)| (i, r.clone()))
+            .unwrap_or_else(|| panic!("{path}'s file row present"));
+        let y = row_idx as u16 + 1; // +1 to undo the y=0 skip above.
+        (buf, y, row.chars().collect())
+    }
+
+    #[test]
+    fn outline_unstaged_file_renders_the_y_column_letter_in_del_strong() {
+        // Unstaged-only (worktree change, no staged one): X is the placeholder, Y carries the
+        // change letter in del_strong (git convention: worktree column is red).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.rs", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "a.rs");
+
+        let x = row
+            .iter()
+            .position(|&c| c == STATUS_PLACEHOLDER)
+            .expect("expected the X (staged) column placeholder '·'") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            'M',
+            "expected the Y (worktree) column to carry the Modified letter right after the \
+             X placeholder, got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the empty X placeholder to carry theme.dim"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().del_strong),
+            "expected the Y column's Modified letter to carry theme.del_strong"
+        );
+    }
+
+    #[test]
+    fn outline_fully_staged_file_renders_the_x_column_letter_in_add_strong() {
+        // `staged_file` writes+stages a brand-new path (Added, not Modified — there's no prior
+        // commit for it to modify). Fully staged (index change, no worktree one): X carries the
+        // letter in add_strong, Y is the placeholder.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("a.rs", "new content\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "a.rs");
+
+        let x = row
+            .iter()
+            .position(|&c| c == 'A')
+            .expect("expected the Added letter in the X (staged) column") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            STATUS_PLACEHOLDER,
+            "expected the Y (worktree) column to be the empty placeholder, got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().add_strong),
+            "expected the X column's Added letter to carry theme.add_strong"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the empty Y placeholder to carry theme.dim"
+        );
+    }
+
+    #[test]
+    fn outline_partially_staged_file_renders_mm_with_green_x_and_red_y() {
+        // Partially staged (both a staged AND an unstaged change): both columns show the change
+        // letter, X in add_strong (green), Y in del_strong (red).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("a.rs", "one\n", "one\nSTAGED\n", "one\nSTAGED\nWORKTREE\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "a.rs");
+
+        let x = row
+            .iter()
+            .position(|&c| c == 'M')
+            .expect("expected the Modified letter in the X column") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            'M',
+            "expected the Modified letter in the Y column too (partial = both axes), got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().add_strong),
+            "expected the X (staged) column's letter to carry theme.add_strong"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().del_strong),
+            "expected the Y (worktree) column's letter to carry theme.del_strong"
+        );
+    }
+
+    #[test]
+    fn outline_untracked_file_renders_a_dim_double_question_mark() {
+        // Untracked overrides the staged-ness-derived matrix entirely: always a dim `??`, even
+        // though an untracked worktree file's StagedStatus is Unstaged under the hood.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("new.txt", "brand new\n")
+            .build()
+            .unwrap();
+        let (buf, y, row) = render_outline_file_row(&fixture, "new.txt");
+
+        let x = row
+            .iter()
+            .position(|&c| c == '?')
+            .expect("expected the untracked '??' marker") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            '?',
+            "expected '??' (both columns), got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected the untracked '?' to carry theme.dim, not an add/del tint"
+        );
+        assert_eq!(
+            buf.cell((x + 1, y)).unwrap().style().fg,
+            Some(Palette::dark().dim),
+            "expected BOTH untracked '?' chars to carry theme.dim"
+        );
+    }
+
+    #[test]
+    fn outline_committed_modified_file_renders_a_single_amber_letter() {
+        // A committed changeset's file has StagedStatus::None — single letter + pad column, not
+        // the X/Y matrix. M/R/C get the dedicated `modified_fg` amber, distinct from `warn_fg`.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("a.rs", "one\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("a.rs", "one\nCHANGED\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = workon::Changeset {
+            name: "cs".to_string(),
+            span: workon::ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = crate::app::ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = git2::Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row_idx = content
+            .iter()
+            .position(|r| r.contains("a.rs"))
+            .expect("a.rs's file row present");
+        let row: Vec<char> = content[row_idx].chars().collect();
+        let y = row_idx as u16 + 1;
+
+        let x = row
+            .iter()
+            .position(|&c| c == 'M')
+            .expect("expected the Modified letter") as u16;
+        assert_eq!(
+            row[x as usize + 1],
+            ' ',
+            "expected the pad column after a committed file's single letter to be a blank space, \
+             got: {:?}",
+            row
+        );
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().modified_fg),
+            "expected the committed Modified letter to carry theme.modified_fg (amber), got a \
+             different color"
+        );
+        assert_ne!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(Palette::dark().warn_fg),
+            "modified_fg must stay a distinct field from warn_fg even though both default to amber"
+        );
+    }
+
+    #[test]
+    fn outline_committed_added_and_deleted_files_render_add_strong_and_del_strong() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("deleted.txt", "keep\n")
+            .create("base")
+            .unwrap();
+        let stage = fixture
+            .commit("main")
+            .file("deleted.txt", "keep\n")
+            .file("added.txt", "new\n")
+            .create("stage")
+            .unwrap();
+        let _ = stage; // only needed to move the branch tip forward before the manual deletion below
+        let repo = fixture.repo().unwrap();
+        let workdir = repo.workdir().unwrap().to_path_buf();
+        std::fs::remove_file(workdir.join("deleted.txt")).unwrap();
+        let mut index = repo.index().unwrap();
+        // `CommitBuilder::create` wrote the index/commit through its OWN `Repository::open`
+        // handle, so `repo`'s cached index is stale until forced to re-read from disk.
+        index.read(true).unwrap();
+        index
+            .remove_path(std::path::Path::new("deleted.txt"))
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("Test User", "test@example.com").unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        let head = repo
+            .commit(Some("HEAD"), &sig, &sig, "head", &tree, &[&parent])
+            .unwrap();
+
+        let cs = workon::Changeset {
+            name: "cs".to_string(),
+            span: workon::ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = crate::app::ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = git2::Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        let added_row_idx = content
+            .iter()
+            .position(|r| r.contains("added.txt"))
+            .expect("added.txt's file row present");
+        let added_row: Vec<char> = content[added_row_idx].chars().collect();
+        let added_x = added_row
+            .iter()
+            .position(|&c| c == 'A')
+            .expect("expected the Added letter") as u16;
+        assert_eq!(
+            buf.cell((added_x, added_row_idx as u16 + 1))
+                .unwrap()
+                .style()
+                .fg,
+            Some(Palette::dark().add_strong),
+            "expected a committed Added file's letter to carry theme.add_strong"
+        );
+
+        let deleted_row_idx = content
+            .iter()
+            .position(|r| r.contains("deleted.txt"))
+            .expect("deleted.txt's file row present");
+        let deleted_row: Vec<char> = content[deleted_row_idx].chars().collect();
+        let deleted_x = deleted_row
+            .iter()
+            .position(|&c| c == 'D')
+            .expect("expected the Deleted letter") as u16;
+        assert_eq!(
+            buf.cell((deleted_x, deleted_row_idx as u16 + 1))
+                .unwrap()
+                .style()
+                .fg,
+            Some(Palette::dark().del_strong),
+            "expected a committed Deleted file's letter to carry theme.del_strong"
+        );
+    }
+
+    #[test]
+    fn icon_mode_nerd_renders_the_rust_file_icon_and_the_dir_icon() {
         use git2::Repository;
         use workon::{Changeset, ChangesetSpan};
 
@@ -2884,9 +4548,11 @@ mod tests {
         if !app.outline_open() {
             app.toggle_outline();
         }
-        app.outline_cycle_mode(); // Stack -> Tree, so `src/` renders as its own Dir row
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree, so `src/` renders as its own Dir row
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
-        app.set_outline_icons(crate::icons::OutlineIcons::Nerd);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
         let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
@@ -2908,13 +4574,13 @@ mod tests {
             .find(|r| r.contains("main.rs"))
             .expect("main.rs file row present");
         assert!(
-            file_row.contains(crate::icons::icon_for_path("main.rs")),
+            file_row.contains(crate::icons::icon_for_path("main.rs", false).0),
             "expected the rust file icon before main.rs, got: {file_row:?}"
         );
     }
 
     #[test]
-    fn outline_icons_none_renders_neither_icon() {
+    fn icon_mode_none_renders_neither_icon() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -2923,11 +4589,13 @@ mod tests {
         if !app.outline_open() {
             app.toggle_outline();
         }
-        app.outline_cycle_mode(); // Stack -> Tree
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree
         assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
         assert_eq!(
-            app.outline_icons(),
-            crate::icons::OutlineIcons::None,
+            app.icon_mode(),
+            crate::icons::IconMode::None,
             "sanity: icons default to None"
         );
 
@@ -2945,6 +4613,108 @@ mod tests {
                 .any(|r| r.contains(crate::icons::DEFAULT_ICON)),
             "icons=none must never render the default file icon, got:\n{}",
             content.join("\n")
+        );
+    }
+
+    // ── CS3: nerd-mode status/header/summary iconography ────────────────────────
+
+    #[test]
+    fn outline_header_nerd_markers_replace_the_unicode_defaults() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        // Skip y=0: it's the full-width winbar, which ALSO renders a (still-unicode, CS4's job)
+        // "⚠ needs restack" marker — an unskipped search would false-positive on it.
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let joined = content.join("\n");
+
+        assert!(
+            joined.contains(super::NERD_CURRENT_MARKER),
+            "expected the nerd current-changeset marker, got:\n{joined}"
+        );
+        assert!(
+            joined.contains(super::NERD_WARN_MARKER),
+            "expected the nerd needs-restack marker, got:\n{joined}"
+        );
+        assert!(
+            !joined.contains('\u{2022}') && !joined.contains('\u{26A0}'),
+            "nerd mode must not leave the plain unicode markers behind in the outline pane, got:\n{joined}"
+        );
+        assert!(
+            joined.contains(super::NERD_BRANCH_ICON),
+            "expected a branch glyph on the changeset header row, got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn outline_file_status_xy_column_is_unaffected_by_icon_mode() {
+        // CS3 retires StagedStatus's nerd/plain glyph split entirely — the X/Y status matrix is
+        // now plain letters + `STATUS_PLACEHOLDER`, icon-mode-independent (only the devicons
+        // per-file icon toggles on `IconMode::Nerd`). A fully staged file (`staged_file` writes a
+        // brand-new path, so it's Added, not Modified) still renders `A·` whether or not nerd
+        // icons are on.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("a.txt", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content: Vec<String> = (1..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+        let row = content
+            .iter()
+            .find(|r| r.contains("a.txt"))
+            .expect("a.txt's file row present");
+        assert!(
+            row.contains(&format!("A{}", '\u{b7}')),
+            "expected the fully-staged 'A·' status pair to survive nerd icon mode, got: {row:?}"
+        );
+    }
+
+    #[test]
+    fn summary_panel_nerd_mode_renders_the_dir_icon_and_diffstat_glyphs() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
+        app.focus_outline(); // opens (a lone changeset defaults closed) and focuses
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree, so a Dir row exists to focus
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { .. }))
+            .expect("a Dir row present in Tree mode") as i64;
+        let delta = dir_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        assert!(matches!(
+            app.outline_items()[app.outline_cursor()],
+            OutlineItem::Dir { .. }
+        ));
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let body = body_text(&buf);
+        assert!(
+            body.contains(crate::icons::DIR_ICON),
+            "expected the summary panel's dir title to carry the nerd dir icon, got:\n{body}"
+        );
+        assert!(
+            body.contains(super::NERD_DIFF_ADDED) && body.contains(super::NERD_DIFF_REMOVED),
+            "expected nerd diffstat glyphs in the summary panel's totals line, got:\n{body}"
         );
     }
 

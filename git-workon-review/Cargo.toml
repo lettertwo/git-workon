@@ -35,6 +35,7 @@ vendored = ["git-workon-lib/vendored", "git2/vendored-libgit2", "git2/vendored-o
 clap.workspace = true
 clap_complete.workspace = true
 crossterm.workspace = true
+devicons.workspace = true
 dirs.workspace = true
 git-workon-lib.workspace = true
 git2.workspace = true
@@ -53,6 +54,7 @@ tree-sitter-md.workspace = true
 tree-sitter-rust.workspace = true
 tree-sitter-toml-ng.workspace = true
 tree-sitter-typescript.workspace = true
+unicode-width.workspace = true
 
 [package.metadata.dist]
 # Redundant with publish = false today; load-bearing at the M3 flip so

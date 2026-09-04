@@ -25,6 +25,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::{RawBinding, View};
+use crate::outline::OutlineMode;
 
 /// One rebindable action. The action *identity* — distinct from `tui.rs`'s `Action`, which is the
 /// concrete effect applied to the `App` (and carries runtime data like a half-page scroll delta
@@ -64,6 +65,8 @@ pub enum Command {
     PrevChangeset,
     ExpandGap,
     ExpandGapAll,
+    HscrollLeft,
+    HscrollRight,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -76,6 +79,12 @@ pub enum Command {
     OutlineBottom,
     OutlineStage,
     OutlineDiscard,
+    OutlineHscrollLeft,
+    OutlineHscrollRight,
+    OutlineNextChangeset,
+    OutlinePrevChangeset,
+    OutlineCollapseAll,
+    OutlineExpandAll,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -273,7 +282,21 @@ pub static REGISTRY: &[Registered] = &[
         view: View::Diff,
         name: "focus-outline",
         default_keys: "h left",
-        description: "Focus the outline",
+        description: "Focus the outline (pans the diff back to column 0 first, if panned)",
+    },
+    Registered {
+        command: Command::HscrollLeft,
+        view: View::Diff,
+        name: "hscroll-left",
+        default_keys: "<",
+        description: "Pan the diff content left",
+    },
+    Registered {
+        command: Command::HscrollRight,
+        view: View::Diff,
+        name: "hscroll-right",
+        default_keys: "> l right",
+        description: "Pan the diff content right",
     },
     Registered {
         command: Command::ExpandGap,
@@ -309,14 +332,15 @@ pub static REGISTRY: &[Registered] = &[
         view: View::Outline,
         name: "open",
         default_keys: "enter",
-        description: "Jump to the selected outline entry",
+        description: "Jump to a file, or fold/unfold a header or directory",
     },
     Registered {
         command: Command::OutlineCycleMode,
         view: View::Outline,
         name: "cycle-mode",
         default_keys: "i",
-        description: "Cycle the outline mode",
+        description:
+            "Cycle the outline mode (stack \u{25b8} stack-tree \u{25b8} flat \u{25b8} tree)",
     },
     Registered {
         command: Command::FocusDiff,
@@ -352,6 +376,48 @@ pub static REGISTRY: &[Registered] = &[
         name: "discard",
         default_keys: "d",
         description: "Discard the file/directory under the cursor",
+    },
+    Registered {
+        command: Command::OutlineHscrollLeft,
+        view: View::Outline,
+        name: "outline-hscroll-left",
+        default_keys: "<",
+        description: "Pan the outline left",
+    },
+    Registered {
+        command: Command::OutlineHscrollRight,
+        view: View::Outline,
+        name: "outline-hscroll-right",
+        default_keys: ">",
+        description: "Pan the outline right",
+    },
+    Registered {
+        command: Command::OutlineNextChangeset,
+        view: View::Outline,
+        name: "outline-next-changeset",
+        default_keys: "n",
+        description: "Jump to the next changeset",
+    },
+    Registered {
+        command: Command::OutlinePrevChangeset,
+        view: View::Outline,
+        name: "outline-prev-changeset",
+        default_keys: "p",
+        description: "Jump to the previous changeset",
+    },
+    Registered {
+        command: Command::OutlineCollapseAll,
+        view: View::Outline,
+        name: "outline-collapse-all",
+        default_keys: "zM",
+        description: "Collapse every changeset/directory in the outline",
+    },
+    Registered {
+        command: Command::OutlineExpandAll,
+        view: View::Outline,
+        name: "outline-expand-all",
+        default_keys: "zR",
+        description: "Expand every changeset/directory in the outline",
     },
 ];
 
@@ -774,9 +840,17 @@ enum HintItem {
     Pair(Command, Command, &'static str),
 }
 
-fn render_hint_item(keymap: &Keymap, item: &HintItem) -> Option<String> {
+/// CS4 (`outline-mode-cycle`): most hint labels are the static string baked into the `HintItem`,
+/// but `OutlineCycleMode`'s label shows the mode `i` would switch TO instead — computed from
+/// `outline_mode` (the outline's CURRENT mode, so this is `outline_mode.cycle()`'s label).
+fn render_hint_item(keymap: &Keymap, item: &HintItem, outline_mode: OutlineMode) -> Option<String> {
     match item {
         HintItem::One(command, label) => {
+            let label = if *command == Command::OutlineCycleMode {
+                format!("\u{2192}{}", outline_mode.cycle().label())
+            } else {
+                (*label).to_string()
+            };
             primary_key(keymap, *command).map(|k| format!("{k} {label}"))
         }
         HintItem::Pair(down, up, label) => {
@@ -805,10 +879,15 @@ const DIFF_HINTS: &[HintItem] = &[
 const OUTLINE_HINTS: &[HintItem] = &[
     HintItem::Pair(Command::OutlineDown, Command::OutlineUp, "move"),
     HintItem::One(Command::OutlineConfirm, "open"),
+    HintItem::Pair(
+        Command::OutlineNextChangeset,
+        Command::OutlinePrevChangeset,
+        "changeset",
+    ),
     HintItem::One(Command::OutlineCycleMode, "mode"),
-    HintItem::One(Command::ToggleOutline, "outline"),
+    // No `o outline` / `q quit` here: with the changeset pair the full set no longer fits 80
+    // cols, and both stay discoverable in the diff footer and the help overlay.
     HintItem::One(Command::ToggleHelp, "help"),
-    HintItem::One(Command::Quit, "quit"),
 ];
 
 /// Build the persistent, always-visible footer hint string for `focused` ([`View::Diff`] or
@@ -816,7 +895,7 @@ const OUTLINE_HINTS: &[HintItem] = &[
 /// string, so a rebind shows here too. A notice temporarily replaces this in the footer (the
 /// caller's job, see `render::render_footer`); an unbound curated action is simply dropped from
 /// the string rather than leaving a stale/wrong key visible.
-pub fn footer_hint(keymap: &Keymap, focused: View) -> String {
+pub fn footer_hint(keymap: &Keymap, focused: View, outline_mode: OutlineMode) -> String {
     let items: &[HintItem] = match focused {
         View::Diff => DIFF_HINTS,
         View::Outline => OUTLINE_HINTS,
@@ -824,7 +903,7 @@ pub fn footer_hint(keymap: &Keymap, focused: View) -> String {
     };
     items
         .iter()
-        .filter_map(|item| render_hint_item(keymap, item))
+        .filter_map(|item| render_hint_item(keymap, item, outline_mode))
         .collect::<Vec<_>>()
         .join("  \u{b7}  ")
 }
@@ -998,6 +1077,99 @@ mod tests {
         );
     }
 
+    // ── diff-hscroll: `hscroll-left`/`hscroll-right` registry rows ─────────────
+
+    #[test]
+    fn hscroll_commands_are_registered_with_no_collision_warnings() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "the new commands' defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert!(
+            !km.keys_for(Command::HscrollLeft).is_empty(),
+            "hscroll-left must resolve to at least one bound key"
+        );
+        assert!(
+            !km.keys_for(Command::HscrollRight).is_empty(),
+            "hscroll-right must resolve to at least one bound key"
+        );
+    }
+
+    #[test]
+    fn less_than_and_greater_than_dispatch_hscroll_in_the_diff_view() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('<'))]),
+            Dispatch::Command(Command::HscrollLeft)
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('>'))]),
+            Dispatch::Command(Command::HscrollRight)
+        );
+    }
+
+    /// `l`/`right` are free in the Diff view (they're only bound in the Outline view, to
+    /// `focus-diff`) — the handoff's locked decision #2 reuses them for `hscroll-right` there,
+    /// mirroring the Outline view's `l`/`right` = focus-diff.
+    #[test]
+    fn l_and_right_dispatch_hscroll_right_in_the_diff_view() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('l'))]),
+            Dispatch::Command(Command::HscrollRight)
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Right)]),
+            Dispatch::Command(Command::HscrollRight)
+        );
+    }
+
+    #[test]
+    fn n_and_p_dispatch_outline_changeset_nav_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "n/p defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(&km, true, &[key(KeyCode::Char('n'))]),
+            Dispatch::Command(Command::OutlineNextChangeset)
+        );
+        assert_eq!(
+            feed(&km, true, &[key(KeyCode::Char('p'))]),
+            Dispatch::Command(Command::OutlinePrevChangeset)
+        );
+    }
+
+    #[test]
+    fn z_m_and_z_r_dispatch_outline_fold_all_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "zM/zR defaults must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(
+                &km,
+                true,
+                &[key(KeyCode::Char('z')), key(KeyCode::Char('M'))]
+            ),
+            Dispatch::Command(Command::OutlineCollapseAll)
+        );
+        assert_eq!(
+            feed(
+                &km,
+                true,
+                &[key(KeyCode::Char('z')), key(KeyCode::Char('R'))]
+            ),
+            Dispatch::Command(Command::OutlineExpandAll)
+        );
+    }
+
     #[test]
     fn a_config_rebind_overrides_the_default() {
         let km = Keymap::from_bindings(&[RawBinding {
@@ -1148,6 +1320,29 @@ mod tests {
     }
 
     #[test]
+    fn help_sections_cycle_mode_entry_spells_out_the_full_order() {
+        // CS4: descriptions are static `&'static str`s baked into `REGISTRY`, so the help
+        // overlay can't mark the CURRENT mode dynamically without a broader refactor — the
+        // locked fallback is a static full-order description, with the dynamic `→next` shown
+        // only in the footer hint (see `footer_hint_outline_cycle_label_tracks_the_current_mode`).
+        let km = Keymap::defaults();
+        let sections = help_sections(&km, View::Outline);
+        let outline = &sections[1];
+        let entry = outline
+            .entries
+            .iter()
+            .find(|e| e.description.contains("Cycle the outline mode"))
+            .expect("cycle-mode row present");
+        assert!(
+            entry
+                .description
+                .contains("stack \u{25b8} stack-tree \u{25b8} flat \u{25b8} tree"),
+            "got: {:?}",
+            entry.description
+        );
+    }
+
+    #[test]
     fn help_sections_skip_an_unbound_action() {
         let km = Keymap::from_bindings(&[RawBinding {
             view: View::Diff,
@@ -1185,7 +1380,7 @@ mod tests {
     #[test]
     fn footer_hint_renders_the_curated_diff_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Diff);
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("s stage"), "got: {hint:?}");
         assert!(hint.contains("d discard"), "got: {hint:?}");
@@ -1197,10 +1392,39 @@ mod tests {
     #[test]
     fn footer_hint_renders_the_curated_outline_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Outline);
+        let hint = footer_hint(&km, View::Outline, OutlineMode::Stack);
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("enter open"), "got: {hint:?}");
-        assert!(hint.contains("i mode"), "got: {hint:?}");
+        assert!(hint.contains("n/p changeset"), "got: {hint:?}");
+        assert!(
+            hint.contains("i \u{2192}stack-tree"),
+            "cycling from Stack must show the next mode, StackTree; got: {hint:?}"
+        );
+        assert!(hint.contains("? help"), "got: {hint:?}");
+        assert!(
+            hint.chars().count() <= 80,
+            "the curated outline hint must fit an 80-col footer even with the longest \
+             next-mode label (stack-tree); got {} chars: {hint:?}",
+            hint.chars().count()
+        );
+    }
+
+    #[test]
+    fn footer_hint_outline_cycle_label_tracks_the_current_mode() {
+        let km = Keymap::defaults();
+        for (mode, next) in [
+            (OutlineMode::Stack, "stack-tree"),
+            (OutlineMode::StackTree, "flat"),
+            (OutlineMode::Flat, "tree"),
+            (OutlineMode::Tree, "stack"),
+        ] {
+            let hint = footer_hint(&km, View::Outline, mode);
+            let want = format!("i \u{2192}{next}");
+            assert!(
+                hint.contains(&want),
+                "mode {mode:?} should hint the NEXT mode {next:?}; got: {hint:?}"
+            );
+        }
     }
 
     #[test]
@@ -1210,7 +1434,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: "x".to_string(),
         }]);
-        let hint = footer_hint(&km, View::Diff);
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
         assert!(hint.contains("x stage"), "got: {hint:?}");
         assert!(!hint.contains("s stage"), "got: {hint:?}");
     }
@@ -1222,7 +1446,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: String::new(),
         }]);
-        let hint = footer_hint(&km, View::Diff);
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
         assert!(!hint.contains("stage"), "got: {hint:?}");
         // The rest of the curated set is unaffected.
         assert!(hint.contains("d discard"), "got: {hint:?}");
