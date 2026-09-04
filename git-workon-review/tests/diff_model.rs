@@ -343,6 +343,92 @@ fn hunk_to_diff_bytes_matches_diff_print() -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+// ── combined diff (CS1: HEAD ↔ worktree-with-index, M3's default zoom) ───────
+
+#[test]
+fn partially_staged_file_appears_fused_in_combined() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .partially_staged_file(
+            "f.txt",
+            "line1\nline2\nline3\n",
+            "line1\nSTAGED\nline3\n",
+            "line1\nSTAGED\nWORKDIR\n",
+        )
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let diffs = diff_uncommitted(repo)?;
+    // Split views each see only their own half of the change.
+    assert_eq!(diffs.staged.files.len(), 1);
+    assert_eq!(diffs.unstaged.files.len(), 1);
+
+    // Combined fuses both onto one file, diffing straight from HEAD to the workdir.
+    assert_eq!(diffs.combined.files.len(), 1);
+    let file = &diffs.combined.files[0];
+    assert_eq!(file.path, "f.txt");
+    assert_eq!(file.status, FileStatus::Modified);
+    assert_eq!(file.hunks.len(), 1);
+    let added: Vec<&[u8]> = file.hunks[0]
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Addition)
+        .map(|l| l.content.as_slice())
+        .collect();
+    // Both the staged AND the unstaged edit show up as additions in the one fused hunk.
+    assert!(added.contains(&b"STAGED\n".as_slice()));
+    assert!(added.contains(&b"WORKDIR\n".as_slice()));
+
+    Ok(())
+}
+
+#[test]
+fn untracked_file_appears_as_added_in_combined() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .untracked_file("new.txt", "hello\nworld\n")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let diffs = diff_uncommitted(repo)?;
+    assert_eq!(diffs.combined.files.len(), 1);
+    let file = &diffs.combined.files[0];
+    assert_eq!(file.path, "new.txt");
+    // Matches the unstaged side's convention (see `untracked_file_has_full_content_as_addition`):
+    // git2 reports untracked deltas as `Delta::Untracked`, not `Delta::Added` — all lines are
+    // still additions since there is no pre-image.
+    assert_eq!(file.status, FileStatus::Untracked);
+    assert!(file.hunks[0]
+        .lines
+        .iter()
+        .all(|l| l.kind == LineKind::Addition));
+
+    Ok(())
+}
+
+#[test]
+fn renamed_in_worktree_file_surfaces_as_renamed_in_combined(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        // Deleted from the working tree, still in HEAD/index...
+        .deleted_file("old.txt", "line1\nline2\nline3\nline4\nline5\n")
+        // ...and a same-content untracked file lands under a new name — a worktree rename
+        // `find_similar` must pair up.
+        .untracked_file("new.txt", "line1\nline2\nline3\nline4\nline5\n")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let diffs = diff_uncommitted(repo)?;
+    assert_eq!(diffs.combined.files.len(), 1);
+    let file = &diffs.combined.files[0];
+    assert_eq!(file.status, FileStatus::Renamed);
+    assert_eq!(file.path, "new.txt");
+    assert_eq!(file.old_path.as_deref(), Some("old.txt"));
+
+    Ok(())
+}
+
 // ── diff_changeset over a real assemble_changesets result ─────────────────────
 
 #[test]
