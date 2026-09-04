@@ -52,7 +52,7 @@ pub enum Command {
     ScrollTop,
     ScrollBottom,
     ToggleLayout,
-    CycleZoom,
+    ToggleMaximize,
     ToggleSplitFocus,
     Refresh,
     StageHunk,
@@ -75,6 +75,8 @@ pub enum Command {
     Search,
     SearchNext,
     SearchPrev,
+    CopyLines,
+    CopyLocation,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -98,7 +100,7 @@ pub enum Command {
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
 /// `name`), the default key tokens that reproduce the pre-config hardcoded binding, and a human
-/// description (the help overlay in CS3 renders from this).
+/// description (the help footer and `?` overlay renders from this).
 #[derive(Debug, Clone, Copy)]
 pub struct Registered {
     pub command: Command,
@@ -196,16 +198,19 @@ pub static REGISTRY: &[Registered] = &[
         description: "Toggle side-by-side / inline layout",
     },
     Registered {
-        command: Command::CycleZoom,
+        command: Command::ToggleMaximize,
         view: View::Diff,
-        name: "cycle-zoom",
+        name: "toggle-maximize",
         // Rebound from `z` (diff-fold-keys): `z` now anchors the `zM`/`zR` gap fold-all chords in
         // this view, and a bare-key binding can't coexist with a longer chord sharing its prefix
-        // (see `shift_z_dispatches_cycle_zoom_with_no_collisions`'s doc comment for the
+        // (see `shift_z_dispatches_toggle_maximize_with_no_collisions`'s doc comment for the
         // mechanics; `build_context`'s prefix-clash check would now warn on this, not just
-        // silently break dispatch). `Z` was free in `View::Diff`.
+        // silently break dispatch). `Z` was free in `View::Diff`. ADR-038, "Rename the keymap
+        // action `cycle-zoom` to `toggle-maximize`": renamed from `cycle-zoom`, keeping the `Z`
+        // binding — a user config still naming `cycle-zoom`
+        // degrades to the keymap's unknown-action warning rather than silently doing nothing.
         default_keys: "Z",
-        description: "Cycle the staged/unstaged zoom",
+        description: "Maximize/restore the focused split pane",
     },
     Registered {
         command: Command::ToggleSplitFocus,
@@ -274,7 +279,8 @@ pub static REGISTRY: &[Registered] = &[
         command: Command::NextHunk,
         view: View::Diff,
         name: "next-hunk",
-        // `n` moved off this default (M11 CS3, `diff-search`): it's now `search-next`'s default,
+        // `n` moved off this default (the in-diff search, `diff-search`): it's now
+        // `search-next`'s default,
         // which itself falls back to this exact action when no search is active — see that row's
         // description. `]h` alone still reaches it directly.
         default_keys: "]h",
@@ -370,6 +376,20 @@ pub static REGISTRY: &[Registered] = &[
         name: "search-prev",
         default_keys: "N",
         description: "Previous search match (or previous hunk, when no search is active)",
+    },
+    Registered {
+        command: Command::CopyLines,
+        view: View::Diff,
+        name: "copy-lines",
+        default_keys: "y",
+        description: "Copy the selected (or cursor) lines' text to the clipboard",
+    },
+    Registered {
+        command: Command::CopyLocation,
+        view: View::Diff,
+        name: "copy-location",
+        default_keys: "Y",
+        description: "Copy path:line (or path:lo-hi) for the selected rows to the clipboard",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {
@@ -676,7 +696,7 @@ pub struct Keymap {
     /// Active bindings when the outline has focus: global ∪ outline.
     outline: Vec<(KeySeq, Command)>,
     /// Resolved key sequences per registry row (parallel to [`REGISTRY`]) — the source for the
-    /// help overlay's "current keys for this action" (CS3).
+    /// help overlay's "current keys for this action" (the help footer and `?` overlay).
     resolved: Vec<Vec<KeySeq>>,
     /// Config problems collected during resolution (unknown action names, key collisions) — the
     /// caller surfaces these through the footer-notice mechanism at startup.
@@ -900,8 +920,9 @@ pub struct HelpSection {
 
 /// Build the help overlay's content for `focused` (the view with keyboard focus — [`View::Diff`]
 /// or [`View::Outline`]; never [`View::Global`]): a "Global" section, then the focused view's own
-/// section, each listing only BOUND actions (an action with no resolved keys — user-unbound — is
-/// skipped, per CS3). Pure and `Keymap`-driven — the display never hardcodes a key string, so a
+/// section, each listing only BOUND actions (an action with no resolved keys — user-unbound —
+/// is skipped, per the help footer and `?` overlay). Pure and `Keymap`-driven — the display
+/// never hardcodes a key string, so a
 /// rebind shows here automatically.
 pub fn help_sections(keymap: &Keymap, focused: View) -> Vec<HelpSection> {
     vec![
@@ -961,7 +982,34 @@ enum HintItem {
     Pair(Command, Command, &'static str),
 }
 
-/// CS4 (`outline-mode-cycle`): most hint labels are the static string baked into the `HintItem`,
+impl HintItem {
+    /// Whether this entry advertises a staging verb, and so drops out of the hint where
+    /// `App::can_stage_current` is false — see [`footer_hint`].
+    ///
+    /// Matched on the COMMAND, not on the entry's position in `DIFF_HINTS`, so a staging verb
+    /// added to a curated set later is covered without a second edit here. A `Pair` counts when
+    /// either half does; no staging command is half of a pair today, and one that were would
+    /// still be a staging entry.
+    fn is_staging(&self) -> bool {
+        fn staging(command: Command) -> bool {
+            matches!(
+                command,
+                Command::StageHunk
+                    | Command::StageFile
+                    | Command::DiscardHunk
+                    | Command::DiscardFile
+                    | Command::OutlineStage
+                    | Command::OutlineDiscard
+            )
+        }
+        match self {
+            HintItem::One(command, _) => staging(*command),
+            HintItem::Pair(a, b, _) => staging(*a) || staging(*b),
+        }
+    }
+}
+
+/// `outline-mode-cycle`: most hint labels are the static string baked into the `HintItem`,
 /// but `OutlineCycleMode`'s label shows the mode `i` would switch TO instead — computed from
 /// `outline_mode` (the outline's CURRENT mode, so this is `outline_mode.cycle()`'s label).
 fn render_hint_item(keymap: &Keymap, item: &HintItem, outline_mode: OutlineMode) -> Option<String> {
@@ -985,8 +1033,9 @@ fn render_hint_item(keymap: &Keymap, item: &HintItem, outline_mode: OutlineMode)
     }
 }
 
-/// The diff view's curated footer hint set (locked design in CS3): nav, stage/discard, outline,
-/// help, quit — ~5-7 entries picked to make the tool feel learnable, not an exhaustive list.
+/// The diff view's curated footer hint set (locked design from the help-footer-and-`?`-overlay
+/// work): nav, stage/discard, outline, help, quit — ~5-7 entries picked to make the tool feel
+/// learnable, not an exhaustive list.
 const DIFF_HINTS: &[HintItem] = &[
     HintItem::Pair(Command::CursorDown, Command::CursorUp, "move"),
     HintItem::One(Command::StageHunk, "stage"),
@@ -996,7 +1045,8 @@ const DIFF_HINTS: &[HintItem] = &[
     HintItem::One(Command::Quit, "quit"),
 ];
 
-/// The outline view's curated footer hint set (locked design in CS3).
+/// The outline view's curated footer hint set (locked design from the help-footer-and-`?`-overlay
+/// work).
 const OUTLINE_HINTS: &[HintItem] = &[
     HintItem::Pair(Command::OutlineDown, Command::OutlineUp, "move"),
     HintItem::One(Command::OutlineConfirm, "open"),
@@ -1016,7 +1066,18 @@ const OUTLINE_HINTS: &[HintItem] = &[
 /// string, so a rebind shows here too. A notice temporarily replaces this in the footer (the
 /// caller's job, see `render::render_footer`); an unbound curated action is simply dropped from
 /// the string rather than leaving a stale/wrong key visible.
-pub fn footer_hint(keymap: &Keymap, focused: View, outline_mode: OutlineMode) -> String {
+///
+/// `can_stage` is `App::can_stage_current` — false where a staging verb can only refuse (a
+/// committed changeset, a binary file, an empty file list). The staging entries drop out of the
+/// string entirely there, the same way an unbound action does, so the hint never advertises a
+/// key that will answer with a refusal notice. The keys stay BOUND and still explain themselves
+/// when pressed: this hides the advertisement, not the behavior.
+pub fn footer_hint(
+    keymap: &Keymap,
+    focused: View,
+    outline_mode: OutlineMode,
+    can_stage: bool,
+) -> String {
     let items: &[HintItem] = match focused {
         View::Diff => DIFF_HINTS,
         View::Outline => OUTLINE_HINTS,
@@ -1024,6 +1085,7 @@ pub fn footer_hint(keymap: &Keymap, focused: View, outline_mode: OutlineMode) ->
     };
     items
         .iter()
+        .filter(|item| can_stage || !item.is_staging())
         .filter_map(|item| render_hint_item(keymap, item, outline_mode))
         .collect::<Vec<_>>()
         .join("  \u{b7}  ")
@@ -1232,8 +1294,9 @@ mod tests {
     }
 
     /// `l`/`right` are free in the Diff view (they're only bound in the Outline view, to
-    /// `focus-diff`) — the handoff's locked decision #2 reuses them for `hscroll-right` there,
-    /// mirroring the Outline view's `l`/`right` = focus-diff.
+    /// `focus-diff`) — the hscroll handoff's locked decision that `h`/`left` pans back to column
+    /// 0 before focusing the outline reuses them for `hscroll-right` there, mirroring the
+    /// Outline view's `l`/`right` = focus-diff.
     #[test]
     fn l_and_right_dispatch_hscroll_right_in_the_diff_view() {
         let km = Keymap::defaults();
@@ -1291,9 +1354,10 @@ mod tests {
         );
     }
 
-    /// CS3 (diff-fold-keys) originally bound `n` as an extra default on `next-hunk`, for symmetry
-    /// with the outline's `n`/`p` changeset nav. M11 CS3 (`diff-search`) reclaims `n` as
-    /// `search-next`'s default instead (falling back to `next-hunk` itself when no search is
+    /// The gap-reset/expand-all-keys work (`diff-fold-keys`) originally bound `n` as an extra
+    /// default on `next-hunk`, for symmetry with the outline's `n`/`p` changeset nav. The
+    /// in-diff search (`diff-search`) reclaims `n` as `search-next`'s default instead (falling
+    /// back to `next-hunk` itself when no search is
     /// active — `App::search_next` — so `n`'s PRACTICAL effect on an unbound-search diff is
     /// unchanged); `p` is untouched, still `prev-hunk`'s extra default. `primary_key` still picks
     /// the first token, so the footer/help keep showing `]h`/`[h` for `next-hunk`/`prev-hunk`
@@ -1318,37 +1382,38 @@ mod tests {
         );
     }
 
-    /// CS3 (diff-fold-keys): `cycle-zoom` was rebound from bare `z` to `Z` to make room for the
-    /// `zM`/`zR` gap fold-all chords in `View::Diff`. This wasn't optional bookkeeping —
-    /// `match_keys` gives a strict-prefix match precedence over an exact one in the SAME scan
-    /// (see its doc comment): had `cycle-zoom` stayed on bare `z` alongside `zM`/`zR`, a lone `z`
-    /// press would always report `Pending` instead of firing `CycleZoom` immediately, and any
-    /// follow-up key that wasn't `M`/`R` would be swallowed as `Unmatched { mid_sequence: true }`
-    /// rather than re-processed — silently breaking `cycle-zoom` with no *runtime* warning; the
-    /// matcher's chord-wins precedence never changed. This test pins the resolved state: `Z`
-    /// fires `CycleZoom` immediately, and `z` only
-    /// ever anchors the `zM`/`zR` chords below — never a bare-key command of its own again.
+    /// The gap-reset/expand-all-keys work (`diff-fold-keys`): `toggle-maximize` (named
+    /// `cycle-zoom` before ADR-038) was rebound
+    /// from bare `z` to `Z` to make room for the `zM`/`zR` gap fold-all chords in `View::Diff`.
+    /// This wasn't optional bookkeeping — `match_keys` gives a strict-prefix match precedence
+    /// over an exact one in the SAME scan (see its doc comment): had it stayed on bare `z`
+    /// alongside `zM`/`zR`, a lone `z` press would always report `Pending` instead of firing
+    /// `ToggleMaximize` immediately, and any follow-up key that wasn't `M`/`R` would be swallowed
+    /// as `Unmatched { mid_sequence: true }` rather than re-processed — silently breaking the
+    /// binding with no *runtime* warning; the matcher's chord-wins precedence never changed. This
+    /// test pins the resolved state: `Z` fires `ToggleMaximize` immediately, and `z` only ever
+    /// anchors the `zM`/`zR` chords below — never a bare-key command of its own again.
     /// (`build_context` now also flags this shape as a prefix clash and warns — see
     /// `a_bare_prefix_binding_warns_about_the_chord_that_shadows_it` below — but the resolved
     /// defaults must still be clash-free, hence the empty-warnings assertion here.)
     #[test]
-    fn shift_z_dispatches_cycle_zoom_with_no_collisions() {
+    fn shift_z_dispatches_toggle_maximize_with_no_collisions() {
         let km = Keymap::defaults();
         assert!(
             km.warnings().is_empty(),
-            "cycle-zoom's rebind to Z must not collide with anything: {:?}",
+            "toggle-maximize's rebind to Z must not collide with anything: {:?}",
             km.warnings()
         );
         assert_eq!(
             feed(&km, false, &[key(KeyCode::Char('Z'))]),
-            Dispatch::Command(Command::CycleZoom)
+            Dispatch::Command(Command::ToggleMaximize)
         );
     }
 
     /// `zM`/`zR` — reset/expand-all gaps in the diff view (companion to the outline's own
     /// `zM`/`zR` fold-all, `z_m_and_z_r_dispatch_outline_fold_all_with_no_collisions` above).
-    /// Coexists cleanly with `Z` (`cycle-zoom`, see the test above) now that `cycle-zoom` no
-    /// longer claims the bare `z` prefix.
+    /// Coexists cleanly with `Z` (`toggle-maximize`, see the test above) now that it no longer
+    /// claims the bare `z` prefix.
     #[test]
     fn z_m_and_z_r_dispatch_diff_gap_fold_all_with_no_collisions() {
         let km = Keymap::defaults();
@@ -1372,6 +1437,30 @@ mod tests {
                 &[key(KeyCode::Char('z')), key(KeyCode::Char('R'))]
             ),
             Dispatch::Command(Command::ExpandAllGaps)
+        );
+    }
+
+    /// In-diff navigation (`copy-lines`/`copy-location`, the yank split): `y` was free in both
+    /// `View::Global` and `View::Diff` (unlike `p`, which `[h`'s extra default and the outline's
+    /// `prev-changeset` already claim), so no existing binding needed to move to make room for
+    /// it — unlike the `z` -> `Z` rebind above. `Y` is likewise free (verified against
+    /// every `default_keys` entry in this registry when the yank split was designed). Pins both
+    /// resolved defaults clash-free the same way those tests do.
+    #[test]
+    fn y_dispatches_copy_lines_and_shift_y_dispatches_copy_location_with_no_collisions() {
+        let km = Keymap::defaults();
+        assert!(
+            km.warnings().is_empty(),
+            "copy-lines/copy-location's default `y`/`Y` must not collide with anything: {:?}",
+            km.warnings()
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('y'))]),
+            Dispatch::Command(Command::CopyLines)
+        );
+        assert_eq!(
+            feed(&km, false, &[key(KeyCode::Char('Y'))]),
+            Dispatch::Command(Command::CopyLocation)
         );
     }
 
@@ -1499,16 +1588,16 @@ mod tests {
 
     #[test]
     fn a_bare_prefix_binding_warns_about_the_chord_that_shadows_it() {
-        // Rebind cycle-zoom back onto bare `z`, which now collides with the `zM`/`zR` gap
+        // Rebind toggle-maximize back onto bare `z`, which now collides with the `zM`/`zR` gap
         // fold-all chords still on their defaults in `View::Diff`. Each chord sharing the `z`
-        // prefix is its own clashing pair — one warning per pair, both naming cycle-zoom.
+        // prefix is its own clashing pair — one warning per pair, both naming toggle-maximize.
         let km = Keymap::from_bindings(&[RawBinding {
             view: View::Diff,
-            action: "cycle-zoom".to_string(),
+            action: "toggle-maximize".to_string(),
             keys: "z".to_string(),
         }]);
         assert_eq!(km.warnings().len(), 2, "warnings: {:?}", km.warnings());
-        assert!(km.warnings().iter().all(|w| w.contains("cycle-zoom")));
+        assert!(km.warnings().iter().all(|w| w.contains("toggle-maximize")));
         assert!(km.warnings().iter().all(|w| w.contains("diff")));
         assert!(km.warnings().iter().any(|w| w.contains("reset-gaps")));
         assert!(km.warnings().iter().any(|w| w.contains("expand-all-gaps")));
@@ -1572,7 +1661,7 @@ mod tests {
         );
     }
 
-    // ── CS3: help overlay / footer hint builders ────────────────────────────
+    // ── Help footer and `?` overlay: help overlay / footer hint builders ─────
 
     #[test]
     fn help_sections_groups_global_and_the_focused_view_only() {
@@ -1594,9 +1683,10 @@ mod tests {
 
     #[test]
     fn help_sections_cycle_mode_entry_spells_out_the_full_order() {
-        // CS4: descriptions are static `&'static str`s baked into `REGISTRY`, so the help
-        // overlay can't mark the CURRENT mode dynamically without a broader refactor — the
-        // locked fallback is a static full-order description, with the dynamic `→next` shown
+        // `outline-mode-cycle`: descriptions are static `&'static str`s baked into `REGISTRY`,
+        // so the help overlay can't mark the CURRENT mode dynamically without a broader
+        // refactor — the locked fallback is a static full-order description, with the dynamic
+        // `→next` shown
         // only in the footer hint (see `footer_hint_outline_cycle_label_tracks_the_current_mode`).
         let km = Keymap::defaults();
         let sections = help_sections(&km, View::Outline);
@@ -1653,7 +1743,7 @@ mod tests {
     #[test]
     fn footer_hint_renders_the_curated_diff_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), true);
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("s stage"), "got: {hint:?}");
         assert!(hint.contains("d discard"), "got: {hint:?}");
@@ -1663,9 +1753,36 @@ mod tests {
     }
 
     #[test]
+    fn footer_hint_drops_the_staging_entries_where_staging_can_only_refuse() {
+        let km = Keymap::defaults();
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), false);
+        assert!(
+            !hint.contains("stage") && !hint.contains("discard"),
+            "a non-stageable file must not advertise the staging verbs, got: {hint:?}"
+        );
+        // The rest of the curated set is untouched — this hides two entries, not the footer.
+        assert!(hint.contains("j/k move"), "got: {hint:?}");
+        assert!(hint.contains("o outline"), "got: {hint:?}");
+        assert!(hint.contains("? help"), "got: {hint:?}");
+        assert!(hint.contains("q quit"), "got: {hint:?}");
+    }
+
+    /// The outline's curated set carries no staging entry to begin with (it was trimmed to fit
+    /// 80 columns), so the flag changes nothing there. Pinned so a later addition to
+    /// `OUTLINE_HINTS` has to decide about `can_stage` rather than inherit an accident.
+    #[test]
+    fn footer_hint_outline_entries_are_unaffected_by_the_staging_flag() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            footer_hint(&km, View::Outline, OutlineMode::Stack, true),
+            footer_hint(&km, View::Outline, OutlineMode::Stack, false),
+        );
+    }
+
+    #[test]
     fn footer_hint_renders_the_curated_outline_entries() {
         let km = Keymap::defaults();
-        let hint = footer_hint(&km, View::Outline, OutlineMode::Stack);
+        let hint = footer_hint(&km, View::Outline, OutlineMode::Stack, true);
         assert!(hint.contains("j/k move"), "got: {hint:?}");
         assert!(hint.contains("enter open"), "got: {hint:?}");
         assert!(hint.contains("n/p changeset"), "got: {hint:?}");
@@ -1691,7 +1808,7 @@ mod tests {
             (OutlineMode::Flat, "tree"),
             (OutlineMode::Tree, "stack"),
         ] {
-            let hint = footer_hint(&km, View::Outline, mode);
+            let hint = footer_hint(&km, View::Outline, mode, true);
             let want = format!("i \u{2192}{next}");
             assert!(
                 hint.contains(&want),
@@ -1707,7 +1824,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: "x".to_string(),
         }]);
-        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), true);
         assert!(hint.contains("x stage"), "got: {hint:?}");
         assert!(!hint.contains("s stage"), "got: {hint:?}");
     }
@@ -1719,7 +1836,7 @@ mod tests {
             action: "stage-hunk".to_string(),
             keys: String::new(),
         }]);
-        let hint = footer_hint(&km, View::Diff, OutlineMode::default());
+        let hint = footer_hint(&km, View::Diff, OutlineMode::default(), true);
         assert!(!hint.contains("stage"), "got: {hint:?}");
         // The rest of the curated set is unaffected.
         assert!(hint.contains("d discard"), "got: {hint:?}");

@@ -1,5 +1,6 @@
-//! CS5's opt-in nerd-font file-type icon table — a pure module, no [`crate::app::App`]/
-//! [`crate::outline`] dependency, mirroring [`crate::summary`]'s pure-module posture.
+//! The opt-in nerd-font file-type icon table (part of file-status letters and opt-in nerd
+//! icons) — a pure module, no [`crate::app::App`]/[`crate::outline`] dependency, mirroring
+//! [`crate::summary`]'s pure-module posture.
 //!
 //! A terminal cannot report which font (patched with the nerd-font private-use glyphs or not)
 //! the user has configured, so there is NO auto-detection here or anywhere else in the crate —
@@ -7,15 +8,15 @@
 //! doc block and `App::apply_view_config`). With the config left at its default (`none`),
 //! nothing in this module is ever called from `render.rs`.
 //!
-//! **Icon table (CS1 polish pass):** per-file glyphs and brand colors are looked up via the
+//! **The devicons-backed icon table:** per-file glyphs and brand colors are looked up via the
 //! [`devicons`] crate (Apache-2.0, `alexpasmantier/devicons`) rather than a hand-rolled table —
 //! 597 filename+extension entries with the same filename-before-extension precedence
 //! [`icon_for_path`] already followed. devicons ships separate Dark/Light color maps; the caller
 //! picks one from the active [`crate::theme::Palette`] (see [`icon_for_path`]'s doc comment).
 //! **Nerd-font v3 requirement:** devicons' glyphs are drawn from nerd-font v3's private-use
 //! codepoints, roughly a fifth of which sit in a Unicode supplementary plane (outside the BMP).
-//! The crate's own `IconMode::Nerd` glyphs picked in CS3 (status/header markers) stay
-//! BMP-only for wider font compatibility, but a per-file icon from devicons may require a v3
+//! The crate's own `IconMode::Nerd` glyphs picked for the nerd-mode status and header glyphs
+//! stay BMP-only for wider font compatibility, but a per-file icon from devicons may require a v3
 //! nerd-font — this is the same "no auto-detection" opt-in tradeoff as the rest of this module.
 //! devicons does not cover directories (it is a per-file mapper), so [`DIR_ICON`] is still ours.
 
@@ -30,7 +31,8 @@ use ratatui::style::Color;
 /// the summary panel's glyphs, and the winbar's marker/diffstat/file icons alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IconMode {
-    /// No icon glyph — today's plain `[glyph][letter] path` row (CS5's unconditional part only).
+    /// No icon glyph — today's plain `[glyph][letter] path` row (the unconditional part of
+    /// file-status letters and opt-in nerd icons only).
     #[default]
     None,
     /// A nerd-font private-use glyph per file extension (falling back to

@@ -1,4 +1,4 @@
-//! The `theme = auto` terminal-derivation probe (ADR-035, CS6).
+//! The `theme = auto` terminal-derivation probe (ADR-035).
 //!
 //! `auto` derives the base16 *scheme* (syntax + monochrome ramp) from the terminal's own colors,
 //! so code in the diff is highlighted in the same palette the user's terminal already uses. It

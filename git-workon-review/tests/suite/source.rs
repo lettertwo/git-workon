@@ -1,5 +1,5 @@
-//! Fixture tests for the M7 `Source` classifier + resolver (ADR-036): the `stack`/`uncommitted`
-//! keywords (CS2), and `<ref>` shape-aware dispatch + `Range` resolution (CS3). Output
+//! Fixture tests for the source selector's `Source` classifier + resolver (ADR-036): the
+//! `stack`/`uncommitted` keywords, and `<ref>` shape-aware dispatch + `Range` resolution. Output
 //! assertions pin `NO_COLOR=1` per the FORCE_COLOR trap this dev environment sets.
 
 use assert_cmd::cargo_bin_cmd;
@@ -128,9 +128,11 @@ fn stack_keyword_caught_up_and_clean_prints_nothing_to_review() {
         .stderr(predicate::str::contains("nothing to review"));
 }
 
-/// The classifier/resolver seam CS2 introduces resolves `Ref` to a named, hinted pre-TUI
-/// failure (real ref resolution is CS3) — end-to-end through the binary, so this doubles as
-/// the CS2 manual smoke check ("a source shape renders or errors honestly"). Color is pinned
+/// The classifier/resolver seam the stack/uncommitted-source-keywords work introduces resolves
+/// `Ref` to a named, hinted pre-TUI failure (real ref resolution is `<ref>` and range
+/// resolution) — end-to-end through the binary, so this doubles as
+/// the stack/uncommitted-source-keywords manual smoke check ("a source shape renders or errors
+/// honestly"). Color is pinned
 /// off: `FORCE_COLOR=3` is set in this dev environment and would otherwise leak ANSI codes
 /// into the assertion.
 #[test]
@@ -150,7 +152,7 @@ fn unresolvable_ref_source_prints_named_error_and_exits_nonzero() {
         ));
 }
 
-// ── CS3: `<ref>` shape-aware dispatch + `Range` resolution ──────────────────────────────────
+// ── `<ref>` and range resolution: shape-aware dispatch + `Range` resolution ─────────────────
 
 both_formats!(ref_on_graphite_tracked_branch_that_is_head_matches_auto_detect,);
 
@@ -445,7 +447,8 @@ fn range_empty_side_defaults_to_head() -> Result<(), Box<dyn Error>> {
 }
 
 /// `review <tag>..<same tag>` is a valid-but-empty range: exit 0, "nothing to review" naming
-/// the source text (ADR-036's empty-but-valid UX, extended in CS3 to name the source).
+/// the source text (ADR-036's empty-but-valid UX, extended by `<ref>` and range resolution to
+/// name the source).
 #[test]
 fn empty_range_between_same_tag_prints_named_nothing_to_review_and_exits_zero() {
     let fixture = FixtureBuilder::new().build().unwrap();

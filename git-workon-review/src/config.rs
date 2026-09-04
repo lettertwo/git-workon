@@ -9,9 +9,11 @@
 //!
 //! ## Status
 //!
-//! CS1 of the everyday-usability pass (see `docs/plans/review-usability-pass.md`): reader
-//! infrastructure + typed getters only. Nothing here is wired into rendering or dispatch yet
-//! — that's CS2 (keymaps), CS4/CS5/CS6 (theming), and CS7 (view settings).
+//! The git-config reader from the everyday-usability pass (see
+//! `docs/plans/review-usability-pass.md`): reader infrastructure + typed getters. Every reader
+//! here is wired in — `keymap.rs` reads the per-view keymaps, `theme.rs` reads the base16
+//! palette/light-scheme/terminal-derivation theming, and `App::apply_view_config` reads the
+//! view-config settings.
 //!
 //! ## Configuration keys
 //!
@@ -42,7 +44,6 @@
 //!
 //! [workon "review.diff"]
 //!   layout = split
-//!   zoom = combined
 //!   text = syntax             ; syntax | tint | edit (default: syntax)
 //! ```
 //!
@@ -105,8 +106,8 @@ impl View {
 
 /// `workon.review.theme` — see [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md).
 ///
-/// `auto` (terminal-derived) is the spec default; the terminal-derivation probe itself is
-/// CS6. Until CS6 lands, callers of [`ReviewConfig::theme`] decide how to treat `Auto`.
+/// `auto` (terminal-derived) is the spec default; `main.rs` runs the terminal-derivation probe
+/// and passes its result to callers of [`ReviewConfig::theme`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
     #[default]
@@ -117,7 +118,8 @@ pub enum Theme {
 
 /// One decomposed `workon.review.<view>.bind.<action>` (or bare `workon.review.bind.<action>`)
 /// config entry: the raw, unparsed value string. Token-grammar parsing (space/reserved-word/
-/// modifier/chord) is CS2's job — see [ADR-034](../../../docs/adr/034-review-git-native-config-schema.md).
+/// modifier/chord) is left for the configurable per-view keymaps to do — see
+/// [ADR-034](../../../docs/adr/034-review-git-native-config-schema.md).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawBinding {
     pub view: View,
@@ -127,9 +129,10 @@ pub struct RawBinding {
     pub keys: String,
 }
 
-/// The four CS7 view-config settings, read raw (unset → `None`) and owned — see
+/// The four view-config settings, read raw (unset → `None`) and owned — see
 /// [`ReviewConfig::view_config`]. Validation (range/enum checks) and default fallback are
-/// [`crate::app::App::apply_view_config`]'s job, same division as [`RawBinding`]/CS2.
+/// [`crate::app::App::apply_view_config`]'s job, the same raw-vs-validated split
+/// [`RawBinding`] draws for the configurable per-view keymaps.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RawViewConfig {
     pub outline_width: Option<i64>,
@@ -137,7 +140,6 @@ pub struct RawViewConfig {
     pub outline_order: Option<String>,
     pub icons: Option<String>,
     pub diff_layout: Option<String>,
-    pub diff_zoom: Option<String>,
     pub diff_text: Option<String>,
 }
 
@@ -211,8 +213,9 @@ pub fn resolve_runtime(repo: &Repository, ctx: &PaletteContext) -> RuntimeConfig
 /// bare `workon.review.bind.<action>` is the global keymap; `workon.review.<view>.bind.<action>`
 /// is a per-view keymap entry. Returns `None` for anything else under `workon.review.*`
 /// (`theme`, a view setting, or an unrecognized shape) — not this reader's job to
-/// validate/warn on unknown bind shapes; that's CS2's collision/unknown-action validation
-/// pass. View settings and `theme` are read directly by their own getters, not through this.
+/// validate/warn on unknown bind shapes; that's the configurable per-view keymaps' own
+/// collision/unknown-action validation pass. View settings and `theme` are read directly by
+/// their own getters, not through this.
 fn parse_bind_key(name: &str) -> Option<(View, String)> {
     let rest = name.strip_prefix("workon.review.")?;
     let parts: Vec<&str> = rest.split('.').collect();
@@ -308,7 +311,6 @@ const KNOWN_SCALAR_KEYS: &[&str] = &[
     "outline.mode",
     "outline.order",
     "diff.layout",
-    "diff.zoom",
     "diff.text",
 ];
 
@@ -404,8 +406,8 @@ impl<'repo> ReviewConfig<'repo> {
         Ok(theme)
     }
 
-    /// Read every `workon.review.theme.*` variable — the CS1 user-configurable colors tier (see
-    /// [`crate::theme::ThemeOverrides`]) — into a [`ThemeOverrides`] plus any warnings for
+    /// Read every `workon.review.theme.*` variable — the user-configurable color-override keys
+    /// (see [`crate::theme::ThemeOverrides`]) — into a [`ThemeOverrides`] plus any warnings for
     /// malformed values. Deliberately separate from [`ReviewConfig::theme`]: `theme` and
     /// `theme.*` are different subsections (`[workon "review"] theme = dark` vs.
     /// `[workon "review.theme"] base00 = …`) and coexist fine — see the module doc's example.
@@ -477,7 +479,8 @@ impl<'repo> ReviewConfig<'repo> {
     /// with git's native precedence (local > global > system) applied.
     ///
     /// Token-grammar parsing (space/reserved-word/modifier/chord), unknown-action validation,
-    /// and collision detection are CS2's job — this is the raw read only.
+    /// and collision detection are left for the configurable per-view keymaps to do — this is
+    /// the raw read only.
     pub fn bindings(&self) -> Result<Vec<RawBinding>, git2::Error> {
         let config = self.repo.config()?;
         // Gather each (view, action) once with its fully-qualified key name. The `entries()`
@@ -508,7 +511,7 @@ impl<'repo> ReviewConfig<'repo> {
     }
 
     /// Get `workon.review.outline.width`, raw. `None` if unset — callers apply the current
-    /// hardcoded default (CS7).
+    /// hardcoded default (the view-config settings).
     pub fn outline_width(&self) -> Result<Option<i64>, git2::Error> {
         self.get_view_i64(View::Outline, "width")
     }
@@ -539,19 +542,14 @@ impl<'repo> ReviewConfig<'repo> {
         self.get_view_string(View::Diff, "layout")
     }
 
-    /// Get `workon.review.diff.zoom`, raw. `None` if unset.
-    pub fn diff_zoom(&self) -> Result<Option<String>, git2::Error> {
-        self.get_view_string(View::Diff, "zoom")
-    }
-
     /// Get `workon.review.diff.text`, raw. `None` if unset — see
-    /// [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s "Revised (CS11, diff
+    /// [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s "Revised (diff
     /// foreground/background split)" section.
     pub fn diff_text(&self) -> Result<Option<String>, git2::Error> {
         self.get_view_string(View::Diff, "text")
     }
 
-    /// Read all four CS7 view-config settings at once into an owned [`RawViewConfig`],
+    /// Read all four view-config settings at once into an owned [`RawViewConfig`],
     /// collapsing a config-read error to `None` — same as every other getter here, `App`'s
     /// resolution (`App::apply_view_config`) treats an unset setting and a failed read
     /// identically (both apply the current hardcoded default). Exists so `main.rs` can read
@@ -565,15 +563,14 @@ impl<'repo> ReviewConfig<'repo> {
             outline_order: self.outline_order().ok().flatten(),
             icons: self.icons().ok().flatten(),
             diff_layout: self.diff_layout().ok().flatten(),
-            diff_zoom: self.diff_zoom().ok().flatten(),
             diff_text: self.diff_text().ok().flatten(),
         }
     }
 
     /// Build the fully-qualified `workon.review.<suffix>` key for a scalar (non-`bind`,
     /// non-`theme.*`) setting, `debug_assert!`ing `suffix` is listed in [`KNOWN_SCALAR_KEYS`] —
-    /// see that constant's doc comment for why this assert is the drift guard for Decision 3's
-    /// registry.
+    /// see that constant's doc comment for why this assert is the drift guard for the
+    /// known-key-drift-test-is-mandatory registry.
     fn scalar_key(suffix: &str) -> String {
         debug_assert!(
             KNOWN_SCALAR_KEYS.contains(&suffix),
@@ -808,7 +805,6 @@ mod tests {
             .config("workon.review.outline.order", "base-first")
             .config("workon.review.icons", "nerd")
             .config("workon.review.diff.layout", "split")
-            .config("workon.review.diff.zoom", "staged")
             .config("workon.review.diff.text", "tint")
             .build()
             .expect("fixture build");
@@ -829,10 +825,6 @@ mod tests {
             config.diff_layout().expect("layout"),
             Some("split".to_string())
         );
-        assert_eq!(
-            config.diff_zoom().expect("zoom"),
-            Some("staged".to_string())
-        );
         assert_eq!(config.diff_text().expect("text"), Some("tint".to_string()));
     }
 
@@ -847,7 +839,6 @@ mod tests {
         assert_eq!(config.outline_order().expect("order"), None);
         assert_eq!(config.icons().expect("icons"), None);
         assert_eq!(config.diff_layout().expect("layout"), None);
-        assert_eq!(config.diff_zoom().expect("zoom"), None);
         assert_eq!(config.diff_text().expect("text"), None);
     }
 
@@ -888,7 +879,7 @@ mod tests {
     fn theme_overrides_reads_the_cursor_unfocused_bg_tint_key() {
         use crate::theme::Palette;
 
-        // CS1 (`unfocused-cursor-wash`): `cursor-unfocused-bg` replaced the outline-only
+        // `unfocused-cursor-wash`: `cursor-unfocused-bg` replaced the outline-only
         // `outline-cursor-unfocused-bg` key with no backward compatibility — see the sibling
         // rejection test below for the dropped old key.
         let fixture = FixtureBuilder::new()
@@ -912,10 +903,10 @@ mod tests {
 
     #[test]
     fn theme_overrides_reads_the_search_match_bg_tint_key() {
-        // M11 CS3 (`diff-search`): `search-match-bg`/`search-current-bg` are brand-new tints with
-        // no scheme slot fallback — this is the ONLY way to set them (see `tint_slot`'s doc
-        // comment), and they must NOT be in `KNOWN_SCALAR_KEYS` (the open-ended `theme.*`
-        // subspace already covers them for the unknown-key warning).
+        // The in-diff search (`diff-search`): `search-match-bg`/`search-current-bg` are
+        // brand-new tints with no scheme slot fallback — this is the ONLY way to set them (see
+        // `tint_slot`'s doc comment), and they must NOT be in `KNOWN_SCALAR_KEYS` (the
+        // open-ended `theme.*` subspace already covers them for the unknown-key warning).
         use crate::theme::Palette;
 
         let fixture = FixtureBuilder::new()
@@ -1038,8 +1029,8 @@ mod tests {
             .expect("theme_overrides");
         assert!(overrides.is_empty(), "invalid value must not set the slot");
         assert_eq!(warnings.len(), 1);
-        // Full-message pin (config-validation-completeness Decision 5): names the expected
-        // format, and `ignoring` with no fallback — an ignored override has none.
+        // Full-message pin (invalid-value warnings name the allowed set and the fallback): names
+        // the expected format, and `ignoring` with no fallback — an ignored override has none.
         assert_eq!(
             warnings[0],
             "workon.review.theme.base00: invalid color \"not-a-color\" \
@@ -1315,7 +1306,6 @@ mod tests {
             .config("workon.review.outline.mode", "tree")
             .config("workon.review.outline.order", "base-first")
             .config("workon.review.diff.layout", "split")
-            .config("workon.review.diff.zoom", "staged")
             .config("workon.review.diff.text", "tint")
             .config("workon.review.theme.base00", "#101010") // a theme slot
             .config("workon.review.theme.cursor-bg", "#1a2b3c") // a theme tint
@@ -1331,8 +1321,28 @@ mod tests {
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
 
-    /// Decision 3's drift test. `KNOWN_SCALAR_KEYS` is a second source of truth alongside the
-    /// getters that actually read `workon.review.*` — this enumerates every scalar getter, sets
+    /// ADR-038, "Remove `workon.review.diff.zoom`": it was removed with no replacement key and no
+    /// compatibility alias, so a config still setting it now degrades exactly like any other
+    /// unrecognized key — one unknown-key warning, no crash, no effect — rather than silently
+    /// applying a dead setting.
+    #[test]
+    fn unknown_key_warnings_flags_the_removed_diff_zoom_key() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.zoom", "combined")
+            .build()
+            .expect("fixture build");
+        let repo = fixture.repo().expect("repo");
+
+        let warnings = ReviewConfig::new(repo)
+            .unknown_key_warnings()
+            .expect("unknown_key_warnings");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("diff.zoom"), "got: {warnings:?}");
+    }
+
+    /// The known-key-drift-test-is-mandatory test. `KNOWN_SCALAR_KEYS` is a second source of truth
+    /// alongside the getters that actually read `workon.review.*` — this enumerates every scalar
+    /// getter, sets
     /// its documented key on a fixture, and asserts BOTH that the getter reads it back AND that
     /// the same key is claimed by the registry (`is_claimed`), so a getter added without a
     /// matching registry entry fails here (not just "the registry agrees with itself"). The
@@ -1347,7 +1357,6 @@ mod tests {
             .config("workon.review.outline.mode", "tree")
             .config("workon.review.outline.order", "base-first")
             .config("workon.review.diff.layout", "split")
-            .config("workon.review.diff.zoom", "staged")
             .config("workon.review.diff.text", "tint")
             .build()
             .expect("fixture build");
@@ -1373,7 +1382,6 @@ mod tests {
                 "diff.layout",
                 config.diff_layout().expect("layout").is_some(),
             ),
-            ("diff.zoom", config.diff_zoom().expect("zoom").is_some()),
             ("diff.text", config.diff_text().expect("text").is_some()),
         ];
 

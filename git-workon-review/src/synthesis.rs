@@ -8,15 +8,15 @@
 //! rewrite.
 //!
 //! This module synthesizes WHOLE hunks (`[whole_hunk_patch]`) and line-precise selections
-//! (`[partial_hunk_patch]`, traps 1-2: direction-dependent drop rules, the EOFNL splice).
+//! (`[partial_hunk_patch]`: the direction-dependent drop rules, the no-newline-at-EOF splice).
 
 use std::collections::BTreeSet;
 
 use crate::error::SynthesisError;
 use crate::model::{FileChange, FileStatus, Hunk, LineKind};
 
-/// Which side of a patch is the "before" image — the direction-dependent drop rules (trap 1)
-/// key off this. Whole-hunk patches don't drop lines, so `PatchBase` only affects
+/// Which side of a patch is the "before" image — the direction-dependent drop rules key off
+/// this. Whole-hunk patches don't drop lines, so `PatchBase` only affects
 /// [`partial_hunk_patch`] (and is otherwise threaded through by [`crate::apply::StageVerb::plan`]
 /// to pick which model a caller synthesizes from).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,7 +215,8 @@ impl PatchText {
         out
     }
 
-    /// Pure transform: swap old/new paths and invert every hunk (trap 1's Old/New base swap,
+    /// Pure transform: swap old/new paths and invert every hunk (the direction-dependent drop
+    /// rules' Old/New base swap,
     /// applied wholesale). Needed because `Repository::apply` has no reverse flag — a
     /// "reverse apply" is `invert()` then a forward apply. `invert(invert(p)) == p` (tested).
     pub fn invert(&self) -> PatchText {
@@ -238,8 +239,9 @@ impl PatchText {
 /// - binary files ([`SynthesisError::BinaryFile`]) — no hunks exist to synthesize from.
 /// - statuses NEITHER a two-sided NOR a one-sided (creation) hunk patch can express
 ///   ([`SynthesisError::LineSelectionUnsupported`]): `Deleted` (a hunk patch of a deletion would
-///   stage an empty blob instead of removing the file — trap 3) and `Unmerged`. CS4's `ops.rs`
-///   routes these statuses to `file_ops.rs` before synthesis is ever reached, so
+///   stage an empty blob instead of removing the file — whole-file-ops fallback) and `Unmerged`.
+///   The whole-file ops and routing layer's `ops.rs` routes these statuses to `file_ops.rs`
+///   before synthesis is ever reached, so
 ///   `LineSelectionUnsupported` is the variant callers see here — it's the closest existing
 ///   error to "use the whole-file op instead," which is exactly its `help` text.
 ///   `Copied` is treated like `Renamed` (both carry an `old_path`).
@@ -289,7 +291,7 @@ fn selectable_hunk(
 }
 
 /// Synthesize a patch for the WHOLE of `file`'s hunk at `hunk_idx` — no line selection, so the
-/// direction-dependent drop rules (trap 1) don't apply; the hunk's lines are copied verbatim.
+/// direction-dependent drop rules don't apply; the hunk's lines are copied verbatim.
 ///
 /// Same refusals as [`selectable_hunk`].
 pub fn whole_hunk_patch(file: &FileChange, hunk_idx: usize) -> Result<PatchText, SynthesisError> {
@@ -340,7 +342,7 @@ enum SpliceNeed {
     KeptDeletion,
 }
 
-/// Trap 2: rewrite a deletion-shaped line that carries
+/// No-newline-at-EOF splice: rewrite a deletion-shaped line that carries
 /// [`crate::model::HunkLine::missing_newline`] when a LATER emitted line is [`LineKind::Context`]
 /// — the shape that lets `git apply` silently corrupt content (see below). Two shapes reach
 /// here, tagged by [`SpliceNeed`]: a dropped-deletion-turned-context line (`base == Old`) and a
@@ -466,7 +468,7 @@ pub struct LineSelection {
 }
 
 /// Synthesize a patch for a LINE-PRECISE selection of `file`'s hunk at `hunk_idx` — the
-/// direction-dependent drop rules (trap 1).
+/// direction-dependent drop rules.
 ///
 /// Context lines are always emitted as context. For the rest, `base` decides what happens to a
 /// line that ISN'T kept:
@@ -533,7 +535,7 @@ pub struct LineSelection {
 /// deletion converted to context (see above) or a KEPT deletion emitted verbatim — followed by
 /// any other emitted line, is spliced by [`splice_eofnl_context_lines`] into git's canonical
 /// delete+re-add form rather than left as a raw context/deletion line — see that function's docs
-/// for why (trap 2).
+/// for why (no-newline-at-EOF splice).
 pub fn partial_hunk_patch(
     file: &FileChange,
     hunk_idx: usize,

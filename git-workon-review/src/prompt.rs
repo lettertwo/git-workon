@@ -1,9 +1,10 @@
 //! A one-row text-input primitive: [`PromptState`] holds a buffer plus a byte-offset cursor and
 //! exposes pure edit operations (never touches [`crate::app::App`] or terminal I/O — the
 //! keymap/cascade wiring that turns key events into these calls, and the pane it renders inside,
-//! are a later changeset's job). M11's outline filter (`/` in the outline pane) and diff search
-//! (`/` in the diff pane) both need "one editable line with a blinking-cursor feel"; rather than
-//! grow that logic twice, this module is that shared line editor, built once and unused until
+//! are a later changeset's job). In-diff navigation's outline fuzzy filter (`/` in the
+//! outline pane) and in-diff search (`/` in the diff pane) both need "one editable line with a
+//! blinking-cursor feel"; rather than grow that logic twice, this module is that shared line
+//! editor, built once and unused until
 //! the next two changesets wire it up.
 //!
 //! Emacs/readline-flavored bindings were chosen over vim-insert-mode ones because the prototype's
@@ -53,14 +54,14 @@ impl PromptState {
     }
 
     /// `true` when nothing has been typed — the caller-facing "is there a query at all" check
-    /// (M11's outline filter/diff search both fall back to their unfiltered/inactive behavior on
-    /// an empty buffer).
+    /// (the outline fuzzy filter/in-diff search both fall back to their unfiltered/inactive
+    /// behavior on an empty buffer).
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
-    /// Reset to a fresh, empty prompt — `Ctrl-c`'s "clear and defocus" behavior (M11's outline
-    /// filter) is one call to this plus a focus-flag flip the caller owns.
+    /// Reset to a fresh, empty prompt — `Ctrl-c`'s "clear and defocus" behavior (the outline
+    /// fuzzy filter) is one call to this plus a focus-flag flip the caller owns.
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;

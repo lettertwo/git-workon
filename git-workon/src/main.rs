@@ -21,7 +21,8 @@ fn main() -> Result<()> {
     // Must run before `CompleteEnv`'s own dispatch: an external subcommand's stub `Command` (see
     // `completers::augment`) carries no argument definitions, so `CompleteEnv` alone can't
     // complete anything typed after it. This hands those words off to the external's own
-    // `COMPLETE=` responder instead (M6 CS3's deferred seam; ADR-036 CS5), and is a no-op in
+    // `COMPLETE=` responder instead (the external-subcommand-completion-enumeration-deferred
+    // seam; ADR-036's source completion and sub-delegation), and is a no-op in
     // every other case (see its doc comment).
     completers::try_delegate_external_completion();
     CompleteEnv::with_factory(|| completers::augment(Cli::command())).complete();

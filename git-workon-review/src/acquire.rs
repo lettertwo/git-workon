@@ -13,29 +13,29 @@ use crate::model::DiffModel;
 
 /// The working-tree diffs a review session needs: the index against `HEAD` (staged), the
 /// working tree against the index (unstaged, including untracked content), and the fused
-/// `HEAD` ↔ worktree view (combined) the M3 renderer reviews by default.
+/// `HEAD` ↔ worktree view (whole) the renderer reviews by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeDiffs {
     pub staged: DiffModel,
     pub unstaged: DiffModel,
     /// `HEAD`'s tree diffed straight against the working tree (index consulted only for
     /// untracked/ignore filtering), fusing staged and unstaged hunks on the same file into one
-    /// diff — the combined-zoom view the M3 renderer reviews (locked design decision #2).
-    pub combined: DiffModel,
+    /// diff — the whole-diff view the renderer reviews by default.
+    pub whole: DiffModel,
 }
 
 /// Diff `HEAD`'s tree against the index (staged), the index against the working tree
-/// (unstaged), and `HEAD`'s tree against the working tree directly (combined), for a
+/// (unstaged), and `HEAD`'s tree against the working tree directly (whole), for a
 /// [`ChangesetSpan::Uncommitted`] changeset.
 ///
-/// The unstaged and combined sides both set `include_untracked`/`recurse_untracked_dirs`/
+/// The unstaged and whole sides both set `include_untracked`/`recurse_untracked_dirs`/
 /// `show_untracked_content` so untracked files carry real content in the model (git2 gives
 /// `Delta::Untracked` natively here — no `/dev/null` header synthesis needed). `find_similar`
 /// runs on all three diffs before materialization so worktree renames (e.g. an untracked file
 /// that replaces a tracked one under a new name) surface as [`crate::model::FileStatus::Renamed`]
 /// rather than a delete+add pair — the read side already handles that status (corpus-proven).
 ///
-/// The two untracked-including diffs (unstaged, combined) pass explicit
+/// The two untracked-including diffs (unstaged, whole) pass explicit
 /// [`DiffFindOptions::for_untracked`] — plain `find_similar(None)`'s default flags (just
 /// `GIT_DIFF_FIND_RENAMES`) do NOT pair an untracked file with a workdir deletion; libgit2
 /// requires `for_untracked` opted in separately for that side of the match. The staged diff
@@ -64,15 +64,15 @@ pub fn diff_uncommitted(repo: &Repository) -> Result<WorktreeDiffs, DiffError> {
     unstaged_diff.find_similar(Some(&mut untracked_find))?;
     let unstaged = DiffModel::from_git2(&unstaged_diff)?;
 
-    let mut combined_diff =
+    let mut whole_diff =
         repo.diff_tree_to_workdir_with_index(Some(&head_tree), Some(&mut worktree_opts))?;
-    combined_diff.find_similar(Some(&mut untracked_find))?;
-    let combined = DiffModel::from_git2(&combined_diff)?;
+    whole_diff.find_similar(Some(&mut untracked_find))?;
+    let whole = DiffModel::from_git2(&whole_diff)?;
 
     Ok(WorktreeDiffs {
         staged,
         unstaged,
-        combined,
+        whole,
     })
 }
 
@@ -201,7 +201,8 @@ pub fn diff_changesets(
 }
 
 /// Resolve the changeset stack the review App opens on for the worktree whose `HEAD` is
-/// `head_branch` (locked design decision M5-fork-7, "auto-detect"): the full Graphite stack
+/// `head_branch` (locked design decision: auto-detect Graphite, else a single uncommitted
+/// changeset): the full Graphite stack
 /// when one is active, or a single synthetic [`Changeset`] spanning the uncommitted worktree
 /// otherwise.
 ///
@@ -210,8 +211,8 @@ pub fn diff_changesets(
 /// (see its module docs) rather than a reviewable uncommitted layer, and mapping `None` to
 /// [`StackModel::Git`] instead would make every branch without upstream tracking (the common
 /// case for a scratch/local branch) fail with `NoUpstream` before it ever got to review a dirty
-/// tree — a regression from M2–M4's "just diff the worktree" default. So the non-Graphite case
-/// is built directly here, matching exactly what `assemble_changesets`'s own
+/// tree — a regression from the original "just diff the worktree" default. So the
+/// non-Graphite case is built directly here, matching exactly what `assemble_changesets`'s own
 /// `insert_uncommitted_layer` would produce for a lone dirty tree: one `current` entry, no
 /// title, not needing a restack.
 pub fn resolve_changesets(

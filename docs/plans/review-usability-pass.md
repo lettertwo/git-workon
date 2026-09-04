@@ -1,11 +1,11 @@
-# Plan — Review TUI Everyday-Usability Pass (M6.5)
+# Plan — Review TUI Everyday-Usability Pass
 
 Design locked 2026-07-07. Decisions live in **[ADR-034](../adr/034-review-git-native-config-schema.md)**
 (config schema + keymap) and **[ADR-035](../adr/035-review-theming-base16-hybrid.md)**
 (theming). This doc is the *execution* plan: what lands, in what order, how each unit is
 verified. Read both ADRs before implementing — this plan does not restate their rationale.
 
-Comments (M7) are deprioritized behind this pass. Goal: make the review TUI usable for
+Comments (now part of the agent-loop work) are deprioritized behind this pass. Goal: make the review TUI usable for
 everyday review work — configurable keybindings, discoverable help, real theming.
 
 ## Scope (four tracks)
@@ -25,25 +25,29 @@ everyday review work — configurable keybindings, discoverable help, real themi
 
 ## Changeset partition (Graphite stack)
 
-Two independent tracks fan out from the shared config reader (CS1), plus view-config off CS1.
+Two independent tracks fan out from the shared config reader (the git-config reader), plus
+view-config off it.
 Each unit is land-alone (green + valuable on `main` by itself) and standalone-review.
 
 ```
 main
- └─ uc-review-config           CS1  ── shared git-config reader
-     ├─ uc-keymap              CS2  ── configurable per-view keymaps (keybinding track)
-     │   └─ uc-help            CS3  ── footer + ? overlay
-     ├─ uc-theme-base16        CS4  ── Theme primitive + render-time resolution (dark only, no visible change)
-     │   └─ uc-theme-light     CS5  ── curated light + theme=dark|light
-     │       └─ uc-theme-auto  CS6  ── terminal-derivation probe + theme=auto default
-     └─ uc-view-config         CS7  ── outline.width/mode, diff.layout/zoom
+ └─ uc-review-config           ── shared git-config reader
+     ├─ uc-keymap              ── configurable per-view keymaps (keybinding track)
+     │   └─ uc-help            ── footer + ? overlay
+     ├─ uc-theme-base16        ── Theme primitive + render-time resolution (dark only, no visible change)
+     │   └─ uc-theme-light     ── curated light + theme=dark|light
+     │       └─ uc-theme-auto  ── terminal-derivation probe + theme=auto default
+     └─ uc-view-config         ── outline.width/mode, diff.layout/zoom
 ```
 
-Order of landing: CS1 → (CS2 → CS3) and (CS4 → CS5 → CS6) and CS7. The keymap and theming
-subtrees are independent after CS1; land in either interleaving. Main-thread diff-read each
+Order of landing: the git-config reader → (configurable per-view keymaps → the help footer and
+`?` overlay) and (the base16 palette primitive → the curated light scheme → the
+terminal-derivation probe for `theme=auto`) and the view-config settings. The keymap and
+theming subtrees are independent after the git-config reader; land in either interleaving.
+Main-thread diff-read each
 before the next lands (per the working style).
 
-### CS1 — `ReviewConfig` reader
+### The git-config reader (`ReviewConfig`)
 - **Decision:** the review binary reads git config for the first time. Mirror
   `git-workon-lib/src/config.rs`'s `WorkonConfig` pattern: read via `repo.config()` (the
   `App` already owns a `Repository` — see `app.rs`). New module `git-workon-review/src/config.rs`.
@@ -53,7 +57,7 @@ before the next lands (per the working style).
 - Verify: unit tests reading `workon.review.*` from a `FixtureBuilder` repo (both a set and
   an unset/default case). Load `/docs testing` first; use FixtureBuilder + predicates.
 
-### CS2 — Action registry + configurable keymaps
+### Configurable per-view keymaps (action registry)
 - **Decision:** ADR-034. Replace the hardcoded `map_key` match (`tui.rs`) with a
   registry-driven dispatch.
 - Build the **action registry**: one table `action → (default keys, human description, view ∈
@@ -62,7 +66,7 @@ before the next lands (per the working style).
 - **Token-grammar parser** (ADR-034): reserved symbolic names (incl. `space`, `tab`, `enter`,
   `esc`, arrows, `backtab`, `f1`–`f12`), modifier prefixes (`ctrl-`/`alt-`/`shift-`), literal
   chars, chords (`]f`). Reserved-word-wins disambiguation.
-- **Load + invert:** read every `workon.review.*.bind.*` var (via CS1), split values into key
+- **Load + invert:** read every `workon.review.*.bind.*` var (via the git-config reader), split values into key
   tokens, build per-view `key → action` maps. A git entry overrides that action's default
   (native single-value precedence — no custom layering). Empty value = unbind.
 - **Validation + collisions:** unknown `bind.<action>` → footer warning (action set is
@@ -74,7 +78,7 @@ before the next lands (per the working style).
   action, a collision); a dispatch test asserting a rebind takes effect. `map_key`'s existing
   behavior tests must still pass (defaults unchanged).
 
-### CS3 — Help surface
+### The help footer and `?` overlay
 - **Decision:** persistent curated per-view footer + `?` overlay targeting the focused view.
 - **Footer:** always-visible one line of ~5–7 **hand-curated** keys for the focused
   context (diff vs outline), rendered from the resolved map + registry descriptions. Updates
@@ -89,7 +93,7 @@ before the next lands (per the working style).
   instrument via a log-file + expect harness, NOT ratatui frame grepping (see the TUI-dogfood
   memory).
 
-### CS4 — base16 `Theme` primitive + render-time resolution
+### The base16 palette primitive (`Theme` + render-time resolution)
 - **Decision:** ADR-035. Largest mechanical unit; **behavior-preserving** (dark stays
   pixel-identical), so land-alone with no user-visible change.
 - Introduce `struct Base16 { base00..base0F }` / `Theme`. Re-express the current `render.rs`
@@ -105,13 +109,13 @@ before the next lands (per the working style).
   fixed test `Theme` (dark) — same asserted colors. Full workspace green. This is the
   regression gate that the refactor changed nothing.
 
-### CS5 — Curated light scheme + `theme = dark|light`
+### The curated light scheme (`theme = dark|light`)
 - Add the **light** base16 instance (paste a published base16 light scheme's 16 hexes — do
-  NOT hand-invent; ADR-035). Wire `workon.review.theme` (via CS1) to select dark/light;
+  NOT hand-invent; ADR-035). Wire `workon.review.theme` (via the git-config reader) to select dark/light;
   derived tints recompute for light automatically.
 - Verify: `theme=light` selects the light instance; tints derive; a render test at light.
 
-### CS6 — `theme = auto` terminal-derivation probe
+### The terminal-derivation probe for `theme=auto`
 - **Decision:** ADR-035. The single most terminal-fragile unit — isolated on purpose.
 - OSC probe on the controlling `/dev/tty` (TUI already renders there — `tui.rs`) at startup,
   raw mode, short timeout: `OSC 4;n;?` (n=0–15) + `OSC 10/11`. Populate slots from real RGB.
@@ -122,10 +126,10 @@ before the next lands (per the working style).
 - Verify: probe parses a synthetic OSC reply into slots; timeout path falls back to curated
   (no hang) — drive with a fake tty/reader, do not depend on the test terminal answering.
 
-### CS7 — View-config settings
-- Read `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom` (via CS1),
-  current hardcoded values as defaults. `outline.width` also addresses M5's deferred
-  narrow-terminal papercut.
+### The view-config settings
+- Read `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom` (via the
+  git-config reader), current hardcoded values as defaults. `outline.width` also addresses
+  the stack-and-outline work's deferred narrow-terminal papercut.
 - Verify: each setting overrides its default from a fixture config; unset = current default.
 
 ## Cross-cutting notes / gotchas
@@ -143,5 +147,6 @@ before the next lands (per the working style).
 ## Deferred (explicitly not this pass)
 - `theme = <named>` / user-supplied base16 scheme files (the "user-configurable colors" tier).
   Additive later — the slot *source* is pluggable behind render-time resolution (ADR-035).
-- Post-subcommand completion delegation (M6 note), git-inference stack model, ref-range
-  sources (M5), and all of M7 comments onward.
+- Post-subcommand completion delegation (the CLI-integration work's note), git-inference
+  stack model, ref-range sources (the stack-and-outline work), and all of the agent-loop
+  work onward.

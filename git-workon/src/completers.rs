@@ -106,7 +106,8 @@ fn augment_external_subcommands(cmd: Command) -> Command {
 const DELEGATED_EXTERNALS: &[&str] = &["review"];
 
 /// Sub-delegate `git-workon <ext> <words...><TAB>` completion to `git-workon-<ext>`'s own
-/// `COMPLETE=<shell>` responder — the M6 CS3-deferred seam, wired here per ADR-036 CS5.
+/// `COMPLETE=<shell>` responder — the external-subcommand-completion-enumeration-deferred seam,
+/// wired here per ADR-036's source completion and sub-delegation.
 ///
 /// `augment_external_subcommands` (above) only adds a bare stub `Command` for each PATH-discovered
 /// external, with no argument definitions of its own — clap_complete's engine has no notion that

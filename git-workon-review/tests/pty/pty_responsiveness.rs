@@ -126,8 +126,8 @@ fn launch_reaches_the_tui_and_quits_promptly() {
     // Theme pinned to dark so the `theme = auto` probe (and its deadline) stays out of this
     // bound — the probe's own responsiveness is pty_smoke.rs's job. One unstaged change so the
     // TUI actually opens; a plain (non-Graphite) repo keeps behavior identical whether or not
-    // the machine has `gt` on PATH — and `StackModel::detect` still runs `detect_gt` first, so
-    // a reintroduced subprocess spawn there is still inside the measured window.
+    // the machine has `gt` on PATH. `StackModel::detect` no longer probes for `gt` at all, so
+    // this bound no longer covers that lookup — it stays a pure metadata check.
     let fixture = FixtureBuilder::new()
         .config("workon.review.theme", "dark")
         .unstaged_file("file.txt", "a\nb\nc\n", "a\nCHANGED\nc\n")

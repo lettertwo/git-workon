@@ -1,5 +1,6 @@
-//! Literal, smartcase text search over a file's pre-collapse diff rows (M11 CS3: `/` in the diff
-//! view). [`compute_matches`] scans [`crate::align::AlignedRow`]s — the space BEFORE gap-collapse
+//! Literal, smartcase text search over a file's pre-collapse diff rows (the in-diff search: `/` in
+//! the diff view). [`compute_matches`] scans [`crate::align::AlignedRow`]s — the space BEFORE
+//! gap-collapse
 //! — so a search sees hidden context exactly like it sees visible content; the caller (`app.rs`)
 //! is what auto-expands a gap a match lands inside, on jump.
 //!

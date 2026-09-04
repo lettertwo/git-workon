@@ -1,5 +1,5 @@
-//! Line-precise patch synthesis round-trips (trap 1: direction-dependent drop rules; trap 2:
-//! the EOFNL del-to-context splice), run against both appliers via `for_each_applier` — see
+//! Line-precise patch synthesis round-trips (direction-dependent drop rules; the no-newline-at-
+//! EOF splice), run against both appliers via `for_each_applier` — see
 //! `tests/apply.rs` for the pattern this borrows (fresh fixture per applier backend).
 
 use git_workon_fixture::prelude::*;
@@ -183,11 +183,11 @@ fn base_old_partial_patch_fails_under_reverse_apply() {
     );
 }
 
-/// Fixture for the trap-2 (EOFNL splice) tests: the committed file's last line ("last") has NO
+/// Fixture for the no-newline-at-EOF-splice tests: the committed file's last line ("last") has NO
 /// trailing newline; the modification deletes that line and adds two new ones, the last of
 /// which ("more\n") DOES end in a newline (so the file gains a trailing newline overall). This
 /// is the shape that produces a deletion carrying `missing_newline` with kept lines after it —
-/// trap 2's precondition.
+/// the no-newline-at-EOF splice's precondition.
 fn eofnl_fixture() -> FixtureBuilder<'static> {
     FixtureBuilder::new()
         .config("core.autocrlf", "false")
@@ -274,7 +274,8 @@ fn spliced_eofnl_patch_stages_correct_bytes() {
         let diffs = diff_uncommitted(repo).expect("diff_uncommitted");
         let file = &diffs.unstaged.files[0];
         // Keep only "more\n"; drop the "last" deletion (context, missing_newline) and the
-        // "replaced\n" addition (omitted under base=Old) — trap 2's exact precondition.
+        // "replaced\n" addition (omitted under base=Old) — the no-newline-at-EOF splice's exact
+        // precondition.
         let keep_add = line_index(file, 0, LineKind::Addition, "more\n");
         let sel = LineSelection {
             keep_adds: [keep_add].into(),

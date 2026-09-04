@@ -1,4 +1,4 @@
-//! Enclosing tree-sitter "scope" lookup for CS9's reveal-to-scope gap expansion.
+//! Enclosing tree-sitter "scope" lookup used by the reveal-to-scope gap expansion.
 //!
 //! Pure module: given a language key (the same key
 //! [`crate::highlight::lang_key_for_ext`] resolves a file extension to) and a file's full text,

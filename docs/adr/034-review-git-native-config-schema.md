@@ -3,7 +3,7 @@
 ## Context
 
 The review TUI (`git-workon-review`) grew its keybindings and colors as hardcoded
-values during M3–M5: a `match` in `tui.rs` for keys, a block of `const … Color::Rgb(…)`
+values during the initial-renderer-through-stack-and-outline work: a `match` in `tui.rs` for keys, a block of `const … Color::Rgb(…)`
 atop `render.rs` for theming. Making either user-configurable needs a config home, and
 the review binary reads no config today (`struct Cli {}` is empty).
 
@@ -32,8 +32,8 @@ is stored **action-as-key** in **per-view subsections**:
 
 ```
 workon.review.theme                    = dark            ; global, non-view
-workon.review.theme.<slot>             = #rrggbb          ; base00-base0f override (CS1)
-workon.review.theme.<tint>             = #rrggbb          ; diff/cursor tint override (CS1)
+workon.review.theme.<slot>             = #rrggbb          ; base00-base0f override (git-config reader)
+workon.review.theme.<tint>             = #rrggbb          ; diff/cursor tint override (git-config reader)
 workon.review.<view>.bind.<action>     = "<key tokens>"  ; a keymap entry
 workon.review.<view>.<setting>         = <value>         ; view config
 ```
@@ -60,8 +60,8 @@ workon.review.<view>.<setting>         = <value>         ; view config
 - **View config** (non-binding) shares the view namespace: `workon.review.outline.width`,
   `workon.review.outline.mode`, `workon.review.diff.layout`, `workon.review.diff.zoom`.
   The `.bind.` marker is what distinguishes a keymap entry from a view setting.
-- **Theme overrides** (CS1, user-configurable colors tier — see
-  [ADR-035](035-review-theming-base16-hybrid.md)'s CS1 revision) live in the `review.theme`
+- **Theme overrides** (the git-config reader, user-configurable colors tier — see
+  [ADR-035](035-review-theming-base16-hybrid.md)'s git-config-reader revision) live in the `review.theme`
   subsection, distinct from the top-level `workon.review.theme` selection itself: `workon.review
   .theme.base00`–`workon.review.theme.base0f` (base16 slot overrides) and eleven kebab-case tint
   keys (`workon.review.theme.cursor-bg`, …). Same validation posture as an unknown bind
@@ -100,8 +100,8 @@ workon.review.<view>.<setting>         = <value>         ; view config
 - Like all git-native config (ADR-006), review config is **not checked into the repo**, so a
   team cannot ship a shared review keymap/theme in-tree. Accepted: this is a
   personal-productivity TUI.
-- The per-view namespace gives previously-hardcoded view settings (outline width — M5
-  deferred narrow-terminal handling — outline mode, diff layout/zoom defaults) a natural
+- The per-view namespace gives previously-hardcoded view settings (outline width — the
+  stack-and-outline work's deferred narrow-terminal handling — outline mode, diff layout/zoom defaults) a natural
   home without a second design pass.
 - Adding a rebindable action = adding it to the enumerable action set (code default +
   dispatch + help entry); it is automatically configurable, validated, and documented.
@@ -148,6 +148,6 @@ enough, since the overwhelmingly common cause of an unknown key is a typo of a r
 ## References
 
 - [ADR-006](006-git-native-config.md) — git-native config under `workon.*` this extends
-- `docs/rfc/workon-review.md` — RFC; this is the everyday-usability pass inserted ahead of M7
+- `docs/rfc/workon-review.md` — RFC; this is the everyday-usability pass inserted ahead of the source-selector work
 - `git-workon-review/src/tui.rs` — current hardcoded keymap (`map_key`) being replaced
 - `git-workon-review/src/render.rs` — current hardcoded palette (`const … Color::Rgb`) — see the theming decision

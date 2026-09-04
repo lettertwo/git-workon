@@ -1,4 +1,5 @@
-//! The concrete [`StagingOp`] the TUI enqueues for a hunk- or file-level staging verb (M4).
+//! The concrete [`StagingOp`] the TUI enqueues for a hunk- or file-level staging verb, from the
+//! staging-verbs work.
 //!
 //! ## The error seam
 //!
@@ -26,7 +27,8 @@ use crate::synthesis::LineSelection;
 /// A queued staging action over one captured [`FileChange`]: a hunk op when `hunk_idx` is
 /// `Some`, a whole-file op when `None`. The `FileChange` is cloned at enqueue time (the file
 /// list is rebuilt on the next refresh), but the DIRECTION is fixed by `verb` at construction —
-/// M4 uses deterministic pane-role direction (locked decision #1), not the queue's live-index
+/// the staging-verbs work uses deterministic pane-role direction (locked decision: verbs act
+/// only in the unstaged/staged panes; direction = pane role), not the queue's live-index
 /// toggle, so there's no snapshot-staleness to resolve inside `run`.
 ///
 /// Line-precise selections do NOT use this type — see [`LineSelectionOp`], which applies a

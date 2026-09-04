@@ -17,8 +17,9 @@ include = [
   "LICENSE*",
   "README.md",
 ]
-# Not yet published to crates.io: flip to publish this crate at M3 (per RFC).
-# At that point: remove this line, add `[[package]] name = "git-workon-review"`
+# Not yet published to crates.io: flipping to publish is deferred (a deferrable sub-decision,
+# see ADR-033) until the crate is ready to release. At that point: remove this line, add
+# `[[package]] name = "git-workon-review"`
 # to release-plz.toml (no version_group — versioned independently of the CLI),
 # and decide the `dist = false` posture below (the homebrew patch step in
 # .github/workflows/release.yml stamps man/completions into every
@@ -58,8 +59,8 @@ tree-sitter-typescript.workspace = true
 unicode-width.workspace = true
 
 [package.metadata.dist]
-# Redundant with publish = false today; load-bearing at the M3 flip so
-# cargo-dist doesn't silently start shipping the (still undesigned) binary.
+# Redundant with publish = false today; load-bearing once the publish flip lands (deferred, see
+# ADR-033) so cargo-dist doesn't silently start shipping the (still undesigned) binary.
 dist = false
 
 [dev-dependencies]
