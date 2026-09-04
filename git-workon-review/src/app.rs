@@ -48,6 +48,7 @@ const SCROLLOFF: usize = 2;
 /// The new side reads from the **worktree file on disk**, not the index blob — unstaged
 /// content isn't in the object database; reading the staged (index) blob is an M4 concern (the
 /// staged/unstaged split zoom).
+#[derive(Debug)]
 pub struct FileView {
     old_text: String,
     new_text: String,
@@ -346,6 +347,59 @@ fn new_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tre
     }
 }
 
+/// Build a [`Role::Combined`] [`FileView`] against `repo`/`ts` for a file whose combined
+/// [`FileChange`] is `file` and whose changeset span is `span` — the shared core
+/// [`App::ensure_role_loaded`]'s combined branch and ADR-037's [`build_file_views`] (the loader
+/// job's pure body) both call, so a deferred-then-loader-completed open is byte-identical to an
+/// eager one. `None` for a binary file or an unreadable tree; never panics.
+fn build_combined_view(
+    repo: &Repository,
+    ts: &mut TsHighlighter,
+    span: ChangesetSpan,
+    file: &FileChange,
+) -> Option<FileView> {
+    if file.is_binary {
+        return None;
+    }
+    // Re-peeled per call rather than cached: for the uncommitted layer `HEAD` can move between
+    // file loads, and the tree is cheap to re-peel either way (see `old_side_tree_for`'s doc
+    // comment).
+    let head_tree = old_side_tree_for(repo, span)?;
+    let new_tree = new_side_tree_for(repo, span);
+    Some(FileView::load(
+        repo,
+        &head_tree,
+        new_tree.as_ref(),
+        file,
+        Role::Combined,
+        ts,
+    ))
+}
+
+/// Build a non-Combined ([`Role::Unstaged`]/[`Role::Staged`]) [`FileView`] against `repo`/`ts` for
+/// sub-role file `file` — the mirror of [`build_combined_view`], shared the same way. Non-Combined
+/// roles are uncommitted-only (a committed changeset's staged/unstaged sub-models are always
+/// empty — see [`DiffState::from_committed`]), so the new side always stays worktree/index (`None`
+/// to [`FileView::load`]) and the old side is always live `HEAD`, never a changeset's `base`.
+/// `None` for a binary file or an unreadable `HEAD`; never panics.
+fn build_sub_role_view(
+    repo: &Repository,
+    ts: &mut TsHighlighter,
+    role: Role,
+    file: &FileChange,
+) -> Option<FileView> {
+    debug_assert_ne!(
+        role,
+        Role::Combined,
+        "build_sub_role_view is non-Combined only"
+    );
+    if file.is_binary {
+        return None;
+    }
+    let head_tree = repo.head().and_then(|h| h.peel_to_tree()).ok()?;
+    Some(FileView::load(repo, &head_tree, None, file, role, ts))
+}
+
 fn read_head_blob(repo: &Repository, tree: &git2::Tree<'_>, path: &str) -> String {
     tree.get_path(Path::new(path))
         .and_then(|entry| entry.to_object(repo))
@@ -604,6 +658,27 @@ pub struct ChangesetView {
     views_combined: Vec<Option<FileView>>,
     views_unstaged: Vec<Option<FileView>>,
     views_staged: Vec<Option<FileView>>,
+    /// ADR-037's per-changeset acquisition state. `Ready` for every changeset this changeset
+    /// (this revision of the codebase) actually diffs through; `Pending`/`Failed` slots are
+    /// constructible today (state model + rendering) but nothing in the synchronous startup/
+    /// refresh paths produces them yet — that lands with the streamed-acquisition changesets.
+    slot: ChangesetSlot,
+}
+
+/// A [`ChangesetView`]'s acquisition state (ADR-037's "Slots" decision). `diff`/the `views_*`
+/// caches stay meaningful only for `Ready` — a `Pending`/`Failed` view's [`DiffState`] is always
+/// [`DiffState::empty`], so every existing `.diff.`-reading call site (file counts, outline
+/// rows, nav guards) already treats it as "nothing to show" with no per-site branch needed; only
+/// the render/outline paths that must actively DISTINGUISH the three states (vs. a genuinely
+/// empty `Ready` changeset) read this directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChangesetSlot {
+    /// Acquisition hasn't run (or hasn't completed) for this changeset yet.
+    Pending,
+    /// The diff (and its view caches) are real.
+    Ready,
+    /// The acquisition attempt errored; the message is shown in place of a diff body.
+    Failed(String),
 }
 
 impl ChangesetView {
@@ -615,7 +690,53 @@ impl ChangesetView {
             views_combined: (0..n).map(|_| None).collect(),
             views_unstaged: (0..n).map(|_| None).collect(),
             views_staged: (0..n).map(|_| None).collect(),
+            slot: ChangesetSlot::Ready,
         }
+    }
+
+    /// Construct a `Pending` slot for `cs` (ADR-037): no diff acquired yet. The outline shows
+    /// its header with a loading indication; navigating onto it renders a changeset-level
+    /// placeholder instead of "(no changes)"/per-file content.
+    pub fn pending(cs: Changeset) -> Self {
+        let mut view = Self::new(cs, DiffState::empty());
+        view.slot = ChangesetSlot::Pending;
+        view
+    }
+
+    /// Construct a `Failed` slot for `cs` carrying `message` (ADR-037): the acquisition attempt
+    /// for this changeset errored. The outline marks it; navigating onto it renders `message`
+    /// instead of a diff body.
+    pub fn failed(cs: Changeset, message: impl Into<String>) -> Self {
+        let mut view = Self::new(cs, DiffState::empty());
+        view.slot = ChangesetSlot::Failed(message.into());
+        view
+    }
+
+    /// Whether this changeset's diff hasn't been acquired yet (ADR-037).
+    pub fn is_pending(&self) -> bool {
+        matches!(self.slot, ChangesetSlot::Pending)
+    }
+
+    /// Whether this changeset's acquisition attempt errored (ADR-037).
+    pub fn is_failed(&self) -> bool {
+        matches!(self.slot, ChangesetSlot::Failed(_))
+    }
+
+    /// This changeset's failure message, if [`Self::is_failed`] — `None` for `Pending`/`Ready`.
+    pub fn failure_message(&self) -> Option<&str> {
+        match &self.slot {
+            ChangesetSlot::Failed(msg) => Some(msg.as_str()),
+            ChangesetSlot::Pending | ChangesetSlot::Ready => None,
+        }
+    }
+
+    /// Whether this changeset's diff is real and ready (ADR-037's third slot state, named from
+    /// the other side) — [`App::refresh`]'s span-keyed reuse reads this to decide which existing
+    /// slots may be carried over wholesale. Deliberately excludes `Failed` (reuse only carries
+    /// `Ready` slots — `r` naturally retries a failed one instead, see the ADR's "Failures") and
+    /// `Pending` (nothing yet to reuse).
+    fn is_ready(&self) -> bool {
+        matches!(self.slot, ChangesetSlot::Ready)
     }
 
     /// Build the [`ChangesetView`] for `cs` from its acquired [`ChangesetDiff`] (see
@@ -767,6 +888,35 @@ pub struct App {
     /// while this is `true`, and the event loop calls [`Self::complete_pending_open`] once input
     /// has been quiet for `OPEN_DEBOUNCE`. Read via [`Self::open_pending`].
     open_pending: bool,
+    /// Whether a [`crate::app::FileLoadSpec`] has already been dispatched to the ADR-037 loader
+    /// thread for the CURRENT pending open — set by [`Self::take_pending_load_spec`], cleared
+    /// whenever a fresh open is marked pending. Without this, every idle `Tick` while
+    /// `open_pending` stays true (the loader hasn't answered yet) would re-dispatch the same
+    /// request; this makes dispatch idempotent across the pending open's whole lifetime.
+    open_pending_dispatched: bool,
+    /// ADR-037's global generation counter. Invariant: bumps ⟺ every view cache was invalidated
+    /// — launch seeds it at `1` ([`Self::from_changesets`]); [`Self::refresh`] bumps it on every
+    /// successful rebuild (still synchronous in this slice). A loader result whose `gen` doesn't
+    /// match this is for a world that no longer exists and is dropped at the inbox chokepoint
+    /// ([`Self::apply_file_ready`]) — the ONLY drop rule; within a generation, results are cached
+    /// even if the user navigated away (warmth, not staleness — see the ADR's "Generations").
+    generation: u64,
+    /// Whether the CURRENT wave (startup's, or the most recent refresh's) has already raised its
+    /// one footer notice for a `ChangesetReady { result: Err }`. Set by
+    /// [`Self::apply_changeset_ready`]; reset to `false` by every [`Self::refresh`] right
+    /// alongside the generation bump, since a refresh dispatching a NEW wave (ADR-037's "Refresh"
+    /// changeset) starts that wave's own "first failure" count over — otherwise a stack whose
+    /// first-ever wave had one bad changeset would never notify again for a LATER, unrelated
+    /// failure. "the wave's first failure raises a footer notice" — this is what makes it FIRST
+    /// per wave, not every one of a bad stack's failures within it.
+    wave_failure_notified: bool,
+    /// The ADR-037 refresh wave [`Self::refresh`] most recently queued (span-keyed reuse's
+    /// changed/new committed spans, stamped with the generation they belong to), if any — taken
+    /// (and cleared) by [`Self::take_pending_wave`]. Mirrors [`Self::open_pending`]/
+    /// [`Self::take_pending_load_spec`]'s shape: `App` computes WHAT needs diffing but never
+    /// touches a thread or a `Repository`-carrying `Sender` itself, so it stays constructible (and
+    /// `refresh` stays synchronously testable) with nothing wired up to actually dispatch this.
+    pending_wave: Option<(u64, Vec<(usize, Changeset)>)>,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -904,6 +1054,10 @@ impl App {
             review_source: None,
             defer_loads: false,
             open_pending: false,
+            open_pending_dispatched: false,
+            generation: 1,
+            wave_failure_notified: false,
+            pending_wave: None,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -983,12 +1137,32 @@ impl App {
         &self.cur().diff.files
     }
 
+    /// ADR-037's global generation — see the field's doc comment for the invariant. The loader
+    /// thread stamps every [`FileLoadSpec`] request it's handed with this value at send time;
+    /// [`Self::apply_file_ready`] drops a result whose stamp no longer matches.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Index into the reviewed stack of the active changeset — read by tests asserting the
     /// [`Self::from_changesets`]/[`Self::refresh`] "honor lib `current`" rule (locked decision
     /// #6), and by changeset-nav's own tests ([`Self::next_changeset`]/[`Self::prev_changeset`]/
     /// [`Self::goto_changeset`]).
     pub fn current_cs(&self) -> usize {
         self.current_cs
+    }
+
+    /// Whether the ACTIVE changeset's slot is `Pending` (ADR-037) — `render.rs`'s body path
+    /// shows a changeset-level loading placeholder instead of "(no changes)"/per-file content
+    /// while this holds.
+    pub fn is_current_pending(&self) -> bool {
+        self.cur().is_pending()
+    }
+
+    /// The ACTIVE changeset's failure message, if its slot is `Failed` (ADR-037) — `render.rs`'s
+    /// body path shows this instead of a diff body.
+    pub fn current_failure(&self) -> Option<&str> {
+        self.cur().failure_message()
     }
 
     /// The active changeset's descriptor (name, source, restack status) — read by tests
@@ -1016,31 +1190,60 @@ impl App {
     }
 
     /// Re-run [`crate::acquire::resolve_changesets`] against the CURRENT `HEAD` branch and
-    /// rebuild every [`ChangesetView`] from scratch — the operation both a manual refresh (`r`)
-    /// and (later) a post-staging-op/external-write refresh need. Re-assembling (not just
-    /// re-diffing the active changeset) matters because a restack can change the stack's
-    /// topology, not just its diffs.
+    /// rebuild [`Self::changesets`] — the operation both a manual refresh (`r`) and the
+    /// post-staging-op/external-write refresh need. Re-assembling (not just re-diffing the
+    /// active changeset) matters because a restack can change the stack's topology, not just its
+    /// diffs.
     ///
-    /// - Rebuilds [`Self::changesets`] and [`Self::base_label`] in place. Does NOT touch `repo`
-    ///   (same handle), `highlighter` (its per-instance grammar cache would have to re-parse
-    ///   every language from scratch if rebuilt), `layout`, or `zoom` (the user's current view
-    ///   mode shouldn't reset just because they pressed `r`, or because a background refresh
-    ///   fired).
+    /// ADR-037 "Refresh" — span-keyed reuse, uncommitted always sync:
+    ///
+    /// - Resolve (this method's first half) stays fully synchronous on the main thread — it's
+    ///   offline and cheap, and re-running it on every refresh is what keeps [`Self::review_source`]
+    ///   honored (see below).
+    /// - The rebuilt view list carries over any existing `Ready` slot whose `(name, span)` is
+    ///   unchanged — a committed diff is a pure function of its span
+    ///   ([`ChangesetSpan::Committed`] compares `base`/`head`; [`ChangesetSpan::CommittedRoot`]
+    ///   compares `head`) — so an ordinary post-staging refresh re-diffs *nothing but the
+    ///   uncommitted layer*. A carried slot keeps its `DiffState` AND warm view caches verbatim:
+    ///   never blanked, never re-diffed. Reuse only ever carries a `Ready` slot — a `Failed` one
+    ///   goes back through the `Pending`+wave path below, which is how `r` naturally retries it
+    ///   with no separate retry machinery.
+    /// - The [`ChangesetSpan::Uncommitted`] layer is never "unchanged": it re-diffs
+    ///   SYNCHRONOUSLY, right here, on every refresh — ms-scale, and this is what preserves
+    ///   staging's guarantee that the next keystroke sees the post-op world (an async refresh
+    ///   would let a second `s` compute its patch against a stale diff). A failed sync re-diff
+    ///   becomes a `Failed` slot plus a footer notice (an explicit error beats stale wrong
+    ///   content) rather than aborting the whole refresh.
+    /// - Every other changed-or-new committed span becomes a `Pending` slot; the caller (the
+    ///   event loop, via [`Self::take_pending_wave`]) dispatches those as an async wave, current-
+    ///   first if the active changeset is among them, same as the streamed-launch wave. Their
+    ///   results land through [`Self::apply_changeset_ready`] tagged with the NEW generation.
+    /// - Every refresh bumps the generation exactly once, right where the view caches it protects
+    ///   are actually replaced — reused (carried) slots' in-flight loader results now carry a
+    ///   stale `gen` and die at [`Self::apply_file_ready`]'s chokepoint; accepted waste for one
+    ///   global rule (see the ADR's "Generations"). [`Self::wave_failure_notified`] resets
+    ///   alongside it, so the freshly-dispatched wave gets its own first-failure notice.
+    ///
+    /// Position rules, adapted to the streamed world:
     /// - Preserves the active changeset by NAME: if a changeset with that name still exists in
     ///   the rebuilt stack, `current_cs` follows it; otherwise it falls back to whichever
     ///   changeset the lib now reports as `current`, or index `0`.
-    /// - Preserves file position by PATH within the (possibly different) active changeset, same
-    ///   rule M4 used: `current` follows the path if it still exists, else clamps into the new
-    ///   list (or `0` if empty).
-    /// - Re-seats the (possibly changed) current file at its first hunk via [`Self::open_current`]
-    ///   — the same path a file switch already uses. This does NOT try to preserve the exact
-    ///   cursor row: the rows under an old cursor position may no longer correspond to the same
-    ///   content once the diff is rebuilt, so jumping to the first hunk (like opening a file fresh)
-    ///   is the only always-valid choice, consistent with how zoom/layout switches already treat
-    ///   cursor position as non-transferable across a reshape.
+    /// - A carried (still-`Ready`) active changeset — or the always-sync uncommitted layer —
+    ///   preserves file position by PATH exactly like before streaming: `current` follows the
+    ///   path if it still exists, else clamps into the new list (or `0` if empty), then
+    ///   [`Self::open_current`] re-seats it at the first hunk (this does NOT try to preserve the
+    ///   exact cursor row — jumping to the first hunk is the only always-valid choice once the
+    ///   diff is rebuilt, consistent with zoom/layout switches). An active changeset that went
+    ///   `Pending` instead has no diff yet to preserve a path INTO — `current` resets to `0` and
+    ///   [`Self::apply_changeset_ready`] re-seats it (to its first file) exactly as it already
+    ///   does for a freshly-`Pending` changeset, once that `ChangesetReady` lands.
+    /// - The rebuilt changeset list can resize/reorder the outline's row list out from under its
+    ///   cursor — reposition it, same as every other diff-initiated nav (does NOT touch
+    ///   `outline.open`/`focused`/`mode`, which persist across a refresh like `layout`/`zoom`).
     ///
-    /// On any assembly/diff error, leaves all existing state untouched and sets an error
-    /// [`Notice`] instead (via [`Self::notify`]) — a failed refresh must never blank the review.
+    /// On a resolve/assembly error (or the uncommitted layer's own sync re-diff failing — see
+    /// above), leaves the rest of `Self::changesets` untouched and sets an error [`Notice`]
+    /// instead (via [`Self::notify`]) — a failed refresh must never blank the review.
     ///
     /// Dispatches on [`Self::review_source`] (M7 CS2 fix): a no-argument launch (`None`) re-runs
     /// today's auto-detect ([`crate::acquire::resolve_changesets`]); an explicit-source launch
@@ -1080,22 +1283,9 @@ impl App {
                 return;
             }
         };
-
-        let diffs = match crate::acquire::diff_changesets(&self.repo, &changesets) {
-            Ok(diffs) => diffs,
-            Err(err) => {
-                self.notify(format!("refresh failed: {err}"), Severity::Error);
-                return;
-            }
-        };
-        let views: Vec<ChangesetView> = changesets
-            .into_iter()
-            .zip(diffs)
-            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
-            .collect();
         // `resolve_changesets` always returns at least one changeset (a lone Uncommitted entry
         // when no stack is active), but stay defensive rather than index an empty `Vec` below.
-        if views.is_empty() {
+        if changesets.is_empty() {
             self.notify("refresh failed: no changesets to review", Severity::Error);
             return;
         }
@@ -1108,23 +1298,80 @@ impl App {
             .get(self.current)
             .map(|f| f.path.clone());
 
-        self.current_cs = views
+        // Span-keyed reuse: pull the OLD view list out so a `Ready` slot whose `(name, span)`
+        // survives can be moved (not cloned) into the rebuilt list, keeping its warm view caches.
+        // `Vec::remove`'s O(n) shift is immaterial at stack sizes (a handful of changesets).
+        let mut old_views = std::mem::take(&mut self.changesets);
+
+        let mut new_views: Vec<ChangesetView> = Vec::with_capacity(changesets.len());
+        let mut to_diff: Vec<(usize, Changeset)> = Vec::new();
+        let mut uncommitted_diff_failed: Option<String> = None;
+
+        for cs in changesets {
+            if cs.span == ChangesetSpan::Uncommitted {
+                match crate::acquire::diff_changeset(&self.repo, &cs) {
+                    Ok(diff) => new_views.push(ChangesetView::from_changeset_diff(cs, diff)),
+                    Err(err) => {
+                        let message = err.to_string();
+                        uncommitted_diff_failed = Some(message.clone());
+                        new_views.push(ChangesetView::failed(cs, message));
+                    }
+                }
+                continue;
+            }
+            if let Some(pos) = old_views
+                .iter()
+                .position(|v| v.is_ready() && v.cs.name == cs.name && v.cs.span == cs.span)
+            {
+                // Carry the slot's diff/view caches verbatim, but adopt the FRESH descriptor —
+                // metadata like `needs_restack` can change even when the span itself didn't.
+                let mut reused = old_views.remove(pos);
+                reused.cs = cs;
+                new_views.push(reused);
+            } else {
+                let idx = new_views.len();
+                to_diff.push((idx, cs.clone()));
+                new_views.push(ChangesetView::pending(cs));
+            }
+        }
+
+        self.current_cs = new_views
             .iter()
             .position(|v| v.cs.name == prev_cs_name)
-            .unwrap_or_else(|| current_cs_index(&views));
-        self.base_label = base_label_for(&views[self.current_cs].cs);
-        self.changesets = views;
+            .unwrap_or_else(|| current_cs_index(&new_views));
+        self.base_label = base_label_for(&new_views[self.current_cs].cs);
+        self.changesets = new_views;
+        // ADR-037: every refresh bumps the generation, right where the view caches it protects
+        // are actually replaced — an early `return` above (a failed resolve) leaves the old
+        // world's caches intact, so it must NOT bump. Any loader result still in flight for the
+        // pre-refresh world now carries a stale `gen` and dies at `apply_file_ready`'s chokepoint;
+        // same for a wave result still in flight for a superseded generation.
+        self.generation += 1;
+        self.wave_failure_notified = false;
 
-        let n = self.cur().diff.files.len();
-        self.current = current_path
-            .and_then(|path| self.cur().diff.files.iter().position(|f| f.path == path))
-            .unwrap_or(if n == 0 { 0 } else { self.current.min(n - 1) });
-
+        if self.cur().is_pending() {
+            self.current = 0;
+        } else {
+            let n = self.cur().diff.files.len();
+            self.current = current_path
+                .and_then(|path| self.cur().diff.files.iter().position(|f| f.path == path))
+                .unwrap_or(if n == 0 { 0 } else { self.current.min(n - 1) });
+        }
         self.open_current();
-        // The rebuilt changeset list can resize/reorder the outline's row list out from under
-        // its cursor — reposition it, same as every other diff-initiated nav (does NOT touch
-        // `outline.open`/`focused`/`mode`, which persist across a refresh like `layout`/`zoom`).
         self.sync_outline_to_current();
+
+        if let Some(err) = uncommitted_diff_failed {
+            self.notify(
+                format!("refresh failed: uncommitted diff failed: {err}"),
+                Severity::Error,
+            );
+        }
+
+        self.pending_wave = if to_diff.is_empty() {
+            None
+        } else {
+            Some((self.generation, to_diff))
+        };
     }
 
     /// Resolve the [`EffectiveZoom`] for file `idx` this frame: the requested [`Self::zoom`] gated
@@ -1291,62 +1538,26 @@ impl App {
                 Role::Staged => self.cur().diff.staged_model.files[mi].clone(),
                 Role::Combined => unreachable!(),
             };
-            if file.is_binary {
+            // `file` is cloned out of `self.cur()` (rather than a borrow) because
+            // `build_sub_role_view` needs `&self.repo` and `&mut self.highlighter` at once, which
+            // a borrow still anchored in `self.cur()` would conflict with — same rationale as the
+            // combined path below.
+            let Some(view) = build_sub_role_view(&self.repo, &mut self.highlighter, role, &file)
+            else {
                 return;
-            }
-            // Build the view in a block so `head_tree` (which borrows `self.repo`) drops before
-            // the `views_for_mut` reborrow — same reason the combined path below can assign a
-            // direct field while `head_tree` is live but this method-call path cannot. `file` is
-            // cloned out of `self.cur()` for the same reason: `FileView::load` needs `&self.repo`
-            // and `&mut self.highlighter` at once, which a borrow still anchored in `self.cur()`
-            // would conflict with.
-            let view = {
-                // Re-peeled per call, same rationale as the combined path below.
-                let Ok(head_tree) = self.repo.head().and_then(|h| h.peel_to_tree()) else {
-                    return;
-                };
-                // Non-Combined roles are uncommitted-only (committed changesets have empty
-                // staged/unstaged sub-models), so the new side always stays worktree/index —
-                // `None` here preserves that exactly.
-                FileView::load(
-                    &self.repo,
-                    &head_tree,
-                    None,
-                    &file,
-                    role,
-                    &mut self.highlighter,
-                )
             };
             self.views_for_mut(role)[idx] = Some(view);
             return;
         }
 
-        // Combined role.
-        // Re-peeled per call rather than cached on `App`: for the uncommitted layer `HEAD` can
-        // move between file loads, and the tree is cheap to re-peel either way.
-        // `self.cur().cs.span` is `Copy`, so reading it here borrows `self` only for this
-        // sub-expression — `head_tree` itself ends up borrowing `self.repo` alone (via the free
-        // `old_side_tree_for`), leaving `&mut self.highlighter` free below. A method tied to
-        // `&self` would instead have bound the tree's lifetime to all of `self`.
-        let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.span) else {
+        // Combined role. `self.cur().cs.span`/`self.cur().diff.files[idx].clone()` are read out
+        // (rather than borrowed) for the same reason as the sub-role branch above —
+        // `build_combined_view` needs `&self.repo` and `&mut self.highlighter` together.
+        let span = self.cur().cs.span;
+        let file = self.cur().diff.files[idx].clone();
+        let Some(view) = build_combined_view(&self.repo, &mut self.highlighter, span, &file) else {
             return;
         };
-        // New-side source mirrors the old side: `None` (worktree) for the uncommitted layer,
-        // the changeset's `head` tree for a committed changeset. Same free-fn borrow dance as
-        // `old_side_tree_for` — both trees borrow only `self.repo`, so `&mut self.highlighter`
-        // stays free for `FileView::load`.
-        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.span);
-        let file = self.cur().diff.files[idx].clone();
-        let view = FileView::load(
-            &self.repo,
-            &head_tree,
-            new_tree.as_ref(),
-            &file,
-            Role::Combined,
-            &mut self.highlighter,
-        );
-        drop(head_tree);
-        drop(new_tree);
         self.cur_mut().views_combined[idx] = Some(view);
     }
 
@@ -1437,13 +1648,31 @@ impl App {
     /// navigation of all, and it must render immediately. Outside defer mode this is exactly
     /// the pre-defer eager behavior.
     pub fn open_current(&mut self) {
-        if self.defer_loads && !self.current_views_cached() {
+        // An empty file list (a `Pending`/`Failed` slot, ADR-037, or a genuinely empty committed
+        // changeset) has nothing to defer: `current_load_spec` indexes `diff.files[self.current]`
+        // unconditionally, which would panic on the loader-dispatch path if `open_pending` were
+        // set here for a file that doesn't exist. There's nothing to load either way — this is
+        // the same "no-op on an empty file list" contract `main.rs`'s streamed-launch comment
+        // documents for a fresh `Pending` changeset, made actually true rather than incidental.
+        if self.defer_loads && !self.files().is_empty() && !self.current_views_cached() {
             self.open_pending = true;
+            // A fresh pending open has nothing dispatched to the loader yet — see
+            // [`Self::take_pending_load_spec`].
+            self.open_pending_dispatched = false;
             self.reset_panes();
             return;
         }
         self.ensure_loaded(self.current);
         self.reset_panes();
+        // F1: an eager load or the empty-file no-op above supersedes any STALE deferred open —
+        // e.g. a pending open set before `r`, followed by a refresh that turns the active
+        // changeset `Pending` (empty files, skipping the defer branch above since there's
+        // nothing to load). Without this, the stale flags survive the refresh and wedge the
+        // idle-Tick fast-poll loop (`take_pending_load_spec` keeps returning `None` for a file
+        // that no longer exists) while the placeholder stays stuck. Mirrors
+        // [`Self::complete_pending_open`]'s tail.
+        self.open_pending = false;
+        self.open_pending_dispatched = false;
     }
 
     /// Whether the view(s) the current file's effective zoom needs are already cached, making a
@@ -1479,6 +1708,221 @@ impl App {
         self.ensure_loaded(self.current);
         self.reset_panes();
         self.open_pending = false;
+        self.open_pending_dispatched = false;
+    }
+
+    // ── ADR-037: the loader thread's request/result seam ────────────────────────
+
+    /// Snapshot everything the ADR-037 loader needs to load the CURRENT file, mirroring exactly
+    /// what [`Self::ensure_loaded`] would read from live state — see [`FileLoadSpec`]'s doc
+    /// comment. Every field is owned (cloned out), so the spec outlives the borrow and can cross
+    /// to the loader thread.
+    ///
+    /// `None` when the current changeset's file list doesn't have an entry at `self.current` —
+    /// a clean uncommitted layer (zero files) is the common case, and a Pending/Failed slot
+    /// (also zero files) will join this once ADR-037's later changesets land. Total by
+    /// construction rather than relying on callers to guard first.
+    fn current_load_spec(&self) -> Option<FileLoadSpec> {
+        let idx = self.current;
+        let zoom = self.effective_zoom_for(idx);
+        let diff = &self.cur().diff;
+        let combined_file = diff.files.get(idx)?.clone();
+        Some(FileLoadSpec {
+            span: self.cur().cs.span,
+            combined_file,
+            zoom,
+            unstaged_file: diff
+                .unstaged_idx
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|mi| diff.unstaged_model.files[mi].clone()),
+            staged_file: diff
+                .staged_idx
+                .get(idx)
+                .copied()
+                .flatten()
+                .map(|mi| diff.staged_model.files[mi].clone()),
+        })
+    }
+
+    /// Take the [`FileLoadSpec`] for the current pending open, tagged with the generation/
+    /// changeset/file it was built against — but ONLY if a request hasn't already been dispatched
+    /// for this same pending open (see [`Self::open_pending_dispatched`]'s doc comment). The event
+    /// loop calls this on every idle `Tick` while an open is pending; without the dispatched guard
+    /// it would re-send the same request on every one of those ticks until the loader answers.
+    /// Returns `None` when nothing is pending, a request already went out for it, or the
+    /// current file has no spec to build (see [`Self::current_load_spec`]) — the pending flags
+    /// are left alone in that last case, matching upstack's eventual empty-file guard in
+    /// [`Self::open_current`]: this is a total fallback for a defer that outraced it, not a
+    /// second copy of that guard.
+    pub fn take_pending_load_spec(&mut self) -> Option<(u64, usize, usize, FileLoadSpec)> {
+        if !self.open_pending || self.open_pending_dispatched {
+            return None;
+        }
+        let spec = self.current_load_spec()?;
+        self.open_pending_dispatched = true;
+        Some((self.generation, self.current_cs, self.current, spec))
+    }
+
+    /// Take the ADR-037 refresh wave [`Self::refresh`] most recently queued (span-keyed reuse's
+    /// changed/new committed spans), if any — `None` when the last refresh had nothing left to
+    /// diff asynchronously (every span was reused or is the always-sync uncommitted layer; this
+    /// is what keeps a single-uncommitted-changeset session's refresh effectively synchronous,
+    /// see the ADR's "Refresh"). Mirrors [`Self::take_pending_load_spec`]'s take-once shape: the
+    /// caller (the event loop — the only place with thread-spawning ability) is responsible for
+    /// actually dispatching it; `App` never touches a `Sender`/`Repository`-carrying handle
+    /// itself, so it stays constructible — and `refresh` stays synchronously testable — with
+    /// nothing wired up to consume this at all.
+    pub fn take_pending_wave(&mut self) -> Option<(u64, Vec<(usize, Changeset)>)> {
+        self.pending_wave.take()
+    }
+
+    /// Apply one loader result (ADR-037's chokepoint, the `FileReady` inbox arm routes here):
+    /// dropped outright on a generation mismatch (`gen != self.generation` — the world it was
+    /// computed against no longer exists, see [`Self::generation`]'s doc comment). Otherwise:
+    ///
+    /// - `Ok(views)` caches every view the result carries, UNLESS that slot is already `Some` — a
+    ///   result for an already-cached file is discarded (the loader is a pure cache-warmer, never
+    ///   an overwriter; the synchronous force-completion fallback may have already filled it).
+    /// - `Err(message)` is a job that panicked or otherwise failed: surfaced as a visible footer
+    ///   notice (never silently stranding the file — see this changeset's report for why a footer
+    ///   notice, not a new per-file `Failed` state, is the shape chosen here).
+    ///
+    /// Either way, when the readied file IS the current pending open, it's seated like
+    /// [`Self::complete_pending_open`]'s tail — with one refinement over a plain "always clear"
+    /// rule: an `Ok` result only clears the pending open when its SHAPE satisfies the current
+    /// effective zoom (see [`loaded_views_satisfy`]). Without this, a zoom cycled mid-load
+    /// (`z` is exempt from force-completion — [`Self::open_current`] re-defers with
+    /// `open_pending_dispatched = false`) lets the stale-shaped in-flight result seat only the
+    /// old view, clear the pending flags, and strand the new zoom's view forever un-dispatched.
+    /// When unsatisfied, `open_pending` stays set and `open_pending_dispatched` resets to
+    /// `false` so the next idle Tick re-dispatches against the NOW-current zoom — mirroring a
+    /// fresh [`Self::open_current`] defer. An `Err` result keeps clearing unconditionally: a
+    /// failed load must not leave the placeholder stuck forever, and correctness never depends
+    /// on this path — the sync fallback owns correctness (see this method's summary above).
+    pub fn apply_file_ready(
+        &mut self,
+        gen: u64,
+        cs_idx: usize,
+        file_idx: usize,
+        result: Result<LoadedViews, String>,
+    ) {
+        if gen != self.generation {
+            return;
+        }
+        let is_current_pending =
+            cs_idx == self.current_cs && file_idx == self.current && self.open_pending;
+        match result {
+            Ok(views) => {
+                let satisfies_current_zoom = is_current_pending
+                    && loaded_views_satisfy(&views, self.effective_zoom_for(file_idx));
+                if let Some(cs) = self.changesets.get_mut(cs_idx) {
+                    match views {
+                        LoadedViews::Single(role, view) => set_if_absent(cs, role, file_idx, view),
+                        LoadedViews::Split { unstaged, staged } => {
+                            set_if_absent(cs, Role::Unstaged, file_idx, unstaged);
+                            set_if_absent(cs, Role::Staged, file_idx, staged);
+                        }
+                    }
+                }
+                if is_current_pending {
+                    if satisfies_current_zoom {
+                        self.reset_panes();
+                        self.open_pending = false;
+                        self.open_pending_dispatched = false;
+                    } else {
+                        self.open_pending_dispatched = false;
+                    }
+                }
+            }
+            Err(message) => {
+                self.notify(format!("failed to load file: {message}"), Severity::Error);
+                if is_current_pending {
+                    self.reset_panes();
+                    self.open_pending = false;
+                    self.open_pending_dispatched = false;
+                }
+            }
+        }
+    }
+
+    /// Apply one streamed-diff wave result (ADR-037's `ChangesetReady` chokepoint, the streamed-
+    /// launch counterpart to [`Self::apply_file_ready`]): dropped outright on a generation
+    /// mismatch, same rule and same reason (the world the wave was diffing no longer exists —
+    /// e.g. a refresh ran mid-wave). Otherwise replaces changeset `idx`'s slot in place:
+    ///
+    /// - `Ok(diff)` builds its `Ready` [`ChangesetView`] via [`ChangesetView::from_changeset_diff`]
+    ///   — the SAME router [`main.rs`'s lone-changeset sync path uses, so a streamed changeset's
+    ///   `DiffState`/view caches are byte-identical to what a synchronous diff would have built.
+    /// - `Err(message)` builds a `Failed` slot carrying it ([`ChangesetView::failed`]); the wave's
+    ///   FIRST failure (across the whole launch, not per-changeset) raises a footer notice — see
+    ///   [`Self::wave_failure_notified`]'s doc comment — and the review continues (a stack with one
+    ///   corrupt changeset still shows the other N-1).
+    ///
+    /// When `idx` IS the active changeset (the outline cursor already sits there — either it was
+    /// the lib-marked `current` changeset at launch, or the user navigated onto its still-`Pending`
+    /// placeholder), it's seated exactly as a fresh open would be: `current` resets to its first
+    /// file and [`Self::open_current`] runs (deferred-open semantics — CS4's placeholder shows
+    /// until the file itself loads), then the outline cursor resyncs. Nothing here requires the
+    /// user to navigate away and back for a just-readied active changeset to become interactive.
+    pub fn apply_changeset_ready(
+        &mut self,
+        gen: u64,
+        idx: usize,
+        result: Result<ChangesetDiff, String>,
+    ) {
+        if gen != self.generation {
+            return;
+        }
+        let Some(existing) = self.changesets.get(idx) else {
+            return;
+        };
+        let cs = existing.cs.clone();
+        // F3: a landed NON-active changeset inserts file rows into the outline's row list,
+        // silently shifting a plain row-index cursor. Capture the identity of the row under the
+        // cursor now (before the slot swap rebuilds `outline_items()`) so it can be re-found
+        // afterward — the active-changeset case doesn't need this, since `sync_outline_to_current`
+        // below already repositions by diff identity, not row index.
+        let cursor_identity = if idx != self.current_cs {
+            self.outline_items()
+                .get(self.outline.cursor)
+                .and_then(outline_row_identity)
+        } else {
+            None
+        };
+        match result {
+            Ok(diff) => {
+                self.changesets[idx] = ChangesetView::from_changeset_diff(cs, diff);
+            }
+            Err(message) => {
+                if !self.wave_failure_notified {
+                    self.notify(
+                        format!("failed to diff a changeset: {message}"),
+                        Severity::Error,
+                    );
+                    self.wave_failure_notified = true;
+                }
+                self.changesets[idx] = ChangesetView::failed(cs, message);
+            }
+        }
+        if idx == self.current_cs {
+            self.current = 0;
+            self.open_current();
+            self.sync_outline_to_current();
+        } else if let Some(identity) = cursor_identity {
+            let items = self.outline_items();
+            if let Some(new_idx) = items
+                .iter()
+                .position(|it| outline_row_identity(it) == Some(identity))
+            {
+                self.outline.cursor = new_idx;
+            } else {
+                // The identified row is gone (e.g. Flat mode deduped it out) — fall back to the
+                // same clamp `sync_outline_to_current` uses.
+                self.outline.cursor = self.outline.cursor.min(items.len().saturating_sub(1));
+            }
+        }
     }
 
     /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`z`). The new zoom
@@ -1640,6 +2084,8 @@ impl App {
                 label: v.cs.title.clone().unwrap_or_else(|| v.cs.name.clone()),
                 current: v.cs.current,
                 needs_restack: v.cs.needs_restack,
+                loading: v.is_pending(),
+                failed: v.is_failed(),
                 files: v
                     .files()
                     .iter()
@@ -2611,6 +3057,20 @@ impl From<WorktreeDiffs> for DiffState {
 }
 
 impl DiffState {
+    /// An empty [`DiffState`] — every field zero-length. Used for `Pending`/`Failed`
+    /// [`ChangesetView`] slots (ADR-037), which carry no real diff; existing `.diff.` read sites
+    /// already treat an empty `files` list as "nothing to show," so this alone is enough to make
+    /// those slots render/navigate as inert with no per-site Pending/Failed branch.
+    fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            unstaged_model: DiffModel { files: Vec::new() },
+            staged_model: DiffModel { files: Vec::new() },
+            unstaged_idx: Vec::new(),
+            staged_idx: Vec::new(),
+        }
+    }
+
     /// Build a [`DiffState`] for a COMMITTED changeset's [`DiffModel`] (`base..head`, already
     /// diffed by [`crate::acquire::diff_committed`]) — there is no staged/unstaged split for a
     /// committed range, so both sub-models are empty and every index map entry is `None`. This
@@ -2634,6 +3094,132 @@ impl DiffState {
 /// when the previously-active changeset's name no longer exists after a re-assembly.
 fn current_cs_index(changesets: &[ChangesetView]) -> usize {
     changesets.iter().position(|v| v.cs.current).unwrap_or(0)
+}
+
+/// The `(cs_idx, file_idx)` identity an [`OutlineItem::Header`]/[`OutlineItem::File`] row
+/// carries — `file_idx` is `None` for a header row. `OutlineItem::Dir` carries no `cs_idx` at
+/// all (see its doc comment) and has no identity to preserve. Used by
+/// [`App::apply_changeset_ready`] (F3) to re-find the row the outline cursor was on after a
+/// streamed diff landing inserts/removes rows ahead of it in the row-index space.
+fn outline_row_identity(item: &OutlineItem) -> Option<(usize, Option<usize>)> {
+    match item {
+        OutlineItem::Header { cs_idx, .. } => Some((*cs_idx, None)),
+        OutlineItem::File {
+            cs_idx, file_idx, ..
+        } => Some((*cs_idx, Some(*file_idx))),
+        OutlineItem::Dir { .. } => None,
+    }
+}
+
+// ── ADR-037: the loader thread's stateless request/job shape ────────────────────
+
+/// Everything the ADR-037 loader job needs to reproduce one file's [`App::ensure_loaded`] work
+/// against its OWN `Repository` + [`TsHighlighter`] — the loader is stateless between jobs (see
+/// the ADR's "Protocol": "each request carries what it needs"). Built by
+/// [`App::current_load_spec`] from live `App` state at request-send time; every field is owned
+/// (cloned out of `App`), so the spec outlives the borrow and crosses to the loader thread.
+#[derive(Debug, Clone)]
+pub struct FileLoadSpec {
+    span: ChangesetSpan,
+    combined_file: FileChange,
+    /// The [`EffectiveZoom`] `App` had AT DISPATCH TIME — the views built are shaped by this,
+    /// not by whatever `App`'s zoom/current file happen to be when the result lands (which may
+    /// have changed by then; that's fine, see the ADR's "Generations": within a generation, a
+    /// result is warmth even after the user navigated away).
+    zoom: EffectiveZoom,
+    unstaged_file: Option<FileChange>,
+    staged_file: Option<FileChange>,
+}
+
+/// The [`FileView`]s [`build_file_views`] built for one [`FileLoadSpec`], shaped exactly like the
+/// [`EffectiveZoom`] it was built for — [`App::apply_file_ready`] reads this shape to know which
+/// cache slot(s) to fill without re-deriving the zoom itself (which could disagree with the zoom
+/// the views were actually built against — see [`FileLoadSpec::zoom`]'s doc comment).
+/// `FileView` fields (`Box`ed here, see below) — a `FileReady` `AppEvent` carrying this unboxed
+/// would otherwise make the WHOLE `AppEvent` enum balloon to `FileView`'s size on every variant
+/// (clippy's `large_enum_variant`), even the plain `Key`/`Tick` ones sent on every keystroke.
+#[derive(Debug)]
+pub enum LoadedViews {
+    Single(Role, Option<Box<FileView>>),
+    Split {
+        unstaged: Option<Box<FileView>>,
+        staged: Option<Box<FileView>>,
+    },
+}
+
+/// Whether a loaded result's SHAPE — what zoom it was built against, per [`FileLoadSpec::zoom`]
+/// — still matches `current_zoom`, the current file's effective zoom at result-apply time. Used
+/// by [`App::apply_file_ready`] to tell a still-useful deferred-open result apart from one a
+/// mid-load `z` cycle outran: `Single` satisfies only the SAME role's `Single`, `Split`
+/// satisfies only `Split` (never the reverse — a `Split` result doesn't seat a `Single` open,
+/// and vice versa, even though `set_if_absent` already caches whichever roles it carries).
+fn loaded_views_satisfy(views: &LoadedViews, current_zoom: EffectiveZoom) -> bool {
+    match (views, current_zoom) {
+        (LoadedViews::Single(role, _), EffectiveZoom::Single(want)) => *role == want,
+        (LoadedViews::Split { .. }, EffectiveZoom::Split) => true,
+        _ => false,
+    }
+}
+
+/// Build every [`FileView`] a [`FileLoadSpec`] needs, against `repo`/`ts` — the ADR-037 loader
+/// thread's pure job body: unit-testable directly against a fixture repo, no threads or channels
+/// involved. Routes through the SAME [`build_combined_view`]/[`build_sub_role_view`] free
+/// functions [`App::ensure_role_loaded`] calls, so a deferred-then-loader-completed open is
+/// byte-identical to an eager [`App::open_current`] — the invariant ADR-037 carries over from
+/// CS4's `complete_pending_open`.
+pub fn build_file_views(
+    repo: &Repository,
+    ts: &mut TsHighlighter,
+    spec: &FileLoadSpec,
+) -> LoadedViews {
+    match spec.zoom {
+        EffectiveZoom::Single(role) => {
+            let view = match role {
+                Role::Combined => build_combined_view(repo, ts, spec.span, &spec.combined_file),
+                Role::Unstaged => spec
+                    .unstaged_file
+                    .as_ref()
+                    .and_then(|f| build_sub_role_view(repo, ts, Role::Unstaged, f)),
+                Role::Staged => spec
+                    .staged_file
+                    .as_ref()
+                    .and_then(|f| build_sub_role_view(repo, ts, Role::Staged, f)),
+            };
+            LoadedViews::Single(role, view.map(Box::new))
+        }
+        EffectiveZoom::Split => LoadedViews::Split {
+            unstaged: spec
+                .unstaged_file
+                .as_ref()
+                .and_then(|f| build_sub_role_view(repo, ts, Role::Unstaged, f))
+                .map(Box::new),
+            staged: spec
+                .staged_file
+                .as_ref()
+                .and_then(|f| build_sub_role_view(repo, ts, Role::Staged, f))
+                .map(Box::new),
+        },
+    }
+}
+
+/// Cache `view` into changeset `cs`'s `role` view slot for file `idx`, UNLESS that slot is
+/// already `Some` — [`App::apply_file_ready`]'s "a result for an already-cached file is
+/// discarded" rule (the loader is a pure cache-warmer, never an overwriter). A no-op if `idx` is
+/// out of range (the changeset shrank across a refresh — should already be unreachable, since a
+/// refresh bumps the generation and `apply_file_ready` drops stale-generation results before
+/// this ever runs, but `get_mut` stays defensive rather than indexing).
+fn set_if_absent(cs: &mut ChangesetView, role: Role, idx: usize, view: Option<Box<FileView>>) {
+    let view = view.map(|boxed| *boxed);
+    let slots = match role {
+        Role::Combined => &mut cs.views_combined,
+        Role::Unstaged => &mut cs.views_unstaged,
+        Role::Staged => &mut cs.views_staged,
+    };
+    if let Some(slot) = slots.get_mut(idx) {
+        if slot.is_none() {
+            *slot = view;
+        }
+    }
 }
 
 /// [`App::base_label`] for the changeset that would become active — a committed changeset's
@@ -2797,8 +3383,8 @@ mod tests {
 
     use super::test_support::app_from_fixture;
     use super::{
-        find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, EffectiveZoom, Layout, Role,
-        Zoom, DEFAULT_OUTLINE_WIDTH,
+        build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
+        EffectiveZoom, Layout, LoadedViews, Role, Severity, Zoom, DEFAULT_OUTLINE_WIDTH,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
@@ -3014,6 +3600,316 @@ mod tests {
         assert!(!app.open_pending());
         assert_eq!(app.cursor, cursor_before);
         assert_eq!(app.scroll, scroll_before);
+    }
+
+    // ── ADR-037: the loader's request/result seam ────────────────────────────────
+
+    #[test]
+    fn build_file_views_matches_ensure_loaded_for_the_combined_role() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("tracked.txt", "line1\nline2\n", "line1\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut eager = app_from_fixture(&fixture);
+        // The file only has an unstaged change, so the default `Split` zoom would collapse to
+        // `Role::Unstaged` — force `Combined` explicitly so this test exercises the role its
+        // name promises (a separate test would be needed for the Split/sub-role shape).
+        eager.set_zoom(Zoom::Combined);
+        eager.ensure_loaded(0);
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+
+        // A SEPARATE `App` gives us `current_load_spec()` for the same file, and a SEPARATE
+        // `Repository` handle + fresh `TsHighlighter` stands in for the loader thread's own —
+        // exactly the two-handle shape `Tui::run`/`spawn_loader_thread` build for real.
+        let mut spec_app = app_from_fixture(&fixture);
+        spec_app.set_zoom(Zoom::Combined);
+        let spec = spec_app
+            .current_load_spec()
+            .expect("fixture has a file at index 0");
+        let repo = fixture.repo().unwrap();
+        let loader_repo =
+            Repository::open(repo.workdir().unwrap()).expect("loader's own repo handle");
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        let LoadedViews::Single(role, Some(loader_view)) = views else {
+            panic!("expected a loaded Combined-role view");
+        };
+        assert_eq!(role, Role::Combined);
+        assert_eq!(loader_view.old_text(), eager_view.old_text());
+        assert_eq!(loader_view.new_text(), eager_view.new_text());
+        assert_eq!(loader_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn apply_file_ready_completes_a_pending_open_byte_identical_to_eager_open() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold\nl10\nl11\nl12\n",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew\nl10\nl11\nl12\n",
+            )
+            .build()
+            .unwrap();
+
+        let (mut deferred, eager) = defer_and_eager_twins(&fixture);
+        assert!(deferred.open_pending());
+
+        // The ASYNC path: take the pending spec (as `tui.rs`'s event loop would on the debounce
+        // `Tick`), build its views through a SEPARATE repo/highlighter (standing in for the
+        // loader thread's own), then apply the result — never `complete_pending_open`.
+        let (gen, cs_idx, file_idx, spec) = deferred
+            .take_pending_load_spec()
+            .expect("a fresh pending open has an undispatched spec");
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        deferred.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        assert!(
+            !deferred.open_pending(),
+            "apply_file_ready must clear the pending flag for the file it just seated"
+        );
+        assert_eq!(
+            deferred.cursor, eager.cursor,
+            "cursor must land on the same (first-hunk) row an eager open would have"
+        );
+        assert_eq!(deferred.scroll, eager.scroll);
+        let deferred_view = deferred.current_view_ref().expect("view now loaded");
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+        assert_eq!(deferred_view.old_text(), eager_view.old_text());
+        assert_eq!(deferred_view.new_text(), eager_view.new_text());
+        assert_eq!(deferred_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn apply_file_ready_redispatches_when_zoom_outran_the_in_flight_load() {
+        // F2 regression: a zoom cycled mid-load must not let the stale-shaped in-flight result
+        // seat and clear the pending open — the new zoom's view would then never be dispatched.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", "committed\n", "staged\n", "workdir\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        // Default zoom is `Split`; this file has both staged and unstaged sub-diffs, so the
+        // effective zoom stays `Split` too.
+        app.open_current();
+        assert!(app.open_pending(), "deferred open must be pending");
+
+        let (gen, cs_idx, file_idx, spec) = app
+            .take_pending_load_spec()
+            .expect("first take dispatches against the Split zoom");
+        assert_eq!(spec.zoom, EffectiveZoom::Split);
+
+        // Mid-load `z`: CycleZoom is exempt from force-completion, so this re-defers the open
+        // against the NEW zoom instead of blocking for it.
+        app.cycle_zoom();
+        assert!(
+            app.open_pending(),
+            "cycling zoom while a load is pending must still be pending"
+        );
+
+        // The loader answers the now-STALE (Split) request.
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        app.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        assert!(
+            app.open_pending(),
+            "a stale-shaped result must not clear the pending open"
+        );
+        assert!(
+            app.take_pending_load_spec().is_some(),
+            "the next Tick must re-dispatch against the current (Combined) zoom"
+        );
+    }
+
+    #[test]
+    fn take_pending_load_spec_dispatches_at_most_once_per_pending_open() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        assert!(
+            app.take_pending_load_spec().is_some(),
+            "first take dispatches"
+        );
+        assert!(
+            app.take_pending_load_spec().is_none(),
+            "a second take before the result lands must not re-dispatch"
+        );
+    }
+
+    #[test]
+    fn take_pending_load_spec_is_none_for_a_fileless_changeset_without_panicking() {
+        // A clean uncommitted layer diffs to zero files. A pending open onto it must not panic
+        // `current_load_spec`'s file-list indexing — F7's regression. Where this test was born
+        // (the loader changeset), a fileless `open_current` still MARKED the open pending and
+        // only the spec-building was total; this changeset's flag hygiene supersedes that —
+        // a fileless open now never marks (and actively clears) `open_pending`, so both the
+        // flag and the spec must come back empty.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        assert!(app.files().is_empty(), "fixture must have no diffed files");
+        app.set_defer_loads(true);
+        app.open_current();
+        assert!(
+            !app.open_pending(),
+            "a fileless open never marks pending (the non-deferred path clears the flags)"
+        );
+
+        assert!(
+            app.take_pending_load_spec().is_none(),
+            "no spec can be built for a file that doesn't exist"
+        );
+    }
+
+    #[test]
+    fn apply_file_ready_drops_a_stale_generation_result() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        let (gen, cs_idx, file_idx, spec) = app.take_pending_load_spec().unwrap();
+
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+
+        // A refresh between dispatch and result bumps the generation — the result now belongs
+        // to a world that no longer exists and must be dropped outright, leaving `open_pending`
+        // untouched (a FRESH open may since be pending for a different generation).
+        app.generation += 1;
+        app.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        assert!(
+            app.open_pending(),
+            "a stale-generation result must not clear a (possibly fresh) pending open"
+        );
+        assert!(
+            app.current_view_ref().is_none(),
+            "a stale-generation result must not populate the view cache"
+        );
+    }
+
+    #[test]
+    fn apply_file_ready_caches_a_result_even_after_navigating_away() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .unstaged_file("b.txt", "two\n", "two\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_zoom(Zoom::Combined);
+        app.set_defer_loads(true);
+        app.open_current(); // a.txt: uncached — defers
+        let (gen, cs_idx, file_idx, spec) = app.take_pending_load_spec().unwrap();
+        assert_eq!(file_idx, 0);
+
+        // Navigate away from a.txt BEFORE the (simulated) loader result lands.
+        app.current = 1;
+        app.open_current();
+
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = crate::highlight::TsHighlighter::new();
+        let views = build_file_views(&loader_repo, &mut loader_ts, &spec);
+        app.apply_file_ready(gen, cs_idx, file_idx, Ok(views));
+
+        // Still within the same generation — the result is warmth, not staleness: a.txt's cache
+        // is populated even though the user is no longer looking at it.
+        assert!(
+            app.role_view_ref(0, Role::Combined).is_some(),
+            "a within-generation result must cache even after the user navigated away"
+        );
+    }
+
+    #[test]
+    fn apply_file_ready_discards_a_result_for_an_already_cached_file() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_zoom(Zoom::Combined);
+        app.ensure_loaded(0); // eagerly cached already
+        assert!(app.role_view_ref(0, Role::Combined).is_some());
+        let old_text_before = app
+            .role_view_ref(0, Role::Combined)
+            .unwrap()
+            .old_text()
+            .to_string();
+
+        // A result claiming NOTHING loaded for this role (e.g. a stale/racing answer) must not
+        // clobber the already-cached view — the loader is a pure cache-warmer, never an
+        // overwriter.
+        app.apply_file_ready(
+            app.generation(),
+            app.current_cs(),
+            0,
+            Ok(LoadedViews::Single(Role::Combined, None)),
+        );
+
+        let view = app.role_view_ref(0, Role::Combined).expect("still cached");
+        assert_eq!(view.old_text(), old_text_before);
+    }
+
+    #[test]
+    fn apply_file_ready_err_surfaces_a_footer_notice_and_clears_pending() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        let (gen, cs_idx, file_idx, _spec) = app.take_pending_load_spec().unwrap();
+        assert!(app.notice.is_none());
+
+        app.apply_file_ready(gen, cs_idx, file_idx, Err("boom".to_string()));
+
+        assert!(
+            !app.open_pending(),
+            "a failed load must not strand the placeholder pending forever"
+        );
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("a failed load surfaces a notice");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("boom"));
     }
 
     // Hunk-nav helpers below operate purely over `DisplayRow` vectors — no fixture repo needed.
@@ -3976,6 +4872,420 @@ mod tests {
             app.notice.is_none(),
             "a PR-source refresh must no-op, not attempt (and fail) a network re-resolution"
         );
+    }
+
+    // ---- ADR-037 refresh: span-keyed reuse, uncommitted always sync, async waves ----------
+
+    /// Build a two-commit chain (`root` then `head`) on the fixture's default branch and return
+    /// both `Oid`s — the shared setup every span-keyed-reuse test below diffs a
+    /// [`ChangesetSpan::Committed`] across.
+    fn root_and_head_commits(fixture: &Fixture) -> (git2::Oid, git2::Oid) {
+        let root = fixture
+            .commit("main")
+            .file("r.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .file("b.txt", "b\n")
+            .create("head")
+            .unwrap();
+        (root, head)
+    }
+
+    #[test]
+    fn refresh_reuses_a_ready_committed_slot_with_unchanged_span_keeping_warm_caches() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        // `head_text: "main"` re-resolves through the branch ref on every refresh — the span
+        // stays `Committed { base: root, head }` as long as `main` doesn't move, exercising the
+        // REAL re-resolve path (not a hand-frozen span) for the "unchanged" case.
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+
+        app.open_current(); // caches file 0 ("a.txt")
+        assert_eq!(app.files().len(), 2, "root..head touches a.txt and b.txt");
+        app.next_file(); // caches file 1 ("b.txt") too
+        app.prev_file(); // back to file 0 — the file `refresh`'s tail will re-seat
+        assert!(app.role_view_ref(1, Role::Combined).is_some());
+
+        let gen_before = app.generation();
+        app.refresh();
+
+        assert_eq!(
+            app.generation(),
+            gen_before + 1,
+            "every refresh bumps the generation, reused slot or not"
+        );
+        assert!(
+            !app.is_current_pending(),
+            "an unchanged span must be carried over Ready, never go through Pending"
+        );
+        assert_eq!(app.files().len(), 2);
+        assert_eq!(app.current, 0, "file position by path is preserved");
+        assert!(
+            app.role_view_ref(1, Role::Combined).is_some(),
+            "file 1's view cache must survive untouched — refresh's tail only (re)opens the \
+             CURRENT file (0), so a still-populated cache at 1 proves the whole ChangesetView \
+             (not just its diff) was carried over rather than rebuilt fresh"
+        );
+        assert!(
+            app.take_pending_wave().is_none(),
+            "a fully-reused refresh has nothing left to diff asynchronously"
+        );
+    }
+
+    #[test]
+    fn refresh_sends_a_changed_committed_span_through_a_wave_instead_of_reusing_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, old_head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: old_head,
+            },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+        app.open_current();
+
+        // Advance `main` past `old_head` — the same shape as a real amend/restack: the name
+        // ("{root}..main") stays identical, but the span's `head` moves.
+        let new_head = fixture
+            .commit("main")
+            .file("c.txt", "c\n")
+            .create("new head")
+            .unwrap();
+
+        let gen_before = app.generation();
+        app.refresh();
+        let gen_after = app.generation();
+        assert_eq!(gen_after, gen_before + 1);
+
+        assert!(
+            app.is_current_pending(),
+            "a changed span must NOT be reused — it goes Pending for the wave to diff"
+        );
+        assert!(app.files().is_empty());
+
+        let (wave_gen, to_diff) = app
+            .take_pending_wave()
+            .expect("a changed committed span must queue a wave request");
+        assert_eq!(wave_gen, gen_after);
+        assert_eq!(to_diff.len(), 1);
+        assert_eq!(
+            to_diff[0].0, 0,
+            "the stack index the result must be seated at"
+        );
+        assert_eq!(
+            to_diff[0].1.span,
+            ChangesetSpan::Committed {
+                base: root,
+                head: new_head,
+            },
+            "the wave must diff the NEW span, not the stale one"
+        );
+        assert!(
+            app.take_pending_wave().is_none(),
+            "take_pending_wave is a take-once — a second call must find nothing left"
+        );
+
+        // A stale-generation result (as if it were still in flight for the pre-refresh world)
+        // must be dropped outright.
+        app.apply_changeset_ready(
+            gen_before,
+            0,
+            Ok(crate::acquire::ChangesetDiff::Committed(
+                crate::acquire::diff_committed(repo, root, new_head).unwrap(),
+            )),
+        );
+        assert!(
+            app.is_current_pending(),
+            "a stale-generation ChangesetReady must be dropped, not seat the changeset"
+        );
+
+        // The NEW generation's result lands and seats the (still active) changeset.
+        app.apply_changeset_ready(
+            gen_after,
+            0,
+            Ok(crate::acquire::ChangesetDiff::Committed(
+                crate::acquire::diff_committed(repo, root, new_head).unwrap(),
+            )),
+        );
+        assert!(!app.is_current_pending());
+        assert_eq!(
+            app.files().len(),
+            3,
+            "root..new_head accumulates a.txt/b.txt (from `head`) and c.txt (from `new_head`)"
+        );
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Committed {
+                base: root,
+                head: new_head,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_that_makes_the_active_changeset_pending_clears_stale_deferred_open_flags() {
+        // F1 regression: a pending open still in flight (dispatched, awaiting a loader result)
+        // right before `r`, followed by a refresh that turns the active changeset Pending (a
+        // changed span goes through the wave, landing empty files) must not leave
+        // `open_pending`/`open_pending_dispatched` wedged. `open_current`'s empty-file guard
+        // skips the defer branch (nothing to load) after the refresh, so nothing else would
+        // clear stale flags without this fix.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, old_head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: old_head,
+            },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+        app.set_defer_loads(true);
+        app.open_current();
+        let _ = app
+            .take_pending_load_spec()
+            .expect("a fresh pending open dispatches");
+        assert!(app.open_pending(), "the open is pending, awaiting a result");
+
+        // Advance `main`, changing the span — refresh must send this through the wave, landing
+        // the active changeset Pending (empty files) rather than reusing the stale slot.
+        fixture
+            .commit("main")
+            .file("c.txt", "c\n")
+            .create("new head")
+            .unwrap();
+
+        app.refresh();
+
+        assert!(
+            app.is_current_pending(),
+            "a changed span must go Pending for the wave"
+        );
+        assert!(app.files().is_empty());
+        assert!(
+            !app.open_pending(),
+            "a stale deferred open must not survive a refresh that empties the active changeset"
+        );
+        assert!(
+            app.take_pending_load_spec().is_none(),
+            "no load spec can be produced for a Pending slot with no files"
+        );
+    }
+
+    #[test]
+    fn refresh_retries_a_failed_committed_slot_via_a_wave_rather_than_reusing_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let (root, head) = root_and_head_commits(&fixture);
+        let repo = fixture.repo().unwrap();
+
+        let cs = Changeset {
+            name: format!("{root}..main"),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        // Seed the slot as `Failed` for this exact (name, span) — as if a previous wave's diff
+        // for it had errored.
+        let view = ChangesetView::failed(cs, "a previous diff attempt failed");
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.set_review_source(crate::source::Source::Range {
+            base_text: root.to_string(),
+            head_text: "main".to_string(),
+            dots: crate::source::RangeDots::Two,
+        });
+        assert!(app.current_failure().is_some());
+
+        app.refresh(); // span is UNCHANGED from the Failed slot's — reuse must still skip it
+
+        assert!(
+            app.is_current_pending(),
+            "reuse only carries `Ready` slots — a `Failed` one goes back through Pending+wave, \
+             which is what makes `r` a retry with no separate retry machinery"
+        );
+        let (_, to_diff) = app
+            .take_pending_wave()
+            .expect("the retried span must be queued for the wave");
+        assert_eq!(to_diff.len(), 1);
+        assert_eq!(
+            to_diff[0].1.span,
+            ChangesetSpan::Committed { base: root, head }
+        );
+    }
+
+    #[test]
+    fn coordinated_refresh_after_staging_rebuilds_the_uncommitted_layer_synchronously_while_reusing_an_unchanged_committed_span(
+    ) {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .unstaged_file("dirty.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        repo.set_head("refs/heads/a").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let changesets = crate::acquire::resolve_changesets(repo, "a").unwrap();
+        assert_eq!(
+            changesets.len(),
+            2,
+            "expected the 'a' Graphite node plus the dirty tree's uncommitted layer"
+        );
+        let diffs = crate::acquire::diff_changesets(repo, &changesets).unwrap();
+        let views: Vec<ChangesetView> = changesets
+            .into_iter()
+            .zip(diffs)
+            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+            .collect();
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        assert_eq!(
+            app.cur().cs.span,
+            ChangesetSpan::Uncommitted,
+            "opens on the uncommitted layer (lib-`current`)"
+        );
+
+        app.open_current(); // cursor lands on dirty.txt's one hunk
+        app.stage_hunk(); // run_op -> coordinated_refresh -> refresh, synchronously
+
+        // The post-op world is visible SYNCHRONOUSLY, before the next event loop iteration.
+        repo.assert(predicate::repo::has_staged_file("dirty.txt"));
+        assert!(
+            !app.is_current_pending(),
+            "the uncommitted layer always re-diffs sync — it must never go through Pending"
+        );
+        assert!(
+            app.take_pending_wave().is_none(),
+            "the 'a' node's committed span didn't change — staging must not have dispatched a \
+             wave for it"
+        );
+    }
+
+    #[test]
+    fn refresh_marks_the_uncommitted_layer_failed_when_its_sync_diff_errors() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_review_source(crate::source::Source::Uncommitted);
+        // Deliberately do NOT call `app.open_current()` here: reading a file's content already
+        // walks `HEAD`'s commit/tree chain through `app`'s OWN `Repository` handle, which would
+        // warm libgit2's per-handle object cache for the exact commit this test corrupts below —
+        // a cache hit would silently mask the corruption instead of exercising the failure path.
+
+        // Corrupt the loose object `HEAD` points to (not the `HEAD` ref itself): `repo.head()`'s
+        // SHORTHAND still resolves fine (refresh's own branch-name read, and
+        // `Source::Uncommitted`'s resolution, which is a pure string wrap needing no repo access
+        // at all), but `diff_uncommitted`'s `repo.head()?.peel_to_tree()` — which walks all the
+        // way to the commit object, through `app`'s never-yet-used-for-this-object handle — fails.
+        let repo = fixture.repo().unwrap();
+        let head_oid = repo.head().unwrap().target().unwrap();
+        let hex = head_oid.to_string();
+        let object_path = repo.path().join("objects").join(&hex[0..2]).join(&hex[2..]);
+        // Loose objects are written read-only by git — reclaim write permission before
+        // clobbering the bytes, or the write itself fails with EACCES.
+        let mut perms = std::fs::metadata(&object_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        std::fs::set_permissions(&object_path, perms).unwrap();
+        std::fs::write(&object_path, b"garbage-not-a-git-object\n").unwrap();
+
+        app.refresh();
+
+        assert!(
+            !app.is_current_pending(),
+            "a sync diff failure sets Failed, not Pending — nothing async is retrying this"
+        );
+        assert!(
+            app.current_failure().is_some(),
+            "the uncommitted layer's failed sync re-diff must become a Failed slot"
+        );
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("a failed uncommitted sync re-diff must set a footer notice");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("uncommitted diff failed"),
+            "got notice text: {:?}",
+            notice.text
+        );
+        assert!(app.take_pending_wave().is_none());
     }
 
     // ---- M4 index watcher (`on_tick`) -------------------------------------------------------
@@ -5538,6 +6848,8 @@ mod tests {
                 label: "cs-a".to_string(),
                 current: false,
                 needs_restack: false,
+                loading: false,
+                failed: false,
             }
         );
         let header_b = items
@@ -5551,7 +6863,278 @@ mod tests {
                 label: "cs-b".to_string(),
                 current: true,
                 needs_restack: true,
+                loading: false,
+                failed: false,
             }
+        );
+    }
+
+    // ── ADR-037: per-changeset slots (Pending/Ready/Failed) ─────────────────────
+
+    /// A minimal [`Changeset`] descriptor for the slot tests below — the slot model only cares
+    /// about the metadata `ChangesetView::pending`/`failed` carry alongside a diff-free
+    /// [`DiffState`], not any real git content.
+    fn bare_changeset(name: &str, current: bool) -> Changeset {
+        Changeset {
+            name: name.to_string(),
+            span: ChangesetSpan::Uncommitted,
+            title: None,
+            current,
+            needs_restack: false,
+        }
+    }
+
+    #[test]
+    fn app_is_constructible_from_a_pending_changeset_alone() {
+        // ADR-037: `App::from_changesets`'s >=1 assert survives unchanged — an all-Pending stack
+        // (the streamed-launch shape, before any diff has landed) is a valid `App`.
+        let view = ChangesetView::pending(bare_changeset("cs-a", true));
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
+        let app = App::from_changesets(repo, vec![view]);
+
+        assert!(app.is_current_pending());
+        assert_eq!(app.current_failure(), None);
+        assert!(app.files().is_empty());
+        assert_eq!(app.changeset_count(), 1);
+    }
+
+    #[test]
+    fn navigating_onto_a_pending_changeset_shows_no_files_and_stays_pending() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let cs_ready = bare_changeset("cs-ready", true);
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        let view_ready = ChangesetView::new(cs_ready, DiffState::from(diffs));
+        let view_pending = ChangesetView::pending(bare_changeset("cs-pending", false));
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_ready, view_pending]);
+
+        assert!(!app.is_current_pending(), "opens on the Ready changeset");
+        assert!(!app.files().is_empty());
+
+        app.next_changeset();
+
+        assert_eq!(app.current_cs(), 1);
+        assert!(app.is_current_pending());
+        assert!(
+            app.files().is_empty(),
+            "a Pending changeset has no file rows to navigate onto"
+        );
+    }
+
+    #[test]
+    fn failed_slot_carries_its_error_message() {
+        let view = ChangesetView::failed(bare_changeset("cs-a", true), "diff acquisition failed");
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
+        let app = App::from_changesets(repo, vec![view]);
+
+        assert!(!app.is_current_pending());
+        assert_eq!(app.current_failure(), Some("diff acquisition failed"));
+        assert!(app.files().is_empty());
+    }
+
+    #[test]
+    fn outline_marks_pending_and_failed_changeset_headers() {
+        let view_pending = ChangesetView::pending(bare_changeset("cs-pending", true));
+        let view_failed = ChangesetView::failed(bare_changeset("cs-failed", false), "boom");
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(repo, vec![view_pending, view_failed]);
+        app.outline.mode = OutlineMode::Stack;
+
+        let items = app.outline_items();
+        assert_eq!(
+            items,
+            vec![
+                OutlineItem::Header {
+                    cs_idx: 0,
+                    label: "cs-pending".to_string(),
+                    current: true,
+                    needs_restack: false,
+                    loading: true,
+                    failed: false,
+                },
+                OutlineItem::Header {
+                    cs_idx: 1,
+                    label: "cs-failed".to_string(),
+                    current: false,
+                    needs_restack: false,
+                    loading: false,
+                    failed: true,
+                },
+            ],
+            "Pending/Failed changesets emit only their (marked) header, no file rows"
+        );
+    }
+
+    // ── ADR-037: the streamed-launch wave's chokepoint ───────────────────────────
+
+    #[test]
+    fn apply_changeset_ready_seats_the_active_changeset_when_its_diff_lands() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", true));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", false));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        assert!(app.is_current_pending());
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            app.generation(),
+            0,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        assert!(
+            !app.is_current_pending(),
+            "the readied ACTIVE changeset must be seated, not left Pending"
+        );
+        assert!(!app.files().is_empty());
+        assert!(
+            app.current_view_ref().is_some(),
+            "seating an active changeset opens its first file exactly like a fresh open would"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_marks_a_non_active_changeset_ready_without_disturbing_current() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", true));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", false));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            app.generation(),
+            1,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        assert_eq!(app.current_cs(), 0, "the active changeset must not move");
+        assert!(
+            app.is_current_pending(),
+            "cs-a is still Pending — only cs-b's slot changed"
+        );
+        app.next_changeset();
+        assert!(
+            !app.is_current_pending(),
+            "cs-b's slot is now Ready after navigating onto it"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_drops_a_stale_generation_result() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view = ChangesetView::pending(bare_changeset("cs-a", true));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        let stale_gen = app.generation();
+        app.generation += 1; // simulate a refresh landing between dispatch and result
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            stale_gen,
+            0,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        assert!(
+            app.is_current_pending(),
+            "a stale-generation result must not seat a changeset from a world that no longer exists"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_err_marks_failed_and_notifies_only_on_the_first_failure() {
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", true));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", false));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        assert!(app.notice.is_none());
+
+        app.apply_changeset_ready(app.generation(), 0, Err("first failure".to_string()));
+        assert!(
+            app.current_failure().is_some(),
+            "the active changeset's Failed slot carries the message"
+        );
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("the wave's first failure raises a footer notice");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("first failure"));
+
+        // A SECOND failure in the same wave must not raise a second notice — only the wave's
+        // FIRST failure does (see `App::wave_failure_notified`'s doc comment). The review
+        // continues: cs-b's slot still becomes Failed even though no new notice fires.
+        app.apply_changeset_ready(app.generation(), 1, Err("second failure".to_string()));
+        let notice_after = app.notice.as_ref().unwrap();
+        assert!(
+            notice_after.text.contains("first failure"),
+            "a second failure in the same wave must not overwrite the first's notice"
+        );
+    }
+
+    #[test]
+    fn apply_changeset_ready_keeps_outline_cursor_anchored_when_an_earlier_non_active_changeset_lands(
+    ) {
+        // F3 regression: cs-a sits BEFORE the active cs-b in the outline row list. Landing cs-a's
+        // diff inserts its file rows ahead of cs-b's header, shifting every row-index cursor at
+        // or after cs-a's header — a plain row-index cursor would silently drift onto one of
+        // cs-a's new file rows instead of staying on cs-b's header.
+        let fixture = two_changes_one_hunk_fixture();
+        let repo = fixture.repo().unwrap();
+        let view_a = ChangesetView::pending(bare_changeset("cs-a", false));
+        let view_b = ChangesetView::pending(bare_changeset("cs-b", true));
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.outline.mode = OutlineMode::Stack;
+        assert_eq!(
+            app.current_cs(),
+            1,
+            "cs-b is the lib-marked current changeset"
+        );
+
+        let items_before = app.outline_items();
+        let cursor_before = items_before
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: 1, .. }))
+            .expect("cs-b's header row exists before cs-a lands");
+        app.outline.cursor = cursor_before;
+
+        let diffs = crate::acquire::diff_uncommitted(repo).unwrap();
+        app.apply_changeset_ready(
+            app.generation(),
+            0,
+            Ok(crate::acquire::ChangesetDiff::Uncommitted(diffs)),
+        );
+
+        let items_after = app.outline_items();
+        assert!(
+            items_after.len() > items_before.len(),
+            "cs-a's file rows must have been inserted ahead of cs-b's header"
+        );
+        assert_eq!(
+            items_after[app.outline_cursor()],
+            OutlineItem::Header {
+                cs_idx: 1,
+                label: "cs-b".to_string(),
+                current: true,
+                needs_restack: false,
+                loading: true,
+                failed: false,
+            },
+            "the outline cursor must still identify cs-b's header row, not whatever row now \
+             sits at its old index"
         );
     }
 

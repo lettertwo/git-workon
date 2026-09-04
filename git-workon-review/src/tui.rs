@@ -1,17 +1,26 @@
 //! Terminal lifecycle, event seam, and the main input loop for the review TUI.
 //!
 //! Ported loop shape from the `review-tui-spike` prototype's `main.rs` (`install_panic_hook`,
-//! raw-mode + alternate-screen setup, `draw -> quit-check -> next_event -> update`), adapted to
-//! read events through [`next_event`] rather than calling crossterm directly from the loop.
+//! raw-mode + alternate-screen setup, `draw -> quit-check -> recv_event -> update`), adapted to
+//! read events through the [`AppEvent`] inbox rather than calling crossterm directly from the
+//! loop.
 //!
-//! M4's index watcher (locked decision #4) does NOT swap `next_event`'s internals for a
-//! channel-fed watcher thread, despite an earlier note here suggesting that direction — the
-//! locked decision is a synchronous poll on the existing `Tick` (every `next_event` timeout),
-//! comparing [`workon_review::refresh::IndexSignature`] and re-diffing in place via
-//! [`App::on_tick`] when it changes. No threads, no `mpsc`, no new deps.
+//! ADR-037 (progressive pipeline) supersedes M4's locked decision #4 — the "no threads, no
+//! `mpsc`" letter of that note, recorded here in an earlier revision, no longer holds. A
+//! dedicated *input thread* (spawned by [`Tui::run`]) is now the ONLY code that calls
+//! crossterm's event API: it blocks on `event::read()` forever, maps each event exactly like
+//! this module's old `next_event`/`drain_pending` read arms did, and forwards mapped events into
+//! an `std::sync::mpsc` inbox that the main loop drains via [`recv_event`]/[`drain_pending`].
+//! `recv_timeout`'s timeout arm IS the `Tick` beat — unchanged from before, just relocated from
+//! `event::poll`'s timeout to the channel's. The M4 index watcher's *semantics* are exactly
+//! unchanged by this move: it still compares [`workon_review::refresh::IndexSignature`] and
+//! re-diffs in place via [`App::on_tick`] on every `Tick`; only the beat's mechanism moved.
 
 use std::fs::File;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
@@ -19,60 +28,362 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use git2::Repository;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
-use workon_review::app::App;
+use workon::Changeset;
+use workon_review::acquire::{diff_changeset, ChangesetDiff};
+use workon_review::app::{self, App, FileLoadSpec, LoadedViews};
+use workon_review::highlight::TsHighlighter;
 use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
 use workon_review::render;
 use workon_review::theme::Palette;
 
-/// One event the review loop reacts to. `Tick` is now also the index-watcher's poll beat (see the
-/// module doc's note on locked decision #4) — `next_event`'s mapping and this enum otherwise stay
-/// the shape M3 built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One event the review loop reacts to. `Tick` is synthesized by the main loop on an inbox
+/// `recv_timeout` timeout — it is never sent through the channel itself (see [`recv_event`]).
+/// `Key`/`Resize` are forwarded from the input thread via [`map_terminal_event`]; `FileReady` is
+/// forwarded from the loader thread via [`run_load_job`]. Not `Copy`/`Clone`/`PartialEq`/`Eq`
+/// (ADR-037): `FileReady`'s payload carries [`LoadedViews`], which wraps
+/// [`workon_review::app::FileView`] — a type with none of those (its highlight/word-diff caches
+/// don't implement them, and rebuilding one is cheap enough that nothing has ever needed to).
+#[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
     Resize(u16, u16),
     Tick,
+    /// One [`LoadRequest`]'s result — ADR-037's loader-result variant. `gen`/`cs_idx`/`file_idx`
+    /// echo the request's stamp; `result` is `Err` for a job that panicked or otherwise failed
+    /// (see [`run_load_job`]'s doc comment for why a footer notice, not a new AppEvent shape, is
+    /// how that surfaces). Applied at ONE chokepoint: [`App::apply_file_ready`].
+    FileReady {
+        gen: u64,
+        cs_idx: usize,
+        file_idx: usize,
+        result: Result<LoadedViews, String>,
+    },
+    /// One changeset's streamed-diff result — ADR-037's streamed-launch counterpart to
+    /// `FileReady`, forwarded from the wave thread [`spawn_wave_thread`] spawns. `gen`/`idx` echo
+    /// the wave's stamp/the changeset's position in `App`'s stack; `result` is `Err` for a
+    /// changeset whose diff itself failed (a bad/garbage `Oid`, not a job panic — see
+    /// [`spawn_wave_thread`]'s doc comment). Applied at ONE chokepoint:
+    /// [`App::apply_changeset_ready`].
+    ChangesetReady {
+        gen: u64,
+        idx: usize,
+        result: Result<ChangesetDiff, String>,
+    },
 }
 
-/// Poll for the next terminal event, up to `timeout`.
-///
-/// `Ok(Some(AppEvent::Tick))` on a plain timeout (the loop's regular redraw beat); `Ok(None)` for
-/// a terminal event we don't map to an [`AppEvent`] (key release/repeat, mouse, paste, focus) —
-/// the loop redraws and keeps going without calling `update`.
-pub fn next_event(timeout: Duration) -> io::Result<Option<AppEvent>> {
-    if !event::poll(timeout)? {
-        return Ok(Some(AppEvent::Tick));
+impl PartialEq for AppEvent {
+    /// Manual, deliberately PARTIAL equality (can't derive — `FileReady`'s `LoadedViews` payload
+    /// isn't `PartialEq`, see the enum's doc comment): `Key`/`Resize`/`Tick` compare structurally,
+    /// exactly like the pre-ADR-037 derive did, for the input-thread tests that still assert
+    /// mapped-event shape via `assert_eq!`. Two `FileReady` events are never considered equal —
+    /// there's no sound definition of "the same loader result" once `FileView` can't be compared,
+    /// and nothing needs one; tests that care about a `FileReady`'s fields match on them directly.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AppEvent::Key(a), AppEvent::Key(b)) => a == b,
+            (AppEvent::Resize(w1, h1), AppEvent::Resize(w2, h2)) => w1 == w2 && h1 == h2,
+            (AppEvent::Tick, AppEvent::Tick) => true,
+            _ => false,
+        }
     }
-    Ok(match event::read()? {
+}
+
+/// The inbox message type: a mapped terminal event, or the input thread's terminal `event::read`
+/// error forwarded verbatim (ADR-037: "the input thread never exits silently" — a read error is
+/// still observable, just relayed rather than swallowed). `Tick` never appears here.
+type InboxMessage = io::Result<AppEvent>;
+
+/// Map one crossterm terminal [`Event`] to the [`AppEvent`] the loop reacts to — key-press and
+/// resize map; key release/repeat, mouse, paste, and focus events are skipped (`None`), exactly
+/// like this module's pre-ADR-037 `next_event`/`drain_pending` read arms did. Pure and
+/// independent of any thread or channel, so it's unit-tested directly; the input thread's loop
+/// body is a thin wrapper around it.
+fn map_terminal_event(event: Event) -> Option<AppEvent> {
+    match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => Some(AppEvent::Key(key)),
         Event::Resize(w, h) => Some(AppEvent::Resize(w, h)),
         _ => None,
-    })
+    }
+}
+
+/// Spawn the dedicated input thread against an already-built inbox sender. Must be called AFTER
+/// the terminal is acquired and any pre-takeover tty work (the theme probe, stray-input flush)
+/// has finished — crossterm input must not be consumed before that ordering completes (see
+/// `main.rs`'s block comment on the resolve/probe/acquire sequence). The thread loops forever on
+/// a blocking `event::read()`, forwarding mapped events; on a read error it forwards the error
+/// once and exits — the sole way this thread ever stops short of the process dying. Never joined:
+/// [`Tui::run`] returns without waiting for it (ADR-037's kill-on-exit lifecycle — the input
+/// thread, like the loader thread, never writes, so an abandoned read can't corrupt anything).
+///
+/// `tx` is a clone of the SAME inbox sender the loader thread also holds (ADR-037's "one inbox" —
+/// [`Tui::run`] builds the channel once and hands a clone to each producer thread), so both
+/// threads' events interleave into a single `recv_event`/`drain_pending` stream.
+fn spawn_input_thread(tx: mpsc::Sender<InboxMessage>) {
+    thread::spawn(move || loop {
+        match event::read() {
+            Ok(event) => {
+                if let Some(mapped) = map_terminal_event(event) {
+                    if tx.send(Ok(mapped)).is_err() {
+                        return; // main loop is gone; nothing left to forward to
+                    }
+                }
+            }
+            Err(err) => {
+                let _ = tx.send(Err(err));
+                return;
+            }
+        }
+    });
+}
+
+/// One file-load request handed to the loader thread (ADR-037's "Protocol": the loader is
+/// stateless between jobs — everything a job needs rides along on the request). `gen`/`cs_idx`/
+/// `file_idx` are stamped at send time from [`App::take_pending_load_spec`]'s return and echoed
+/// back verbatim on the [`AppEvent::FileReady`] result, so [`App::apply_file_ready`] can apply
+/// (or drop) it without the loader ever touching `App`.
+struct LoadRequest {
+    gen: u64,
+    cs_idx: usize,
+    file_idx: usize,
+    spec: FileLoadSpec,
+}
+
+/// Extract a human-readable message from a `catch_unwind` panic payload — the common `&str`/
+/// `String` panic-message shapes get their text; anything else (a panic with a non-string
+/// payload) falls back to a generic message rather than failing to report at all.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        s.to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "loader job panicked".to_string()
+    }
+}
+
+/// The ADR-037 loader job's pure body: `LoadRequest -> AppEvent`, unit-tested directly (no
+/// threads) against a fixture repo + highlighter. Wrapped in `catch_unwind` per the ADR's
+/// "Lifecycle" decision — the specific failure mode this catches that nothing else does: a
+/// panicked job would otherwise silently drop into a slot stranded `Pending` forever (the file
+/// never re-requested, since [`App::open_pending_dispatched`]'s guard already marked it sent), an
+/// invisible hang instead of a visible error.
+///
+/// A panic's message surfaces through [`AppEvent::FileReady`]'s `Err` arm, which
+/// [`App::apply_file_ready`] turns into a footer notice — a footer notice, not a new per-file
+/// `Failed` slot, is the shape chosen here (see this changeset's report): it's visible, it
+/// doesn't strand `open_pending`, and correctness never depended on the loader succeeding in the
+/// first place (the force-completion sync fallback is where correctness actually lives).
+fn run_load_job(repo: &Repository, ts: &mut TsHighlighter, req: LoadRequest) -> AppEvent {
+    let LoadRequest {
+        gen,
+        cs_idx,
+        file_idx,
+        spec,
+    } = req;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        app::build_file_views(repo, ts, &spec)
+    }))
+    .map_err(panic_message);
+    AppEvent::FileReady {
+        gen,
+        cs_idx,
+        file_idx,
+        result,
+    }
+}
+
+/// Spawn the ADR-037 loader thread: it owns its own long-lived `Repository` + `TsHighlighter`
+/// (never `App`'s — the loader is a separate thread and can't touch `App`'s handles) and serves
+/// [`LoadRequest`]s sequentially off `req_rx`, forwarding each job's [`AppEvent::FileReady`] into
+/// the shared inbox via `tx` (a clone of the same sender the input thread holds). Returns the
+/// `Sender` half the main loop dispatches requests through.
+///
+/// If `repo_path` can't be opened here (should be unreachable — `main.rs` already opened it once
+/// to build `App`), the thread exits immediately without serving anything: every subsequent
+/// dispatch attempt just accumulates in `req_rx`'s buffer until the main loop's `send` starts
+/// erroring, which is harmless (the force-completion sync fallback is what correctness actually
+/// depends on — see [`run_load_job`]'s doc comment). Never joined — same kill-on-exit lifecycle as
+/// the input thread.
+fn spawn_loader_thread(
+    repo_path: PathBuf,
+    tx: mpsc::Sender<InboxMessage>,
+) -> mpsc::Sender<LoadRequest> {
+    let (req_tx, req_rx) = mpsc::channel::<LoadRequest>();
+    thread::spawn(move || {
+        let Ok(repo) = Repository::open(&repo_path) else {
+            return;
+        };
+        let mut ts = TsHighlighter::new();
+        for req in req_rx {
+            let event = run_load_job(&repo, &mut ts, req);
+            if tx.send(Ok(event)).is_err() {
+                return; // main loop is gone; nothing left to forward to
+            }
+        }
+    });
+    req_tx
+}
+
+/// Spawn a ADR-037 diff wave — the startup wave over the whole resolved stack, or (ADR-037
+/// "Refresh") a refresh's span-keyed reuse leftovers, the changed/new committed spans
+/// [`workon_review::app::App::take_pending_wave`] queued. Stripes `to_diff` (`current_idx`-first
+/// if the active changeset is among the pairs being diffed, then input order) across
+/// `available_parallelism`-many transient WORKER threads — same fan-out shape as
+/// `crate::acquire::diff_changesets` (each worker opens its own `Repository`, since
+/// `git2::Repository` is `Send` but not `Sync`) — but STREAM each result the instant it completes
+/// via `tx` rather than joining the batch. Never joined itself either — a wave straggler left
+/// running past quit (or superseded by a later refresh's generation) is harmless: it only ever
+/// sends into an inbox nothing is listening to anymore, or a result [`App::apply_changeset_ready`]
+/// drops outright on a generation mismatch; `tx.send` failing is the signal each worker already
+/// checks for the former.
+///
+/// `to_diff`'s `usize` is the pair's index into `App`'s FULL changeset stack (not a position
+/// within `to_diff` itself) — carried straight through to each `ChangesetReady { idx, .. }` so
+/// [`App::apply_changeset_ready`] can seat the result without `App` and this wave ever agreeing
+/// on a separate numbering.
+///
+/// A DELIBERATELY separate set of threads from the loader thread (ADR-037 leaves this shape
+/// open — "yours to shape"): the wave never touches the loader's request queue, so an in-flight
+/// wave can never starve a `LoadFile` request behind it — they run on entirely disjoint threads
+/// with entirely disjoint work queues. The cost is a second family of `Repository` handles
+/// (`workers + 1`, alongside the loader's one) alive for the wave's brief lifetime; accepted for
+/// the starvation-freedom it buys for free.
+///
+/// A changeset whose own diff fails (a bad/garbage `Oid` — see [`diff_changeset`]'s doc comment)
+/// sends `Err` for THAT changeset only; a worker whose own `Repository::open` fails sends `Err`
+/// for every changeset in its chunk (mirroring `diff_changesets`' per-chunk failure shape) rather
+/// than silently dropping them — every index must get exactly one result, or its slot stays
+/// `Pending` forever with nothing left to complete it.
+fn spawn_wave_thread(
+    repo_path: PathBuf,
+    tx: mpsc::Sender<InboxMessage>,
+    to_diff: Vec<(usize, Changeset)>,
+    gen: u64,
+    current_idx: Option<usize>,
+) {
+    thread::spawn(move || {
+        let n = to_diff.len();
+        if n == 0 {
+            return;
+        }
+        // The active changeset first (if it's among these pairs at all), then input order for
+        // the rest — the changeset the user lands on becomes interactive earliest (ADR-037's
+        // "Slots"). `current_pos` is a position WITHIN `to_diff`, not the stack index itself.
+        let current_pos = current_idx.and_then(|ci| to_diff.iter().position(|(idx, _)| *idx == ci));
+        let mut order: Vec<usize> = Vec::with_capacity(n);
+        order.extend(current_pos);
+        order.extend((0..n).filter(|&i| Some(i) != current_pos));
+
+        let workers = thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .min(n);
+        let chunk = n.div_ceil(workers.max(1));
+
+        thread::scope(|scope| {
+            for pos_chunk in order.chunks(chunk) {
+                let tx = tx.clone();
+                let to_diff = &to_diff;
+                let repo_path = &repo_path;
+                scope.spawn(move || {
+                    let repo = match Repository::open(repo_path) {
+                        Ok(repo) => repo,
+                        Err(err) => {
+                            let message = err.to_string();
+                            for &pos in pos_chunk {
+                                let (idx, _) = &to_diff[pos];
+                                if tx
+                                    .send(Ok(AppEvent::ChangesetReady {
+                                        gen,
+                                        idx: *idx,
+                                        result: Err(message.clone()),
+                                    }))
+                                    .is_err()
+                                {
+                                    return; // main loop is gone
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    for &pos in pos_chunk {
+                        let (idx, cs) = &to_diff[pos];
+                        let result = diff_changeset(&repo, cs).map_err(|e| e.to_string());
+                        if tx
+                            .send(Ok(AppEvent::ChangesetReady {
+                                gen,
+                                idx: *idx,
+                                result,
+                            }))
+                            .is_err()
+                        {
+                            return; // main loop is gone; nothing left to forward to
+                        }
+                    }
+                });
+            }
+        });
+    });
+}
+
+/// The ADR-037 pipeline handles [`event_loop`] needs to dispatch off-thread work — bundled into
+/// one struct (rather than four separate parameters) so `event_loop` stays under clippy's
+/// `too_many_arguments`. `inbox` is the single shared receiver; `load_tx`/`wave_tx` dispatch to
+/// the loader thread and a fresh diff-wave thread respectively; `repo_path` is what any
+/// newly-spawned wave thread opens its own `Repository` handle against (a refresh can queue a
+/// wave well after startup, so this is kept around for the whole loop, not just its setup).
+#[derive(Clone, Copy)]
+struct Pipeline<'a> {
+    inbox: &'a mpsc::Receiver<InboxMessage>,
+    load_tx: &'a mpsc::Sender<LoadRequest>,
+    wave_tx: &'a mpsc::Sender<InboxMessage>,
+    repo_path: &'a Path,
+}
+
+/// Receive the next event from `inbox`, waiting up to `timeout`. A timeout with nothing received
+/// yields `Ok(AppEvent::Tick)` — the loop's regular redraw beat, and the mechanism the M4 index
+/// watcher polls on (see the module doc). A disconnected inbox (the input thread panicked, or
+/// exited after an error without this being observed yet) is surfaced as an `io::Error` rather
+/// than spinning — the loop must exit, not busy-loop on an empty channel forever.
+fn recv_event(inbox: &mpsc::Receiver<InboxMessage>, timeout: Duration) -> io::Result<AppEvent> {
+    match inbox.recv_timeout(timeout) {
+        Ok(Ok(event)) => Ok(event),
+        Ok(Err(err)) => Err(err),
+        Err(mpsc::RecvTimeoutError::Timeout) => Ok(AppEvent::Tick),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(
+            "review TUI input thread disconnected without a final error",
+        )),
+    }
 }
 
 /// Cap on how many events [`drain_pending`] batches per iteration — leftover input past this
-/// count is simply picked up by the next iteration's `next_event` call.
+/// count is simply picked up by the next iteration's `recv_event` call.
 const MAX_DRAIN_BATCH: usize = 128;
 
-/// Drain all immediately-available terminal events into `batch`, mapping them exactly like
-/// [`next_event`]'s read arm (key-press and resize map; release/repeat/mouse/paste/focus are
-/// skipped, not pushed). Unlike calling `next_event(Duration::ZERO)` in a loop, a not-ready poll
-/// here simply stops draining — it must NOT fabricate a `Tick`, since `next_event`'s `!poll` arm
-/// exists solely to give the loop its regular redraw beat on a real timeout, and reusing it here
-/// would inject a spurious tick at the end of every drain.
-fn drain_pending(batch: &mut Vec<AppEvent>) -> io::Result<()> {
+/// Drain all immediately-available events from `inbox` into `batch`. Unlike calling
+/// `recv_event(inbox, Duration::ZERO)` in a loop, an empty inbox here simply stops draining — it
+/// must NOT fabricate a `Tick`, since [`recv_event`]'s timeout arm exists solely to give the loop
+/// its regular redraw beat on a real timeout, and reusing it here would inject a spurious tick at
+/// the end of every drain.
+fn drain_pending(
+    inbox: &mpsc::Receiver<InboxMessage>,
+    batch: &mut Vec<AppEvent>,
+) -> io::Result<()> {
     while batch.len() < MAX_DRAIN_BATCH {
-        if !event::poll(Duration::ZERO)? {
-            break;
-        }
-        match event::read()? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => batch.push(AppEvent::Key(key)),
-            Event::Resize(w, h) => batch.push(AppEvent::Resize(w, h)),
-            _ => {}
+        match inbox.try_recv() {
+            Ok(Ok(event)) => batch.push(event),
+            Ok(Err(err)) => return Err(err),
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::other(
+                    "review TUI input thread disconnected without a final error",
+                ))
+            }
         }
     }
     Ok(())
@@ -356,6 +667,19 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             false
         }
         AppEvent::Resize(_, _) => false,
+        AppEvent::FileReady {
+            gen,
+            cs_idx,
+            file_idx,
+            result,
+        } => {
+            app.apply_file_ready(gen, cs_idx, file_idx, result);
+            false
+        }
+        AppEvent::ChangesetReady { gen, idx, result } => {
+            app.apply_changeset_ready(gen, idx, result);
+            false
+        }
     }
 }
 
@@ -567,10 +891,82 @@ impl Tui {
     /// Run the main loop against `app`, then restore the terminal. Callers must have already
     /// called `app.open_current()` — under CS4's deferred-load mode (`app.set_defer_loads(true)`,
     /// `main.rs`'s default) that call marks the open PENDING rather than loading eagerly, so the
-    /// first frame shows CS4's placeholder for one `OPEN_DEBOUNCE` window instead of blocking on
-    /// the initial file's load; a caller that never turned defer mode on gets eager behavior.
-    pub fn run(&mut self, app: &mut App, keymap: &Keymap, theme: &Palette) -> io::Result<()> {
-        let result = event_loop(&mut self.terminal, app, keymap, theme);
+    /// first frame shows CS4's placeholder until the ADR-037 loader thread answers (or a
+    /// force-completion chokepoint loads it synchronously first); a caller that never turned defer
+    /// mode on gets eager behavior.
+    ///
+    /// `repo_path` opens the loader thread's OWN `Repository` handle — a second handle onto the
+    /// same on-disk repo `app` already holds one of, exactly like `crate::acquire::diff_changesets`'s
+    /// worker threads (`app` can't hand its handle across threads: `git2::Repository` is `Send`
+    /// but not `Sync`).
+    ///
+    /// Builds the single ADR-037 inbox HERE and spawns both the input thread and the loader thread
+    /// against clones of its sender — after the terminal is fully acquired (`self` already exists,
+    /// so raw mode and the alternate screen are live) and after every earlier tty consumer
+    /// (`main.rs`'s theme probe and its stray-input flush) has already run, since those must own
+    /// the tty before crossterm's event stream has a reader racing them. Neither thread is joined:
+    /// when `run` returns, `main` returns, and the process takes both down (ADR-037's kill-on-exit
+    /// lifecycle — neither thread ever writes, so an abandoned one can't corrupt anything).
+    pub fn run(
+        &mut self,
+        app: &mut App,
+        keymap: &Keymap,
+        theme: &Palette,
+        repo_path: PathBuf,
+    ) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        spawn_input_thread(tx.clone());
+        let load_tx = spawn_loader_thread(repo_path.clone(), tx.clone());
+        let pipeline = Pipeline {
+            inbox: &rx,
+            load_tx: &load_tx,
+            wave_tx: &tx,
+            repo_path: &repo_path,
+        };
+        let result = event_loop(&mut self.terminal, app, keymap, theme, &pipeline);
+        let restored = self.restore();
+        result.and(restored)
+    }
+
+    /// ADR-037's streamed-launch counterpart to [`Self::run`]: for a stack of MORE than one
+    /// changeset, `main.rs` calls this instead — `app` is already constructible from
+    /// resolved-but-undiffed changesets (every slot `Pending`), and this is what starts the
+    /// diffing itself, alongside the input/loader threads `run` always spawns. No splash: the
+    /// first frame `event_loop` draws IS the live outline with `Pending` rows (see
+    /// `main.rs`'s block comment on the `changesets.len()` fork).
+    ///
+    /// `changesets` is the SAME resolved list `app`'s `Pending` slots were built from — handed
+    /// here (rather than re-read off `app`) since `App` only keeps [`workon_review::app::
+    /// ChangesetView`]s, not the bare [`Changeset`]s the wave diffs against.
+    pub fn run_streamed(
+        &mut self,
+        app: &mut App,
+        keymap: &Keymap,
+        theme: &Palette,
+        repo_path: PathBuf,
+        changesets: Vec<Changeset>,
+    ) -> io::Result<()> {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        spawn_input_thread(tx.clone());
+        let load_tx = spawn_loader_thread(repo_path.clone(), tx.clone());
+        // `App::from_changesets` (which built `app`'s all-`Pending` slots) picked `current_cs`
+        // via the same lib-`current` lookup this enumeration mirrors, so `app.current_cs()` IS
+        // that changeset's index into `to_diff` here — no separate lookup needed.
+        let to_diff: Vec<(usize, Changeset)> = changesets.into_iter().enumerate().collect();
+        spawn_wave_thread(
+            repo_path.clone(),
+            tx.clone(),
+            to_diff,
+            app.generation(),
+            Some(app.current_cs()),
+        );
+        let pipeline = Pipeline {
+            inbox: &rx,
+            load_tx: &load_tx,
+            wave_tx: &tx,
+            repo_path: &repo_path,
+        };
+        let result = event_loop(&mut self.terminal, app, keymap, theme, &pipeline);
         let restored = self.restore();
         result.and(restored)
     }
@@ -618,7 +1014,14 @@ fn event_loop<W: Write>(
     app: &mut App,
     keymap: &Keymap,
     theme: &Palette,
+    pipeline: &Pipeline<'_>,
 ) -> io::Result<()> {
+    let Pipeline {
+        inbox,
+        load_tx,
+        wave_tx,
+        repo_path,
+    } = *pipeline;
     let mut pending: Vec<KeyPress> = Vec::new();
     let mut quit = false;
 
@@ -629,25 +1032,53 @@ fn event_loop<W: Write>(
             return Ok(());
         }
 
-        // While an open is pending, poll on the short debounce window instead of the regular
-        // 200ms redraw beat, so the deferred load runs promptly once input goes quiet — a plain
-        // timeout (no new terminal event) is what "quiet" means here. This borrows the same
-        // `Tick` beat the M4 index watcher already polls on (see the module doc); the watcher
-        // occasionally running ~120ms early during a debounce window is harmless (its own doc
-        // comment already tolerates an "unseen" signature settling one tick late).
+        // While an open is pending, wait on the short debounce window instead of the regular
+        // 200ms redraw beat, so the deferred load's request goes out promptly once input goes
+        // quiet — a plain timeout (no new inbox message) is what "quiet" means here. This borrows
+        // the same `Tick` beat the M4 index watcher already polls on (see the module doc); the
+        // watcher occasionally running ~120ms early during a debounce window is harmless (its own
+        // doc comment already tolerates an "unseen" signature settling one tick late).
         let timeout = if app.open_pending() {
             OPEN_DEBOUNCE
         } else {
             Duration::from_millis(200)
         };
 
-        if let Some(event) = next_event(timeout)? {
-            if matches!(event, AppEvent::Tick) && app.open_pending() {
-                app.complete_pending_open();
+        let event = recv_event(inbox, timeout)?;
+        // ADR-037: the debounce-fired deferred open is now an ASYNC `LoadFile` request rather
+        // than a synchronous `complete_pending_open` — the placeholder keeps rendering until the
+        // loader's `FileReady` result lands (or a force-completion chokepoint loads it
+        // synchronously first, e.g. the user presses `j` before the loader answers).
+        // `take_pending_load_spec` is idempotent across repeated debounce-window Ticks: it
+        // returns `None` once a request has already gone out for the current pending open.
+        if matches!(event, AppEvent::Tick) && app.open_pending() {
+            if let Some((gen, cs_idx, file_idx, spec)) = app.take_pending_load_spec() {
+                let _ = load_tx.send(LoadRequest {
+                    gen,
+                    cs_idx,
+                    file_idx,
+                    spec,
+                });
             }
-            let mut batch = vec![event];
-            drain_pending(&mut batch)?;
-            quit = update_batch(app, keymap, &mut pending, batch);
+        }
+        let mut batch = vec![event];
+        drain_pending(inbox, &mut batch)?;
+        quit = update_batch(app, keymap, &mut pending, batch);
+
+        // ADR-037 "Refresh": every refresh trigger (`r`, the on-tick index watcher, a
+        // post-staging drain) runs through `App::refresh` somewhere inside the `update_batch`
+        // call above, however deeply nested — `App` itself never touches a thread, so it just
+        // queues the span-keyed-reuse leftovers on `Self::pending_wave` for whoever's holding the
+        // thread-spawning ability to pick up. This ONE checkpoint, run after every batch, is that
+        // pickup: it covers every refresh trigger uniformly with no per-trigger wiring.
+        if let Some((gen, to_diff)) = app.take_pending_wave() {
+            spawn_wave_thread(
+                repo_path.to_path_buf(),
+                wave_tx.clone(),
+                to_diff,
+                gen,
+                Some(app.current_cs()),
+            );
         }
     }
 }
@@ -664,6 +1095,128 @@ mod tests {
 
     fn ctrl_key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    // ── ADR-037: input thread's pure mapping + inbox draining ──────────────────
+
+    #[test]
+    fn map_terminal_event_maps_key_press_and_resize() {
+        assert_eq!(
+            map_terminal_event(Event::Key(key(KeyCode::Char('q')))),
+            Some(AppEvent::Key(key(KeyCode::Char('q'))))
+        );
+        assert_eq!(
+            map_terminal_event(Event::Resize(80, 24)),
+            Some(AppEvent::Resize(80, 24))
+        );
+    }
+
+    #[test]
+    fn map_terminal_event_skips_release_repeat_mouse_paste_and_focus() {
+        use crossterm::event::{KeyEventState, MouseEvent, MouseEventKind};
+
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
+        assert_eq!(map_terminal_event(Event::Key(release)), None);
+
+        let repeat = KeyEvent::new_with_kind_and_state(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+            KeyEventState::NONE,
+        );
+        assert_eq!(map_terminal_event(Event::Key(repeat)), None);
+
+        assert_eq!(
+            map_terminal_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })),
+            None
+        );
+        assert_eq!(map_terminal_event(Event::Paste("pasted".to_string())), None);
+        assert_eq!(map_terminal_event(Event::FocusGained), None);
+        assert_eq!(map_terminal_event(Event::FocusLost), None);
+    }
+
+    /// `AppEvent` dropped `PartialEq`/`Eq` in ADR-037 (`FileReady`'s `LoadedViews` payload wraps
+    /// `FileView`, which has neither) — this test-only helper is the `matches!`-based replacement
+    /// for the `assert_eq!(event, AppEvent::Key(key(...)))` shape used throughout this module's
+    /// tests. Only compares `code`/`modifiers`/`kind` (what `key(...)`/`ctrl_key(...)` set), same
+    /// fields a `PartialEq` derive on `KeyEvent` itself would have compared.
+    fn is_key_event(event: &AppEvent, expected: KeyEvent) -> bool {
+        matches!(event, AppEvent::Key(k) if *k == expected)
+    }
+
+    #[test]
+    fn recv_event_yields_tick_on_a_plain_timeout() {
+        let (_tx, rx) = mpsc::channel::<InboxMessage>();
+        let event = recv_event(&rx, Duration::from_millis(5)).expect("timeout is not an error");
+        assert!(matches!(event, AppEvent::Tick));
+    }
+
+    #[test]
+    fn recv_event_forwards_a_sent_event_before_the_timeout() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Ok(AppEvent::Key(key(KeyCode::Char('q'))))).unwrap();
+        let event = recv_event(&rx, Duration::from_secs(1)).unwrap();
+        assert!(is_key_event(&event, key(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn recv_event_propagates_a_forwarded_read_error() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Err(io::Error::other("read failed"))).unwrap();
+        let err = recv_event(&rx, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.to_string(), "read failed");
+    }
+
+    #[test]
+    fn recv_event_errors_when_the_inbox_disconnects_instead_of_spinning() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        drop(tx);
+        let result = recv_event(&rx, Duration::from_millis(5));
+        assert!(
+            result.is_err(),
+            "a disconnected inbox must surface as an error, not a Tick"
+        );
+    }
+
+    #[test]
+    fn drain_pending_collects_everything_immediately_available_without_a_tick() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Ok(AppEvent::Key(key(KeyCode::Char('a'))))).unwrap();
+        tx.send(Ok(AppEvent::Key(key(KeyCode::Char('b'))))).unwrap();
+        let mut batch = Vec::new();
+        drain_pending(&rx, &mut batch).unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(is_key_event(&batch[0], key(KeyCode::Char('a'))));
+        assert!(is_key_event(&batch[1], key(KeyCode::Char('b'))));
+    }
+
+    #[test]
+    fn drain_pending_stops_on_an_empty_inbox_without_fabricating_a_tick() {
+        let (_tx, rx) = mpsc::channel::<InboxMessage>();
+        let mut batch = Vec::new();
+        drain_pending(&rx, &mut batch).unwrap();
+        assert!(
+            batch.is_empty(),
+            "an empty inbox must not inject a spurious Tick"
+        );
+    }
+
+    #[test]
+    fn drain_pending_propagates_a_forwarded_read_error() {
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        tx.send(Err(io::Error::other("read failed"))).unwrap();
+        let mut batch = Vec::new();
+        let err = drain_pending(&rx, &mut batch).unwrap_err();
+        assert_eq!(err.to_string(), "read failed");
     }
 
     #[test]
@@ -855,6 +1408,88 @@ mod tests {
         let owned = Repository::open(repo.workdir().expect("fixture has a workdir"))
             .expect("reopen fixture repo");
         App::new(owned, diffs)
+    }
+
+    // ── ADR-037: the loader job's pure body ──────────────────────────────────────
+
+    #[test]
+    fn panic_message_reads_a_str_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(panic_message(payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_reads_a_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        assert_eq!(panic_message(payload), "boom");
+    }
+
+    #[test]
+    fn panic_message_falls_back_for_a_non_string_payload() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42_i32);
+        assert_eq!(panic_message(payload), "loader job panicked");
+    }
+
+    #[test]
+    fn run_load_job_result_matches_a_synchronous_ensure_loaded() {
+        use git_workon_fixture::prelude::*;
+        use workon_review::app::Role;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut eager = app_from_fixture(&fixture);
+        eager.ensure_loaded(0);
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+        let eager_old_text = eager_view.old_text().to_string();
+        let eager_new_text = eager_view.new_text().to_string();
+
+        // Same two-handle shape the real loader thread uses: `app`'s own repo builds the spec,
+        // a SEPARATE repo + highlighter (standing in for `spawn_loader_thread`'s own) runs the
+        // job.
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        let (gen, cs_idx, file_idx, spec) = app
+            .take_pending_load_spec()
+            .expect("a fresh pending open has an undispatched spec");
+
+        let repo = fixture.repo().unwrap();
+        let loader_repo = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut loader_ts = TsHighlighter::new();
+        let event = run_load_job(
+            &loader_repo,
+            &mut loader_ts,
+            LoadRequest {
+                gen,
+                cs_idx,
+                file_idx,
+                spec,
+            },
+        );
+
+        let AppEvent::FileReady {
+            gen: got_gen,
+            cs_idx: got_cs_idx,
+            file_idx: got_file_idx,
+            result,
+        } = event
+        else {
+            panic!("run_load_job must return a FileReady event");
+        };
+        assert_eq!(got_gen, gen);
+        assert_eq!(got_cs_idx, cs_idx);
+        assert_eq!(got_file_idx, file_idx);
+
+        let LoadedViews::Single(role, Some(view)) = result.expect("job must not fail") else {
+            panic!("expected a loaded single-role view");
+        };
+        assert_eq!(role, Role::Unstaged, "a.txt has only an unstaged change");
+        assert_eq!(view.old_text(), eager_old_text);
+        assert_eq!(view.new_text(), eager_new_text);
     }
 
     #[test]
@@ -1568,14 +2203,19 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending_batch: Vec<KeyPress> = Vec::new();
         let mut pending_seq: Vec<KeyPress> = Vec::new();
-        let events = vec![
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-        ];
+        // `AppEvent` isn't `Clone` (ADR-037: `FileReady`'s payload wraps a non-`Clone`
+        // `FileView`), so the batch/sequential runs each build their own copy of the same
+        // three-key press sequence rather than sharing one `Vec` via `.clone()`.
+        let build_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+            ]
+        };
 
-        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
-        for event in events {
+        update_batch(&mut app_batch, &km, &mut pending_batch, build_events());
+        for event in build_events() {
             update(&mut app_seq, &km, &mut pending_seq, event);
         }
 
@@ -1604,15 +2244,19 @@ mod tests {
         let km = Keymap::defaults();
         let mut pending_batch: Vec<KeyPress> = Vec::new();
         let mut pending_seq: Vec<KeyPress> = Vec::new();
-        let events = vec![
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-            AppEvent::Key(key(KeyCode::Char('k'))),
-        ];
+        // See the sibling test above for why this builds two independent copies rather than
+        // cloning one `Vec<AppEvent>`.
+        let build_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+                AppEvent::Key(key(KeyCode::Char('k'))),
+            ]
+        };
 
-        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
-        for event in events {
+        update_batch(&mut app_batch, &km, &mut pending_batch, build_events());
+        for event in build_events() {
             update(&mut app_seq, &km, &mut pending_seq, event);
         }
         assert_eq!(app_batch.cursor, app_seq.cursor);
@@ -1631,18 +2275,20 @@ mod tests {
         let mut app_seq2 = many_files_app(&fixture_seq2, 1);
         let mut pending_batch2: Vec<KeyPress> = Vec::new();
         let mut pending_seq2: Vec<KeyPress> = Vec::new();
-        let boundary_events = vec![
-            AppEvent::Key(key(KeyCode::Char('k'))),
-            AppEvent::Key(key(KeyCode::Char('j'))),
-        ];
+        let build_boundary_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('k'))),
+                AppEvent::Key(key(KeyCode::Char('j'))),
+            ]
+        };
 
         update_batch(
             &mut app_batch2,
             &km,
             &mut pending_batch2,
-            boundary_events.clone(),
+            build_boundary_events(),
         );
-        for event in boundary_events {
+        for event in build_boundary_events() {
             update(&mut app_seq2, &km, &mut pending_seq2, event);
         }
         assert_eq!(app_batch2.cursor, app_seq2.cursor);
@@ -1716,13 +2362,15 @@ mod tests {
         let mut pending_batch: Vec<KeyPress> = Vec::new();
         let mut pending_seq: Vec<KeyPress> = Vec::new();
         let cursor_before = app_batch.cursor;
-        let events = vec![
-            AppEvent::Key(key(KeyCode::Char('j'))), // swallowed by the confirm modal
-            AppEvent::Key(key(KeyCode::Char('n'))), // cancels the confirm
-        ];
+        let build_events = || {
+            vec![
+                AppEvent::Key(key(KeyCode::Char('j'))), // swallowed by the confirm modal
+                AppEvent::Key(key(KeyCode::Char('n'))), // cancels the confirm
+            ]
+        };
 
-        update_batch(&mut app_batch, &km, &mut pending_batch, events.clone());
-        for event in events {
+        update_batch(&mut app_batch, &km, &mut pending_batch, build_events());
+        for event in build_events() {
             update(&mut app_seq, &km, &mut pending_seq, event);
         }
 
@@ -1949,6 +2597,200 @@ mod tests {
         assert!(
             top_row.contains("resolving changesets…"),
             "splash frame must show the launch-activity message, got: {top_row:?}"
+        );
+    }
+
+    // ── ADR-037: real-thread integration smoke ─────────────────────────────────
+
+    /// ADR-037's Testing layer 3, part one: the ONE test in this module that spawns the REAL
+    /// [`spawn_loader_thread`]/[`spawn_wave_thread`] against real `mpsc` channels — everything
+    /// else in this file drives `update`/`update_batch` with synthetic events specifically to
+    /// avoid real threads (see the ADR's "Testing" decision: layers 1-2 are thread-free by
+    /// design). This is the one exception, confined here.
+    ///
+    /// Mirrors `main.rs`'s streamed-launch shape exactly: `App::from_changesets` over
+    /// all-`Pending` slots, `set_defer_loads(true)`, `open_current()`, then the same
+    /// `spawn_wave_thread` call `Tui::run_streamed` makes. From there this test plays the event
+    /// loop's OWN role by hand — draining the shared inbox and routing `ChangesetReady`/
+    /// `FileReady` through the exact chokepoints `update`'s match arms call
+    /// (`App::apply_changeset_ready`/`App::apply_file_ready`), plus the same post-batch
+    /// `take_pending_load_spec` dispatch `event_loop` runs on every idle tick while an open is
+    /// pending — except here it's driven the instant the active changeset seats, not gated behind
+    /// a real debounce `Tick`, since nothing here is racing real terminal input.
+    ///
+    /// Bounded by `recv_timeout` per receive (not a wall-clock test deadline): a wedged thread
+    /// times out and fails loudly rather than hanging the suite, but a healthy run's actual
+    /// duration is however long the real diff/load work takes — no sleeping, no fixed budget, so
+    /// this stays load-tolerant enough to run unconditionally (unlike `pty_responsiveness.rs`'s
+    /// `#[ignore]` siblings, which assert actual elapsed wall-clock time).
+    #[test]
+    fn real_threads_stream_a_wave_and_complete_a_deferred_file_open() {
+        use git_workon_fixture::prelude::*;
+        use workon::{Changeset, ChangesetSpan};
+        use workon_review::app::ChangesetView;
+
+        // A 4-changeset committed stack, each adding one file — the streamed-launch "multi-
+        // changeset fixture stack" the plan calls for, deep enough that the wave has real
+        // fan-out work (`spawn_wave_thread` stripes across `available_parallelism` workers) and
+        // that the ACTIVE (last, `current: true`) changeset has a real, uncached file for the
+        // deferred-open assertion.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let c1 = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("c1")
+            .unwrap();
+        let c2 = fixture
+            .commit("main")
+            .file("b.txt", "b\n")
+            .create("c2")
+            .unwrap();
+        let c3 = fixture
+            .commit("main")
+            .file("c.txt", "c\n")
+            .create("c3")
+            .unwrap();
+        let c4 = fixture
+            .commit("main")
+            .file("d.txt", "d\n")
+            .create("c4")
+            .unwrap();
+
+        let bare = |name: &str, base, head, current| Changeset {
+            name: name.to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current,
+            needs_restack: false,
+        };
+        let changesets = vec![
+            bare("cs-1", root, c1, false),
+            bare("cs-2", c1, c2, false),
+            bare("cs-3", c2, c3, false),
+            bare("cs-4", c3, c4, true),
+        ];
+
+        let repo = fixture.repo().unwrap();
+        let repo_path = repo.workdir().unwrap().to_path_buf();
+        let owned = Repository::open(&repo_path).unwrap();
+
+        let pending_views: Vec<ChangesetView> = changesets
+            .iter()
+            .cloned()
+            .map(ChangesetView::pending)
+            .collect();
+        let mut app = App::from_changesets(owned, pending_views);
+        app.set_defer_loads(true);
+        app.open_current();
+
+        let active_idx = app.current_cs();
+        assert_eq!(
+            active_idx, 3,
+            "the lib-current changeset (cs-4) opens active"
+        );
+        assert!(app.is_current_pending(), "every slot starts Pending");
+
+        let (tx, rx) = mpsc::channel::<InboxMessage>();
+        let load_tx = spawn_loader_thread(repo_path.clone(), tx.clone());
+        let to_diff: Vec<(usize, Changeset)> = changesets.into_iter().enumerate().collect();
+        spawn_wave_thread(
+            repo_path.clone(),
+            tx.clone(),
+            to_diff,
+            app.generation(),
+            Some(active_idx),
+        );
+        drop(tx); // this test's only senders now are the two spawned threads
+
+        let deadline_per_recv = Duration::from_secs(15);
+        let mut changesets_ready = vec![false; app.changeset_count()];
+        let mut active_file_loaded = false;
+        let mut dispatched_active_load = false;
+
+        loop {
+            if changesets_ready.iter().all(|&r| r) && active_file_loaded {
+                break;
+            }
+            let event = rx
+                .recv_timeout(deadline_per_recv)
+                .expect("loader/wave thread must answer within the deadline")
+                .expect("neither real thread should forward a read error in this test");
+
+            match event {
+                AppEvent::ChangesetReady { gen, idx, result } => {
+                    assert!(
+                        result.is_ok(),
+                        "a committed changeset diff must not fail here"
+                    );
+                    app.apply_changeset_ready(gen, idx, result);
+                    changesets_ready[idx] = true;
+                }
+                AppEvent::FileReady {
+                    gen,
+                    cs_idx,
+                    file_idx,
+                    result,
+                } => {
+                    assert!(result.is_ok(), "a real file load must not fail here");
+                    app.apply_file_ready(gen, cs_idx, file_idx, result);
+                    if cs_idx == active_idx && file_idx == 0 {
+                        active_file_loaded = true;
+                    }
+                }
+                other => panic!("unexpected event in the real-thread smoke: {other:?}"),
+            }
+
+            // The same post-batch checkpoint `event_loop` runs on every idle `Tick` while an
+            // open is pending — dispatched here the instant it's possible (right after the
+            // active changeset seats) rather than gated behind a real debounce, since nothing in
+            // this test races real terminal input.
+            if !dispatched_active_load && app.open_pending() {
+                if let Some((gen, cs_idx, file_idx, spec)) = app.take_pending_load_spec() {
+                    load_tx
+                        .send(LoadRequest {
+                            gen,
+                            cs_idx,
+                            file_idx,
+                            spec,
+                        })
+                        .expect("loader thread must still be alive to receive the dispatch");
+                    dispatched_active_load = true;
+                }
+            }
+        }
+
+        assert!(
+            changesets_ready.iter().all(|&r| r),
+            "every slot must land Ready: {changesets_ready:?}"
+        );
+        assert!(
+            !app.is_current_pending(),
+            "the active changeset must be seated once its wave result lands"
+        );
+        assert_eq!(
+            app.current_cs(),
+            active_idx,
+            "seating must not move which changeset is active"
+        );
+        assert!(
+            active_file_loaded,
+            "the active changeset's deferred file open must complete via a real FileReady"
+        );
+        assert!(
+            !app.open_pending(),
+            "a completed FileReady must clear the pending-open flag"
+        );
+        assert!(
+            app.current_view_ref().is_some(),
+            "the active file's view must be cached after its FileReady lands"
         );
     }
 }

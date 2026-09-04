@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use ratatui::style::Color;
 
+use crate::probe_cache;
 use crate::theme::{self, tint_toward, Base16, Palette};
 
 /// The colors read back from a terminal OSC probe. `ansi16` is `Some` only if **all 16** ANSI
@@ -65,8 +66,31 @@ pub struct ProbeResult {
 /// full deadline — and giving up early on a merely-slow terminal is worse than the wait, because
 /// replies that arrive after the probe stopped listening leak into crossterm as phantom
 /// keystrokes (`r` → refresh storms, `d` → a discard confirm that captures the keyboard).
-pub fn detect_auto_palette() -> Palette {
-    palette_for_auto(&probe_terminal(Duration::from_millis(800)))
+///
+/// [`crate::probe_cache`] remembers a terminal that has already paid this deadline and gotten
+/// nothing back: when this launch's controlling terminal has a live "silent" verdict cached, the
+/// probe is skipped entirely and the curated fallback returns immediately (identical to what an
+/// empty probe result would have produced). A terminal that answers ANYTHING is never cached, so
+/// live detection keeps working there every launch.
+///
+/// The second element of the returned tuple is whether a real probe conversation happened on the
+/// controlling tty this call — `false` only on a cache hit. `main.rs` uses it (instead of just
+/// "theme was auto") to decide whether [`flush_pending_tty_input`] is needed: a cache hit writes
+/// nothing to the tty, so no replies are ever owed and flushing would only risk eating legitimate
+/// type-ahead (see that function's doc comment).
+pub fn detect_auto_palette() -> (Palette, bool) {
+    let key = probe_cache::terminal_key();
+    if key.as_ref().is_some_and(probe_cache::is_cached_silent) {
+        return (Palette::dark(), false);
+    }
+
+    let (probe, timed_out_silent) = probe_terminal(Duration::from_millis(800));
+    if timed_out_silent {
+        if let Some(key) = &key {
+            probe_cache::record_silent(key);
+        }
+    }
+    (palette_for_auto(&probe), true)
 }
 
 /// Discard any bytes pending on the controlling tty's input queue. `main.rs` calls this after the
@@ -148,19 +172,41 @@ pub fn build_base16(ansi: &[Color; 16], background: Color, foreground: Option<Co
 
 /// Run the tty probe, collapsing any failure to an empty [`ProbeResult`]. On non-unix platforms
 /// (no `/dev/tty` / `termios`) it always reports empty, so `auto` degrades to curated dark there.
-fn probe_terminal(timeout: Duration) -> ProbeResult {
+///
+/// The second element is `true` only when [`query_terminal_raw`] paid the FULL `timeout` and
+/// still got zero reply bytes — [`probe_cache`]'s one cacheable case. A terminal that answered
+/// (even partially) or a probe that couldn't even start (no `/dev/tty`, not a tty, a failed
+/// write) are both `false`: the former has nothing to cache, the latter never waited long enough
+/// for caching to save anything.
+fn probe_terminal(timeout: Duration) -> (ProbeResult, bool) {
     #[cfg(unix)]
     {
         match query_terminal_raw(&build_query(), timeout) {
-            Some(bytes) => parse_osc_replies(&bytes),
-            None => ProbeResult::default(),
+            ProbeOutcome::Replied(bytes) => (parse_osc_replies(&bytes), false),
+            ProbeOutcome::TimedOutSilent => (ProbeResult::default(), true),
+            ProbeOutcome::Unavailable => (ProbeResult::default(), false),
         }
     }
     #[cfg(not(unix))]
     {
         let _ = timeout;
-        ProbeResult::default()
+        (ProbeResult::default(), false)
     }
+}
+
+/// The outcome of one attempt at [`query_terminal_raw`] — distinguishes "the terminal answered"
+/// from the two different ways it can answer nothing, only one of which is worth caching (see
+/// [`probe_terminal`]'s doc comment).
+#[cfg(unix)]
+enum ProbeOutcome {
+    /// At least one reply byte arrived.
+    Replied(Vec<u8>),
+    /// The probe wrote its query, waited the full `timeout`, and got nothing back — the terminal
+    /// this launch already paid the deadline for.
+    TimedOutSilent,
+    /// Probing wasn't possible this launch at all (no `/dev/tty`, not a tty, the query write
+    /// failed) — always fast, never worth remembering.
+    Unavailable,
 }
 
 /// The bytes we write to the terminal: `OSC 4;n;?` for each of the 16 ANSI colors, then
@@ -312,24 +358,31 @@ fn has_da1_terminator(bytes: &[u8]) -> bool {
 /// is the one function the unit tests do NOT call (it needs a real tty); everything it feeds
 /// ([`parse_osc_replies`], [`build_base16`], [`palette_for_auto`]) is pure and tested directly.
 ///
-/// Returns the raw reply bytes, or `None` if `/dev/tty` can't be opened, isn't a tty, or the read
-/// yields nothing before the timeout. `None` and an empty read both degrade to the curated
-/// fallback upstream.
+/// Returns a [`ProbeOutcome`]: `Replied` bytes, `TimedOutSilent` when the full `timeout` elapsed
+/// with nothing back, or `Unavailable` when `/dev/tty` can't be opened, isn't a tty, or the query
+/// write itself fails (all of which return fast, well under `timeout`). The
+/// `elapsed >= timeout` check distinguishing the latter two is deliberately a wall-clock
+/// comparison rather than a distinct signal threaded up from [`read_replies`] — it needs no
+/// change to that function or its already-covered unit tests, and the two cases are only ever
+/// milliseconds vs. the full deadline apart.
 #[cfg(unix)]
-fn query_terminal_raw(query: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+fn query_terminal_raw(query: &[u8], timeout: Duration) -> ProbeOutcome {
     use std::os::unix::io::AsRawFd;
+    use std::time::Instant;
 
-    let mut tty = std::fs::File::options()
+    let Ok(mut tty) = std::fs::File::options()
         .read(true)
         .write(true)
         .open("/dev/tty")
-        .ok()?;
+    else {
+        return ProbeOutcome::Unavailable;
+    };
     let fd = tty.as_raw_fd();
 
     // Save the current termios; bail (leaving the tty untouched) if this isn't a tty.
     let mut saved: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut saved) } != 0 {
-        return None;
+        return ProbeOutcome::Unavailable;
     }
 
     // Switch to raw so the OSC replies (terminated by ST/BEL, not newline) arrive uncooked and
@@ -341,9 +394,10 @@ fn query_terminal_raw(query: &[u8], timeout: Duration) -> Option<Vec<u8>> {
     raw.c_cc[libc::VMIN] = 0;
     raw.c_cc[libc::VTIME] = 1;
     if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
-        return None; // termios unchanged — nothing to restore
+        return ProbeOutcome::Unavailable; // termios unchanged — nothing to restore
     }
 
+    let started = Instant::now();
     let outcome = read_replies(&mut tty, fd, query, timeout);
 
     // Discard anything still in the terminal's input queue before handing the tty back — a
@@ -356,7 +410,12 @@ fn query_terminal_raw(query: &[u8], timeout: Duration) -> Option<Vec<u8>> {
 
     // ALWAYS restore, on success or failure.
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &saved) };
-    outcome
+
+    match outcome {
+        Some(bytes) => ProbeOutcome::Replied(bytes),
+        None if started.elapsed() >= timeout => ProbeOutcome::TimedOutSilent,
+        None => ProbeOutcome::Unavailable, // the query write failed — an early bail, not a wait
+    }
 }
 
 /// The read half of [`query_terminal_raw`], factored out so `termios` restoration wraps it on

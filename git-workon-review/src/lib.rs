@@ -25,6 +25,7 @@ pub mod keymap;
 pub mod model;
 pub mod ops;
 pub mod outline;
+pub mod probe_cache;
 pub mod queue;
 pub mod refresh;
 pub mod render;
