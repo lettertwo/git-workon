@@ -134,11 +134,9 @@ pub fn resolve_changesets(
     head_branch: &str,
 ) -> Result<Vec<Changeset>, DiffError> {
     match StackModel::detect(repo) {
-        StackModel::Graphite => Ok(assemble_changesets(
-            repo,
-            head_branch,
-            StackModel::Graphite,
-        )?),
+        model @ (StackModel::Graphite | StackModel::GhStack) => {
+            Ok(assemble_changesets(repo, head_branch, model)?)
+        }
         StackModel::None | StackModel::Git => Ok(vec![Changeset {
             name: head_branch.to_string(),
             source: ChangesetSource::Uncommitted,
