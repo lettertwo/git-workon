@@ -7,7 +7,7 @@
 
 use git2::{BranchType, Oid, Repository};
 use git_workon_fixture::prelude::*;
-use workon::{assemble_changesets, Changeset, ChangesetSource, StackModel};
+use workon::{assemble_changesets, Changeset, ChangesetSpan, StackModel, UncommittedLayer};
 use workon_review::acquire::{diff_changeset, diff_committed, diff_uncommitted, ChangesetDiff};
 use workon_review::error::DiffError;
 use workon_review::model::{FileStatus, LineKind};
@@ -450,7 +450,8 @@ fn diff_changeset_over_real_graphite_stack() -> Result<(), Box<dyn std::error::E
     let a_head = commit_onto(repo, &main_commit, "feature.txt", "hello\n");
     fixture.update_branch("a", a_head)?;
 
-    let changesets = assemble_changesets(repo, "a", StackModel::Graphite)?;
+    let changesets =
+        assemble_changesets(repo, "a", StackModel::Graphite, UncommittedLayer::Include)?;
     let a_cs = changesets
         .iter()
         .find(|c| c.name == "a")
@@ -469,6 +470,95 @@ fn diff_changeset_over_real_graphite_stack() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+fn diff_changesets_matches_sequential_diff_changeset_in_input_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // A two-branch Graphite stack plus the uncommitted layer: exercises every span kind the
+    // parallel fan-out stripes across workers (Committed × 2, Uncommitted) in one call.
+    let fixture = FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .graphite_config(&["main"])
+        .branch_metadata("a", "main")
+        .branch_metadata("b", "a")
+        .unstaged_file("tracked.txt", "line1\nline2\n", "line1\nCHANGED\n")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    // Advance "a" and "b" independently so each committed changeset has its own diff.
+    let main_tip = repo
+        .find_branch("main", BranchType::Local)?
+        .get()
+        .target()
+        .unwrap();
+    let a_head = commit_onto(repo, &repo.find_commit(main_tip)?, "a.txt", "from a\n");
+    fixture.update_branch("a", a_head)?;
+    let b_head = commit_onto(repo, &repo.find_commit(a_head)?, "b.txt", "from b\n");
+    fixture.update_branch("b", b_head)?;
+
+    let changesets =
+        assemble_changesets(repo, "b", StackModel::Graphite, UncommittedLayer::Include)?;
+    assert!(
+        changesets.len() >= 3,
+        "expected two committed changesets plus the uncommitted layer"
+    );
+
+    let parallel = workon_review::acquire::diff_changesets(repo, &changesets)?;
+
+    assert_eq!(parallel.len(), changesets.len());
+    for (cs, got) in changesets.iter().zip(&parallel) {
+        let sequential = diff_changeset(repo, cs)?;
+        assert_eq!(
+            got, &sequential,
+            "parallel diff for '{}' must match the sequential one, in input order",
+            cs.name
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn diff_changesets_surfaces_the_first_failing_changeset_by_input_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("core.autocrlf", "false")
+        .build()?;
+    let repo = fixture.repo()?;
+    let head = repo.head()?.target().unwrap();
+
+    let good = Changeset {
+        name: "good".to_string(),
+        span: ChangesetSpan::CommittedRoot { head },
+        title: None,
+        current: false,
+        needs_restack: false,
+    };
+    let garbage = Oid::from_str("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")?;
+    let bad = |name: &str| Changeset {
+        name: name.to_string(),
+        span: ChangesetSpan::Committed {
+            base: garbage,
+            head,
+        },
+        title: None,
+        current: true,
+        needs_restack: false,
+    };
+    let changesets = vec![good, bad("bad-first"), bad("bad-second")];
+
+    let err = workon_review::acquire::diff_changesets(repo, &changesets)
+        .expect_err("a garbage base Oid must fail the whole acquisition");
+    match err {
+        DiffError::ChangesetDiffFailed { name, .. } => assert_eq!(
+            name, "bad-first",
+            "the FIRST failing changeset by input order is the one reported"
+        ),
+        other => panic!("expected ChangesetDiffFailed, got {other:?}"),
+    }
+
+    Ok(())
+}
+
+#[test]
 fn diff_changeset_with_bad_base_oid_fails_never_empty() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new().build()?;
     let repo = fixture.repo()?;
@@ -476,7 +566,7 @@ fn diff_changeset_with_bad_base_oid_fails_never_empty() -> Result<(), Box<dyn st
 
     let cs = Changeset {
         name: "bogus".to_string(),
-        source: ChangesetSource::Committed {
+        span: ChangesetSpan::Committed {
             base: Oid::ZERO_SHA1,
             head,
         },

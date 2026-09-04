@@ -109,6 +109,83 @@ fn tab_lists_external_subcommands_from_path() {
     );
 }
 
+/// The sibling `git-workon-review` binary, built alongside this test binary as part of the
+/// workspace (`cargo test --workspace` / `-p git-workon` after a workspace build both produce
+/// it). Located via the workspace's `target/<profile>/` (one level up from this crate's
+/// `CARGO_MANIFEST_DIR`) rather than pulled in as a Cargo dev-dependency, which would drag
+/// `git-workon-review`'s whole tree-sitter-heavy dependency tree into every `git-workon` test
+/// build for one delegation test. NOT `current_exe()`-relative: this repo shares cargo's
+/// intermediate build artifacts across worktrees (a `build-dir` override in `.cargo/config.toml`),
+/// so test binaries themselves live under that shared dir while final binaries still land in
+/// this worktree's own `target/<profile>/`.
+fn review_binary_path() -> std::path::PathBuf {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .join("target")
+        .join(profile)
+        .join("git-workon-review")
+}
+
+/// ADR-036 CS5 / M6 CS3's deferred seam: `git workon review <TAB>` shells out to the review
+/// binary's own `COMPLETE=` responder rather than completing against review's argument-less stub
+/// `Command` (`augment_external_subcommands`). Uses the *real* compiled `git-workon-review`
+/// (via `PathStub::command_exe`, not the canned `arg:`/`cwd:` script `command` writes) so the
+/// candidates asserted here — `stack`/`uncommitted` — are genuinely the review binary's own SOURCE
+/// completer output, proving the index-shifted shell-out end to end.
+#[test]
+fn tab_after_review_subcommand_delegates_to_review_binary_completer() {
+    let review_exe = review_binary_path();
+    assert!(
+        review_exe.is_file(),
+        "expected a sibling git-workon-review binary at {review_exe:?} \
+         (built as part of a workspace build/test run)"
+    );
+
+    let stub = PathStub::new()
+        .unwrap()
+        .command_exe("review", &review_exe)
+        .unwrap();
+
+    // `git workon review <TAB>` — index 2 is the (empty) word after `review`.
+    let candidates = bash_candidates(&stub.path(), &["git-workon", "review", ""], 2);
+
+    assert!(
+        candidates.iter().any(|c| c == "stack"),
+        "expected the review binary's own `stack` keyword candidate, delegated through: {candidates:?}"
+    );
+    assert!(
+        candidates.iter().any(|c| c == "uncommitted"),
+        "expected the review binary's own `uncommitted` keyword candidate, delegated through: {candidates:?}"
+    );
+}
+
+/// Security regression: only `DELEGATED_EXTERNALS` (`completers.rs`) are re-invoked under the
+/// `COMPLETE=` protocol. A non-allowlisted external is a plain user script that has no idea what
+/// `COMPLETE` means — it would just run for real on every TAB press, its normal stdout misread as
+/// completion candidates and its side effects fired. `PathStub::command`'s canned script prints
+/// distinctive `arg:`/`cwd:` lines to stdout when executed; asserting those never appear (and the
+/// process still exits cleanly, falling through to the stub top-level candidate) proves the stub
+/// was never invoked.
+#[test]
+fn tab_after_non_allowlisted_external_does_not_execute_it() {
+    let stub = PathStub::new().unwrap().command("greet").unwrap();
+
+    let candidates = bash_candidates(&stub.path(), &["git-workon", "greet", ""], 2);
+
+    assert!(
+        candidates
+            .iter()
+            .all(|c| !c.starts_with("arg:") && !c.starts_with("cwd:")),
+        "non-allowlisted external must never be executed for completion: {candidates:?}"
+    );
+}
+
 #[test]
 fn external_subcommand_does_not_shadow_a_builtin_in_completion() {
     // A `git-workon-list` stub must not produce a duplicate `list` candidate — the built-in owns

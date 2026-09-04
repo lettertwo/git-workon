@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use git2::Repository;
-use workon::{Changeset, ChangesetSource};
+use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
@@ -25,6 +25,7 @@ use crate::ops;
 use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
+use crate::source::{resolve_source, Source};
 use crate::stage_op::{FileStagingOp, LineSelectionOp};
 use crate::synthesis::LineSelection;
 use crate::wordiff::{word_diff_spans, Span};
@@ -312,12 +313,18 @@ impl FileView {
 /// not all of `App` — a `&self` method here would make the borrow checker treat the tree as
 /// blocking every OTHER field access (e.g. `&mut self.highlighter`) for its whole lifetime, even
 /// though the two never actually conflict.
-fn old_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2::Tree<'_>> {
-    match source {
-        ChangesetSource::Committed { base, .. } => {
-            repo.find_commit(base).and_then(|c| c.tree()).ok()
-        }
-        ChangesetSource::Uncommitted => repo.head().and_then(|h| h.peel_to_tree()).ok(),
+fn old_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tree<'_>> {
+    match span {
+        ChangesetSpan::Committed { base, .. } => repo.find_commit(base).and_then(|c| c.tree()).ok(),
+        // Root commit reviewed on its own: the old side is the empty tree. `treebuilder(None)`
+        // builds (and `write` persists, idempotently — git's well-known empty-tree object) an
+        // empty tree without needing a real parent commit to peel.
+        ChangesetSpan::CommittedRoot { .. } => repo
+            .treebuilder(None)
+            .and_then(|b| b.write())
+            .and_then(|oid| repo.find_tree(oid))
+            .ok(),
+        ChangesetSpan::Uncommitted => repo.head().and_then(|h| h.peel_to_tree()).ok(),
     }
 }
 
@@ -330,12 +337,12 @@ fn old_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2:
 ///
 /// A free function for the same borrow-checker reason as [`old_side_tree_for`]: the returned
 /// [`git2::Tree`] borrows only `repo`, leaving `&mut self.highlighter` free at the call site.
-fn new_side_tree_for(repo: &Repository, source: ChangesetSource) -> Option<git2::Tree<'_>> {
-    match source {
-        ChangesetSource::Committed { head, .. } => {
+fn new_side_tree_for(repo: &Repository, span: ChangesetSpan) -> Option<git2::Tree<'_>> {
+    match span {
+        ChangesetSpan::Committed { head, .. } | ChangesetSpan::CommittedRoot { head } => {
             repo.find_commit(head).and_then(|c| c.tree()).ok()
         }
-        ChangesetSource::Uncommitted => None,
+        ChangesetSpan::Uncommitted => None,
     }
 }
 
@@ -741,6 +748,25 @@ pub struct App {
     /// every key as a modal (mirroring [`Self::pending_confirm`]'s capture) — see its doc comment
     /// for the precedence between the two modals.
     pub help_visible: bool,
+    /// The `git workon review [<source>]` argument the session was launched with, set via
+    /// [`Self::set_review_source`] (M7 CS2 fix). `None` means the session was launched via
+    /// no-argument auto-detect (`crate::acquire::resolve_changesets`); `Some(source)` means an
+    /// explicit ask (`stack`, `uncommitted`, and later CS3/CS4's ref/range/PR variants) that
+    /// [`Self::refresh`] must re-resolve on every refresh, NEVER downgrade to auto-detect — a
+    /// setter (rather than a constructor parameter) so `App::from_changesets`'s signature, and
+    /// every existing test building through it, stays untouched.
+    review_source: Option<Source>,
+    /// CS4's idle-deferred load switch. `false` (the default) keeps every pre-CS4
+    /// `open_current`/render-path behavior byte-identical, so the ~80 existing tests asserting
+    /// eager loads keep passing unchanged. `main.rs` turns this on via [`Self::set_defer_loads`]
+    /// right after construction; the event loop is what actually defers (see `tui.rs`'s
+    /// `OPEN_DEBOUNCE`).
+    defer_loads: bool,
+    /// Set when [`Self::open_current`] deferred its load (only possible while
+    /// [`Self::defer_loads`] is on) — the render path shows a placeholder instead of loading
+    /// while this is `true`, and the event loop calls [`Self::complete_pending_open`] once input
+    /// has been quiet for `OPEN_DEBOUNCE`. Read via [`Self::open_pending`].
+    open_pending: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -806,7 +832,7 @@ impl App {
             .unwrap_or_default();
         let cs = Changeset {
             name,
-            source: ChangesetSource::Uncommitted,
+            span: ChangesetSpan::Uncommitted,
             title: None,
             current: true,
             needs_restack: false,
@@ -875,6 +901,9 @@ impl App {
             refresh_coordinator,
             outline,
             help_visible: false,
+            review_source: None,
+            defer_loads: false,
+            open_pending: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -882,6 +911,15 @@ impl App {
         // file, whenever the current changeset isn't the first in the stack.
         app.sync_outline_to_current();
         app
+    }
+
+    /// Record the `[SOURCE]` argument the review session was launched with, so
+    /// [`Self::refresh`] re-resolves that same ask instead of silently falling back to
+    /// no-argument auto-detect (M7 CS2 fix). `main.rs` calls this right after
+    /// [`Self::from_changesets`] whenever a `[SOURCE]` argument was given; a no-argument launch
+    /// never calls it, leaving [`Self::review_source`] at its `None` default.
+    pub fn set_review_source(&mut self, source: Source) {
+        self.review_source = Some(source);
     }
 
     /// The current `.git/index`'s cheap fingerprint (mtime + size), or `None` if the read fails —
@@ -966,12 +1004,15 @@ impl App {
     }
 
     /// Whether the ACTIVE changeset is a committed range (`base..head`) rather than the
-    /// uncommitted worktree layer — derived from [`workon::ChangesetSource`] on every call rather
+    /// uncommitted worktree layer — derived from [`workon::ChangesetSpan`] on every call rather
     /// than cached (locked decision #2's "derive, don't store" mode gate). Drives every
     /// committed-mode guard: the mode-aware staging refusal, skipping combined attribution (no
     /// staged/unstaged sets exist to color by), and locking zoom to combined.
     pub fn is_committed(&self) -> bool {
-        matches!(self.cur().cs.source, ChangesetSource::Committed { .. })
+        matches!(
+            self.cur().cs.span,
+            ChangesetSpan::Committed { .. } | ChangesetSpan::CommittedRoot { .. }
+        )
     }
 
     /// Re-run [`crate::acquire::resolve_changesets`] against the CURRENT `HEAD` branch and
@@ -1000,6 +1041,16 @@ impl App {
     ///
     /// On any assembly/diff error, leaves all existing state untouched and sets an error
     /// [`Notice`] instead (via [`Self::notify`]) — a failed refresh must never blank the review.
+    ///
+    /// Dispatches on [`Self::review_source`] (M7 CS2 fix): a no-argument launch (`None`) re-runs
+    /// today's auto-detect ([`crate::acquire::resolve_changesets`]); an explicit-source launch
+    /// (`Some`) re-runs [`crate::source::resolve_source`] against THAT source, never auto-detect
+    /// — every ref-shaped source variant (`Stack`, `Uncommitted`, `Ref`, `Range`) is offline,
+    /// so re-resolving on every refresh (manual `r` and the tick-driven index watcher alike) is
+    /// cheap and safe. Without this, both refresh triggers would silently swap an explicit
+    /// review (e.g. `uncommitted`) for the current `HEAD`'s auto-detected state.
+    /// [`Source::Pr`] is the one exception: it resolves over the network (gh metadata + fetch),
+    /// so refresh is a no-op for it — see the match arm below.
     pub fn refresh(&mut self) {
         let Some(head_branch) = self
             .repo
@@ -1011,7 +1062,18 @@ impl App {
             return;
         };
 
-        let changesets = match crate::acquire::resolve_changesets(&self.repo, &head_branch) {
+        let changesets = match &self.review_source {
+            None => crate::acquire::resolve_changesets(&self.repo, &head_branch)
+                .map_err(|err| err.to_string()),
+            // A PR review is committed-only: nothing it renders depends on the index/worktree
+            // state that refresh exists to pick up, and re-resolving would hit the network
+            // (gh metadata + fetch) on every tick-driven refresh. Remote freshness is a
+            // re-launch, not a refresh.
+            Some(Source::Pr(_)) => return,
+            Some(source) => resolve_source(&self.repo, &head_branch, source.clone())
+                .map_err(|err| err.to_string()),
+        };
+        let changesets = match changesets {
             Ok(cs) => cs,
             Err(err) => {
                 self.notify(format!("refresh failed: {err}"), Severity::Error);
@@ -1019,16 +1081,18 @@ impl App {
             }
         };
 
-        let mut views = Vec::with_capacity(changesets.len());
-        for cs in changesets {
-            match crate::acquire::diff_changeset(&self.repo, &cs) {
-                Ok(diff) => views.push(ChangesetView::from_changeset_diff(cs, diff)),
-                Err(err) => {
-                    self.notify(format!("refresh failed: {err}"), Severity::Error);
-                    return;
-                }
+        let diffs = match crate::acquire::diff_changesets(&self.repo, &changesets) {
+            Ok(diffs) => diffs,
+            Err(err) => {
+                self.notify(format!("refresh failed: {err}"), Severity::Error);
+                return;
             }
-        }
+        };
+        let views: Vec<ChangesetView> = changesets
+            .into_iter()
+            .zip(diffs)
+            .map(|(cs, diff)| ChangesetView::from_changeset_diff(cs, diff))
+            .collect();
         // `resolve_changesets` always returns at least one changeset (a lone Uncommitted entry
         // when no stack is active), but stay defensive rather than index an empty `Vec` below.
         if views.is_empty() {
@@ -1161,8 +1225,12 @@ impl App {
     }
 
     /// Read-only access to file `idx`'s already-loaded [`FileView`] for `role` (`None` if the role
-    /// has no change for the file, or it isn't loaded yet).
-    pub(crate) fn role_view_ref(&self, idx: usize, role: Role) -> Option<&FileView> {
+    /// has no change for the file, or it isn't loaded yet). `pub` (not `pub(crate)`) so the
+    /// separate `git-workon-review` bin crate's `tui.rs` tests can assert a file was — or, more
+    /// importantly, was NOT — loaded without visiting it (CS2's event-coalescing regression
+    /// test); read-only and does not touch `open_current`/`ensure_loaded`/`outline_move_by`'s
+    /// eager-load semantics.
+    pub fn role_view_ref(&self, idx: usize, role: Role) -> Option<&FileView> {
         self.views_for(role).get(idx).and_then(|v| v.as_ref())
     }
 
@@ -1256,18 +1324,18 @@ impl App {
         // Combined role.
         // Re-peeled per call rather than cached on `App`: for the uncommitted layer `HEAD` can
         // move between file loads, and the tree is cheap to re-peel either way.
-        // `self.cur().cs.source` is `Copy`, so reading it here borrows `self` only for this
+        // `self.cur().cs.span` is `Copy`, so reading it here borrows `self` only for this
         // sub-expression — `head_tree` itself ends up borrowing `self.repo` alone (via the free
         // `old_side_tree_for`), leaving `&mut self.highlighter` free below. A method tied to
         // `&self` would instead have bound the tree's lifetime to all of `self`.
-        let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.source) else {
+        let Some(head_tree) = old_side_tree_for(&self.repo, self.cur().cs.span) else {
             return;
         };
         // New-side source mirrors the old side: `None` (worktree) for the uncommitted layer,
         // the changeset's `head` tree for a committed changeset. Same free-fn borrow dance as
         // `old_side_tree_for` — both trees borrow only `self.repo`, so `&mut self.highlighter`
         // stays free for `FileView::load`.
-        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.source);
+        let new_tree = new_side_tree_for(&self.repo, self.cur().cs.span);
         let file = self.cur().diff.files[idx].clone();
         let view = FileView::load(
             &self.repo,
@@ -1336,10 +1404,81 @@ impl App {
         self.derive_scroll();
     }
 
+    /// Turn CS4's idle-deferred load mode on/off. `main.rs` calls this with `true` right after
+    /// [`Self::from_changesets`], before the first [`Self::open_current`] — see the field's doc
+    /// comment. Exposed as a setter (rather than folded into construction) so every existing test
+    /// building through `from_changesets`/`App::new` keeps today's eager behavior untouched.
+    pub fn set_defer_loads(&mut self, on: bool) {
+        self.defer_loads = on;
+    }
+
+    /// Whether CS4's idle-deferred load mode is on — see [`Self::set_defer_loads`].
+    pub fn defer_loads(&self) -> bool {
+        self.defer_loads
+    }
+
+    /// Whether [`Self::open_current`] deferred its load and it hasn't been completed yet — the
+    /// render path (in defer mode) and the event loop both read this: render to decide whether to
+    /// show the placeholder, the event loop to decide whether to shorten its poll timeout and to
+    /// call [`Self::complete_pending_open`] on the next idle tick.
+    pub fn open_pending(&self) -> bool {
+        self.open_pending
+    }
+
     /// Load the current file's needed views and reset both panes to their first hunks.
+    ///
+    /// In [`Self::defer_loads`] mode a file whose views are NOT yet cached does not load here:
+    /// the open is marked pending and the panes reset anyway (the cursor falls back to row 0
+    /// for the still-unloaded view, via [`Self::role_first_hunk`]'s `unwrap_or(0)` — harmless,
+    /// since the body renders a placeholder until [`Self::complete_pending_open`] runs). A file
+    /// whose views ARE cached takes the eager path even in defer mode: `ensure_loaded` is a
+    /// pure cache hit there, and deferring would only trade an instantly-renderable diff for a
+    /// placeholder flash lasting the debounce window — revisiting a file is the most common
+    /// navigation of all, and it must render immediately. Outside defer mode this is exactly
+    /// the pre-defer eager behavior.
     pub fn open_current(&mut self) {
+        if self.defer_loads && !self.current_views_cached() {
+            self.open_pending = true;
+            self.reset_panes();
+            return;
+        }
         self.ensure_loaded(self.current);
         self.reset_panes();
+    }
+
+    /// Whether the view(s) the current file's effective zoom needs are already cached, making a
+    /// deferred open pointless (`ensure_loaded` would be a cache hit). Split checks EITHER pane:
+    /// a role with no change for the file stays legitimately `None` forever (see
+    /// [`Self::ensure_role_loaded`]), so requiring both would defer a one-role file every time.
+    /// A partially-cached split (one loadable pane in, one missing) takes the eager path and
+    /// loads the single missing pane synchronously — one file, cheap, and consistent with the
+    /// both-`None` gate the render placeholder uses.
+    fn current_views_cached(&self) -> bool {
+        match self.effective_zoom_for(self.current) {
+            EffectiveZoom::Single(role) => self.role_view_ref(self.current, role).is_some(),
+            EffectiveZoom::Split => {
+                self.role_view_ref(self.current, Role::Unstaged).is_some()
+                    || self.role_view_ref(self.current, Role::Staged).is_some()
+            }
+        }
+    }
+
+    /// Complete a deferred open, if one is pending: load the current file's needed views, then
+    /// reset both panes again so the cursor now derives from the REAL first-hunk row (rather than
+    /// the `0` fallback [`Self::open_current`] left it at). A no-op when nothing is pending —
+    /// idempotent, so the event loop can call this liberally (e.g. on every idle tick while
+    /// pending) without worrying about double-loading.
+    ///
+    /// Invariant this pins (the equivalence the tests assert): after this returns, `App` state is
+    /// byte-identical to what an eager [`Self::open_current`] would have produced for the same
+    /// current file.
+    pub fn complete_pending_open(&mut self) {
+        if !self.open_pending {
+            return;
+        }
+        self.ensure_loaded(self.current);
+        self.reset_panes();
+        self.open_pending = false;
     }
 
     /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`z`). The new zoom
@@ -1596,12 +1735,22 @@ impl App {
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
     /// clamped into the current row list. Landing on a FILE row jumps the diff there
-    /// immediately (outline -> diff, per the locked design); landing on a HEADER row does NOT
-    /// jump — only [`Self::outline_confirm`] (`Enter`) jumps from a header, since a header's
-    /// "first file" isn't necessarily where a `j`/`k` scan through the stack should keep
-    /// stopping the diff. This calls [`Self::switch_changeset`] directly (not `next_file`/
-    /// `goto_changeset`), so it does NOT re-trigger [`Self::sync_outline_to_current`] — see that
-    /// method's doc comment for why only the DIFF-initiated entry points do.
+    /// immediately (outline -> diff, per the locked design); a HEADER/DIR row itself never
+    /// causes a jump — only [`Self::outline_confirm`] (`Enter`) jumps from a header, since a
+    /// header's "first file" isn't necessarily where a `j`/`k` scan through the stack should
+    /// keep stopping the diff. This calls [`Self::switch_changeset`] directly (not
+    /// `next_file`/`goto_changeset`), so it does NOT re-trigger
+    /// [`Self::sync_outline_to_current`] — see that method's doc comment for why only the
+    /// DIFF-initiated entry points do.
+    ///
+    /// A multi-row `delta` is a coalesced burst of unit presses (the event loop merges
+    /// same-sign `j`/`k` runs — see `tui.rs`'s `update_batch`), so it must be
+    /// indistinguishable from the unit presses it stands for: N unit moves jump the diff at
+    /// every FILE row they cross, leaving it on the LAST one when the run stops on a
+    /// header/dir row. So a non-File landing scans back toward (but excluding) the starting
+    /// row for the last file crossed and jumps there. For a unit move that range is empty,
+    /// preserving the single-press rule above: bare `j`/`k` onto a header neither jumps nor
+    /// resets the diff.
     pub fn outline_move_by(&mut self, delta: i64) {
         let items = self.outline_items();
         if items.is_empty() {
@@ -1617,6 +1766,19 @@ impl App {
         } = &items[new_idx]
         {
             self.switch_changeset(*cs_idx, *file_idx);
+        } else if new_idx as i64 != cur {
+            let step = if delta > 0 { -1 } else { 1 };
+            let mut idx = new_idx as i64 + step;
+            while idx != cur && (0..=max).contains(&idx) {
+                if let OutlineItem::File {
+                    cs_idx, file_idx, ..
+                } = &items[idx as usize]
+                {
+                    self.switch_changeset(*cs_idx, *file_idx);
+                    break;
+                }
+                idx += step;
+            }
         }
     }
 
@@ -2478,12 +2640,14 @@ fn current_cs_index(changesets: &[ChangesetView]) -> usize {
 /// base rev (7-char short-sha), or `"HEAD"` for the uncommitted layer (worktree ↔ `HEAD`,
 /// unchanged from M2–M4).
 fn base_label_for(cs: &Changeset) -> String {
-    match cs.source {
-        ChangesetSource::Committed { base, .. } => {
+    match cs.span {
+        ChangesetSpan::Committed { base, .. } => {
             let full = base.to_string();
             full.chars().take(7).collect()
         }
-        ChangesetSource::Uncommitted => "HEAD".to_string(),
+        // No real base commit to abbreviate — the base is the empty tree.
+        ChangesetSpan::CommittedRoot { .. } => "(empty)".to_string(),
+        ChangesetSpan::Uncommitted => "HEAD".to_string(),
     }
 }
 
@@ -2629,7 +2793,7 @@ pub(crate) mod test_support {
 mod tests {
     use git2::Repository;
     use git_workon_fixture::prelude::*;
-    use workon::{Changeset, ChangesetSource};
+    use workon::{Changeset, ChangesetSpan};
 
     use super::test_support::app_from_fixture;
     use super::{
@@ -2740,6 +2904,116 @@ mod tests {
         assert!(app.files()[0].is_binary);
         app.ensure_loaded(0);
         assert!(app.current_view_ref().is_none());
+    }
+
+    // ── CS4: idle-deferred loads ──────────────────────────────────────────────
+
+    /// A twin pair: one `App` with `defer_loads` off (the eager baseline), one with it on. Both
+    /// built from independent copies of the SAME fixture so their diffs (and hunks) line up.
+    fn defer_and_eager_twins(fixture: &git_workon_fixture::fixture::Fixture) -> (App, App) {
+        let mut eager = app_from_fixture(fixture);
+        eager.open_current();
+
+        let mut deferred = app_from_fixture(fixture);
+        deferred.set_defer_loads(true);
+        deferred.open_current();
+
+        (deferred, eager)
+    }
+
+    #[test]
+    fn open_current_defers_load_and_complete_matches_eager_open() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold\nl10\nl11\nl12\n",
+                "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nnew\nl10\nl11\nl12\n",
+            )
+            .build()
+            .unwrap();
+
+        let (mut deferred, eager) = defer_and_eager_twins(&fixture);
+
+        // `open_current` under defer mode loads NOTHING and marks the open pending.
+        assert!(
+            deferred.current_view_ref().is_none(),
+            "deferred open_current must not have loaded the current view"
+        );
+        assert!(deferred.open_pending(), "the open must be marked pending");
+
+        deferred.complete_pending_open();
+
+        assert!(
+            !deferred.open_pending(),
+            "complete_pending_open must clear the pending flag"
+        );
+        assert_eq!(
+            deferred.cursor, eager.cursor,
+            "cursor must land on the same (first-hunk) row an eager open would have"
+        );
+        assert_eq!(deferred.scroll, eager.scroll);
+        let deferred_view = deferred.current_view_ref().expect("view now loaded");
+        let eager_view = eager.current_view_ref().expect("eager view loaded");
+        assert_eq!(deferred_view.old_text(), eager_view.old_text());
+        assert_eq!(deferred_view.new_text(), eager_view.new_text());
+        assert_eq!(deferred_view.display.len(), eager_view.display.len());
+    }
+
+    #[test]
+    fn revisiting_a_cached_file_reopens_eagerly_without_a_pending_window() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "1\n2\n3\n", "1\nA\n3\n")
+            .unstaged_file("b.txt", "1\n2\n3\n", "1\nB\n3\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current(); // a.txt: uncached — defers
+        assert!(app.open_pending(), "an uncached file defers its open");
+        app.complete_pending_open();
+
+        app.current = 1;
+        app.open_current(); // b.txt: uncached — defers
+        assert!(app.open_pending(), "a different uncached file still defers");
+        app.complete_pending_open();
+
+        app.current = 0;
+        app.open_current(); // back to a.txt: cached — must NOT defer
+        assert!(
+            !app.open_pending(),
+            "revisiting a cached file must reopen eagerly — a pending window here would \
+             flash the loading placeholder over an instantly-renderable diff"
+        );
+        assert!(
+            app.current_view_ref().is_some(),
+            "the cached view is available the moment the open returns"
+        );
+    }
+
+    #[test]
+    fn complete_pending_open_is_a_no_op_when_nothing_pending() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("tracked.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_defer_loads(true);
+        app.open_current();
+        app.complete_pending_open();
+        assert!(!app.open_pending());
+
+        let cursor_before = app.cursor;
+        let scroll_before = app.scroll;
+        // Calling again with nothing pending must not touch cursor/scroll or reload anything.
+        app.complete_pending_open();
+        assert!(!app.open_pending());
+        assert_eq!(app.cursor, cursor_before);
+        assert_eq!(app.scroll, scroll_before);
     }
 
     // Hunk-nav helpers below operate purely over `DisplayRow` vectors — no fixture repo needed.
@@ -3593,6 +3867,115 @@ mod tests {
 
         assert_eq!(app.layout, Layout::Inline, "refresh must not reset layout");
         assert_eq!(app.zoom, Zoom::Combined, "refresh must not reset zoom");
+    }
+
+    /// M7 CS2 fix: a session launched with an explicit `[SOURCE]` argument must have `refresh`
+    /// re-resolve THAT source, never silently downgrade to no-argument auto-detect. A Graphite
+    /// stack is active (`assemble_changesets` would return the whole `a`/`b` stack for
+    /// auto-detect), but the session was launched with `uncommitted` — so both the manual `r`
+    /// key and the tick-driven index watcher must keep showing only the single uncommitted
+    /// changeset, not swap in the full stack.
+    #[test]
+    fn refresh_re_resolves_the_launched_source_instead_of_auto_detecting() {
+        use crate::source::Source;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .branch_metadata("b", "a")
+            .untracked_file("scratch.txt", "hi\n")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        // `App::refresh` re-derives the branch from the repo's ACTUAL `HEAD`, not from a name
+        // handed to `resolve_source` — so the fixture's checkout must really be on "b" for
+        // auto-detect (were the fix absent) to see the `a`/`b` stack, not `main`.
+        repo.set_head("refs/heads/b").unwrap();
+        repo.checkout_head(None).unwrap();
+
+        let source = Source::Uncommitted;
+        let changesets =
+            crate::source::resolve_source(repo, "b", source.clone()).expect("resolve_source");
+        assert_eq!(
+            changesets.len(),
+            1,
+            "uncommitted keyword always resolves to exactly one changeset"
+        );
+        let mut views = Vec::with_capacity(changesets.len());
+        for cs in changesets {
+            let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+            views.push(ChangesetView::from_changeset_diff(cs, diff));
+        }
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.set_review_source(source);
+        app.open_current();
+
+        app.refresh();
+
+        assert_eq!(
+            app.changeset_count(),
+            1,
+            "refresh must keep reviewing only the uncommitted changeset, not the full \
+             Graphite stack auto-detect would find"
+        );
+        assert_eq!(app.cur().cs.span, ChangesetSpan::Uncommitted);
+    }
+
+    /// A PR-sourced review must survive refresh untouched: re-resolving would hit the network
+    /// (gh + fetch), so [`App::refresh`] no-ops for [`Source::Pr`]. The fixture has no PR and no
+    /// gh — if refresh DID try to re-resolve, `resolve_pr` would fail and raise a "refresh
+    /// failed" notice; asserting no notice (and unchanged views) pins the no-op.
+    #[test]
+    fn refresh_is_a_no_op_for_a_pr_source() {
+        use crate::source::Source;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        fixture
+            .commit("main")
+            .file("a.txt", "one\n")
+            .create("first")
+            .unwrap();
+        fixture
+            .commit("main")
+            .file("a.txt", "two\n")
+            .create("second")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let base = head.parent(0).unwrap();
+        let cs = workon::Changeset {
+            name: "pr-1".to_string(),
+            span: ChangesetSpan::Committed {
+                base: base.id(),
+                head: head.id(),
+            },
+            title: Some("a pr".to_string()),
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let views = vec![ChangesetView::from_changeset_diff(cs, diff)];
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.set_review_source(Source::Pr("pr-1".to_string()));
+        app.open_current();
+
+        app.refresh();
+
+        assert_eq!(app.changeset_count(), 1);
+        assert_eq!(app.cur().cs.name, "pr-1");
+        assert!(
+            app.notice.is_none(),
+            "a PR-source refresh must no-op, not attempt (and fail) a network re-resolution"
+        );
     }
 
     // ---- M4 index watcher (`on_tick`) -------------------------------------------------------
@@ -4482,8 +4865,8 @@ mod tests {
         assert_eq!(app.current_cs(), 0);
         assert_eq!(app.base_label, "HEAD");
         assert!(matches!(
-            app.current_changeset().source,
-            ChangesetSource::Uncommitted
+            app.current_changeset().span,
+            ChangesetSpan::Uncommitted
         ));
     }
 
@@ -4507,7 +4890,7 @@ mod tests {
         let repo = fixture.repo().unwrap();
         let cs = Changeset {
             name: "main".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4563,7 +4946,7 @@ mod tests {
         let repo = fixture.repo().unwrap();
         let cs = Changeset {
             name: "main".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4598,14 +4981,14 @@ mod tests {
         // Deliberately NOT current — listed first, so a naive "open index 0" would pick it.
         let not_current = Changeset {
             name: "not-current".to_string(),
-            source: ChangesetSource::Committed { base, head: base },
+            span: ChangesetSpan::Committed { base, head: base },
             title: None,
             current: false,
             needs_restack: false,
         };
         let current = Changeset {
             name: "current".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4663,7 +5046,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -4673,7 +5056,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: false,
             needs_restack: false,
@@ -4797,7 +5180,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -4807,7 +5190,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: true,
             needs_restack: false,
@@ -4977,14 +5360,14 @@ mod tests {
 
         let committed = Changeset {
             name: "committed".to_string(),
-            source: ChangesetSource::Committed { base, head },
+            span: ChangesetSpan::Committed { base, head },
             title: Some("Committed work".to_string()),
             current: false,
             needs_restack: false,
         };
         let uncommitted = Changeset {
             name: "uncommitted".to_string(),
-            source: ChangesetSource::Uncommitted,
+            span: ChangesetSpan::Uncommitted,
             title: None,
             current: true,
             needs_restack: false,
@@ -5120,7 +5503,7 @@ mod tests {
 
         let cs_a = Changeset {
             name: "cs-a".to_string(),
-            source: ChangesetSource::Committed {
+            span: ChangesetSpan::Committed {
                 base: root,
                 head: mid,
             },
@@ -5130,7 +5513,7 @@ mod tests {
         };
         let cs_b = Changeset {
             name: "cs-b".to_string(),
-            source: ChangesetSource::Committed { base: mid, head },
+            span: ChangesetSpan::Committed { base: mid, head },
             title: None,
             current: true,
             needs_restack: true,
@@ -5227,17 +5610,52 @@ mod tests {
     fn outline_move_by_on_a_header_row_does_not_jump_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
-        app.outline.cursor = 0; // cs-a's header row
-        let cs_before = app.current_cs();
-        let file_before = app.current;
-
         // Header rows sit at indices 0 (cs-a) and 3 (cs-b) in Stack mode (header, a1, a2,
-        // header). Move onto the cs-b header without landing on a file row in between.
-        app.outline_move_by(3);
+        // header, b1). Park the diff on a2, cursor on its row.
+        app.outline.cursor = 2;
+        app.switch_changeset(0, 1);
+        app.cursor += 1; // nudge off the open position so a hidden re-open would be visible
+        let cursor_before = app.cursor;
+
+        // A UNIT move onto the header: the header itself never jumps — and must not reset the
+        // diff's cursor either (a re-`switch_changeset` to the same file would).
+        app.outline_move_by(1);
         assert_eq!(
             (app.current_cs(), app.current),
-            (cs_before, file_before),
-            "landing the outline cursor on a header row must not move the diff"
+            (0, 1),
+            "a bare j onto a header row must not move the diff"
+        );
+        assert_eq!(app.cursor, cursor_before, "...nor reset the diff cursor");
+    }
+
+    #[test]
+    fn coalesced_outline_burst_onto_a_header_matches_sequential_unit_moves() {
+        // A multi-row delta is CS2's coalesced stand-in for N unit presses, so the two must be
+        // indistinguishable — including which file the diff follows when the burst stops on a
+        // header row (the LAST file crossed, exactly where unit presses leave it).
+        let mut coalesced = two_committed_changesets_two_and_one_files();
+        coalesced.outline.mode = OutlineMode::Stack;
+        coalesced.outline.cursor = 0;
+        coalesced.outline_move_by(3); // header -> a1 -> a2 -> cs-b header
+
+        let mut sequential = two_committed_changesets_two_and_one_files();
+        sequential.outline.mode = OutlineMode::Stack;
+        sequential.outline.cursor = 0;
+        for _ in 0..3 {
+            sequential.outline_move_by(1);
+        }
+
+        assert_eq!(coalesced.outline.cursor, sequential.outline.cursor);
+        assert_eq!(
+            (coalesced.current_cs(), coalesced.current),
+            (sequential.current_cs(), sequential.current),
+            "a summed burst stopping on a header must leave the diff on the last file \
+             crossed, like the unit presses it coalesces"
+        );
+        assert_eq!(
+            (coalesced.current_cs(), coalesced.current),
+            (0, 1),
+            "...which is a2 here"
         );
     }
 
@@ -5351,7 +5769,7 @@ mod tests {
 
         let cs = Changeset {
             name: "cs".to_string(),
-            source: ChangesetSource::Committed { base: root, head },
+            span: ChangesetSpan::Committed { base: root, head },
             title: None,
             current: true,
             needs_restack: false,

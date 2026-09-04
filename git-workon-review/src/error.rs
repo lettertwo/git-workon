@@ -28,6 +28,11 @@ pub enum ReviewError {
     #[error(transparent)]
     #[diagnostic(transparent)]
     Apply(#[from] ApplyError),
+
+    /// A `git workon review <source>` argument failed to resolve to changesets
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    Source(#[from] SourceError),
 }
 
 /// Errors building a [`crate::model::DiffModel`] from git2 structures, or acquiring one for a
@@ -116,5 +121,83 @@ pub enum ApplyError {
         path: String,
         #[source]
         source: std::io::Error,
+    },
+}
+
+/// Errors resolving a `git workon review <source>` positional argument to changesets
+/// (ADR-036: the classifier/resolver seam is [`crate::source::Source`]).
+#[derive(Error, Diagnostic, Debug)]
+pub enum SourceError {
+    /// The `stack` keyword found no Graphite metadata and `branch` has no upstream to infer a
+    /// git-only stack from. An explicit ask deserves an explicit failure — never a silent
+    /// fall-through to the uncommitted layer (ADR-036).
+    #[error("branch '{branch}' has no Graphite stack and no upstream to infer one from")]
+    #[diagnostic(
+        code(workon::review::stack_no_upstream),
+        help(
+            "set an upstream (git branch --set-upstream-to=<remote>/{branch}), \
+             or run 'git workon review uncommitted'"
+        )
+    )]
+    NoUpstream { branch: String },
+
+    /// Assembling the requested stack failed for a reason other than a missing upstream
+    /// (broken Graphite metadata, an unresolvable branch, a bad recorded parent revision).
+    #[error("failed to assemble the stack for '{branch}'")]
+    #[diagnostic(code(workon::review::stack_resolution_failed))]
+    StackResolutionFailed {
+        branch: String,
+        #[source]
+        source: workon::WorkonError,
+    },
+
+    /// A `<ref>` argument (or one side of a `Range`) doesn't rev-parse to anything reviewable —
+    /// a typo, a deleted branch, a garbage commit-ish.
+    #[error("cannot resolve '{text}' as a review source")]
+    #[diagnostic(
+        code(workon::review::unresolvable_source),
+        help(
+            "try 'stack', 'uncommitted', a branch/tag/commit, a..b / a...b range, \
+             or a PR reference (pr-123, #123)"
+        )
+    )]
+    UnresolvableSource { text: String },
+
+    /// An untracked (or remote-tracking) `<ref>` branch has neither an upstream nor a resolvable
+    /// trunk to compute "what this branch adds" from.
+    #[error("branch '{branch}' has no upstream and no trunk to compute a base from")]
+    #[diagnostic(
+        code(workon::review::no_base_for_branch),
+        help(
+            "set an upstream (git branch --set-upstream-to=<remote>/{branch}), \
+             or ensure a trunk branch (main/master) exists"
+        )
+    )]
+    NoBaseForBranch { branch: String },
+
+    /// `check_gh_available` found no working `gh` CLI — a PR reference can't resolve without it,
+    /// the same requirement `git workon #123`'s own PR workflow has.
+    #[error("'{text}' is a PR reference, but gh is not available")]
+    #[diagnostic(
+        code(workon::review::gh_unavailable),
+        help("install the gh CLI and run 'gh auth login', then retry")
+    )]
+    GhUnavailable {
+        text: String,
+        #[source]
+        source: workon::WorkonError,
+    },
+
+    /// Resolving a PR reference failed after `gh` was confirmed available: an unknown PR number,
+    /// `gh` not authenticated, a fork remote/fetch failure, or a missing base/head ref.
+    #[error("failed to resolve PR reference '{text}'")]
+    #[diagnostic(
+        code(workon::review::pr_resolution_failed),
+        help("check the PR number and that 'gh auth status' is logged in")
+    )]
+    PrResolutionFailed {
+        text: String,
+        #[source]
+        source: workon::WorkonError,
     },
 }
