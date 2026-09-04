@@ -22,7 +22,7 @@ use workon::{
     PrMetadata, StackModel, UncommittedLayer, WorkonError,
 };
 
-use crate::acquire::uncommitted_changeset;
+use crate::acquire::{stack_model, uncommitted_changeset};
 use crate::error::SourceError;
 
 /// Which dot form a [`Source::Range`] was spelled with — git-diff semantics differ (ADR-036).
@@ -214,17 +214,17 @@ fn remote_branch_tip(repo: &Repository, remote: &str, branch: &str) -> Option<Oi
         .and_then(|b| b.get().target())
 }
 
-/// `stack` keyword resolution: stack metadata (Graphite or gh-stack) when active, otherwise the
-/// git-inference arm (`StackModel::Git`, first wired into the binary here) — never a silent
-/// downgrade to `StackModel::None`'s empty result, since the keyword is an explicit ask for the
-/// real stack.
+/// `stack` keyword resolution: stack metadata (Graphite or gh-stack) when active per
+/// [`stack_model`] (config first, then detection), otherwise the git-inference arm
+/// (`StackModel::Git`, first wired into the binary here) — never a silent downgrade to
+/// `StackModel::None`'s empty result, since the keyword is an explicit ask for the real stack.
 /// The uncommitted layer rides along (`UncommittedLayer::Include`): `stack` always means
 /// "focused on real `HEAD`."
 fn resolve_stack(
     repo: &Repository,
     head_branch: &str,
 ) -> Result<Vec<workon::Changeset>, SourceError> {
-    let model = match StackModel::detect(repo) {
+    let model = match stack_model(repo) {
         StackModel::None | StackModel::Git => StackModel::Git,
         metadata @ (StackModel::Graphite | StackModel::GhStack) => metadata,
     };
@@ -250,8 +250,9 @@ fn map_assemble_err(branch: &str) -> impl Fn(WorkonError) -> SourceError + '_ {
 
 /// `<ref>` resolution — shape-aware dispatch (ADR-036), checked in order:
 ///
-/// 1. A Graphite-tracked LOCAL branch (`text` names a local branch, qualified spellings like
-///    `refs/heads/<name>`/`heads/<name>` included, AND that branch has a Graphite metadata row)
+/// 1. A stack-tracked LOCAL branch (`text` names a local branch, qualified spellings like
+///    `refs/heads/<name>`/`heads/<name>` included, AND that branch has a metadata row in the
+///    active provider per [`stack_model`], Graphite or gh-stack)
 ///    → the whole stack focused there, exactly like `stack` but pinned to `text`'s branch
 ///    instead of real `HEAD`. The uncommitted layer rides along only when the resolved branch
 ///    IS `head_branch` — this is the first caller to pass [`UncommittedLayer::Omit`].
@@ -269,17 +270,19 @@ fn resolve_ref(
     text: String,
 ) -> Result<Vec<workon::Changeset>, SourceError> {
     if let Some(branch_name) = resolve_local_branch_name(repo, &text) {
-        if workon::current_stack(repo, &branch_name, StackModel::Graphite)
-            .ok()
-            .flatten()
-            .is_some()
+        let model = stack_model(repo);
+        if matches!(model, StackModel::Graphite | StackModel::GhStack)
+            && workon::current_stack(repo, &branch_name, model)
+                .ok()
+                .flatten()
+                .is_some()
         {
             let layer = if branch_name == head_branch {
                 UncommittedLayer::Include
             } else {
                 UncommittedLayer::Omit
             };
-            return assemble_changesets(repo, &branch_name, StackModel::Graphite, layer)
+            return assemble_changesets(repo, &branch_name, model, layer)
                 .map_err(map_assemble_err(&branch_name));
         }
 
