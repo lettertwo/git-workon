@@ -72,6 +72,9 @@ pub enum Command {
     ExpandAllGaps,
     HscrollLeft,
     HscrollRight,
+    Search,
+    SearchNext,
+    SearchPrev,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -90,6 +93,7 @@ pub enum Command {
     OutlinePrevChangeset,
     OutlineCollapseAll,
     OutlineExpandAll,
+    OutlineFilter,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -270,7 +274,10 @@ pub static REGISTRY: &[Registered] = &[
         command: Command::NextHunk,
         view: View::Diff,
         name: "next-hunk",
-        default_keys: "]h n",
+        // `n` moved off this default (M11 CS3, `diff-search`): it's now `search-next`'s default,
+        // which itself falls back to this exact action when no search is active — see that row's
+        // description. `]h` alone still reaches it directly.
+        default_keys: "]h",
         description: "Go to the next hunk",
     },
     Registered {
@@ -342,6 +349,27 @@ pub static REGISTRY: &[Registered] = &[
         name: "expand-all-gaps",
         default_keys: "zR",
         description: "Reveal every collapsed gap in the file",
+    },
+    Registered {
+        command: Command::Search,
+        view: View::Diff,
+        name: "search",
+        default_keys: "/",
+        description: "Search within the current file",
+    },
+    Registered {
+        command: Command::SearchNext,
+        view: View::Diff,
+        name: "search-next",
+        default_keys: "n",
+        description: "Next search match (or next hunk, when no search is active)",
+    },
+    Registered {
+        command: Command::SearchPrev,
+        view: View::Diff,
+        name: "search-prev",
+        default_keys: "N",
+        description: "Previous search match (or previous hunk, when no search is active)",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {
@@ -449,6 +477,13 @@ pub static REGISTRY: &[Registered] = &[
         name: "outline-expand-all",
         default_keys: "zR",
         description: "Expand every changeset/directory in the outline",
+    },
+    Registered {
+        command: Command::OutlineFilter,
+        view: View::Outline,
+        name: "filter",
+        default_keys: "/",
+        description: "Fuzzy-filter the outline",
     },
 ];
 
@@ -1256,23 +1291,26 @@ mod tests {
         );
     }
 
-    /// CS3 (diff-fold-keys): `n`/`p` are extra default bindings on the existing hunk-nav
-    /// commands (`]h`/`[h`), added purely for symmetry with the outline's `n`/`p` changeset nav.
-    /// `primary_key` still picks the first token, so the footer/help keep showing `]h`/`[h` —
-    /// `next-hunk`/`prev-hunk` aren't in `DIFF_HINTS` today, but `primary_key`/`keys_for` (which
-    /// the help overlay uses) are exercised by `footer_hint_renders_the_curated_diff_entries` and
+    /// CS3 (diff-fold-keys) originally bound `n` as an extra default on `next-hunk`, for symmetry
+    /// with the outline's `n`/`p` changeset nav. M11 CS3 (`diff-search`) reclaims `n` as
+    /// `search-next`'s default instead (falling back to `next-hunk` itself when no search is
+    /// active — `App::search_next` — so `n`'s PRACTICAL effect on an unbound-search diff is
+    /// unchanged); `p` is untouched, still `prev-hunk`'s extra default. `primary_key` still picks
+    /// the first token, so the footer/help keep showing `]h`/`[h` for `next-hunk`/`prev-hunk`
+    /// themselves — neither is in `DIFF_HINTS` today, but `primary_key`/`keys_for` (which the help
+    /// overlay uses) are exercised by `footer_hint_renders_the_curated_diff_entries` and
     /// `help_sections_groups_global_and_the_focused_view_only`.
     #[test]
-    fn n_and_p_dispatch_diff_hunk_nav_with_no_collisions() {
+    fn n_dispatches_search_next_and_p_still_dispatches_prev_hunk_with_no_collisions() {
         let km = Keymap::defaults();
         assert!(
             km.warnings().is_empty(),
-            "n/p hunk-nav defaults must not collide with anything: {:?}",
+            "n/p defaults must not collide with anything: {:?}",
             km.warnings()
         );
         assert_eq!(
             feed(&km, false, &[key(KeyCode::Char('n'))]),
-            Dispatch::Command(Command::NextHunk)
+            Dispatch::Command(Command::SearchNext)
         );
         assert_eq!(
             feed(&km, false, &[key(KeyCode::Char('p'))]),

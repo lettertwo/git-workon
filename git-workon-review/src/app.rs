@@ -30,6 +30,7 @@ use crate::ops;
 use crate::outline::{
     self, FoldKey, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder,
 };
+use crate::prompt::PromptState;
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
 use crate::scope::enclosing_scope_lines;
@@ -460,6 +461,18 @@ impl FileView {
             .get(&inline_idx)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// M11 CS3 (search): literal, smartcase matches of `query` against this file's PRE-collapse
+    /// row space — see [`crate::search::compute_matches`]'s doc comment for why that space (not
+    /// [`Self::display`]/[`Self::inline`]) is what's scanned.
+    pub(crate) fn search_matches(&self, query: &str) -> Vec<crate::search::SearchMatch> {
+        crate::search::compute_matches(
+            &self.aligned,
+            query,
+            |n| self.old_line(n).to_string(),
+            |n| self.new_line(n).to_string(),
+        )
     }
 }
 
@@ -965,6 +978,20 @@ pub struct OutlineState {
     /// outlives its own toggling row's disappearance and reappearance (e.g. a discard-then-recreate
     /// of the same path) for as long as the session runs.
     pub folds: HashMap<OutlineMode, HashSet<FoldKey>>,
+    /// CS2 (`outline-filter`, M11): the fuzzy-filter query, `/` while the outline has focus opens.
+    /// Read fresh every [`App::outline_items`] call (via [`outline::fold_outline_filtered`])
+    /// rather than
+    /// cached — persistence across a rebuild (staging op, mode cycle, refresh) is therefore free:
+    /// the query itself just sits here untouched by any of those, so the very next
+    /// [`App::outline_items`] call re-derives the same filtered view from the fresh row list. See
+    /// [`Self::filter_focused`] for the two-focus model this pairs with.
+    pub filter: PromptState,
+    /// Whether the one-row filter input (not the outline row list) currently has keyboard capture
+    /// — the prototype's two-focus model (locked design #2 in the M11 plan): `/` sets this `true`;
+    /// `Enter`/`Esc` set it back to `false` while KEEPING [`Self::filter`]'s query; `Ctrl-c` clears
+    /// the query AND sets this `false`. Meaningless unless [`OutlineState::focused`] is also
+    /// `true` — the filter input can't have keyboard capture while the diff pane does.
+    pub filter_focused: bool,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -1431,6 +1458,29 @@ pub struct App {
     /// [`Self::zoom_key_label`] is a label rather than a keymap reference), so it only raises the
     /// flag here and the event loop — which DOES hold those — does the actual reload.
     config_reload_requested: bool,
+    /// M11 CS3 (`diff-search`): the ACCEPTED search query, `/` in the diff view opens the prompt
+    /// to edit. Survives file/changeset switches (vim-register semantics — see
+    /// [`Self::recompute_search`]'s doc comment for what recomputes it on which trigger). `None`
+    /// while no search has ever been
+    /// accepted, or after [`Self::search_clear`].
+    search_query: Option<String>,
+    /// The one-row prompt's own live editing buffer — separate from [`Self::search_query`] so
+    /// typing previews highlights without committing them: [`Self::search_accept`] (`Enter`) is
+    /// the only path that copies this into `search_query`; [`Self::search_abort`] (`Esc`) discards
+    /// it, leaving `search_query` (and its highlights) exactly as they were before `/` was pressed.
+    search_prompt: PromptState,
+    /// Whether the search prompt currently has keyboard capture — the diff-view analog of
+    /// [`OutlineState::filter_focused`]'s two-state model, except search has no "focus the prompt,
+    /// keep typing history" step: every `/` starts a fresh, empty prompt (see [`Self::search_focus`]).
+    search_focused: bool,
+    /// The CURRENT search text's matches (the live prompt buffer's while [`Self::search_focused`],
+    /// else [`Self::search_query`]'s) against the focused pane's file, in file order — recomputed
+    /// by [`Self::recompute_search`] on every trigger the M11 CS3 plan names: prompt edits, accept,
+    /// abort, file/changeset switch, refresh, layout/zoom change.
+    search_matches: Vec<crate::search::SearchMatch>,
+    /// Index into [`Self::search_matches`] of the match the cursor is currently parked on —
+    /// `None` while merely previewing (typing, before `Enter`) or when there's nothing to park on.
+    search_current: Option<usize>,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1563,6 +1613,8 @@ impl App {
             order: OutlineOrder::default(),
             hscroll: 0,
             folds: HashMap::new(),
+            filter: PromptState::new(),
+            filter_focused: false,
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -1614,6 +1666,11 @@ impl App {
             pending_wave: None,
             zoom_key_label: "Z".to_string(),
             config_reload_requested: false,
+            search_query: None,
+            search_prompt: PromptState::new(),
+            search_focused: false,
+            search_matches: Vec::new(),
+            search_current: None,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1970,7 +2027,7 @@ impl App {
 
     /// The role whose view [`Self::cursor`]/[`Self::scroll`] currently drive for file `idx`: the
     /// single effective role, or the focused split pane's role.
-    fn focused_role_for(&self, idx: usize) -> Role {
+    pub(crate) fn focused_role_for(&self, idx: usize) -> Role {
         match self.effective_zoom_for(idx) {
             EffectiveZoom::Single(role) => role,
             EffectiveZoom::Split => self.split_focus_role(),
@@ -2176,6 +2233,10 @@ impl App {
         }
         self.derive_scroll();
         // The unfocused pane's scroll is derived at render time, once its height is known.
+        // M11 CS3: `reset_panes` is the one chokepoint every file/changeset switch, refresh, and
+        // zoom cycle already funnels through (`open_current`/`complete_pending_open` both end
+        // here) — see [`Self::recompute_search`]'s doc comment for the full trigger list.
+        self.recompute_search();
     }
 
     /// Jump the focused pane's cursor to its role view's first hunk, then re-derive `scroll`.
@@ -2570,6 +2631,9 @@ impl App {
             SplitPane::Staged => SplitPane::Unstaged,
         };
         self.derive_scroll();
+        // `current_view_ref` now resolves to the OTHER pane's view — recompute so matches,
+        // jumps, and gap expansion are driven by the newly-focused pane, not a stale one.
+        self.recompute_search();
     }
 
     /// Reshape onto changeset `target` (clamped into range), landing on file `file_idx` of ITS
@@ -2695,37 +2759,12 @@ impl App {
             .collect()
     }
 
-    /// Build (via [`outline::fold_outline`]) the current [`OutlineMode`]'s FOLD-FILTERED row list
-    /// — the outline cursor's SINGLE index space, and the source of truth every other outline
-    /// consumer reads: `render.rs`, [`Self::outline_move_by`]/[`Self::outline_move_to`],
-    /// [`Self::outline_confirm`], [`Self::summary_target`], and the staging-verb resolution in
-    /// [`Self::outline_row_targets`] all funnel through this SAME method (CS5, `outline-fold`) —
-    /// so folding a Header/Dir can never silently retarget a cursor move or a stage/discard verb
-    /// onto the wrong row: there is no OTHER row list any of them could accidentally read
-    /// instead. Rebuilt fresh on every call (cheap: a small stack times a handful of files each,
-    /// no caching, same posture as [`Self::effective_zoom_for`]) rather than cached on `App`, so
-    /// it's never stale across a mode toggle, a nav, a fold, or a refresh. `render.rs`'s marker
-    /// needs the per-row hidden-file counts this discards — see
-    /// [`Self::outline_items_with_hidden_counts`].
-    pub fn outline_items(&self) -> Vec<OutlineItem> {
-        self.outline_folded().items
-    }
-
-    /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count —
-    /// `render_outline`'s data source. Every OTHER outline consumer uses [`Self::outline_items`]
-    /// instead, which just discards the counts it doesn't need; both funnel through the same
-    /// [`Self::outline_folded`] build, so they can never disagree about which rows are visible.
-    pub fn outline_items_with_hidden_counts(&self) -> (Vec<OutlineItem>, Vec<usize>) {
-        let folded = self.outline_folded();
-        (folded.items, folded.hidden_counts)
-    }
-
-    /// The shared build [`Self::outline_items`]/[`Self::outline_items_with_hidden_counts`]/
-    /// [`Self::outline_target_index`] all read from — [`outline::fold_outline`] applied to the
-    /// current mode/order/fold-set, so there's exactly one place that pairs "which changesets by
-    /// which state" with "the fold set for the CURRENT mode" (`self.outline.folds` is keyed by
-    /// [`OutlineMode`]; a mode with no folds recorded yet reads as "everything expanded", the
-    /// default).
+    /// The current [`OutlineMode`]'s FOLD-FILTERED row list — [`Self::outline_items`]'s FOLD-ONLY
+    /// input, before CS2's fuzzy filter (if any) is layered on top. `render.rs`'s marker needs the
+    /// per-row hidden-file counts this alone carries — see [`Self::outline_items_with_hidden_counts`].
+    /// Rebuilt fresh on every call (cheap: a small stack times a handful of files each, no
+    /// caching, same posture as [`Self::effective_zoom_for`]) rather than cached on `App`, so it's
+    /// never stale across a mode toggle, a nav, a fold, or a refresh.
     fn outline_folded(&self) -> outline::FoldedOutline {
         let snapshot = self.outline_snapshot();
         let folds = self.outline.folds.get(&self.outline.mode);
@@ -2734,15 +2773,79 @@ impl App {
         })
     }
 
-    /// Resolve a target row matched against the FULL (unfiltered) row list to its position in
-    /// [`Self::outline_items`]'s FILTERED list — its own index if it's visible, or its nearest
-    /// visible (collapsed) ancestor's if a fold hides it (CS5's "`sync_outline_to_current`
-    /// targeting a file hidden under a collapsed node lands on the collapsed ancestor WITHOUT
-    /// auto-expanding" rule — see [`outline::FoldedOutline::visible_index`]'s doc comment). `find`
-    /// matches against the full build (via `outline::build_items` directly, not
-    /// [`Self::outline_items`]) since a fold-hidden target has no index in the filtered list at
-    /// all to match against.
+    /// CS2's fuzzy filter, REVISED 2026-07-24: filter-then-rebuild — the outline cursor's SINGLE
+    /// index space, and the source of truth every other outline consumer reads: `render.rs`,
+    /// [`Self::outline_move_by`]/[`Self::outline_move_to`], [`Self::outline_confirm`],
+    /// [`Self::summary_target`], and the staging-verb resolution in [`Self::outline_row_targets`]
+    /// all funnel through [`Self::outline_items`]/[`Self::outline_items_with_hidden_counts`] below
+    /// — so an active filter can never silently retarget a cursor move or a stage/discard verb
+    /// onto a row the filter itself hid.
+    ///
+    /// Delegates entirely to [`outline::fold_outline_filtered`], which scores every changeset's
+    /// title and every file's FULL path AT THE SOURCE, rebuilds the row list from the surviving
+    /// file set with the ordinary [`outline::build_items`]/[`outline::apply_fold`] machinery, and
+    /// only THEN folds — so headers, dir rows, tree guides, and hidden-count markers all come out
+    /// structurally correct instead of a flattened, re-ordered list. An empty query short-circuits
+    /// inside that fn to a plain [`outline::fold_outline`] call (the "zero regression when the
+    /// filter is unused" rule), so no special-casing is needed here.
+    fn outline_filtered_and_marks(&self) -> (outline::FoldedOutline, outline::FilterMarks) {
+        let snapshot = self.outline_snapshot();
+        let folds = self.outline.folds.get(&self.outline.mode);
+        outline::fold_outline_filtered(
+            &snapshot,
+            self.outline.mode,
+            self.outline.order,
+            |key| folds.is_some_and(|set| set.contains(key)),
+            self.outline.filter.buffer(),
+        )
+    }
+
+    /// [`Self::outline_filtered_and_marks`]'s row list alone — see that method's doc comment for
+    /// the filter-then-rebuild composition, and [`Self::outline_items_with_hidden_counts`] for the
+    /// render-facing variant that also carries fold markers and match indices.
+    fn outline_filtered(&self) -> outline::FoldedOutline {
+        self.outline_filtered_and_marks().0
+    }
+
+    pub fn outline_items(&self) -> Vec<OutlineItem> {
+        self.outline_filtered().items
+    }
+
+    /// [`Self::outline_items`], plus (aligned by index) each row's CS5 hidden-file marker count
+    /// and CS2's fuzzy-match char indices (empty when no filter is active, or for a row that
+    /// isn't itself a match — see [`outline::FilterMarks`]'s doc comment) — `render_outline`'s
+    /// data source.
+    pub fn outline_items_with_hidden_counts(
+        &self,
+    ) -> (Vec<OutlineItem>, Vec<usize>, Vec<Vec<usize>>) {
+        let (folded, marks) = self.outline_filtered_and_marks();
+        (folded.items, folded.hidden_counts, marks.match_indices)
+    }
+
+    /// Resolve a target row matched against the FULL (unfiltered, unfolded) row list to its
+    /// position in [`Self::outline_items`]'s row list.
+    ///
+    /// With NO CS2 fuzzy filter active: its own index if it's visible, or its nearest visible
+    /// (collapsed) ancestor's if a fold hides it (CS5's "`sync_outline_to_current` targeting a
+    /// file hidden under a collapsed node lands on the collapsed ancestor WITHOUT auto-expanding"
+    /// rule — see [`outline::FoldedOutline::visible_index`]'s doc comment). `find` matches against
+    /// the full build (via `outline::build_items` directly, not [`Self::outline_items`]) since a
+    /// fold-hidden target has no index in the fold-filtered list at all to match against.
+    ///
+    /// With a CS2 fuzzy filter active: `None` when the target row's own text didn't survive the
+    /// filter — REVISED 2026-07-24's rebuild DOES preserve ancestor Header/Dir rows, but `find`
+    /// here always matches a specific `File` row's true `cs_idx`/`file_idx` (see
+    /// [`Self::sync_outline_to_current`]'s call site), and a `File` row that didn't itself survive
+    /// filtering is genuinely absent from the rebuilt list — there's no "nearest surviving
+    /// ancestor" fallback for a FILTERED-out file the way a FOLDED-hidden one gets, since the
+    /// filter's ancestor rows carry no notion of "the file that would have been here." Callers
+    /// (currently only [`Self::sync_outline_to_current`]) already treat `None` as "leave the
+    /// cursor where it is, clamped" — precisely the CS2 gotcha's "no-op instead of clearing the
+    /// filter" requirement, since neither branch here ever touches [`OutlineState::filter`] itself.
     fn outline_target_index(&self, find: impl Fn(&OutlineItem) -> bool) -> Option<usize> {
+        if !self.outline.filter.is_empty() {
+            return self.outline_items().iter().position(find);
+        }
         let snapshot = self.outline_snapshot();
         let full = outline::build_items(&snapshot, self.outline.mode, self.outline.order);
         let full_idx = full.iter().position(find)?;
@@ -2829,6 +2932,33 @@ impl App {
 
     pub fn outline_cursor(&self) -> usize {
         self.outline.cursor
+    }
+
+    /// CS2 (`outline-filter`): the current filter query, for `render.rs`'s input-row line.
+    pub fn outline_filter_query(&self) -> &str {
+        self.outline.filter.buffer()
+    }
+
+    /// CS2: the filter input's own [`PromptState`] — `render.rs` calls
+    /// [`PromptState::render_line`] on it directly rather than `app.rs` doing so itself, keeping
+    /// this module free of a `ratatui` dependency (see [`Region`]'s doc comment for the same
+    /// discipline elsewhere in this file).
+    pub fn outline_filter_state(&self) -> &PromptState {
+        &self.outline.filter
+    }
+
+    /// CS2: whether the filter INPUT ROW (not the outline row list) currently has keyboard
+    /// capture — see [`OutlineState::filter_focused`]'s doc comment for the two-focus model.
+    pub fn outline_filter_focused(&self) -> bool {
+        self.outline.filter_focused
+    }
+
+    /// CS2: whether `render_outline` should paint the filter input row at all — non-empty query
+    /// OR input-focused (locked design: typing shows the row; leaving it focused with an empty
+    /// query still shows it, so the cursor has somewhere to render). `false` (the pre-CS2 default)
+    /// renders the outline exactly as before this changeset.
+    pub fn outline_filter_active(&self) -> bool {
+        self.outline.filter_focused || !self.outline.filter.is_empty()
     }
 
     /// Top-of-viewport row index into [`Self::outline_items`]'s row list — see
@@ -3335,6 +3465,420 @@ impl App {
             .or_default()
             .clear();
         self.sync_outline_to_current();
+    }
+
+    // ── Outline fuzzy filter (CS2 `outline-filter`, M11) ─────────────────────────
+
+    /// `/` while the outline has focus: give the filter input row keyboard capture. The keymap
+    /// only ever dispatches this while [`OutlineState::focused`] is already `true` (it's a
+    /// [`crate::config::View::Outline`]-namespaced command), so this never has to flip that flag
+    /// itself. Leaves any existing query untouched — re-pressing `/` on an already-active filter
+    /// just returns capture to it rather than resetting anything.
+    pub fn outline_filter_focus(&mut self) {
+        self.outline.filter_focused = true;
+    }
+
+    /// `Enter`/`Esc` while the filter input is focused: hand keyboard capture back to the outline
+    /// row LIST, KEEPING the query — the locked two-focus model (`Ctrl-c` below is the only path
+    /// that clears it). The row list itself needs no re-derivation here: it already reads
+    /// [`OutlineState::filter`] live on every [`Self::outline_items`] call, so nothing about the
+    /// visible rows changes just because capture moves off the input row.
+    pub fn outline_filter_unfocus(&mut self) {
+        self.outline.filter_focused = false;
+    }
+
+    /// `Ctrl-c` while the filter input is focused: clear the query AND hand capture back to the
+    /// list — the one path that discards the filter entirely, unlike [`Self::outline_filter_unfocus`].
+    /// Re-syncs the cursor via [`Self::sync_outline_to_current`] (mirroring
+    /// [`Self::outline_collapse_all`]/[`Self::outline_expand_all`]'s reseat) since clearing the
+    /// query can radically reshape the row list (from a short filtered set back to the full
+    /// fold-filtered one).
+    pub fn outline_filter_clear(&mut self) {
+        self.outline.filter.clear();
+        self.outline.filter_focused = false;
+        self.sync_outline_to_current();
+    }
+
+    /// After any filter-input edit that can change the QUERY TEXT (so the matched row set itself
+    /// just reshaped, not merely the cursor's position within a stable list): reseat the outline
+    /// cursor onto the HIGHEST-scoring row ([`outline::FilterMarks::best_index`], ties keeping the
+    /// earlier row) — mirroring a picker reopening its list on every keystroke — and re-derive the
+    /// scroll. REVISED 2026-07-24: the rebuilt row list is structural, not score-ordered, so "the
+    /// best match" is no longer always row `0` — it can be anywhere the rebuild placed it. Falls
+    /// back to `0` when no row carries a score at all (the query cleared back to empty, or the
+    /// rebuilt list is empty). `render_body`'s summary-vs-diff branch ([`Self::summary_target`])
+    /// and `outline_move_by`'s own switch-on-landing behavior both key off `outline.cursor`, so
+    /// parking it at the new best match rather than leaving it at a stale index is what makes
+    /// typing feel live rather than leaving the cursor pointing at whatever row happened to still
+    /// be there.
+    fn outline_filter_reflow(&mut self) {
+        let (folded, marks) = self.outline_filtered_and_marks();
+        self.outline.cursor = marks.best_index().unwrap_or(0);
+        self.derive_outline_scroll(folded.items.len());
+    }
+
+    /// Insert one typed char into the filter query (every non-control, non-Alt `Char` key while
+    /// the filter input is focused).
+    pub fn outline_filter_insert_char(&mut self, c: char) {
+        self.outline.filter.insert_char(c);
+        self.outline_filter_reflow();
+    }
+
+    /// `Backspace` while the filter input is focused.
+    pub fn outline_filter_backspace(&mut self) {
+        self.outline.filter.backspace();
+        self.outline_filter_reflow();
+    }
+
+    /// `Delete` while the filter input is focused.
+    pub fn outline_filter_delete(&mut self) {
+        self.outline.filter.delete();
+        self.outline_filter_reflow();
+    }
+
+    /// `Left` while the filter input is focused — moves the INPUT's own cursor, not the outline
+    /// selection (`Down`/`Up`/`Ctrl-n`/`Ctrl-p` do that instead — see `tui::update`'s filter-input
+    /// capture arm). Doesn't reshape the row list, so no [`Self::outline_filter_reflow`].
+    pub fn outline_filter_move_left(&mut self) {
+        self.outline.filter.move_left();
+    }
+
+    /// `Right` while the filter input is focused — see [`Self::outline_filter_move_left`].
+    pub fn outline_filter_move_right(&mut self) {
+        self.outline.filter.move_right();
+    }
+
+    /// `Home`/`Ctrl-a` while the filter input is focused.
+    pub fn outline_filter_move_home(&mut self) {
+        self.outline.filter.move_home();
+    }
+
+    /// `End`/`Ctrl-e` while the filter input is focused.
+    pub fn outline_filter_move_end(&mut self) {
+        self.outline.filter.move_end();
+    }
+
+    /// `Ctrl-u` while the filter input is focused.
+    pub fn outline_filter_clear_to_start(&mut self) {
+        self.outline.filter.clear_to_start();
+        self.outline_filter_reflow();
+    }
+
+    /// `Ctrl-w` while the filter input is focused.
+    pub fn outline_filter_delete_word_back(&mut self) {
+        self.outline.filter.delete_word_back();
+        self.outline_filter_reflow();
+    }
+
+    // ── Diff search (CS3 `diff-search`, M11) ─────────────────────────────────────
+
+    /// Whether the search prompt currently has keyboard capture (`/` opened it, `Enter`/`Esc`
+    /// haven't closed it yet) — `tui.rs`'s modal-capture cascade arm and mouse-swallow guard, and
+    /// `render.rs`'s footer prompt, all gate on this.
+    pub fn search_focused(&self) -> bool {
+        self.search_focused
+    }
+
+    /// Whether an ACCEPTED search is live (survives the prompt closing) — the fallback gate for
+    /// `n`/`N` (contextual hunk-nav fallback when this is `false`) and the Esc-precedence ladder's
+    /// "clear the active search" arm.
+    pub fn search_active(&self) -> bool {
+        self.search_query.is_some()
+    }
+
+    /// The prompt's own live editing buffer, for `render.rs`'s footer prompt (mirrors
+    /// [`Self::outline_filter_state`]).
+    pub fn search_prompt_state(&self) -> &PromptState {
+        &self.search_prompt
+    }
+
+    /// The current search's matches (recomputed by [`Self::recompute_search`]), in file order.
+    pub fn search_matches(&self) -> &[crate::search::SearchMatch] {
+        &self.search_matches
+    }
+
+    /// Index into [`Self::search_matches`] the cursor is currently parked on, if any — the
+    /// distinguishing mark between `search-match-bg` (every match) and `search-current-bg` (this
+    /// one) `render.rs` paints.
+    pub fn search_current_index(&self) -> Option<usize> {
+        self.search_current
+    }
+
+    /// `/` in the diff view: open a FRESH, empty search prompt (unlike the outline filter, the
+    /// search prompt never pre-fills from the last accepted query — vim's `/` doesn't either).
+    pub fn search_focus(&mut self) {
+        self.search_prompt.clear();
+        self.search_focused = true;
+        self.recompute_search();
+    }
+
+    /// The text driving [`Self::search_matches`] right now: the live prompt buffer while
+    /// [`Self::search_focused`] (so typing previews highlights), else the last ACCEPTED query —
+    /// this is what makes [`Self::search_abort`] "restore the previously accepted search" free
+    /// (closing the prompt without touching `search_query` just switches which text
+    /// [`Self::recompute_search`] reads next).
+    fn active_search_text(&self) -> Option<&str> {
+        if self.search_focused && !self.search_prompt.is_empty() {
+            Some(self.search_prompt.buffer())
+        } else {
+            self.search_query.as_deref()
+        }
+    }
+
+    /// Recompute [`Self::search_matches`] from [`Self::active_search_text`] against the FOCUSED
+    /// pane's current file view — called on every trigger the M11 CS3 plan names: every prompt
+    /// edit (live preview), accept/abort, file/changeset switch and refresh (both funnel through
+    /// [`Self::reset_panes`]), and a layout/zoom change (harmless to re-run even when the match
+    /// content can't have changed — matches address the layout-agnostic `AlignedRow` space).
+    /// [`Self::search_current`] always resets to `None` here: a fresh match list has no "the
+    /// cursor is parked on match N" claim to make until [`Self::search_accept`]/
+    /// [`Self::search_next`]/[`Self::search_prev`] jumps to one.
+    fn recompute_search(&mut self) {
+        self.search_current = None;
+        let Some(text) = self.active_search_text() else {
+            self.search_matches.clear();
+            return;
+        };
+        if text.is_empty() {
+            self.search_matches.clear();
+            return;
+        }
+        let text = text.to_string();
+        self.search_matches = match self.current_view_ref() {
+            Some(view) => view.search_matches(&text),
+            None => Vec::new(),
+        };
+    }
+
+    /// `Enter` while the prompt is focused: commit the buffer as the accepted query, close the
+    /// prompt, and jump to the first match at-or-after the cursor (wrapping to the file's first
+    /// match, with a footer notice, if none is at-or-after it). An empty buffer clears the search
+    /// instead of accepting a no-op query.
+    pub fn search_accept(&mut self) {
+        let text = self.search_prompt.buffer().to_string();
+        self.search_focused = false;
+        self.search_prompt.clear();
+        if text.is_empty() {
+            self.search_clear();
+            return;
+        }
+        self.search_query = Some(text);
+        self.recompute_search();
+        if self.search_matches.is_empty() {
+            return;
+        }
+        match self.first_match_at_or_after_cursor() {
+            Some(idx) => self.jump_to_search_match(idx, false),
+            None => self.jump_to_search_match(0, true),
+        }
+    }
+
+    /// `Esc` while the prompt is focused: discard the buffer, close the prompt, and restore
+    /// whichever accepted search (or none) was active before `/` was pressed — free, since
+    /// [`Self::active_search_text`] already falls back to [`Self::search_query`] once
+    /// [`Self::search_focused`] is `false`.
+    pub fn search_abort(&mut self) {
+        self.search_focused = false;
+        self.search_prompt.clear();
+        self.recompute_search();
+    }
+
+    /// `Esc` with the diff focused and an active search (no prompt open) — clears the search
+    /// entirely, the Esc-precedence ladder's own arm (ranked with the line-selection cancel, see
+    /// `tui.rs::resolve_key`).
+    pub fn search_clear(&mut self) {
+        self.search_query = None;
+        self.search_focused = false;
+        self.search_prompt.clear();
+        self.search_matches.clear();
+        self.search_current = None;
+    }
+
+    /// Insert a char at the prompt's cursor and recompute the live preview.
+    pub fn search_insert_char(&mut self, c: char) {
+        self.search_prompt.insert_char(c);
+        self.recompute_search();
+    }
+
+    /// `Backspace` while the prompt is focused.
+    pub fn search_backspace(&mut self) {
+        self.search_prompt.backspace();
+        self.recompute_search();
+    }
+
+    /// `Delete` while the prompt is focused.
+    pub fn search_delete(&mut self) {
+        self.search_prompt.delete();
+        self.recompute_search();
+    }
+
+    /// `Left` while the prompt is focused — doesn't reshape the match list, so no recompute.
+    pub fn search_move_left(&mut self) {
+        self.search_prompt.move_left();
+    }
+
+    /// `Right` while the prompt is focused — see [`Self::search_move_left`].
+    pub fn search_move_right(&mut self) {
+        self.search_prompt.move_right();
+    }
+
+    /// `Ctrl-a`/`Home` while the prompt is focused.
+    pub fn search_move_home(&mut self) {
+        self.search_prompt.move_home();
+    }
+
+    /// `Ctrl-e`/`End` while the prompt is focused.
+    pub fn search_move_end(&mut self) {
+        self.search_prompt.move_end();
+    }
+
+    /// `Ctrl-u` while the prompt is focused.
+    pub fn search_clear_to_start(&mut self) {
+        self.search_prompt.clear_to_start();
+        self.recompute_search();
+    }
+
+    /// `Ctrl-w` while the prompt is focused.
+    pub fn search_delete_word_back(&mut self) {
+        self.search_prompt.delete_word_back();
+        self.recompute_search();
+    }
+
+    /// The [`crate::align::AlignedRow`] index (into [`FileView::aligned`], the SAME space
+    /// [`crate::search::SearchMatch::aligned_idx`] addresses) the cursor's current row corresponds
+    /// to — resolved by lineno rather than by position in the active layout's row vector, since
+    /// the inline layout's per-run Del-then-Add reordering (see `align::inline_rows`) means a
+    /// row's POSITION there does NOT correspond to `aligned_idx` order the way it does in the SBS
+    /// layout. `None` when the view or the cursor's row can't be resolved.
+    fn cursor_aligned_idx(&self) -> Option<usize> {
+        let view = self.current_view_ref()?;
+        let (old, new) = match self.layout {
+            Layout::Sbs => display_row_linenos(view.display.get(self.cursor)?),
+            Layout::Inline => inline_row_linenos(view.inline.get(self.cursor)?),
+        };
+        view.aligned.iter().position(|r| {
+            let (row_old, row_new) = (row_lineno(r.old), row_lineno(r.new));
+            match (old, new) {
+                (Some(_), Some(_)) => row_old == old && row_new == new,
+                (Some(_), None) => row_old == old,
+                (None, Some(_)) => row_new == new,
+                (None, None) => false,
+            }
+        })
+    }
+
+    /// The first [`Self::search_matches`] index whose row is at-or-after the cursor's own
+    /// position, in aligned-row order (not lineno — old/new linenos diverge in files with net
+    /// insertions/deletions, which can otherwise skip or misorder del-side matches) —
+    /// [`Self::search_accept`]'s jump target. `None` when every match lies strictly before the
+    /// cursor (the wrap case its caller handles).
+    fn first_match_at_or_after_cursor(&self) -> Option<usize> {
+        let cursor_idx = self.cursor_aligned_idx().unwrap_or(0);
+        self.search_matches
+            .iter()
+            .position(|m| m.aligned_idx >= cursor_idx)
+    }
+
+    /// `n`/`N` (contextual): jump to the next/previous search match when a search is active,
+    /// wrapping (with a footer notice) at either end; falls back to [`Self::next_hunk_row`]/
+    /// [`Self::prev_hunk_row`] when no search is active at all (`search-next`/`search-prev`'s
+    /// registry description names this fallback).
+    fn search_step(&mut self, forward: bool) {
+        if !self.search_active() || self.search_matches.is_empty() {
+            if forward {
+                self.next_hunk_row();
+            } else {
+                self.prev_hunk_row();
+            }
+            return;
+        }
+        let n = self.search_matches.len();
+        let (next_idx, wrapped) = match self.search_current {
+            Some(cur) => {
+                if forward {
+                    let next = (cur + 1) % n;
+                    (next, next < cur)
+                } else {
+                    let next = (cur + n - 1) % n;
+                    (next, next > cur)
+                }
+            }
+            // No prior current (a search just accepted, or `n`/`N` pressed before any jump):
+            // land on the nearest match at-or-after the cursor either direction — same starting
+            // point [`Self::search_accept`] itself would have picked.
+            None => match self.first_match_at_or_after_cursor() {
+                Some(idx) => (idx, false),
+                None => (0, true),
+            },
+        };
+        self.jump_to_search_match(next_idx, wrapped);
+    }
+
+    /// `n` (default binding `search-next`): see [`Self::search_step`].
+    pub fn search_next(&mut self) {
+        self.search_step(true);
+    }
+
+    /// `N` (default binding `search-prev`): see [`Self::search_step`].
+    pub fn search_prev(&mut self) {
+        self.search_step(false);
+    }
+
+    /// Park the cursor on [`Self::search_matches`]`[idx]`: auto-expand the gap it's hidden behind
+    /// (if any — [`crate::align::gap_key_for_aligned_idx`] + [`FileView::expand_gap`], the
+    /// existing CS8/CS9 machinery), then locate the row in the ACTIVE layout's own vector by the
+    /// match's (old, new) lineno pair and land there. `wrapped` raises the footer notice the plan
+    /// calls for; a match whose row can't be located post-expansion (should be unreachable once
+    /// expanded) leaves the cursor where it was rather than panicking.
+    fn jump_to_search_match(&mut self, idx: usize, wrapped: bool) {
+        let Some(&m) = self.search_matches.get(idx) else {
+            return;
+        };
+        self.search_current = Some(idx);
+
+        if let Some(view) = self.current_view() {
+            if let Some(key) = crate::align::gap_key_for_aligned_idx(&view.aligned, m.aligned_idx) {
+                let hidden = crate::align::gap_hidden_range(&view.aligned, key, &view.expansions)
+                    .is_some_and(|(start, end)| m.aligned_idx >= start && m.aligned_idx < end);
+                if hidden {
+                    view.expand_gap(key, 0, 0, true);
+                }
+            }
+        }
+
+        let layout = self.layout;
+        if let Some(view) = self.current_view_ref() {
+            let target = (m.old_lineno, m.new_lineno);
+            let row = match layout {
+                Layout::Sbs => view
+                    .display
+                    .iter()
+                    .position(|r| display_row_linenos(r) == target),
+                // Side-aware, not pair equality: the inline layout splits a paired change row's
+                // match (which carries BOTH linenos) into separate Del/Add rows that each carry
+                // only one — `Both` (a context row, which always carries both) is the only side
+                // where full-pair equality still applies.
+                Layout::Inline => view.inline.iter().position(|r| match m.side {
+                    crate::search::SearchSide::Old => {
+                        matches!(r, InlineRow::Del { old, .. } if Some(*old) == m.old_lineno)
+                    }
+                    crate::search::SearchSide::New => {
+                        matches!(r, InlineRow::Add { new, .. } if Some(*new) == m.new_lineno)
+                    }
+                    crate::search::SearchSide::Both => inline_row_linenos(r) == target,
+                }),
+            };
+            if let Some(row) = row {
+                self.cursor = row;
+            }
+        }
+
+        self.cancel_selection();
+        self.derive_scroll();
+        self.clamp_cursor();
+        if wrapped {
+            self.notify("search wrapped", Severity::Info);
+        }
     }
 
     // ── Outline staging (CS7) ───────────────────────────────────────────────────
@@ -4020,6 +4564,10 @@ impl App {
             };
         }
         self.derive_scroll();
+        // M11 CS3: named as a recompute trigger by the plan even though the match ADDRESSES
+        // (aligned-space) can't actually change here — only which display/inline row each one
+        // resolves to. Cheap to re-run regardless (see [`Self::recompute_search`]'s doc comment).
+        self.recompute_search();
     }
 
     /// Set the render layout directly — the config-startup (CS7) counterpart to
@@ -4177,6 +4725,7 @@ impl App {
                 };
             }
             self.derive_scroll();
+            self.recompute_search();
         }
 
         if self.outline.mode != outline_mode_before || self.outline.order != outline_order_before {
@@ -5144,8 +5693,10 @@ fn row_lineno(row: Row) -> Option<usize> {
 }
 
 /// The (old, new) 1-based line numbers a display row occupies — `None` on a filler side, and
-/// `(None, None)` for a gap row (which belongs to no hunk).
-fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
+/// `(None, None)` for a gap row (which belongs to no hunk). `pub(crate)`: `render.rs`'s M11 CS3
+/// search-highlight lookup reuses this exact pairing (the same key [`crate::search::SearchMatch`]
+/// carries) rather than re-deriving its own.
+pub(crate) fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
     match row {
         DisplayRow::Row(r) => (row_lineno(r.old), row_lineno(r.new)),
         DisplayRow::Gap { .. } => (None, None),
@@ -5189,8 +5740,8 @@ fn gap_scope_start(
     Some((scope_start, anchor_prefers_new))
 }
 
-/// Inline-coordinate analog of [`display_row_linenos`].
-fn inline_row_linenos(row: &InlineRow) -> (Option<usize>, Option<usize>) {
+/// Inline-coordinate analog of [`display_row_linenos`]. `pub(crate)` for the same reason.
+pub(crate) fn inline_row_linenos(row: &InlineRow) -> (Option<usize>, Option<usize>) {
     match *row {
         InlineRow::Context { old, new } => (Some(old), Some(new)),
         InlineRow::Del { old, .. } => (Some(old), None),
@@ -11944,6 +12495,188 @@ mod tests {
         );
     }
 
+    // ── M11 CS3 (`diff-search`) ──────────────────────────────────────────────
+
+    /// [`two_hunks_with_a_wide_gap_fixture`], but the middle of the hidden context run carries a
+    /// unique needle (`ctx20` → `needle_line`) — CS3's "hidden-context rows are searchable, and
+    /// jumping to one auto-expands its gap" fixture.
+    fn two_hunks_with_a_buried_needle_fixture() -> Fixture {
+        let mut committed = String::from("OLD_HUNK_A\n");
+        let mut modified = String::from("NEW_HUNK_A\n");
+        for i in 1..=40 {
+            let line = if i == 20 {
+                "needle_line".to_string()
+            } else {
+                format!("ctx{i}")
+            };
+            committed.push_str(&line);
+            committed.push('\n');
+            modified.push_str(&line);
+            modified.push('\n');
+        }
+        committed.push_str("OLD_HUNK_B\n");
+        modified.push_str("NEW_HUNK_B\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn search_finds_a_match_hidden_inside_a_collapsed_gap() {
+        let fixture = two_hunks_with_a_buried_needle_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        assert_eq!(
+            app.search_matches().len(),
+            1,
+            "the buried needle must be found even while its gap is still collapsed"
+        );
+    }
+
+    #[test]
+    fn search_accept_jumps_to_the_first_match_and_auto_expands_its_gap() {
+        let fixture = two_hunks_with_a_buried_needle_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(
+            app.current_view_ref()
+                .unwrap()
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "precondition: the fixture's wide context run must start out collapsed"
+        );
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "jumping to a match buried in the gap must fully reveal it: {:?}",
+            view.display
+        );
+        match view.display[app.cursor] {
+            DisplayRow::Row(row) => {
+                assert_eq!(row.old, Row::Line(21), "needle_line is old-side line 21");
+            }
+            other => panic!("expected the cursor to land on the needle's row, got {other:?}"),
+        }
+        assert!(!app.search_focused(), "accept must close the prompt");
+        assert!(app.search_active());
+    }
+
+    #[test]
+    fn search_next_and_prev_wrap_with_a_footer_notice() {
+        // Two occurrences of the SAME needle on two different visible lines (both hunk change
+        // rows, so no gap machinery is in play here — this test is purely about n/N wrap).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "f.txt",
+                "alpha old\nctx\nbeta old\n",
+                "alpha needle\nctx\nbeta needle\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.search_focus();
+        for c in "needle".chars() {
+            app.search_insert_char(c);
+        }
+        app.search_accept();
+        assert_eq!(app.search_matches().len(), 2);
+        assert_eq!(app.search_current_index(), Some(0));
+
+        app.search_next();
+        assert_eq!(app.search_current_index(), Some(1));
+        assert!(
+            app.notice.is_none(),
+            "advancing without wrapping raises no notice"
+        );
+
+        app.search_next();
+        assert_eq!(
+            app.search_current_index(),
+            Some(0),
+            "n at the last match wraps to the first"
+        );
+        assert!(
+            app.notice.is_some(),
+            "wrapping forward must raise a footer notice"
+        );
+
+        app.clear_notice();
+        app.search_prev();
+        assert_eq!(
+            app.search_current_index(),
+            Some(1),
+            "N at the first match wraps to the last"
+        );
+        assert!(
+            app.notice.is_some(),
+            "wrapping backward must raise a footer notice too"
+        );
+    }
+
+    #[test]
+    fn search_next_and_prev_fall_back_to_hunk_nav_with_no_active_search() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert!(
+            !app.search_active(),
+            "precondition: no search has ever been accepted"
+        );
+
+        let cursor_before = app.cursor;
+        app.search_next();
+        assert_eq!(
+            app.cursor,
+            find_next_hunk_row(&app.current_view_ref().unwrap().display, cursor_before)
+                .unwrap_or(cursor_before),
+            "with no active search, search-next must fall back to next-hunk"
+        );
+    }
+
+    #[test]
+    fn esc_with_diff_focused_and_an_active_search_clears_it_before_walking_out_to_the_outline() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.open = true;
+
+        app.search_focus();
+        app.search_insert_char('c'); // "ctx..." lines all match a bare 'c'
+        app.search_accept();
+        assert!(app.search_active());
+
+        // The keymap-driven Esc ladder itself lives in `tui.rs`; this pins the `App`-level state
+        // transition `App::search_clear` provides for that ladder's arm.
+        app.search_clear();
+        assert!(
+            !app.search_active(),
+            "Esc's search-clear arm must deactivate the search"
+        );
+        assert!(app.search_matches().is_empty());
+    }
+
     // ── CS9: reveal gaps to the enclosing tree-sitter scope ─────────────────
 
     /// A `.rs` fixture where both edits sit inside the SAME long function, with a 40-line
@@ -12471,5 +13204,199 @@ mod tests {
         assert_eq!(app.cursor, cursor_before);
         assert_eq!(app.outline_cursor(), outline_cursor_before);
         assert_eq!((app.current_cs(), app.current), current_before);
+    }
+
+    // ── CS2 (`outline-filter`, M11): fuzzy filter ─────────────────────────────────
+
+    #[test]
+    fn outline_items_applies_the_active_filter_and_keeps_true_indices() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        assert_eq!(
+            app.outline_items().len(),
+            5,
+            "unfiltered: [Header cs-a, a1.txt, a2.txt, Header cs-b, b1.txt]"
+        );
+
+        app.outline_filter_insert_char('b');
+        app.outline_filter_insert_char('1');
+
+        let items = app.outline_items();
+        // REVISED 2026-07-24: the rebuild keeps cs-b's Header alongside its surviving file —
+        // cs-a's Header (and both its files) is dropped entirely, since neither its title
+        // ("cs-a") nor a1.txt/a2.txt match "b1".
+        assert_eq!(
+            items.len(),
+            2,
+            "cs-b's header rebuilds structurally alongside the one file that matches 'b1'"
+        );
+        assert!(
+            matches!(items[0], OutlineItem::Header { cs_idx: 1, .. }),
+            "cs-b's header comes first (its own row), got {:?}",
+            items[0]
+        );
+        assert_eq!(
+            items[1],
+            OutlineItem::File {
+                cs_idx: 1,
+                file_idx: 0,
+                path: "b1.txt".to_string(),
+                status: StagedStatus::None,
+                change: FileStatus::Added,
+                guides: Vec::new(),
+            },
+            "the surviving row keeps its TRUE cs_idx/file_idx into App::changesets"
+        );
+    }
+
+    /// REVISED 2026-07-24: parking the cursor on "the best match" is no longer always row `0` —
+    /// the rebuilt list keeps cs-b's Header ahead of its own (only, and therefore best-scoring)
+    /// matching file, so the cursor must land on the FILE row, not the unscored header above it.
+    #[test]
+    fn outline_filter_reflow_parks_the_cursor_on_the_highest_scoring_row_not_row_zero() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+
+        app.outline_filter_insert_char('b');
+        app.outline_filter_insert_char('1');
+
+        let items = app.outline_items();
+        let file_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path, .. } if path == "b1.txt"))
+            .expect("b1.txt survives the 'b1' filter");
+        assert_ne!(
+            file_idx, 0,
+            "sanity: the file row is NOT row 0 (the header is)"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            file_idx,
+            "the cursor parks on b1.txt (the only scored row), not on cs-b's unscored header \
+             at row 0"
+        );
+    }
+
+    #[test]
+    fn outline_items_empty_query_reproduces_the_unfiltered_fold_filtered_list() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        let before = app.outline_items();
+
+        // Focusing the filter input alone (no query typed) must be a complete no-op on the row
+        // list — the locked "zero regression when unused" rule.
+        app.outline_filter_focus();
+
+        assert_eq!(app.outline_items(), before);
+    }
+
+    #[test]
+    fn outline_filter_query_persists_across_a_mode_cycle_and_a_staging_op() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("apple.txt", "a\n", "a\nCHANGED\n")
+            .unstaged_file("banana.txt", "b\n", "b\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        open_focused_outline(&mut app, OutlineMode::Flat, 0);
+        app.outline_filter_insert_char('a');
+        app.outline_filter_insert_char('p');
+        app.outline_filter_insert_char('p');
+        assert_eq!(app.outline_filter_query(), "app");
+        assert_eq!(app.outline_items().len(), 1, "only apple.txt matches 'app'");
+
+        // A mode cycle rebuilds the row list from scratch — the query must survive untouched, and
+        // re-filter the newly-rebuilt list the same way.
+        app.outline_cycle_mode();
+        assert_eq!(
+            app.outline_filter_query(),
+            "app",
+            "a mode cycle must not clear the filter query"
+        );
+        assert_eq!(app.outline_items().len(), 1, "still just apple.txt");
+
+        // A staging op runs `coordinated_refresh`, which rebuilds `outline_snapshot`/the fold —
+        // the query must survive that too.
+        let idx = outline_file_row(&app, "apple.txt");
+        app.outline.cursor = idx;
+        app.outline_stage();
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.outline_filter_query(),
+            "app",
+            "a staging op's refresh must not clear the filter query"
+        );
+    }
+
+    #[test]
+    fn outline_filter_clear_restores_the_full_row_list_and_unfocuses_the_input() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        let full_len = app.outline_items().len();
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('b');
+        assert!(app.outline_items().len() < full_len);
+
+        app.outline_filter_clear();
+
+        assert!(app.outline_filter_query().is_empty());
+        assert!(!app.outline_filter_focused());
+        assert_eq!(app.outline_items().len(), full_len);
+    }
+
+    #[test]
+    fn outline_filter_unfocus_keeps_the_query_and_the_narrowed_row_list() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        app.outline_filter_focus();
+        app.outline_filter_insert_char('b');
+        let narrowed_len = app.outline_items().len();
+
+        app.outline_filter_unfocus();
+
+        assert!(!app.outline_filter_focused());
+        assert_eq!(app.outline_filter_query(), "b");
+        assert_eq!(app.outline_items().len(), narrowed_len);
+    }
+
+    #[test]
+    fn sync_outline_to_current_no_ops_the_cursor_when_the_current_file_is_filtered_out() {
+        // A file-nav call (`next_file`) triggers `sync_outline_to_current`; with a filter active
+        // that hides the landing file's own row, the cursor must stay wherever it already was
+        // (clamped into the filtered list's bounds) rather than the filter being silently cleared
+        // to make room for a "found" row.
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Flat, 0);
+        app.outline_filter_insert_char('a'); // matches a1.txt/a2.txt, not b1.txt
+        let items = app.outline_items();
+        assert!(
+            items
+                .iter()
+                .all(|it| !matches!(it, OutlineItem::File { cs_idx: 1, .. })),
+            "b1.txt (cs-b) must be filtered out by the 'a' query"
+        );
+        let cursor_before = app.outline_cursor();
+        let query_before = app.outline_filter_query().to_string();
+
+        // Switch the diff's current file to b1.txt (cs-b), which the active filter hides.
+        // `switch_changeset` itself never calls `sync_outline_to_current` (see that method's own
+        // doc comment on the sync-follow discipline), so call it directly here — exactly what a
+        // diff-initiated nav entry point (`next_file`/`refresh`/…) would do next.
+        app.switch_changeset(1, 0);
+        app.sync_outline_to_current();
+
+        assert_eq!(
+            app.outline_filter_query(),
+            query_before,
+            "the filter must never be cleared as a side effect of a sync no-op"
+        );
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before.min(app.outline_items().len().saturating_sub(1)),
+            "the cursor merely clamps into the filtered list's bounds, exactly like the \
+             pre-CS2 fallback for an unresolvable sync target"
+        );
     }
 }

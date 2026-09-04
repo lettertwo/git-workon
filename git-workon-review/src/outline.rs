@@ -24,6 +24,9 @@
 
 use std::collections::HashMap;
 
+use fuzzy_matcher::skim::SkimMatcherV2;
+use fuzzy_matcher::FuzzyMatcher;
+
 use crate::model::FileStatus;
 
 /// Which of the outline's row-building strategies is active — cycled by `i` (only while the
@@ -268,11 +271,36 @@ pub(crate) fn build_items(
     mode: OutlineMode,
     order: OutlineOrder,
 ) -> Vec<OutlineItem> {
+    build_items_inner(changesets, mode, order, None)
+}
+
+/// [`build_items`] with CS2's per-row inclusion gate (`filter`) layered on — the REVISED
+/// 2026-07-24 "rebuild from the surviving file set" entry point [`fold_outline_filtered`] calls.
+/// Deliberately walks the SAME, full, unpruned `changesets` slice `build_items` does (see
+/// [`is_included`]'s doc comment) — every `cs_idx`/`file_idx` this emits is therefore still
+/// computed the exact same positional way `build_items` always has, so the true-index invariant
+/// holds for free rather than needing a new index-carrying field on [`OutlineChangeset`]/
+/// [`OutlineFile`].
+fn build_items_filtered(
+    changesets: &[OutlineChangeset],
+    mode: OutlineMode,
+    order: OutlineOrder,
+    filter: &QueryMatches,
+) -> Vec<OutlineItem> {
+    build_items_inner(changesets, mode, order, Some(filter))
+}
+
+fn build_items_inner(
+    changesets: &[OutlineChangeset],
+    mode: OutlineMode,
+    order: OutlineOrder,
+    filter: Option<&QueryMatches>,
+) -> Vec<OutlineItem> {
     match mode {
-        OutlineMode::Flat => build_flat(changesets, order),
-        OutlineMode::Stack => build_stack(changesets, order),
-        OutlineMode::Tree => build_tree(changesets),
-        OutlineMode::StackTree => build_stack_tree(changesets, order),
+        OutlineMode::Flat => build_flat(changesets, order, filter),
+        OutlineMode::Stack => build_stack(changesets, order, filter),
+        OutlineMode::Tree => build_tree(changesets, filter),
+        OutlineMode::StackTree => build_stack_tree(changesets, order, filter),
     }
 }
 
@@ -453,15 +481,263 @@ pub(crate) fn fold_outline(
     apply_fold(&items, is_folded)
 }
 
+// ── Fuzzy filter (CS2 `outline-filter`, REVISED 2026-07-24: filter-then-rebuild) ────
+
+/// One row's fuzzy-match result against the SOURCE text it was scored on (a changeset's title, or
+/// a file's FULL repo-relative path — never a dir segment or a tree leaf; REVISED 2026-07-24 drops
+/// those as independent match targets). `score` is only meaningful compared against another
+/// [`FilterMatch`] from the SAME query. `indices` are CHAR indices into that source text, not yet
+/// remapped onto whatever text the eventual row displays — [`attach_filter_marks`] does that.
+/// `matched_len` is that source text's own char count, which the tree-mode leaf remap needs to
+/// compute the offset into a row that only displays the path's trailing segment.
+#[derive(Debug, Clone)]
+struct FilterMatch {
+    score: i64,
+    indices: Vec<usize>,
+    matched_len: usize,
+}
+
+/// [`score_changesets`]'s output: every changeset/file's own [`FilterMatch`] (if it has one),
+/// keyed by TRUE `cs_idx`/`file_idx` — never by array position, since the rebuild step below still
+/// walks the FULL, unpruned `changesets` slice (see [`is_included`]'s doc comment for why nothing
+/// here ever needs its own `cs_idx` field to stay correct). `matched_cs` is the "does this
+/// changeset survive AT ALL" set (title match OR at least one file match) the stack-shaped
+/// builders gate their header emission on.
+struct QueryMatches {
+    header_matches: HashMap<usize, FilterMatch>,
+    file_matches: HashMap<(usize, usize), FilterMatch>,
+    matched_cs: std::collections::HashSet<usize>,
+}
+
+/// Score every changeset in `changesets` against `query` at the SOURCE, per REVISED 2026-07-24's
+/// "match at the source, not the built rows" rule — in two tiers:
+///
+/// 1. **Files first.** Score each file's FULL path individually; every match is recorded under
+///    `file_matches` and the changeset enters `matched_cs`.
+/// 2. **Titles only as a fallback**, when NO file anywhere in the snapshot matched. A title match
+///    then keeps the WHOLE changeset (every file, unscored) via `header_matches`.
+///
+/// The fallback tier exists because titles are prose: a fuzzy subsequence like `"an"` matches
+/// "Uncommitted ch·an·ges" (and half the titles in a real stack), so letting a title match
+/// compete with file matches would routinely pull entire changesets into a query meant to narrow
+/// to one file. Demoting titles to the no-file-results case keeps both intents predictable:
+/// file-ish queries always narrow to files; a query that matches nothing BUT a title (typing a
+/// changeset's name) still surfaces that changeset with all its files.
+///
+/// A changeset with neither tier's match never enters `matched_cs`, which is what causes
+/// [`build_stack`]/[`build_stack_tree`] to drop its header (and, transitively,
+/// [`build_flat`]/[`build_tree`] to drop every one of its files) entirely.
+fn score_changesets(changesets: &[OutlineChangeset], query: &str) -> QueryMatches {
+    let matcher = SkimMatcherV2::default();
+    let mut out = QueryMatches {
+        header_matches: HashMap::new(),
+        file_matches: HashMap::new(),
+        matched_cs: std::collections::HashSet::new(),
+    };
+    for (cs_idx, cs) in changesets.iter().enumerate() {
+        for (file_idx, file) in cs.files.iter().enumerate() {
+            if let Some((score, indices)) = matcher.fuzzy_indices(&file.path, query) {
+                out.file_matches.insert(
+                    (cs_idx, file_idx),
+                    FilterMatch {
+                        score,
+                        indices,
+                        matched_len: file.path.chars().count(),
+                    },
+                );
+                out.matched_cs.insert(cs_idx);
+            }
+        }
+    }
+    if out.file_matches.is_empty() {
+        for (cs_idx, cs) in changesets.iter().enumerate() {
+            if let Some((score, indices)) = matcher.fuzzy_indices(&cs.label, query) {
+                out.header_matches.insert(
+                    cs_idx,
+                    FilterMatch {
+                        score,
+                        indices,
+                        matched_len: cs.label.chars().count(),
+                    },
+                );
+                out.matched_cs.insert(cs_idx);
+            }
+        }
+    }
+    out
+}
+
+/// Whether `(cs_idx, file_idx)` survives filtering: unconditionally `true` when `filter` is
+/// `None` (the ordinary, unfiltered build every pre-CS2 test exercises), else `true` when either
+/// the file's OWN path matched, or its changeset's TITLE matched (a title match "keeps the WHOLE
+/// changeset, all files" — see [`score_changesets`]'s doc comment).
+fn is_included(filter: Option<&QueryMatches>, cs_idx: usize, file_idx: usize) -> bool {
+    match filter {
+        None => true,
+        Some(f) => {
+            f.header_matches.contains_key(&cs_idx)
+                || f.file_matches.contains_key(&(cs_idx, file_idx))
+        }
+    }
+}
+
+/// [`fold_outline_filtered`]'s per-row output, parallel to its [`FoldedOutline::items`]: each
+/// row's fuzzy-match char indices REMAPPED onto whatever text that row itself displays (empty if
+/// the row isn't itself a match — an ancestor `Dir` kept only because a descendant survived, or a
+/// `Header` kept only because a file survived), and each row's own score (`None` for the same
+/// "not itself a match" rows) — [`Self::best_index`] is [`App::outline_filter_reflow`]'s
+/// cursor-park source.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FilterMarks {
+    pub match_indices: Vec<Vec<usize>>,
+    pub scores: Vec<Option<i64>>,
+}
+
+impl FilterMarks {
+    fn empty_for(len: usize) -> Self {
+        FilterMarks {
+            match_indices: vec![Vec::new(); len],
+            scores: vec![None; len],
+        }
+    }
+
+    /// The FIRST row (by rendered position) carrying the HIGHEST score, or `None` if no row in
+    /// this build has a score at all (no filter active, or — impossible in practice, since a
+    /// changeset only ever survives via its own or a file's match — every survivor is an
+    /// unscored ancestor). Ties keep the earlier row: the fold only replaces the running best on
+    /// a STRICTLY greater score.
+    pub(crate) fn best_index(&self) -> Option<usize> {
+        self.scores
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|score| (i, score)))
+            .fold(None, |best: Option<(usize, i64)>, (i, score)| match best {
+                Some((_, best_score)) if best_score >= score => best,
+                _ => Some((i, score)),
+            })
+            .map(|(i, _)| i)
+    }
+}
+
+/// [`fold_outline_filtered`]'s final step: remap [`score_changesets`]'s SOURCE-text match indices
+/// onto whatever text each rebuilt+folded row actually displays, and carry each row's own score
+/// alongside.
+///
+/// - [`OutlineItem::Header`]: the row's own `label` IS the text that was scored (a title match),
+///   so its indices need no remap.
+/// - [`OutlineItem::File`]: `file_matches` indices address the FULL path that was scored. In
+///   [`OutlineMode::Flat`]/[`OutlineMode::Stack`] (empty `guides`) the row's own `path` field IS
+///   that full path — no remap. In [`OutlineMode::Tree`]/[`OutlineMode::StackTree`] (non-empty
+///   `guides`) the row displays only the LEAF segment (the ancestor [`OutlineItem::Dir`] rows
+///   already carry the rest — see [`OutlineItem::File`]'s own doc comment). A trie leaf is always
+///   the full path's own TRAILING segment, so shifting every index left by `matched_len -
+///   leaf_len` lands it in the leaf's own char range; an index that shifts negative addressed a
+///   character in an ancestor directory segment this row doesn't render, so it's dropped.
+/// - [`OutlineItem::Dir`]: deliberately left UNHIGHLIGHTED. REVISED 2026-07-24 drops dir rows as
+///   independent match targets, and a surviving dir can have several children whose match spans
+///   disagree — picking one arbitrarily (or unioning spans from unrelated files) would misrepresent
+///   what actually matched. Leaving dir rows plain is the simple, honest choice; render still
+///   dims them via the existing tree-guide styling, so they read as quiet structure either way.
+fn attach_filter_marks(
+    items: &[OutlineItem],
+    header_matches: &HashMap<usize, FilterMatch>,
+    file_matches: &HashMap<(usize, usize), FilterMatch>,
+) -> FilterMarks {
+    let mut marks = FilterMarks::empty_for(items.len());
+    for (i, item) in items.iter().enumerate() {
+        match item {
+            OutlineItem::Header { cs_idx, .. } => {
+                if let Some(m) = header_matches.get(cs_idx) {
+                    marks.match_indices[i] = m.indices.clone();
+                    marks.scores[i] = Some(m.score);
+                }
+            }
+            OutlineItem::File {
+                cs_idx,
+                file_idx,
+                path,
+                guides,
+                ..
+            } => {
+                if let Some(m) = file_matches.get(&(*cs_idx, *file_idx)) {
+                    marks.scores[i] = Some(m.score);
+                    marks.match_indices[i] = if guides.is_empty() {
+                        m.indices.clone()
+                    } else {
+                        let leaf_len = path.chars().count();
+                        let offset = m.matched_len.saturating_sub(leaf_len);
+                        m.indices
+                            .iter()
+                            .filter_map(|&idx| idx.checked_sub(offset))
+                            .filter(|&shifted| shifted < leaf_len)
+                            .collect()
+                    };
+                }
+            }
+            OutlineItem::Dir { .. } => {}
+        }
+    }
+    marks
+}
+
+/// [`score_changesets`] + rebuild ([`build_items_filtered`]) + [`apply_fold`] +
+/// [`attach_filter_marks`] composed — `App::outline_filtered`'s single entry point (mirrors how
+/// [`fold_outline`] composes the fold-only case). `query.is_empty()` short-circuits straight to a
+/// plain [`fold_outline`] call with every mark empty/`None` — the "zero regression when the
+/// filter is unused" rule, now enforced HERE rather than duplicated by every caller.
+///
+/// REVISED 2026-07-24's "rebuild, don't post-filter" rule: the surviving changesets/files are fed
+/// back through the SAME [`build_items`]/[`apply_fold`] machinery every other build uses (via
+/// [`build_items_filtered`]'s inclusion gate), so headers, dir rows, tree guides, fold behavior,
+/// and hidden-count markers all come out structurally correct — no flattening, no guide reset.
+/// Ordering is therefore the outline's ordinary structural order, never score-descending; the
+/// score is used ONLY to pick [`App::outline_filter_reflow`]'s cursor-park target via
+/// [`FilterMarks::best_index`].
+pub(crate) fn fold_outline_filtered(
+    changesets: &[OutlineChangeset],
+    mode: OutlineMode,
+    order: OutlineOrder,
+    is_folded: impl Fn(&FoldKey) -> bool,
+    query: &str,
+) -> (FoldedOutline, FilterMarks) {
+    if query.is_empty() {
+        let folded = fold_outline(changesets, mode, order, is_folded);
+        let marks = FilterMarks::empty_for(folded.items.len());
+        return (folded, marks);
+    }
+    let matches = score_changesets(changesets, query);
+    let items = build_items_filtered(changesets, mode, order, &matches);
+    let folded = apply_fold(&items, is_folded);
+    let marks = attach_filter_marks(
+        &folded.items,
+        &matches.header_matches,
+        &matches.file_matches,
+    );
+    (folded, marks)
+}
+
 /// [`OutlineMode::Stack`]: a header per changeset, then its files in order — no de-duplication,
 /// every changeset's own copy of a path (if touched more than once across the stack) gets its
 /// own row under its own header. `order` picks which end of the stack paints first; `cs_idx`/
 /// `file_idx` are computed from the ORIGINAL (base -> head) enumeration before any reversal, so
 /// they stay true indices into `App::changesets` either way.
-fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+///
+/// `filter` (REVISED 2026-07-24): `None` builds every row, exactly as before this changeset —
+/// `Some` skips a changeset's header (and every one of its files) entirely when it isn't in
+/// `matched_cs`, and skips an individual surviving changeset's own non-matching files via
+/// [`is_included`]. Never renumbers: `cs_idx`/`file_idx` are still read straight off the SAME
+/// positional scan, so a filtered build's indices are exactly as true as an unfiltered one's.
+fn build_stack(
+    changesets: &[OutlineChangeset],
+    order: OutlineOrder,
+    filter: Option<&QueryMatches>,
+) -> Vec<OutlineItem> {
     let n = changesets.len();
     let mut items = Vec::new();
     for (cs_idx, cs) in scan_order(changesets, order) {
+        if filter.is_some_and(|f| !f.matched_cs.contains(&cs_idx)) {
+            continue;
+        }
         items.push(OutlineItem::Header {
             cs_idx,
             n,
@@ -472,6 +748,9 @@ fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outl
             failed: cs.failed,
         });
         for (file_idx, file) in cs.files.iter().enumerate() {
+            if !is_included(filter, cs_idx, file_idx) {
+                continue;
+            }
             items.push(OutlineItem::File {
                 cs_idx,
                 file_idx,
@@ -494,7 +773,18 @@ fn build_stack(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outl
 /// independent of `order` — [`latest_by_path`] always scans base -> head regardless of which way
 /// the row list is displayed, so the resolution below reuses it rather than re-deriving from the
 /// (possibly reversed) `order` scan used for display order.
-fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+///
+/// `filter` (REVISED 2026-07-24): the de-dupe target resolution (which occurrence a shared path
+/// jumps to) is untouched by filtering — it's derived from the FULL, unpruned `changesets`, same
+/// as always. Only the FINAL emit step changes: a path is dropped when its resolved (closest-to-
+/// head) occurrence itself doesn't survive [`is_included`] — even if some OLDER, non-displayed
+/// occurrence of the same path would have matched, since Flat mode never shows that older copy
+/// anyway (unfiltered or not).
+fn build_flat(
+    changesets: &[OutlineChangeset],
+    order: OutlineOrder,
+    filter: Option<&QueryMatches>,
+) -> Vec<OutlineItem> {
     let latest = latest_by_path(changesets);
     let mut order_list: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -507,16 +797,19 @@ fn build_flat(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<Outli
     }
     order_list
         .into_iter()
-        .map(|path| {
+        .filter_map(|path| {
             let occ = latest[&path];
-            OutlineItem::File {
+            if !is_included(filter, occ.cs_idx, occ.file_idx) {
+                return None;
+            }
+            Some(OutlineItem::File {
                 cs_idx: occ.cs_idx,
                 file_idx: occ.file_idx,
                 path,
                 status: occ.status,
                 change: occ.change,
                 guides: Vec::new(),
-            }
+            })
         })
         .collect()
 }
@@ -656,10 +949,18 @@ fn emit(
 /// level ([`emit`]), not by stack position, and [`latest_by_path`]'s de-dupe always resolves to
 /// the closest-to-head occurrence regardless of scan order — so [`OutlineOrder`] has nothing to
 /// affect here, and unlike the stack-shaped builders this one takes no `order` parameter.
-fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
+///
+/// `filter` (REVISED 2026-07-24): same de-dupe-then-gate story as [`build_flat`] — an excluded
+/// occurrence's path is simply never inserted into the trie, so its ancestor `Dir` rows vanish
+/// too whenever it was their only surviving child (a dir with zero inserted descendants never
+/// gets emitted at all — see [`emit`]).
+fn build_tree(changesets: &[OutlineChangeset], filter: Option<&QueryMatches>) -> Vec<OutlineItem> {
     let latest = latest_by_path(changesets);
     let mut root = TrieNode::default();
     for (path, occ) in &latest {
+        if !is_included(filter, occ.cs_idx, occ.file_idx) {
+            continue;
+        }
         let segments: Vec<&str> = path.split('/').collect();
         root.insert(&segments, *occ);
     }
@@ -673,10 +974,20 @@ fn build_tree(changesets: &[OutlineChangeset]) -> Vec<OutlineItem> {
 /// each changeset trie is built from just that changeset's files, matching `build_stack`'s "every
 /// changeset's own copy gets its own row" rule). `order` picks which end of the stack paints
 /// first, same as [`build_stack`]; `cs_idx`/`file_idx` stay true indices regardless.
-fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec<OutlineItem> {
+///
+/// `filter` (REVISED 2026-07-24): same header-skip gate as [`build_stack`], plus the same
+/// never-insert-an-excluded-file gate [`build_tree`] uses for its own per-changeset trie.
+fn build_stack_tree(
+    changesets: &[OutlineChangeset],
+    order: OutlineOrder,
+    filter: Option<&QueryMatches>,
+) -> Vec<OutlineItem> {
     let n = changesets.len();
     let mut items = Vec::new();
     for (cs_idx, cs) in scan_order(changesets, order) {
+        if filter.is_some_and(|f| !f.matched_cs.contains(&cs_idx)) {
+            continue;
+        }
         items.push(OutlineItem::Header {
             cs_idx,
             n,
@@ -688,6 +999,9 @@ fn build_stack_tree(changesets: &[OutlineChangeset], order: OutlineOrder) -> Vec
         });
         let mut root = TrieNode::default();
         for (file_idx, file) in cs.files.iter().enumerate() {
+            if !is_included(filter, cs_idx, file_idx) {
+                continue;
+            }
             let segments: Vec<&str> = file.path.split('/').collect();
             root.insert(
                 &segments,
@@ -1484,5 +1798,430 @@ mod tests {
             "the header survives collapsed; both files are hidden"
         );
         assert_eq!(folded.hidden_counts, vec![2]);
+    }
+
+    // ── Fuzzy filter (CS2 `outline-filter`, REVISED 2026-07-24: filter-then-rebuild) ────
+
+    /// `fold_outline_filtered` with an always-visible fold (no key folded) — the shape most of
+    /// these tests want; a couple below pass their own predicate to check fold interaction.
+    fn filtered(
+        changesets: &[OutlineChangeset],
+        mode: OutlineMode,
+        order: OutlineOrder,
+        query: &str,
+    ) -> (FoldedOutline, FilterMarks) {
+        fold_outline_filtered(changesets, mode, order, |_| false, query)
+    }
+
+    #[test]
+    fn fold_outline_filtered_drops_non_matches_and_keeps_true_indices_on_survivors() {
+        let changesets = vec![cs(
+            "cs-a",
+            true,
+            false,
+            &[
+                ("src/app.rs", StagedStatus::None),
+                ("README.md", StagedStatus::None),
+            ],
+        )];
+        let (folded, _) = filtered(
+            &changesets,
+            OutlineMode::Stack,
+            OutlineOrder::BaseFirst,
+            "app",
+        );
+        assert_eq!(
+            folded.items,
+            vec![
+                OutlineItem::Header {
+                    cs_idx: 0,
+                    n: 1,
+                    label: "cs-a".to_string(),
+                    current: true,
+                    needs_restack: false,
+                    loading: false,
+                    failed: false,
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 0,
+                    path: "src/app.rs".to_string(),
+                    status: StagedStatus::None,
+                    change: FileStatus::Modified,
+                    guides: Vec::new(),
+                },
+            ],
+            "the header rebuilds structurally (unlike the pre-REVISED flat list), and \
+             src/app.rs keeps its TRUE cs_idx/file_idx (0, 0) — README.md (file_idx 1) is \
+             dropped, it never matches 'app'"
+        );
+    }
+
+    #[test]
+    fn fold_outline_filtered_preserves_structural_order_not_score_order() {
+        // Same two strings/query the pre-REVISED `apply_filter` score-ordering test used to prove
+        // "src/x/app_helper.rs" (a long, scattered match) scores LOWER than "app.rs" (an exact,
+        // unbroken substring match) — but cs-a (the lower-scoring file's changeset) renders
+        // FIRST here, because REVISED 2026-07-24 drops the old score-descending sort entirely in
+        // favor of the outline's ordinary base -> head structural order.
+        let changesets = vec![
+            cs(
+                "cs-a",
+                false,
+                false,
+                &[("src/x/app_helper.rs", StagedStatus::None)],
+            ),
+            cs("cs-b", true, false, &[("app.rs", StagedStatus::None)]),
+        ];
+        let (folded, marks) = filtered(
+            &changesets,
+            OutlineMode::Stack,
+            OutlineOrder::BaseFirst,
+            "app.rs",
+        );
+        let paths: Vec<&str> = folded
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                OutlineItem::File { path, .. } => Some(path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["src/x/app_helper.rs", "app.rs"],
+            "cs-a's (lower-scoring) file still renders before cs-b's (higher-scoring) one — \
+             base -> head structural order, not score order"
+        );
+        let scattered_idx = folded
+            .items
+            .iter()
+            .position(
+                |it| matches!(it, OutlineItem::File { path, .. } if path == "src/x/app_helper.rs"),
+            )
+            .unwrap();
+        let exact_idx = folded
+            .items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path, .. } if path == "app.rs"))
+            .unwrap();
+        assert!(
+            marks.scores[exact_idx].unwrap() > marks.scores[scattered_idx].unwrap(),
+            "app.rs's exact match must still score higher than the scattered one, even though \
+             it renders SECOND"
+        );
+    }
+
+    #[test]
+    fn fold_outline_filtered_title_match_keeps_the_whole_changesets_files_unscored() {
+        let changesets = vec![cs(
+            "release-widget",
+            true,
+            false,
+            &[
+                ("one.rs", StagedStatus::None),
+                ("two.rs", StagedStatus::None),
+            ],
+        )];
+        let (folded, marks) = filtered(
+            &changesets,
+            OutlineMode::Stack,
+            OutlineOrder::BaseFirst,
+            "release",
+        );
+        assert_eq!(
+            folded.items,
+            vec![
+                OutlineItem::Header {
+                    cs_idx: 0,
+                    n: 1,
+                    label: "release-widget".to_string(),
+                    current: true,
+                    needs_restack: false,
+                    loading: false,
+                    failed: false,
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 0,
+                    path: "one.rs".to_string(),
+                    status: StagedStatus::None,
+                    change: FileStatus::Modified,
+                    guides: Vec::new(),
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 1,
+                    path: "two.rs".to_string(),
+                    status: StagedStatus::None,
+                    change: FileStatus::Modified,
+                    guides: Vec::new(),
+                },
+            ],
+            "a title match on 'release-widget' keeps EVERY file, even though neither one.rs nor \
+             two.rs matches 'release' on its own"
+        );
+        assert!(
+            marks.scores[0].is_some(),
+            "the header itself is the match, so it carries a score"
+        );
+        assert_eq!(
+            marks.scores[1..].to_vec(),
+            vec![None, None],
+            "the files were never individually scored — kept only because their changeset's \
+             title matched"
+        );
+    }
+
+    #[test]
+    fn a_file_match_anywhere_suppresses_the_title_fallback_tier() {
+        // "an" fuzzy-matches the prose title "refactor changes" (subsequence: ch·an·ges) AND the
+        // file banana.txt. Titles are a FALLBACK tier only: because a file matched somewhere, the
+        // title-matched changeset must NOT survive — otherwise short file queries would pull in
+        // whole changesets through their prose titles (the regression: "an" vs the ever-present
+        // "Uncommitted changes" label).
+        let changesets = vec![
+            cs(
+                "refactor changes",
+                false,
+                false,
+                &[("zzz.qqq", StagedStatus::None)],
+            ),
+            cs("other", true, false, &[("banana.txt", StagedStatus::None)]),
+        ];
+        let (folded, _) = filtered(
+            &changesets,
+            OutlineMode::Stack,
+            OutlineOrder::BaseFirst,
+            "an",
+        );
+        assert!(
+            folded
+                .items
+                .iter()
+                .all(|it| !matches!(it, OutlineItem::Header { cs_idx: 0, .. })),
+            "the title-matched changeset must be suppressed by the file match, got {:?}",
+            folded.items
+        );
+        assert!(
+            folded.items.iter().any(
+                |it| matches!(it, OutlineItem::File { cs_idx: 1, path, .. } if path == "banana.txt")
+            ),
+            "banana.txt (the file-tier match) survives with its true indices, got {:?}",
+            folded.items
+        );
+    }
+
+    #[test]
+    fn fold_outline_filtered_keeps_dir_ancestors_for_a_deep_tree_match() {
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        // 'b.rs' matches only src/a/b.rs (none of c.rs/d.rs/top.rs contain a 'b').
+        let (folded, marks) = filtered(
+            &changesets,
+            OutlineMode::Tree,
+            OutlineOrder::HeadFirst,
+            "b.rs",
+        );
+        assert_eq!(
+            folded.items,
+            vec![
+                OutlineItem::Dir {
+                    name: "src".to_string(),
+                    path: "src".to_string(),
+                    cs_idx: None,
+                    // Every guide is `true` here (unlike the UNFILTERED build's [false]/
+                    // [false,false]/[false,false,true]): once c.rs/d.rs/top.rs are filtered out,
+                    // src/ and src/a/ each become their PARENT's only (and therefore last)
+                    // child, and b.rs becomes src/a/'s only child too.
+                    guides: vec![true],
+                },
+                OutlineItem::Dir {
+                    name: "a".to_string(),
+                    path: "src/a".to_string(),
+                    cs_idx: None,
+                    guides: vec![true, true],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 1,
+                    path: "b.rs".to_string(),
+                    status: StagedStatus::None,
+                    change: FileStatus::Modified,
+                    guides: vec![true, true, true],
+                },
+            ],
+            "a deep match rebuilds its ancestor src/ and src/a/ Dir rows, with CORRECT (re-derived,\
+             not stale) tree guides — no other row (c.rs, d.rs, top.rs) survives"
+        );
+        assert!(
+            marks.match_indices[0].is_empty() && marks.match_indices[1].is_empty(),
+            "the ancestor Dir rows are left unhighlighted (REVISED 2026-07-24: dir rows are no \
+             longer independent match targets, and picking one child's span to show on a \
+             multi-child dir would be misleading — see attach_filter_marks's doc comment)"
+        );
+        assert_eq!(
+            marks.match_indices[2],
+            vec![0, 1, 2, 3],
+            "'b.rs' matches the leaf's own full text; since the leaf IS the whole matched \
+             suffix here, the remap is a no-op shift of 0"
+        );
+    }
+
+    #[test]
+    fn fold_outline_filtered_remaps_a_tree_leafs_match_indices_off_the_ancestor_prefix() {
+        // 'a/b' scores against the FULL path "src/a/b.rs", matching the 'a', '/', 'b' run that
+        // straddles the src/a/ ancestor prefix and the b.rs leaf's own first char — only the
+        // leaf-local portion should survive the remap onto the rendered leaf text "b.rs".
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let (folded, marks) = filtered(
+            &changesets,
+            OutlineMode::Tree,
+            OutlineOrder::HeadFirst,
+            "a/b",
+        );
+        let leaf_idx = folded
+            .items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path, .. } if path == "b.rs"))
+            .expect("b.rs survives the 'a/b' query");
+        // "src/a/b.rs": indices of 'a' (4), '/' (5), 'b' (6) — the leaf "b.rs" starts at char 6
+        // (full length 10, leaf length 4, offset 6). Only the 'b' at index 6 shifts into the
+        // leaf's own [0, 4) range (shifted to 0); 'a' and the preceding '/' shift negative and
+        // are dropped.
+        assert_eq!(
+            marks.match_indices[leaf_idx],
+            vec![0],
+            "only the leaf-local 'b' survives the remap; the ancestor-segment 'a' and '/' \
+             matches are dropped, not misrendered onto the wrong chars of 'b.rs'"
+        );
+    }
+
+    #[test]
+    fn fold_outline_filtered_stack_tree_mode_keeps_dir_ancestors_too() {
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let (folded, _) = filtered(
+            &changesets,
+            OutlineMode::StackTree,
+            OutlineOrder::HeadFirst,
+            "b.rs",
+        );
+        assert_eq!(
+            folded.items,
+            vec![
+                OutlineItem::Header {
+                    cs_idx: 0,
+                    n: 1,
+                    label: "cs-a".to_string(),
+                    current: true,
+                    needs_restack: false,
+                    loading: false,
+                    failed: false,
+                },
+                OutlineItem::Dir {
+                    name: "src".to_string(),
+                    path: "src".to_string(),
+                    cs_idx: Some(0),
+                    guides: vec![true],
+                },
+                OutlineItem::Dir {
+                    name: "a".to_string(),
+                    path: "src/a".to_string(),
+                    cs_idx: Some(0),
+                    guides: vec![true, true],
+                },
+                OutlineItem::File {
+                    cs_idx: 0,
+                    file_idx: 1,
+                    path: "b.rs".to_string(),
+                    status: StagedStatus::None,
+                    change: FileStatus::Modified,
+                    guides: vec![true, true, true],
+                },
+            ],
+            "StackTree mode also rebuilds a deep match's ancestor Dir rows under its header, \
+             with correct guides"
+        );
+    }
+
+    #[test]
+    fn fold_outline_filtered_empty_query_is_a_zero_regression_no_op() {
+        let changesets = vec![cs(
+            "cs-a",
+            true,
+            false,
+            &[
+                ("a1.txt", StagedStatus::None),
+                ("a2.txt", StagedStatus::None),
+            ],
+        )];
+        let plain = fold_outline(
+            &changesets,
+            OutlineMode::Stack,
+            OutlineOrder::BaseFirst,
+            |_| false,
+        );
+        let (folded, marks) =
+            filtered(&changesets, OutlineMode::Stack, OutlineOrder::BaseFirst, "");
+        assert_eq!(
+            folded.items, plain.items,
+            "an empty query must reproduce the plain fold_outline build exactly"
+        );
+        assert_eq!(folded.hidden_counts, plain.hidden_counts);
+        assert_eq!(folded.visible_index, plain.visible_index);
+        assert!(
+            marks.scores.iter().all(Option::is_none)
+                && marks.match_indices.iter().all(Vec::is_empty),
+            "no filter active means no row carries a score or a highlight"
+        );
+    }
+
+    #[test]
+    fn fold_outline_filtered_folds_the_rebuilt_tree_same_as_an_unfiltered_build() {
+        // The fold applies to the REBUILT (post-filter) row list, not the pre-filter one — a
+        // collapsed src/ should still hide its filtered-in descendant.
+        let changesets = vec![deep_path_changeset("cs-a", true, false)];
+        let (folded, _) = fold_outline_filtered(
+            &changesets,
+            OutlineMode::Tree,
+            OutlineOrder::HeadFirst,
+            |key| {
+                *key == FoldKey::Dir {
+                    path: "src".to_string(),
+                    owner: None,
+                }
+            },
+            "b.rs",
+        );
+        assert_eq!(
+            folded.items,
+            vec![OutlineItem::Dir {
+                name: "src".to_string(),
+                path: "src".to_string(),
+                cs_idx: None,
+                // `true`, not `false`: with c.rs/d.rs/top.rs filtered out, src/ is root's only
+                // (and therefore last) surviving child — see the sibling test above.
+                guides: vec![true],
+            }],
+            "src/ survives collapsed, but its own (filtered-in) b.rs descendant stays hidden"
+        );
+        assert_eq!(
+            folded.hidden_counts,
+            vec![1],
+            "src/'s marker counts its one hidden (but filter-surviving) file"
+        );
+    }
+
+    #[test]
+    fn filter_marks_best_index_picks_the_first_strictly_highest_score() {
+        let marks = FilterMarks {
+            match_indices: vec![Vec::new(); 4],
+            scores: vec![Some(1), Some(5), Some(5), None],
+        };
+        assert_eq!(
+            marks.best_index(),
+            Some(1),
+            "the first of the two tied-highest scores (index 1) wins, not the later one"
+        );
+        assert_eq!(FilterMarks::empty_for(3).best_index(), None);
     }
 }

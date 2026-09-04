@@ -977,6 +977,7 @@ dependencies = [
  "devicons",
  "dirs",
  "expectrl",
+ "fuzzy-matcher",
  "git-workon-fixture",
  "git-workon-lib",
  "git2",
