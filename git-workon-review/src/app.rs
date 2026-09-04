@@ -16,17 +16,23 @@ use git2::Repository;
 use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
-use crate::align::{align_file, collapse_gaps, inline_rows, CellKind, DisplayRow, InlineRow, Row};
+use crate::align::{
+    align_file, collapse_gaps_with_expansions, gap_hidden_range, inline_rows, AlignedRow, CellKind,
+    DisplayRow, GapExpansion, InlineRow, Row,
+};
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
-use crate::highlight::{FgSpan, TsHighlighter};
+use crate::highlight::{lang_key_for_ext, FgSpan, TsHighlighter};
+use crate::icons::OutlineIcons;
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
 use crate::ops;
-use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode};
+use crate::outline::{self, OutlineChangeset, OutlineFile, OutlineItem, OutlineMode, OutlineOrder};
 use crate::queue::{OpOutcome, StagingOp, StagingQueue};
 use crate::refresh::{IndexSignature, RefreshCoordinator};
+use crate::scope::enclosing_scope_lines;
 use crate::source::{resolve_source, Source};
 use crate::stage_op::{FileStagingOp, LineSelectionOp};
+use crate::summary;
 use crate::synthesis::LineSelection;
 use crate::wordiff::{word_diff_spans, Span};
 
@@ -50,6 +56,20 @@ const SCROLLOFF: usize = 2;
 /// staged/unstaged split zoom).
 #[derive(Debug)]
 pub struct FileView {
+    /// The pre-collapse row list [`Self::display`]/[`Self::inline`] derive from — retained (CS8)
+    /// so a gap can be re-collapsed with a wider [`GapExpansion`] window without re-diffing the
+    /// file. `AlignedRow` is small/`Copy`, so cloning the whole vector per expansion is cheap
+    /// relative to re-running `align_file`.
+    aligned: Vec<AlignedRow>,
+    /// Per-gap expansion requests, keyed by the hidden run's start index in [`Self::aligned`]
+    /// (the same key [`DisplayRow::Gap`]/[`InlineRow::Gap`] carry). Reset to empty on every
+    /// [`Self::load`] — expansions are NOT preserved across a refresh; the view rebuilds from
+    /// scratch and every gap re-collapses to its base window. See [`Self::expand_gap`].
+    expansions: HashMap<usize, GapExpansion>,
+    /// The file's hunks, retained (CS8) alongside [`Self::aligned`] so [`Self::rebuild_rows`] can
+    /// recompute [`Self::display_hunk`]/[`Self::inline_hunk`] after an expansion without needing
+    /// the original [`FileChange`] back.
+    hunks: Vec<Hunk>,
     old_text: String,
     new_text: String,
     old_lines: Vec<String>,
@@ -134,9 +154,45 @@ impl FileView {
         let old_lines: Vec<String> = old_text.lines().map(str::to_string).collect();
         let new_lines: Vec<String> = new_text.lines().map(str::to_string).collect();
 
-        let aligned = align_file(&file.hunks, old_lines.len(), new_lines.len());
-        let display = collapse_gaps(&aligned.rows);
-        let first_hunk_row = display
+        let aligned = align_file(&file.hunks, old_lines.len(), new_lines.len()).rows;
+        let old_hl = ts.highlight_file(old_source_path, &old_text);
+        let new_hl = ts.highlight_file(&file.path, &new_text);
+
+        let mut view = Self {
+            aligned,
+            expansions: HashMap::new(),
+            hunks: file.hunks.clone(),
+            old_text,
+            new_text,
+            old_lines,
+            new_lines,
+            display: Vec::new(),
+            first_hunk_row: 0,
+            first_inline_hunk_row: 0,
+            old_hl,
+            new_hl,
+            word_spans: HashMap::new(),
+            inline: Vec::new(),
+            inline_word_spans: HashMap::new(),
+            display_hunk: Vec::new(),
+            inline_hunk: Vec::new(),
+        };
+        view.rebuild_rows();
+        view
+    }
+
+    /// Recompute [`Self::display`]/[`Self::inline`] (and everything derived from them) from
+    /// [`Self::aligned`] + [`Self::expansions`] — called once at [`Self::load`] and again after
+    /// every [`Self::expand_gap`]. Row-keyed word-span caches are cleared: an expansion changes
+    /// which display/inline index a given content row lands at, so a cached span keyed by the OLD
+    /// index would silently mismatch the row it renders under. The highlight caches
+    /// ([`Self::old_hl`]/[`Self::new_hl`]) are source-line-indexed (one entry per line of the full
+    /// old/new text), not row-indexed, so an expansion — which only changes how many already-hl'd
+    /// lines are VISIBLE — never invalidates them.
+    fn rebuild_rows(&mut self) {
+        self.display = collapse_gaps_with_expansions(&self.aligned, &self.expansions);
+        self.first_hunk_row = self
+            .display
             .iter()
             .position(|row| {
                 matches!(
@@ -146,45 +202,100 @@ impl FileView {
             })
             .unwrap_or(0);
 
-        let old_hl = ts.highlight_file(old_source_path, &old_text);
-        let new_hl = ts.highlight_file(&file.path, &new_text);
-        let inline = inline_rows(&display);
-        let first_inline_hunk_row = inline
+        self.inline = inline_rows(&self.display);
+        self.first_inline_hunk_row = self
+            .inline
             .iter()
             .position(is_inline_hunk_content_row)
             .unwrap_or(0);
 
-        let display_hunk = display
+        self.display_hunk = self
+            .display
             .iter()
             .map(|row| {
                 let (old, new) = display_row_linenos(row);
-                hunk_for_linenos(&file.hunks, old, new)
+                hunk_for_linenos(&self.hunks, old, new)
             })
             .collect();
-        let inline_hunk = inline
+        self.inline_hunk = self
+            .inline
             .iter()
             .map(|row| {
                 let (old, new) = inline_row_linenos(row);
-                hunk_for_linenos(&file.hunks, old, new)
+                hunk_for_linenos(&self.hunks, old, new)
             })
             .collect();
 
-        Self {
-            old_text,
-            new_text,
-            old_lines,
-            new_lines,
-            display,
-            first_hunk_row,
-            first_inline_hunk_row,
-            old_hl,
-            new_hl,
-            word_spans: HashMap::new(),
-            inline,
-            inline_word_spans: HashMap::new(),
-            display_hunk,
-            inline_hunk,
+        self.word_spans.clear();
+        self.inline_word_spans.clear();
+    }
+
+    /// Accumulate an expansion request for the gap keyed `key` (CS8's progressive reveal) and
+    /// rebuild the derived rows. `more_before`/`more_after` ADD to whatever was already revealed
+    /// at that edge (repeated `Enter` presses widen further); `full` is sticky — once set for this
+    /// gap it stays set. A `key` with no matching gap in the current `display` is harmless: the
+    /// entry simply sits unused in the map until a gap with that key exists again (it never will,
+    /// since keys are stable pre-collapse indices — this is just defensive, not reachable from
+    /// [`App::expand_gap_at_cursor`], which validates the cursor row first).
+    pub fn expand_gap(&mut self, key: usize, more_before: usize, more_after: usize, full: bool) {
+        let entry = self.expansions.entry(key).or_default();
+        entry.before += more_before;
+        entry.after += more_after;
+        entry.full |= full;
+        self.rebuild_rows();
+    }
+
+    /// CS9's scope-reveal: widen the gap keyed `key` to uncover a tree-sitter scope range
+    /// `[scope_start, scope_end]` (1-based, inclusive — as returned by
+    /// [`crate::scope::enclosing_scope_lines`]) that encloses the gap's anchor line, in
+    /// `anchor_prefers_new`'s frame (new-side lineno when `true`, old-side when `false` — see
+    /// [`App::expand_gap_at_cursor`]'s anchor selection). Only the gap's TRAILING edge (`after`)
+    /// is ever widened: the anchor sits at the gap's following edge and `scope_start` is what
+    /// climbs upward from it toward the gap; `scope_end` falls among rows already visible after
+    /// the gap by construction (the anchor line is inside the scope), so the leading edge never
+    /// has anything new to reveal here.
+    ///
+    /// Returns `true` when this widened the gap (grew `after`, or revealed the whole run because
+    /// the scope covers it entirely); `false` when the scope added nothing new — either the gap
+    /// is already fully revealed/not a gap at all, or `scope_start` doesn't reach far enough
+    /// upward to uncover any currently-hidden row. The caller's signal to fall back to the flat
+    /// +10 reveal, so repeated presses always widen.
+    pub fn scope_expand_gap(
+        &mut self,
+        key: usize,
+        scope_start: usize,
+        anchor_prefers_new: bool,
+    ) -> bool {
+        let Some((hidden_start, hidden_end)) =
+            gap_hidden_range(&self.aligned, key, &self.expansions)
+        else {
+            return false;
+        };
+        // Non-empty by construction: `gap_hidden_range` returns `None` (never an empty range)
+        // once an expansion covers the whole run — see its `effective_before + effective_after
+        // >= run_len` arm.
+        let hidden = &self.aligned[hidden_start..hidden_end];
+
+        let lineno_of =
+            |row: &AlignedRow| row_lineno(if anchor_prefers_new { row.new } else { row.old });
+        // Context rows always carry a lineno on both sides (see the module doc's lineno
+        // invariant), and linenos increase monotonically through a run, so counting from the
+        // trailing edge backward while the scope still covers each row is safe.
+        let count = hidden
+            .iter()
+            .rev()
+            .take_while(|row| lineno_of(row).is_some_and(|n| n >= scope_start))
+            .count();
+
+        if count == 0 {
+            return false;
         }
+        if count >= hidden.len() {
+            self.expand_gap(key, 0, 0, true);
+        } else {
+            self.expand_gap(key, 0, count, false);
+        }
+        true
     }
 
     /// The hunk (index into the file's `hunks`) whose span covers display row `row`, or `None`
@@ -552,6 +663,29 @@ fn parse_outline_mode(raw: &str) -> Option<OutlineMode> {
     }
 }
 
+/// Parse `workon.review.outline.order` (CS3) into an [`OutlineOrder`]. Canonical strings mirror
+/// the variant names, kebab-cased: `head-first`, `base-first`. `None` on anything else —
+/// [`App::apply_view_config`] falls back to [`OutlineOrder::default`] and warns.
+fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
+    match raw {
+        "head-first" => Some(OutlineOrder::HeadFirst),
+        "base-first" => Some(OutlineOrder::BaseFirst),
+        _ => None,
+    }
+}
+
+/// Parse `workon.review.outline.icons` (CS5) into an [`OutlineIcons`]. Canonical strings mirror
+/// the variant names, kebab-cased: `nerd`, `none`. `None` on anything else —
+/// [`App::apply_view_config`] falls back to [`OutlineIcons::default`] (also `none` — CS5's
+/// no-auto-detection default) and warns.
+fn parse_outline_icons(raw: &str) -> Option<OutlineIcons> {
+    match raw {
+        "nerd" => Some(OutlineIcons::Nerd),
+        "none" => Some(OutlineIcons::None),
+        _ => None,
+    }
+}
+
 /// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. Canonical strings mirror the
 /// variant names: `sbs`, `inline`. `None` on anything else — [`App::apply_view_config`] falls
 /// back to [`Layout::default`] and warns.
@@ -576,6 +710,75 @@ fn parse_diff_zoom(raw: &str) -> Option<Zoom> {
     }
 }
 
+/// CS4: which outline row a Header/Dir cursor selection resolves to — [`App::summary_target`]'s
+/// return type, and the input [`App::summary_for`] consumes to build the renderable summary.
+/// `render.rs`'s `render_summary` never matches on this directly — it only calls
+/// `App::summary_for`/renders the [`Summary`] that comes back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SummaryTarget {
+    /// The cursor rests on an [`OutlineItem::Header`] row — `cs_idx` is that row's true index
+    /// into [`App::changesets`].
+    Changeset(usize),
+    /// The cursor rests on an [`OutlineItem::Dir`] row — `path` is that row's full path, `cs_idx`
+    /// its `cs_idx` (`Some` in [`OutlineMode::StackTree`], `None` in the cross-stack
+    /// [`OutlineMode::Tree`] — see that field's doc comment on [`OutlineItem::Dir`]).
+    Dir { cs_idx: Option<usize>, path: String },
+}
+
+/// CS4: the renderable summary [`App::summary_for`] builds for a [`SummaryTarget`] — a thin
+/// wrapper so `render.rs` has one return type to match on regardless of which kind of row was
+/// selected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Summary {
+    Changeset(summary::ChangesetSummary),
+    Dir(summary::DirSummary),
+}
+
+/// CS7: a stable identity for an outline File/Dir row, captured BEFORE a staging/discard op's
+/// `coordinated_refresh` rebuilds [`App::outline_items`]'s row list, so the row can be re-found
+/// (or gracefully lost, e.g. a fully-discarded file) afterward — see
+/// [`App::restore_outline_position`]. `cs_idx`/`path` mirror the row's own fields, EXCEPT a
+/// [`OutlineItem::File`]'s `path` here is always the FULL path (from the underlying
+/// [`FileChange`]), never the Tree/StackTree leaf-only segment the row itself may display — two
+/// rows in different directories can share a leaf name, so the leaf alone isn't a stable key.
+/// [`OutlineItem::Dir`]'s own `path` field is already full regardless of mode, so it's reused
+/// as-is. No [`OutlineItem::Header`] variant: a header row is never a staging/discard target (see
+/// [`App::outline_row_targets`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutlineRowIdentity {
+    File { cs_idx: usize, path: String },
+    Dir { cs_idx: Option<usize>, path: String },
+}
+
+impl OutlineRowIdentity {
+    /// Whether outline row `item` is the same row this identity was captured from. A
+    /// [`OutlineItem::File`]'s displayed `path` may be leaf-only (Tree/StackTree) — that's
+    /// resolved through [`App::outline_row_targets`]'s `(cs_idx, file_idx)` lookup instead of
+    /// comparing against the row's own `path` field.
+    fn matches_file(&self, item_cs_idx: usize, full_path: &str) -> bool {
+        matches!(
+            self,
+            OutlineRowIdentity::File { cs_idx, path }
+                if *cs_idx == item_cs_idx && path == full_path
+        )
+    }
+
+    /// Whether outline row `item` is the same row this identity was captured from.
+    fn matches_dir(&self, item: &OutlineItem) -> bool {
+        match (self, item) {
+            (
+                OutlineRowIdentity::Dir { cs_idx, path },
+                OutlineItem::Dir {
+                    cs_idx: item_cs_idx,
+                    path: item_path,
+                    ..
+                },
+            ) => cs_idx == item_cs_idx && path == item_path,
+            _ => false,
+        }
+    }
+}
+
 /// The outline side pane's own state (locked fork 3): whether it's showing, whether IT (rather
 /// than the diff) currently has keyboard focus, its own cursor (an index into
 /// [`App::outline_items`]'s row list — a wholly separate coordinate space from [`App::cursor`]),
@@ -590,6 +793,17 @@ pub struct OutlineState {
     /// The outline pane's column width — `workon.review.outline.width` (CS7), defaulting to
     /// [`DEFAULT_OUTLINE_WIDTH`]. Read by `render.rs` in place of the old fixed const.
     pub width: u16,
+    /// Top-of-viewport row index into [`App::outline_items`]'s row list, derived from `cursor`
+    /// via the same scrolloff discipline as [`App::scroll`] (see [`App::derive_outline_scroll`]) —
+    /// never written directly.
+    pub scroll: usize,
+    /// Which end of the stack the stack-shaped modes display first — `workon.review.outline.order`
+    /// (CS3), defaulting to [`OutlineOrder::HeadFirst`]. Read by [`App::outline_items`].
+    pub order: OutlineOrder,
+    /// CS5: opt-in nerd-font file/dir icons — `workon.review.outline.icons`, defaulting to
+    /// [`OutlineIcons::None`] (no auto-detection story exists — a terminal can't report the
+    /// user's font). Read by `render::build_outline_line`.
+    pub icons: OutlineIcons,
 }
 
 /// Which of a split's two panes has focus — the top pane renders the unstaged role, the bottom the
@@ -609,6 +823,68 @@ enum SplitPane {
 struct PaneState {
     cursor: usize,
     scroll: usize,
+}
+
+/// CS6: a staging op's pre-op position, captured by [`App::capture_position`] before
+/// `coordinated_refresh` and restored by [`App::restore_position`] after — so a staging op keeps
+/// the reviewer's place instead of `reset_panes`' first-hunk reseat (that reseat still runs for
+/// every MANUAL nav: file/changeset switches, zoom cycles). `path` + `role` say WHERE (the same
+/// file, the pane the reviewer was in); `old_lineno`/`new_lineno` say WHAT (the acted-on row's
+/// position in `role`'s own coordinate frame — the two sides a role's rows are diffed against,
+/// per [`FileView::load`]'s table). Deliberately NO pre-op zoom snapshot: [`App::restore_position`]
+/// re-derives the POST-op [`EffectiveZoom`] from live state, since the op itself is exactly what
+/// invalidates a pre-op snapshot.
+struct PositionMemento {
+    path: String,
+    role: Role,
+    old_lineno: Option<usize>,
+    new_lineno: Option<usize>,
+}
+
+/// The target role's display row (active layout) whose lineno IN `new_frame`'s coordinate frame
+/// (`true` = new side, `false` = old side — the frame the memento's target lineno was captured
+/// in) is the first `>= target`. Rows with no lineno on that side — gaps, and the unpaired
+/// Del/Add rows whose only lineno lives on the OTHER side — are skipped rather than compared:
+/// old-side and new-side numbering diverge as soon as a file has any insertion or deletion above
+/// the row, so mixing frames in one monotonic scan would let e.g. a deletion hunk's old-side
+/// numbers (which run ahead of the surrounding new-side numbers) capture the cursor first.
+///
+/// Falls back to the LAST row carrying a lineno in that frame when `target` is past the view's
+/// end (staging the acted-on hunk can shrink the file out from under the old lineno). `None`
+/// only when NO row carries a lineno in that frame (e.g. anchoring old-frame in an added-only
+/// file) — the caller keeps `reset_panes`' first-hunk position then.
+fn find_nearest_row(
+    view: &FileView,
+    layout: Layout,
+    target: usize,
+    new_frame: bool,
+) -> Option<usize> {
+    let in_frame = |old: Option<usize>, new: Option<usize>| if new_frame { new } else { old };
+    let linenos: Vec<(usize, usize)> = match layout {
+        Layout::Sbs => view
+            .display
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                let (old, new) = display_row_linenos(row);
+                in_frame(old, new).map(|n| (i, n))
+            })
+            .collect(),
+        Layout::Inline => view
+            .inline
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| {
+                let (old, new) = inline_row_linenos(row);
+                in_frame(old, new).map(|n| (i, n))
+            })
+            .collect(),
+    };
+    linenos
+        .iter()
+        .find(|(_, n)| *n >= target)
+        .or_else(|| linenos.last())
+        .map(|(i, _)| *i)
 }
 
 /// Slide `prev_scroll` the minimum amount to keep `cursor` within `[SCROLLOFF, pane_height - 1 -
@@ -815,6 +1091,9 @@ pub struct App {
     /// [`Self::pane_height`] — [`Self::derive_alt_scroll`] derives the unfocused pane's scroll
     /// against THIS, not the focused pane's height.
     pub(crate) alt_height: usize,
+    /// Content height of the outline pane, written by the renderer each frame — same discipline
+    /// as [`Self::pane_height`]. Read by [`Self::derive_outline_scroll`].
+    pub outline_height: usize,
     /// Label for the old side of the diff, shown next to a rename's `old_path` in the header.
     /// M4 only reviews the uncommitted (`HEAD` ↔ worktree) diffs, so this is always `"HEAD"`
     /// today; M5's committed-changeset zoom will want the changeset's actual base rev.
@@ -942,6 +1221,19 @@ pub enum PendingOp {
         file_idx: usize,
         selections: Vec<(usize, LineSelection)>,
     },
+    /// CS7: discard every file in `files` — `(changeset name, file path)` pairs — from the
+    /// worktree: an outline File row's single target, or a Dir row's every file under its path.
+    /// Stored by NAME + PATH rather than raw `(cs_idx, file_idx)` indices because the confirm
+    /// modal doesn't stop the tick beat: an external index change (e.g. `git add` from another
+    /// terminal) can run a full refresh between `d` and `y`, rebuilding the per-changeset file
+    /// lists and shifting positions — [`App::resolve_confirm`] re-resolves each pair against the
+    /// LIVE changesets at answer time (silently skipping any that vanished) so a stale index can
+    /// never discard the wrong file. `identity` is the acted-on outline row's
+    /// [`OutlineRowIdentity`], captured at request-time for the post-op outline cursor restore.
+    DiscardOutlineFiles {
+        files: Vec<(String, String)>,
+        identity: OutlineRowIdentity,
+    },
 }
 
 /// A pending destructive op plus the scope-stating prompt shown on the footer until answered.
@@ -1008,12 +1300,18 @@ impl App {
         // "decided without interview" default — preserves the M4 full-width look for a lone
         // uncommitted changeset), unfocused (the diff keeps initial keyboard focus so the user
         // can start reading immediately), Stack mode (shows the structure M5 exists to surface).
+        // Under the pure open/closed toggle (`o`) this is now a consistent split: `o` controls
+        // visibility, `h`/[`App::focus_outline`] controls focus — so seeding open+unfocused here
+        // doesn't fight the toggle the way it did under the old three-state cycle.
         let outline = OutlineState {
             open: changesets.len() > 1,
             focused: false,
             cursor: 0,
             mode: OutlineMode::default(),
             width: DEFAULT_OUTLINE_WIDTH,
+            scroll: 0,
+            order: OutlineOrder::default(),
+            icons: OutlineIcons::default(),
         };
         let mut refresh_coordinator = RefreshCoordinator::new();
         // Seed the coordinator with the index signature as it stands right after this initial
@@ -1038,6 +1336,7 @@ impl App {
             pane_height: 20,
             alt: PaneState::default(),
             alt_height: 20,
+            outline_height: 20,
             base_label,
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
@@ -1589,6 +1888,12 @@ impl App {
     /// run on file open and zoom change. The two role coordinate spaces disagree, so carrying a
     /// raw cursor index across a role/zoom switch would be meaningless; jumping to the role's own
     /// first hunk (the same position a fresh file open lands on) is always valid and predictable.
+    ///
+    /// This is also what `coordinated_refresh` leaves behind after a staging op (via
+    /// `open_current`), since a refresh is itself a file "open" of the post-op state — CS6's
+    /// `App::restore_position` runs immediately after, overwriting this first-hunk reseat with
+    /// the reviewer's pre-op position when it can. Every OTHER caller (manual file/changeset
+    /// nav, zoom cycles) has no such follow-up, so first-hunk-on-open is still what they see.
     fn reset_panes(&mut self) {
         // Any file open / zoom change reshapes the coordinate space an active selection is keyed
         // in, so drop it (see [`Self::selection_anchor`]).
@@ -2071,14 +2376,14 @@ impl App {
 
     // ── Outline side pane (CS3) ─────────────────────────────────────────────────
 
-    /// Snapshot every reviewed changeset into [`OutlineChangeset`]/[`OutlineFile`] and build the
-    /// current [`OutlineMode`]'s row list — the outline cursor's index space, and the source of
-    /// truth `render.rs` draws from. Rebuilt fresh on every call (cheap: a small stack times a
-    /// handful of files each, no caching, same posture as [`Self::effective_zoom_for`]) rather
-    /// than cached on `App`, so it's never stale across a mode toggle, a nav, or a refresh.
-    pub fn outline_items(&self) -> Vec<OutlineItem> {
-        let snapshot: Vec<OutlineChangeset> = self
-            .changesets
+    // ── Summary panel (CS4) ─────────────────────────────────────────────────────
+
+    /// Snapshot every reviewed changeset into [`OutlineChangeset`]/[`OutlineFile`] — the input
+    /// [`Self::outline_items`] feeds `outline::build_items`, and CS4's [`Self::summary_for`]
+    /// feeds `outline::latest_by_path` for a [`OutlineMode::Tree`] directory's cross-stack
+    /// aggregate. Rebuilt fresh on every call, same posture as [`Self::outline_items`] itself.
+    fn outline_snapshot(&self) -> Vec<OutlineChangeset> {
+        self.changesets
             .iter()
             .map(|v| OutlineChangeset {
                 label: v.cs.title.clone().unwrap_or_else(|| v.cs.name.clone()),
@@ -2093,11 +2398,95 @@ impl App {
                     .map(|(idx, f)| OutlineFile {
                         path: f.path.clone(),
                         status: v.staged_status(idx),
+                        change: f.status,
                     })
                     .collect(),
             })
-            .collect();
-        outline::build_items(&snapshot, self.outline.mode)
+            .collect()
+    }
+
+    /// Build the current [`OutlineMode`]'s row list — the outline cursor's index space, and the
+    /// source of truth `render.rs` draws from. Rebuilt fresh on every call (cheap: a small stack
+    /// times a handful of files each, no caching, same posture as [`Self::effective_zoom_for`])
+    /// rather than cached on `App`, so it's never stale across a mode toggle, a nav, or a
+    /// refresh.
+    pub fn outline_items(&self) -> Vec<OutlineItem> {
+        let snapshot = self.outline_snapshot();
+        outline::build_items(&snapshot, self.outline.mode, self.outline.order)
+    }
+
+    /// CS4: the outline row a Header/Dir cursor selection resolves to — `None` when the outline
+    /// isn't in a state where the diff area shows a summary instead of a file's diff (closed,
+    /// merely open-but-unfocused, or the cursor is on a File row). `render_body` branches on this
+    /// before any of its usual diff-body gates (pending/failed/binary/deferred-load).
+    pub fn summary_target(&self) -> Option<SummaryTarget> {
+        if !self.outline.open || !self.outline.focused {
+            return None;
+        }
+        let items = self.outline_items();
+        match items.get(self.outline.cursor)? {
+            OutlineItem::Header { cs_idx, .. } => Some(SummaryTarget::Changeset(*cs_idx)),
+            OutlineItem::Dir { path, cs_idx, .. } => Some(SummaryTarget::Dir {
+                cs_idx: *cs_idx,
+                path: path.clone(),
+            }),
+            OutlineItem::File { .. } => None,
+        }
+    }
+
+    /// Build the renderable summary for `target` (see [`Self::summary_target`]) —
+    /// `render::render_summary`'s data source.
+    pub fn summary_for(&self, target: SummaryTarget) -> Summary {
+        match target {
+            SummaryTarget::Changeset(cs_idx) => {
+                let view = &self.changesets[cs_idx];
+                let label = view
+                    .cs
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| view.cs.name.clone());
+                let failure_message = view.failure_message().map(|s| s.to_string());
+                Summary::Changeset(summary::changeset_summary(
+                    label,
+                    view.cs.current,
+                    view.cs.needs_restack,
+                    view.is_pending(),
+                    view.is_failed(),
+                    failure_message,
+                    view.files(),
+                ))
+            }
+            SummaryTarget::Dir {
+                cs_idx: Some(cs_idx),
+                path,
+            } => {
+                // StackTree mode: the dir row's trie belongs to exactly one changeset, so scope
+                // the aggregate to that changeset's own files (mirrors `build_stack_tree`'s "no
+                // cross-changeset dedup" rule).
+                let view = &self.changesets[cs_idx];
+                Summary::Dir(summary::dir_summary(
+                    path,
+                    &view.files().iter().collect::<Vec<_>>(),
+                ))
+            }
+            SummaryTarget::Dir { cs_idx: None, path } => {
+                // Tree mode: the dir row's trie spans the whole stack with no single owning
+                // changeset — aggregate over the same last-write-wins de-duped path set the Tree
+                // outline itself displays, reusing `outline::latest_by_path` rather than
+                // re-deriving the dedup rule here. `latest_by_path` returns a `HashMap`, whose
+                // iteration order is unspecified — sort by path so the panel's file list reads in
+                // the same alpha order the Tree outline itself paints (`emit`'s own sort).
+                let snapshot = self.outline_snapshot();
+                let latest = outline::latest_by_path(&snapshot);
+                let mut entries: Vec<(&String, &outline::FileOccurrence)> = latest.iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+                let files: Vec<&FileChange> = entries
+                    .into_iter()
+                    .filter_map(|(_, occ)| self.changesets[occ.cs_idx].files().get(occ.file_idx))
+                    .collect();
+                Summary::Dir(summary::dir_summary(path, &files))
+            }
+        }
     }
 
     pub fn outline_open(&self) -> bool {
@@ -2112,6 +2501,12 @@ impl App {
         self.outline.cursor
     }
 
+    /// Top-of-viewport row index into [`Self::outline_items`]'s row list — see
+    /// [`Self::derive_outline_scroll`].
+    pub fn outline_scroll(&self) -> usize {
+        self.outline.scroll
+    }
+
     /// The outline pane's column width — `workon.review.outline.width` (CS7), or
     /// [`DEFAULT_OUTLINE_WIDTH`] if never set. Read by `render.rs` in place of the old fixed
     /// const.
@@ -2123,35 +2518,55 @@ impl App {
         self.outline.mode
     }
 
-    /// `o`: a three-state cycle — closed -> open+focused -> open+unfocused (focus back on the
-    /// diff, pane stays visible) -> closed. Opening always grabs focus (per the locked design);
-    /// the middle -> closed transition ("o while the outline is open but the diff has focus
-    /// closes it") isn't explicitly specified in the plan but is the natural completion of the
-    /// cycle, kept simple rather than adding a separate "close" key.
+    /// Which end of the stack the outline displays first — `workon.review.outline.order` (CS3),
+    /// or [`OutlineOrder::default`] if never set.
+    pub fn outline_order(&self) -> OutlineOrder {
+        self.outline.order
+    }
+
+    /// CS5: whether the outline renders nerd-font icons — `workon.review.outline.icons`, or
+    /// [`OutlineIcons::default`] (`None`) if never set.
+    pub fn outline_icons(&self) -> OutlineIcons {
+        self.outline.icons
+    }
+
+    /// `o`: a pure show/hide toggle — closed -> open+focused (+[`Self::sync_outline_to_current`]),
+    /// open (regardless of focus) -> closed+diff-focused. Focus itself is now a separate concern
+    /// handled by [`Self::focus_outline`]/[`Self::focus_diff`] (`h`/`l`) — `o` only ever changes
+    /// visibility. The opening arm IS `focus_outline`'s closed-case behavior, so it delegates
+    /// there rather than restating it.
     pub fn toggle_outline(&mut self) {
         if !self.outline.open {
-            self.outline.open = true;
-            self.outline.focused = true;
-            self.sync_outline_to_current();
-        } else if self.outline.focused {
-            self.outline.focused = false;
+            self.focus_outline();
         } else {
             self.outline.open = false;
+            self.outline.focused = false;
         }
+    }
+
+    /// `h`/Esc-cascade target: focus the outline, opening it first if it's closed. Syncing the
+    /// cursor to the current diff position only happens on the closed -> open transition — if the
+    /// outline is already open, re-focusing it (e.g. `h` after a manual `j`/`k` outline move
+    /// followed by `l`) must not stomp a manually positioned cursor.
+    pub fn focus_outline(&mut self) {
+        if !self.outline.open {
+            self.outline.open = true;
+            self.sync_outline_to_current();
+        }
+        self.outline.focused = true;
+    }
+
+    /// `l`/Enter: return focus to the diff. The outline stays open — this only ever changes
+    /// focus, never visibility (that's `o`/[`Self::toggle_outline`]'s job).
+    pub fn focus_diff(&mut self) {
+        self.outline.focused = false;
     }
 
     /// `?`: toggle the help overlay (CS3). A plain flip — the overlay always renders whatever
     /// view currently has keyboard focus (see `render::render_help_overlay`), so there is no
-    /// extra state to reposition here, unlike [`Self::toggle_outline`]'s three-state cycle.
+    /// extra state to reposition here, unlike [`Self::toggle_outline`].
     pub fn toggle_help(&mut self) {
         self.help_visible = !self.help_visible;
-    }
-
-    /// Return focus to the diff without closing the outline (`Esc` while the outline has focus —
-    /// `tui::update` routes it here instead of quitting, per the locked design's "Esc must still
-    /// not quit when the outline has focus").
-    pub fn outline_unfocus(&mut self) {
-        self.outline.focused = false;
     }
 
     /// `i` while the outline has focus: cycle [`OutlineMode`], then reposition the cursor onto
@@ -2177,6 +2592,22 @@ impl App {
     /// [`OutlineState::mode`] today (the outline cursor starts at `0` either way).
     pub fn set_outline_mode(&mut self, mode: OutlineMode) {
         self.outline.mode = mode;
+    }
+
+    /// Set the outline stack order directly — the config-startup (CS3) counterpart there is no
+    /// interactive key for today. Same non-resync posture as [`Self::set_outline_mode`]: called
+    /// before the first [`Self::open_current`], so no [`Self::sync_outline_to_current`] call is
+    /// needed here either.
+    pub fn set_outline_order(&mut self, order: OutlineOrder) {
+        self.outline.order = order;
+    }
+
+    /// Set the outline icons setting directly — the config-startup (CS5) counterpart; there is
+    /// no interactive key for this (icons are a static config choice, not something to toggle
+    /// mid-session). Same non-resync posture as [`Self::set_outline_mode`]/
+    /// [`Self::set_outline_order`].
+    pub fn set_outline_icons(&mut self, icons: OutlineIcons) {
+        self.outline.icons = icons;
     }
 
     /// Move the outline's own cursor by `delta` rows (`j`/`k` while the outline has focus),
@@ -2226,6 +2657,42 @@ impl App {
                 idx += step;
             }
         }
+        self.derive_outline_scroll(items.len());
+    }
+
+    /// `g`/`G` while the outline has focus: jump the cursor straight to row `idx` (clamped into
+    /// the current row list), landing on it in one step — unlike [`Self::outline_move_by`], there
+    /// is NO burst back-scan here: a jump to a HEADER/DIR row simply doesn't move the diff (`g`
+    /// typically lands on the stack's first header), and a jump to a FILE row jumps the diff
+    /// straight there (`G` typically lands on the last file). Used by [`Self::outline_top`]/
+    /// [`Self::outline_bottom`].
+    fn outline_move_to(&mut self, idx: usize) {
+        let items = self.outline_items();
+        if items.is_empty() {
+            self.outline.cursor = 0;
+            self.derive_outline_scroll(0);
+            return;
+        }
+        let idx = idx.min(items.len() - 1);
+        self.outline.cursor = idx;
+        if let OutlineItem::File {
+            cs_idx, file_idx, ..
+        } = &items[idx]
+        {
+            self.switch_changeset(*cs_idx, *file_idx);
+        }
+        self.derive_outline_scroll(items.len());
+    }
+
+    /// `g` while the outline has focus: jump the cursor to the first row.
+    pub fn outline_top(&mut self) {
+        self.outline_move_to(0);
+    }
+
+    /// `G` while the outline has focus: jump the cursor to the last row.
+    pub fn outline_bottom(&mut self) {
+        let last = self.outline_items().len().saturating_sub(1);
+        self.outline_move_to(last);
     }
 
     /// `Enter` while the outline has focus: jump the diff to the row under the outline cursor (a
@@ -2254,6 +2721,242 @@ impl App {
         self.outline.focused = false;
     }
 
+    // ── Outline staging (CS7) ───────────────────────────────────────────────────
+
+    /// Whether the changeset at `cs_idx` is a committed range rather than the uncommitted
+    /// worktree layer — the per-index counterpart to [`Self::is_committed`] (which only reads the
+    /// ACTIVE changeset). CS7's outline verbs need this because the acted-on row's changeset is
+    /// whichever one the outline cursor rests on, not necessarily the diff's current changeset.
+    fn is_committed_at(&self, cs_idx: usize) -> bool {
+        self.changesets.get(cs_idx).is_some_and(|view| {
+            matches!(
+                view.cs.span,
+                ChangesetSpan::Committed { .. } | ChangesetSpan::CommittedRoot { .. }
+            )
+        })
+    }
+
+    /// Resolve the outline row at `idx` to its [`OutlineRowIdentity`] plus the `(cs_idx,
+    /// file_idx)` pairs an outline stage/discard verb applies to — `None` for a
+    /// [`OutlineItem::Header`] row (never a staging target) or an out-of-range `idx`.
+    ///
+    /// A [`OutlineItem::File`] row resolves to its own single target. A [`OutlineItem::Dir`] row
+    /// resolves to every file under its `path` (segment-boundary match, [`summary::path_is_under`]
+    /// — the same rule the summary panel's [`summary::dir_summary`] uses): scoped to that row's own
+    /// changeset in [`OutlineMode::StackTree`] (`cs_idx: Some`), or to the cross-stack
+    /// last-write-wins de-duped set [`outline::latest_by_path`] returns in [`OutlineMode::Tree`]
+    /// (`cs_idx: None`) — mirrors [`Self::summary_for`]'s own Dir-row branching.
+    fn outline_row_targets(&self, idx: usize) -> Option<(OutlineRowIdentity, Vec<(usize, usize)>)> {
+        let items = self.outline_items();
+        match items.get(idx)? {
+            OutlineItem::Header { .. } => None,
+            OutlineItem::File {
+                cs_idx, file_idx, ..
+            } => {
+                let path = self
+                    .changesets
+                    .get(*cs_idx)?
+                    .files()
+                    .get(*file_idx)?
+                    .path
+                    .clone();
+                Some((
+                    OutlineRowIdentity::File {
+                        cs_idx: *cs_idx,
+                        path,
+                    },
+                    vec![(*cs_idx, *file_idx)],
+                ))
+            }
+            OutlineItem::Dir { path, cs_idx, .. } => {
+                let identity = OutlineRowIdentity::Dir {
+                    cs_idx: *cs_idx,
+                    path: path.clone(),
+                };
+                let targets = match cs_idx {
+                    Some(cs_idx) => self
+                        .changesets
+                        .get(*cs_idx)?
+                        .files()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, f)| summary::path_is_under(&f.path, path))
+                        .map(|(file_idx, _)| (*cs_idx, file_idx))
+                        .collect(),
+                    None => {
+                        let snapshot = self.outline_snapshot();
+                        let latest = outline::latest_by_path(&snapshot);
+                        latest
+                            .iter()
+                            .filter(|(p, _)| summary::path_is_under(p, path))
+                            .map(|(_, occ)| (occ.cs_idx, occ.file_idx))
+                            .collect()
+                    }
+                };
+                Some((identity, targets))
+            }
+        }
+    }
+
+    /// Per-file verb selection by [`outline::StagedStatus`] — mirrors [`Self::verb_for_role`]'s
+    /// toggle direction (unstaged stages, staged unstages), but keyed off the FILE's own status
+    /// rather than a pane role, since a Dir row's files can each carry a different status.
+    /// [`outline::StagedStatus::None`] shouldn't normally occur on the uncommitted changeset's own
+    /// file (a changed file always has SOME status) — treated as a Stage attempt so the op surfaces
+    /// whatever git reports rather than silently refusing.
+    fn outline_target_verb(&self, cs_idx: usize, file_idx: usize) -> StageVerb {
+        match self.changesets[cs_idx].staged_status(file_idx) {
+            outline::StagedStatus::Staged => StageVerb::Unstage,
+            outline::StagedStatus::Unstaged
+            | outline::StagedStatus::Partial
+            | outline::StagedStatus::None => StageVerb::Stage,
+        }
+    }
+
+    /// Footer refusal for an outline stage/discard verb — parallels [`Self::notify_combined_refusal`]
+    /// but for the two CS7-specific refusal reasons: `committed` (the row's changeset — or, for a
+    /// Dir row, at least one file under it — is a committed range, not the uncommitted worktree
+    /// layer) or not (the cursor sits on a [`OutlineItem::Header`] row, which is never a target).
+    fn notify_outline_refusal(&mut self, verb: &str, committed: bool) {
+        if committed {
+            self.notify(
+                format!("changeset is already committed — nothing to {verb}"),
+                Severity::Error,
+            );
+        } else {
+            self.notify(
+                format!("select a file or directory to {verb}"),
+                Severity::Error,
+            );
+        }
+    }
+
+    /// The shared resolve-and-gate preamble of the outline staging verbs (`s`/`d`): resolve the
+    /// row under the outline cursor to its identity + targets, refusing (with `verb` naming the
+    /// action in the notice) on a Header row or when any target belongs to a committed changeset,
+    /// and bailing silently on an empty target list. One helper so the two verbs' gates can't
+    /// drift apart.
+    fn outline_verb_targets(
+        &mut self,
+        verb: &str,
+    ) -> Option<(OutlineRowIdentity, Vec<(usize, usize)>)> {
+        let Some((identity, targets)) = self.outline_row_targets(self.outline.cursor) else {
+            self.notify_outline_refusal(verb, false);
+            return None;
+        };
+        if targets
+            .iter()
+            .any(|&(cs_idx, _)| self.is_committed_at(cs_idx))
+        {
+            self.notify_outline_refusal(verb, true);
+            return None;
+        }
+        if targets.is_empty() {
+            return None;
+        }
+        Some((identity, targets))
+    }
+
+    /// `s` while the outline has focus: stage or unstage the file/directory under the cursor. A
+    /// [`OutlineItem::File`] row stages or unstages per its own [`Self::outline_target_verb`]; a
+    /// [`OutlineItem::Dir`] row applies the same per-file verb selection to every file under it
+    /// (each file stages or unstages independently — a mixed-status directory is not an all-stage
+    /// or all-unstage op). Refuses on a [`OutlineItem::Header`] row or when any target belongs to
+    /// a committed changeset (see [`Self::notify_outline_refusal`]).
+    pub fn outline_stage(&mut self) {
+        let Some((identity, targets)) = self.outline_verb_targets("stage") else {
+            return;
+        };
+        let ops: Vec<Box<dyn StagingOp>> = targets
+            .iter()
+            .filter_map(|&(cs_idx, file_idx)| {
+                let file = self.changesets.get(cs_idx)?.files().get(file_idx)?.clone();
+                let verb = self.outline_target_verb(cs_idx, file_idx);
+                Some(Box::new(FileStagingOp::file(file, verb)) as Box<dyn StagingOp>)
+            })
+            .collect();
+        self.outline_run_ops(ops, identity);
+    }
+
+    /// `d` while the outline has focus: request confirmation to discard the file/directory under
+    /// the cursor from the worktree — a [`OutlineItem::File`] row discards just that file; a
+    /// [`OutlineItem::Dir`] row discards every file under it, and the confirm prompt names the
+    /// scope. Same refusal gates as [`Self::outline_stage`]. The discard itself runs when the user
+    /// answers `y` (see [`Self::resolve_confirm`]'s [`PendingOp::DiscardOutlineFiles`] arm).
+    pub fn outline_discard(&mut self) {
+        let Some((identity, targets)) = self.outline_verb_targets("discard") else {
+            return;
+        };
+        let prompt = match &identity {
+            OutlineRowIdentity::File { path, .. } => {
+                format!("Discard all changes to `{path}`? (y/n)")
+            }
+            OutlineRowIdentity::Dir { path, .. } => format!(
+                "Discard changes to {} files under {path}/? (y/n)",
+                targets.len()
+            ),
+        };
+        let files: Vec<(String, String)> = targets
+            .iter()
+            .filter_map(|&(cs_idx, file_idx)| {
+                let view = self.changesets.get(cs_idx)?;
+                let path = view.files().get(file_idx)?.path.clone();
+                Some((view.cs.name.clone(), path))
+            })
+            .collect();
+        self.request_confirm(prompt, PendingOp::DiscardOutlineFiles { files, identity });
+    }
+
+    /// The outline-facing counterpart to [`Self::run_op`]: drain `ops` through [`Self::run_ops`],
+    /// then restore the OUTLINE cursor to (or nearest to) `identity`'s row rather
+    /// than a diff-pane position (CS6's [`PositionMemento`]/[`Self::restore_position`] only make
+    /// sense when the diff pane, not the outline, was the focused surface the op started from).
+    /// [`Self::coordinated_refresh`] (inside `run_ops`) itself calls `sync_outline_to_current`,
+    /// which can leave the outline cursor on a wholly unrelated row (wherever the DIFF's current
+    /// file happens to be) — this runs after that and overwrites it with the acted-on row's own
+    /// position, or the nearest surviving row if it's gone (e.g. a fully-discarded file).
+    fn outline_run_ops(&mut self, ops: Vec<Box<dyn StagingOp>>, identity: OutlineRowIdentity) {
+        let pre_op_cursor = self.outline.cursor;
+        // Restore after BOTH outcomes: `run_ops` refreshes (and thereby yanks the outline cursor
+        // via `sync_outline_to_current`) even on a partial failure, and the acted-on row is where
+        // the user is looking either way.
+        let _ = self.run_ops(ops);
+        self.restore_outline_position(&identity, pre_op_cursor);
+    }
+
+    /// Re-find `identity`'s row in the freshly rebuilt [`Self::outline_items`] and reseat
+    /// [`OutlineState::cursor`] there; clamps into bounds instead when the row is gone (a fully
+    /// discarded file drops out of the combined diff — and with it its row — entirely). Does not
+    /// touch [`OutlineState::focused`] — an outline-initiated op
+    /// only ever runs while the outline already has focus, and nothing here changes that.
+    fn restore_outline_position(&mut self, identity: &OutlineRowIdentity, pre_op_cursor: usize) {
+        let items = self.outline_items();
+        let found = items.iter().position(|item| match item {
+            OutlineItem::File {
+                cs_idx, file_idx, ..
+            } => {
+                let full_path = self
+                    .changesets
+                    .get(*cs_idx)
+                    .and_then(|v| v.files().get(*file_idx))
+                    .map(|f| f.path.as_str());
+                full_path.is_some_and(|p| identity.matches_file(*cs_idx, p))
+            }
+            OutlineItem::Dir { .. } => identity.matches_dir(item),
+            OutlineItem::Header { .. } => false,
+        });
+        match found {
+            Some(idx) => self.outline.cursor = idx,
+            // Row gone (the NORMAL outcome of a successful discard — the file left the combined
+            // diff and took its row with it): stay near where the user was ACTING, not wherever
+            // the refresh's `sync_outline_to_current` just parked the cursor (the diff's current
+            // file, unrelated to the acted-on row). `pre_op_cursor` is the acted-on row's own
+            // pre-op position; clamping it lands on the nearest surviving neighbor.
+            None => self.outline.cursor = pre_op_cursor.min(items.len().saturating_sub(1)),
+        }
+        self.derive_outline_scroll(items.len());
+    }
+
     /// Reposition (never rebuild/refocus) the outline cursor onto the row matching the CURRENT
     /// diff changeset+file, or clamp it into bounds if no such row exists (e.g. Flat mode
     /// deduped the current file's changeset out of the list). The sync-follow discipline's echo
@@ -2273,6 +2976,7 @@ impl App {
         let items = self.outline_items();
         if items.is_empty() {
             self.outline.cursor = 0;
+            self.derive_outline_scroll(0);
             return;
         }
         if let Some(idx) = items.iter().position(|it| {
@@ -2286,6 +2990,7 @@ impl App {
         } else {
             self.outline.cursor = self.outline.cursor.min(items.len() - 1);
         }
+        self.derive_outline_scroll(items.len());
     }
 
     /// Row count of file `idx`'s `role` view in the active layout's space (0 if absent/unloaded).
@@ -2340,6 +3045,22 @@ impl App {
         let rows = self.role_row_count(self.current, role);
         self.alt.scroll =
             derive_scroll_value(self.alt.cursor, self.alt.scroll, rows, self.alt_height);
+    }
+
+    /// Re-derive the outline pane's `scroll` from its `cursor` — the outline's counterpart to
+    /// [`Self::derive_scroll`], reusing the same [`derive_scroll_value`] core against
+    /// [`Self::outline_height`]. Called after every outline-cursor mutation (mirroring how every
+    /// diff-cursor mutator ends with `derive_scroll`); the renderer also re-derives each frame,
+    /// which covers resizes. Takes the outline row count from the caller — every call site has
+    /// just built (or is about to paint from) [`Self::outline_items`], and rebuilding the whole
+    /// snapshot here again just for `.len()` would double the work on every keypress and frame.
+    pub(crate) fn derive_outline_scroll(&mut self, rows: usize) {
+        self.outline.scroll = derive_scroll_value(
+            self.outline.cursor,
+            self.outline.scroll,
+            rows,
+            self.outline_height,
+        );
     }
 
     /// The `(scroll, cursor)` a split pane renders with: the focused pane contributes its own
@@ -2423,6 +3144,78 @@ impl App {
             self.cursor = row;
             self.derive_scroll();
         }
+    }
+
+    /// Reveal more of the collapsed gap under the cursor (`Enter`), or the WHOLE gap (`E`, when
+    /// `full`) — CS8's progressive unfold, extended by CS9 with a two-tier `Enter`: A silent
+    /// no-op when the cursor isn't on a `Gap` row (or there's no loaded view): unlike a staging
+    /// refusal this isn't a mode error worth interrupting the user over, same precedent as
+    /// [`Self::next_hunk_row`] finding no later hunk.
+    ///
+    /// - `full` (`E`): unchanged from CS8 — always the flat full-run reveal via
+    ///   [`FileView::expand_gap`], regardless of grammar.
+    /// - `!full` (`Enter`, CS9): FIRST tries a tree-sitter scope-reveal —
+    ///   [`gap_scope_start`] resolves the gap's anchor (the following row's new-side lineno,
+    ///   preferring new like CS6's [`Self::restore_position`], old-side for delete-only files)
+    ///   to the smallest enclosing [`crate::scope`] node, and [`FileView::scope_expand_gap`]
+    ///   widens the gap's trailing edge to uncover it. Falls back to the flat +10/+10 reveal
+    ///   (same as CS8) when: the file's extension has no bundled grammar, no allowlisted
+    ///   ancestor encloses the anchor, or the scope reveals nothing new (already fully visible)
+    ///   — so repeated `Enter` presses always widen the gap, uniformly.
+    ///
+    /// `self.cursor`'s INDEX is left untouched either way. Rows revealed at the gap's leading
+    /// edge insert immediately before the gap's own row (shifting the gap marker — and
+    /// everything after it — down), so after [`FileView::rebuild_rows`] the row now sitting at
+    /// the old index is the first newly revealed line rather than the gap marker itself: the
+    /// cursor visually lands on the start of the revealed region without this method needing to
+    /// compute a new index. The scope-reveal path only ever widens the TRAILING edge (see
+    /// [`FileView::scope_expand_gap`]'s doc for why), so this holds there too.
+    pub fn expand_gap_at_cursor(&mut self, full: bool) {
+        let cursor = self.cursor;
+        let layout = self.layout;
+        // Read out before taking `current_view()`'s exclusive borrow — `gap_scope_start` only
+        // needs the path strings, not the file, so cloning two short `String`s here avoids a
+        // `self.cur()`/`self.current_view()` borrow conflict for the whole rest of the method.
+        let anchor_paths = self.cur().diff.files.get(self.current).map(|f| {
+            let new_path = f.path.clone();
+            let old_path = f.old_path.clone().unwrap_or_else(|| f.path.clone());
+            (new_path, old_path)
+        });
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        let key = match layout {
+            Layout::Sbs => match view.display.get(cursor) {
+                Some(DisplayRow::Gap { key, .. }) => *key,
+                _ => return,
+            },
+            Layout::Inline => match view.inline.get(cursor) {
+                Some(InlineRow::Gap { key, .. }) => *key,
+                _ => return,
+            },
+        };
+
+        let scope_revealed = !full
+            && anchor_paths
+                .as_ref()
+                .and_then(|(new_path, old_path)| {
+                    gap_scope_start(view, layout, cursor, new_path, old_path)
+                })
+                .is_some_and(|(scope_start, anchor_prefers_new)| {
+                    view.scope_expand_gap(key, scope_start, anchor_prefers_new)
+                });
+
+        if !scope_revealed {
+            view.expand_gap(key, 10, 10, full);
+        }
+        // The expansion just reshaped the focused pane's row space — whichever tier did it —
+        // so cancel any active selection rather than translating it, per `selection_anchor`'s
+        // invariant (same rule as layout toggles, zoom changes, file switches, and split-focus
+        // swaps). Only reached when a gap actually expanded; the non-gap no-op above leaves a
+        // selection alone.
+        self.cancel_selection();
+        self.derive_scroll();
+        self.clamp_cursor();
     }
 
     /// Toggle between side-by-side and inline layouts (`L`). Deliberately does not try to
@@ -2509,6 +3302,28 @@ impl App {
             None => OutlineMode::default(),
         };
         self.set_outline_mode(mode);
+
+        let order = match &raw.outline_order {
+            Some(o) => parse_outline_order(o).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.outline.order = '{o}' unrecognized; using default"
+                ));
+                OutlineOrder::default()
+            }),
+            None => OutlineOrder::default(),
+        };
+        self.set_outline_order(order);
+
+        let icons = match &raw.outline_icons {
+            Some(i) => parse_outline_icons(i).unwrap_or_else(|| {
+                warnings.push(format!(
+                    "workon.review.outline.icons = '{i}' unrecognized; using default"
+                ));
+                OutlineIcons::default()
+            }),
+            None => OutlineIcons::default(),
+        };
+        self.set_outline_icons(icons);
 
         let layout = match &raw.diff_layout {
             Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
@@ -2762,21 +3577,62 @@ impl App {
                 };
                 self.run_op(LineSelectionOp::new(file, selections, StageVerb::Discard));
             }
+            PendingOp::DiscardOutlineFiles { files, identity } => {
+                // Re-resolve each (changeset name, path) pair against the LIVE changesets — an
+                // intervening tick refresh may have shifted every index since `d` was pressed
+                // (see the variant's doc); a pair that no longer resolves is silently skipped
+                // (its file already left the diff, so there's nothing left to discard).
+                let ops: Vec<Box<dyn StagingOp>> = files
+                    .iter()
+                    .filter_map(|(cs_name, path)| {
+                        let view = self.changesets.iter().find(|v| v.cs.name == *cs_name)?;
+                        let file = view.files().iter().find(|f| f.path == *path)?.clone();
+                        Some(Box::new(FileStagingOp::file(file, StageVerb::Discard))
+                            as Box<dyn StagingOp>)
+                    })
+                    .collect();
+                self.outline_run_ops(ops, identity);
+            }
         }
     }
 
     /// Enqueue `op`, drain the queue on the same beat, then act on the outcome: a failure or panic
-    /// surfaces on the footer and skips the refresh (the index is now in whatever partial state
-    /// the failed op left it in — the user resolves with `r`); a `Completed` drain refreshes,
-    /// rebuilding the views + attribution from the new index (locked decision #5).
+    /// surfaces on the footer (and the views still refresh — see [`Self::run_ops`] for why); a
+    /// `Completed` drain refreshes, rebuilding the views + attribution from the new index (locked
+    /// decision #5), then restores the reviewer's pre-op DIFF position (CS6) — a staging op is
+    /// the ONE nav path that does not reset to the role's first hunk; every manual nav still
+    /// does, via `reset_panes` unchanged.
     ///
-    /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]) or a (possibly
-    /// multi-hunk) line selection ([`LineSelectionOp`], which applies as ONE merged patch rather
-    /// than enqueueing one op per hunk — see that type's docs for why splitting is wrong). Either
-    /// way exactly one op is ever in flight, so the queue's trap-4 live-index staleness doesn't
-    /// apply — the queue is here for its lock-retry and panic isolation.
+    /// A thin diff-facing wrapper over [`Self::run_ops`] (one op, one memento) — the diff pane's
+    /// staging verbs (`s`/`S`/`d`/`D`) are the only callers, so the shared drain/refresh core
+    /// lives on `run_ops` and this just supplies the diff-position memento CS7's outline verbs
+    /// don't want (see [`Self::outline_run_ops`], which restores the OUTLINE cursor instead).
     fn run_op(&mut self, op: impl StagingOp + 'static) {
-        self.queue.enqueue(op);
+        let memento = self.capture_position();
+        if self.run_ops(vec![Box::new(op)]).is_ok() {
+            if let Some(memento) = memento {
+                self.restore_position(memento);
+            }
+        }
+    }
+
+    /// Enqueue every op in `ops`, drain the queue on the same beat, then run a
+    /// [`Self::coordinated_refresh`] REGARDLESS of outcome — the drain never stops on a failure,
+    /// so a partial multi-op batch has already mutated the index/worktree and the views must
+    /// re-read that reality even while a failure notice shows. Returns `Err` after notifying the
+    /// first failure/panic, `Ok(())` otherwise. Callers own what happens next (a diff-position or
+    /// outline-cursor restore, or nothing) — this only owns the queue mechanics.
+    ///
+    /// Generic over any [`StagingOp`] — a hunk/file op ([`FileStagingOp`]), a (possibly
+    /// multi-hunk) line selection ([`LineSelectionOp`], which applies as ONE merged patch rather
+    /// than enqueueing one op per hunk — see that type's docs for why splitting is wrong), or
+    /// (CS7) several independent whole-file ops from an outline Dir row. The queue's trap-4
+    /// live-index staleness doesn't apply here: every op resolves its own direction from the live
+    /// index inside `run` (see `queue.rs`'s module doc), so draining several back-to-back is safe.
+    fn run_ops(&mut self, ops: Vec<Box<dyn StagingOp>>) -> Result<(), ()> {
+        for op in ops {
+            self.queue.enqueue(op);
+        }
         // Distinct fields (`queue` mutable, `repo`/`applier` shared) — the borrow checker permits
         // the disjoint borrows in one call, so the queue needn't be taken out and put back.
         let outcomes = self.queue.drain(&self.repo, &self.applier);
@@ -2785,10 +3641,107 @@ impl App {
             OpOutcome::Panicked(_) => Some("staging operation panicked".to_string()),
             OpOutcome::Completed(_) => None,
         });
+        // Refresh in BOTH arms: the queue's drain never stops on a failure (`pump` runs every
+        // queued op regardless), so in a multi-op batch a single failure still leaves up to N-1
+        // other ops applied to the index/worktree — the views must re-read that reality even
+        // while the failure notice shows. (For a single-op batch the refresh is a harmless
+        // re-read of unchanged state.)
+        self.coordinated_refresh();
         match failure {
-            Some(message) => self.notify(message, Severity::Error),
-            None => self.coordinated_refresh(),
+            Some(message) => {
+                self.notify(message, Severity::Error);
+                Err(())
+            }
+            None => Ok(()),
         }
+    }
+
+    /// Snapshot the focused pane's file/role/position ahead of a staging op, for
+    /// [`Self::restore_position`] to reseat after the op's `coordinated_refresh` (CS6). `None`
+    /// when there's no current file, the current view is the combined role (never a staging
+    /// target — [`Self::staging_role`]), or the focused role's view isn't loaded; restore is then
+    /// a no-op and today's `reset_panes` first-hunk behavior stands.
+    fn capture_position(&self) -> Option<PositionMemento> {
+        let path = self.files().get(self.current)?.path.clone();
+        let role = self.staging_role()?;
+        let view = self.role_view_ref(self.current, role)?;
+        // Reuse the same row -> lineno extraction `FileView::load` builds its hunk maps from
+        // (a Gap row yields (None, None), which restore treats as nothing-to-search-for).
+        let (old_lineno, new_lineno) = match self.layout {
+            Layout::Sbs => view
+                .display
+                .get(self.cursor)
+                .map(display_row_linenos)
+                .unwrap_or((None, None)),
+            Layout::Inline => view
+                .inline
+                .get(self.cursor)
+                .map(inline_row_linenos)
+                .unwrap_or((None, None)),
+        };
+        Some(PositionMemento {
+            path,
+            role,
+            old_lineno,
+            new_lineno,
+        })
+    }
+
+    /// Reseat the focused pane to a pre-staging-op position after `coordinated_refresh` rebuilds
+    /// the views (CS6) — the staging-path counterpart to `reset_panes`' first-hunk reseat, which
+    /// this deliberately leaves untouched for every manual nav (file/changeset switch, zoom
+    /// cycle). Falls back to whatever `reset_panes` already produced (today's first-hunk
+    /// behavior) when the acted-on file's path is gone (fully discarded) or its memento carried
+    /// no lineno at all (the cursor sat on a `Gap` row pre-op — nothing to search for).
+    fn restore_position(&mut self, m: PositionMemento) {
+        if self.files().get(self.current).map(|f| f.path.as_str()) != Some(m.path.as_str()) {
+            return;
+        }
+        // Force the load `reset_panes` may have deferred so the view below actually exists.
+        self.complete_pending_open();
+
+        // Target role: a still-`Split` file keeps both panes, so stay on the memento's own role
+        // (locked decision: same file, same pane, unless that pane's role is now gone). A
+        // collapsed-to-`Single` file has exactly one surviving role — THAT is the target
+        // regardless of which pane the op started in, which is what lands "fully staging a file
+        // in Split" in the staged pane of the same file.
+        let target_role = match self.effective_zoom_for(self.current) {
+            EffectiveZoom::Split => m.role,
+            EffectiveZoom::Single(role) => role,
+        };
+        if matches!(self.effective_zoom_for(self.current), EffectiveZoom::Split)
+            && self.split_focus_role() != target_role
+        {
+            // Never assign `split_focus` directly — this swaps the cursor/scroll/pane-height
+            // stashes along with it.
+            self.toggle_split_focus();
+        }
+
+        let Some(view) = self.role_view_ref(self.current, target_role) else {
+            return;
+        };
+
+        // The memento's linenos were captured in `m.role`'s own frame (new = worktree for
+        // Unstaged/Combined, new = index for Staged — see `FileView::load`'s table). Preferring
+        // new over old is correct BOTH when the role is unchanged (the common case: same pane,
+        // same frame) AND on the one role change that can happen here — unstaged -> staged after
+        // fully staging a file in Split. In that case the staged view's new side (index) now
+        // holds exactly what the unstaged view's new side (worktree) held a moment ago, because
+        // staging made index == worktree for this file; so new -> new is still the right
+        // mapping. Whichever side supplies the target, the SEARCH stays in that same frame —
+        // `find_nearest_row` never falls back across sides (see its doc for why mixing frames
+        // mis-lands the cursor).
+        let (target_lineno, new_frame) = match (m.new_lineno, m.old_lineno) {
+            (Some(n), _) => (n, true),
+            (None, Some(o)) => (o, false),
+            (None, None) => return,
+        };
+        let Some(cursor) = find_nearest_row(view, self.layout, target_lineno, new_frame) else {
+            return;
+        };
+        self.cursor = cursor;
+        self.clamp_cursor();
+        self.derive_scroll();
     }
 
     /// Start a line selection anchored at the current cursor (`v`). Refuses (a notice, no anchor
@@ -3302,6 +4255,43 @@ fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<usize>) {
     }
 }
 
+/// CS9's tree-sitter scope-reveal inputs for the gap at `gap_cursor`: the anchor line and which
+/// side it's in (`true` = new, `false` = old), resolved from the row immediately FOLLOWING the
+/// gap in `layout`'s row vector — the plan's rationale: the next hunk is what you're reading
+/// toward, so its enclosing scope is what's worth revealing. Prefers the new-side lineno when
+/// present, falling back to old (CS6's [`App::restore_position`] convention) for the rows a
+/// delete-only file's `Filler` new side never populates.
+///
+/// Returns `None` when: there's no row after the gap (a trailing gap with nothing beyond it to
+/// anchor on), the anchor path's extension has no bundled grammar, or
+/// [`enclosing_scope_lines`] finds no enclosing scope for the anchor line — every case the
+/// caller treats identically, falling back to the flat +10/+10 reveal.
+fn gap_scope_start(
+    view: &FileView,
+    layout: Layout,
+    gap_cursor: usize,
+    new_path: &str,
+    old_path: &str,
+) -> Option<(usize, bool)> {
+    let (old, new) = match layout {
+        Layout::Sbs => display_row_linenos(view.display.get(gap_cursor + 1)?),
+        Layout::Inline => inline_row_linenos(view.inline.get(gap_cursor + 1)?),
+    };
+
+    let (anchor_line, anchor_prefers_new, text, lang_path) = match new {
+        Some(n) => (n, true, view.new_text(), new_path),
+        None => (old?, false, view.old_text(), old_path),
+    };
+
+    let ext = Path::new(lang_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let lang_key = lang_key_for_ext(ext)?;
+    let (scope_start, _scope_end) = enclosing_scope_lines(lang_key, text, anchor_line)?;
+    Some((scope_start, anchor_prefers_new))
+}
+
 /// Inline-coordinate analog of [`display_row_linenos`].
 fn inline_row_linenos(row: &InlineRow) -> (Option<usize>, Option<usize>) {
     match *row {
@@ -3384,12 +4374,14 @@ mod tests {
     use super::test_support::app_from_fixture;
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        EffectiveZoom, Layout, LoadedViews, Role, Severity, Zoom, DEFAULT_OUTLINE_WIDTH,
+        EffectiveZoom, Layout, LoadedViews, Role, Severity, Summary, SummaryTarget, Zoom,
+        DEFAULT_OUTLINE_WIDTH,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::ReviewConfig;
+    use crate::icons::OutlineIcons;
     use crate::model::FileStatus;
-    use crate::outline::{OutlineItem, OutlineMode, StagedStatus};
+    use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
 
     #[test]
     fn combined_files_arrive_path_sorted() {
@@ -3933,7 +4925,7 @@ mod tests {
     }
 
     fn gap_row(skipped: usize) -> DisplayRow {
-        DisplayRow::Gap { skipped }
+        DisplayRow::Gap { key: 0, skipped }
     }
 
     #[test]
@@ -5601,6 +6593,252 @@ mod tests {
         repo.assert(predicate::repo::has_untracked_file("new.txt"));
     }
 
+    // ---- CS6: staging preserves diff position ----------------------------------------------
+
+    /// Three single-line edits well-separated (>6 lines of pure context apart, git's own
+    /// hunk-splitting threshold) so each is its own hunk AND the context between any two
+    /// collapses to a [`DisplayRow::Gap`] — exercising both the mid-file-hunk and the
+    /// lands-in-a-gap restore paths.
+    fn three_hunk_fixture() -> Fixture {
+        let head: String = (1..=24).map(|n| format!("L{n}\n")).collect();
+        let worktree: String = (1..=24)
+            .map(|n| {
+                if n == 2 || n == 12 || n == 22 {
+                    format!("L{n}X\n")
+                } else {
+                    format!("L{n}\n")
+                }
+            })
+            .collect();
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &head, &worktree)
+            .build()
+            .unwrap()
+    }
+
+    /// The row-native lineno `App::restore_position` would target for `row` — new side,
+    /// falling back to old — used by these tests to check where the cursor actually landed
+    /// without re-deriving the production search itself.
+    fn row_lineno(row: &DisplayRow) -> Option<usize> {
+        match row {
+            DisplayRow::Row(r) => match r.new {
+                Row::Line(n) => Some(n),
+                Row::Filler => match r.old {
+                    Row::Line(n) => Some(n),
+                    Row::Filler => None,
+                },
+            },
+            DisplayRow::Gap { .. } => None,
+        }
+    }
+
+    #[test]
+    fn stage_hunk_on_a_middle_hunk_lands_the_cursor_near_it_not_at_the_first_hunk() {
+        let fixture = three_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Single(Unstaged): no staged half exists yet.
+        let first_hunk_row = app.cursor;
+
+        app.next_hunk_row(); // hunk 1 (line 2) -> hunk 2 (line 12)
+        let hunk2_row = app.cursor;
+        assert_ne!(
+            hunk2_row, first_hunk_row,
+            "test setup: must have moved off hunk 1"
+        );
+
+        app.stage_hunk(); // stages ONLY hunk 2 -> the file now has both sub-diffs again
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Split,
+            "hunks 1/3 stayed unstaged, hunk 2 is now staged — both halves exist"
+        );
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "the memento's own role (Unstaged) survives, so it stays the target"
+        );
+        assert_ne!(
+            app.cursor, first_hunk_row,
+            "must NOT reset to the first hunk (today's manual-nav-only behavior)"
+        );
+
+        let view = app.role_view_ref(app.current, Role::Unstaged).unwrap();
+        let lineno = row_lineno(&view.display[app.cursor])
+            .expect("restore must not land the cursor back on a Gap row");
+        assert!(
+            lineno > 2 && lineno < 22,
+            "expected the cursor between hunk 1 (line 2) and hunk 3 (line 22) — near hunk 2's \
+             old position (line 12) — got line {lineno}"
+        );
+    }
+
+    #[test]
+    fn fully_staging_a_file_in_split_lands_the_cursor_in_the_staged_pane_at_the_same_lines() {
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Split; focused pane defaults to Unstaged, on gamma's hunk (line 3)
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert_eq!(app.split_focus_role(), Role::Unstaged);
+
+        app.stage_hunk(); // stages the only unstaged hunk -> the file is now fully staged
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Staged),
+            "no unstaged half survives a full stage"
+        );
+
+        let view = app.role_view_ref(app.current, Role::Staged).unwrap();
+        let staged_first_hunk_row = match app.layout {
+            Layout::Sbs => view.first_hunk_row,
+            Layout::Inline => view.first_inline_hunk_row,
+        };
+        assert_ne!(
+            app.cursor, staged_first_hunk_row,
+            "must land on gamma's own row, not beta's (the staged view's first hunk)"
+        );
+        let lineno = row_lineno(&view.display[app.cursor]).expect("gamma's row has a lineno");
+        assert_eq!(
+            lineno, 3,
+            "gamma is line 3 in both HEAD and the fully-staged index"
+        );
+    }
+
+    #[test]
+    fn unstaging_in_the_staged_pane_keeps_focus_there_when_it_survives() {
+        let head: String = (1..=14).map(|n| format!("L{n}\n")).collect();
+        // Index stages two well-separated edits (lines 2 and 10); the worktree matches the
+        // index except for one MORE edit (line 14) that was never staged.
+        let index: String = (1..=14)
+            .map(|n| {
+                if n == 2 || n == 10 {
+                    format!("L{n}X\n")
+                } else {
+                    format!("L{n}\n")
+                }
+            })
+            .collect();
+        let worktree: String = (1..=14)
+            .map(|n| {
+                if n == 2 || n == 10 || n == 14 {
+                    format!("L{n}X\n")
+                } else {
+                    format!("L{n}\n")
+                }
+            })
+            .collect();
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", &head, &index, &worktree)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // Split; focused pane defaults to Unstaged (line 14's hunk)
+        app.toggle_split_focus(); // -> Staged pane, cursor on hunk 1 (line 2)
+        let first_hunk_row = app.cursor;
+        app.next_hunk_row(); // -> hunk 2 (line 10)
+        assert_ne!(
+            app.cursor, first_hunk_row,
+            "test setup: must have moved off hunk 1"
+        );
+
+        app.stage_hunk(); // staged pane -> unstage direction: reverts line 10's index entry
+
+        assert!(
+            app.notice.is_none(),
+            "unstage must succeed: {:?}",
+            app.notice
+        );
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Split,
+            "line 2 stays staged and line 10/14 are both unstaged now — both halves survive"
+        );
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Staged,
+            "the memento's own role (Staged) survives, so focus stays there"
+        );
+
+        let view = app.role_view_ref(app.current, Role::Staged).unwrap();
+        let staged_first_hunk_row = match app.layout {
+            Layout::Sbs => view.first_hunk_row,
+            Layout::Inline => view.first_inline_hunk_row,
+        };
+        assert_ne!(
+            app.cursor, staged_first_hunk_row,
+            "must NOT reset to the (now sole) first hunk at line 2"
+        );
+    }
+
+    #[test]
+    fn discarding_the_only_file_in_the_changeset_falls_back_gracefully_without_panicking() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("only.txt", "hello\nworld\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.files().len(), 1);
+
+        app.discard_file();
+        assert!(app.pending_confirm.is_some());
+        app.resolve_confirm(true); // runs the discard through run_op -> restore_position
+
+        assert!(
+            app.notice.is_none(),
+            "discard must succeed: {:?}",
+            app.notice
+        );
+        assert!(
+            app.files().is_empty(),
+            "the untracked file's only diff vanishes once discarded"
+        );
+        assert_eq!(
+            app.cursor, 0,
+            "the path check bails out; reset_panes' fallback stands"
+        );
+    }
+
+    #[test]
+    fn staging_with_the_cursor_on_a_gap_row_falls_back_without_panicking() {
+        let fixture = three_hunk_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = {
+            let view = app.role_view_ref(app.current, Role::Unstaged).unwrap();
+            view.display
+                .iter()
+                .position(|r| matches!(r, DisplayRow::Gap { .. }))
+                .expect("three well-separated hunks must collapse a gap between them")
+        };
+        app.cursor = gap_row;
+
+        app.stage_file(); // whole-file op: ignores the cursor for WHAT it stages
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Staged),
+            "no unstaged half survives a whole-file stage"
+        );
+        // The pre-op cursor sat on a Gap row, so the memento carried no lineno — restore is a
+        // no-op and today's `reset_panes` first-hunk reseat stands.
+        let view = app.role_view_ref(app.current, Role::Staged).unwrap();
+        let expected = match app.layout {
+            Layout::Sbs => view.first_hunk_row,
+            Layout::Inline => view.first_inline_hunk_row,
+        };
+        assert_eq!(app.cursor, expected);
+    }
+
     // ---- M4 staging: discard confirm flow --------------------------------------------------
 
     #[test]
@@ -6726,7 +7964,7 @@ mod tests {
     }
 
     #[test]
-    fn toggle_outline_cycles_closed_open_focused_open_unfocused_closed() {
+    fn toggle_outline_is_a_pure_show_hide_toggle() {
         let mut app = two_committed_changesets_two_and_one_files();
         // Force a known starting state regardless of the default.
         while app.outline_open() {
@@ -6737,19 +7975,88 @@ mod tests {
         app.toggle_outline();
         assert!(
             app.outline_open() && app.outline_focused(),
-            "opening focuses"
+            "o from closed opens AND focuses"
         );
 
         app.toggle_outline();
+        assert!(
+            !app.outline_open() && !app.outline_focused(),
+            "o from open+focused closes — the toggle only ever tracks visibility"
+        );
+
+        // Re-open, then unfocus without going through `toggle_outline` (mirrors the startup
+        // seed: open, but diff-focused) — `o` from THAT state must still close, not cycle
+        // through a middle focused-then-unfocused state.
+        app.toggle_outline();
+        app.focus_diff();
+        assert!(app.outline_open() && !app.outline_focused());
+
+        app.toggle_outline();
+        assert!(
+            !app.outline_open() && !app.outline_focused(),
+            "o from open+unfocused closes the pane"
+        );
+    }
+
+    #[test]
+    fn focus_outline_opens_when_closed_and_syncs_the_cursor() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        while app.outline_open() {
+            app.toggle_outline();
+        }
+        assert!(!app.outline_open());
+        // Move the diff onto the second changeset before focusing, so a sync is observable.
+        app.next_changeset();
+        let current_cs = app.current_cs();
+
+        app.focus_outline();
+
+        assert!(app.outline_open() && app.outline_focused());
+        let items = app.outline_items();
+        assert!(
+            matches!(
+                items[app.outline_cursor()],
+                crate::outline::OutlineItem::File { cs_idx, .. } if cs_idx == current_cs
+            ),
+            "opening via focus_outline syncs the cursor to the current diff position"
+        );
+    }
+
+    #[test]
+    fn focus_outline_on_an_already_open_outline_does_not_move_the_cursor() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        while app.outline_open() {
+            app.toggle_outline();
+        }
+        app.toggle_outline(); // open + focus, synced
+        app.outline_move_by(-1); // manually reposition the outline cursor
+        app.focus_diff();
+        let cursor_before = app.outline_cursor();
+
+        app.focus_outline();
+
+        assert!(app.outline_focused());
+        assert_eq!(
+            app.outline_cursor(),
+            cursor_before,
+            "re-focusing an already-open outline must not stomp a manually positioned cursor"
+        );
+    }
+
+    #[test]
+    fn focus_diff_unfocuses_without_closing_the_outline() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        while app.outline_open() {
+            app.toggle_outline();
+        }
+        app.toggle_outline(); // open + focus
+        assert!(app.outline_open() && app.outline_focused());
+
+        app.focus_diff();
+
         assert!(
             app.outline_open() && !app.outline_focused(),
-            "toggling while focused returns focus to the diff without closing"
-        );
-
-        app.toggle_outline();
-        assert!(
-            !app.outline_open(),
-            "toggling again while open-but-unfocused closes the pane"
+            "focus_diff unfocuses but leaves the outline open"
         );
     }
 
@@ -6839,6 +8146,9 @@ mod tests {
         let owned = Repository::open(repo.workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(owned, vec![view_a, view_b]);
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — this test asserts per-header marker content, not
+        // display order, so it doesn't need to track the new HeadFirst default.
+        app.outline.order = OutlineOrder::BaseFirst;
 
         let items = app.outline_items();
         assert_eq!(
@@ -6944,6 +8254,10 @@ mod tests {
         let repo = Repository::open(fixture.repo().unwrap().workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(repo, vec![view_pending, view_failed]);
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — this test asserts the exact header vec, which is
+        // incidental to base -> head storage order here, not what's under test (the
+        // loading/failed markers).
+        app.outline.order = OutlineOrder::BaseFirst;
 
         let items = app.outline_items();
         assert_eq!(
@@ -7098,6 +8412,10 @@ mod tests {
         let owned = Repository::open(repo.workdir().unwrap()).unwrap();
         let mut app = App::from_changesets(owned, vec![view_a, view_b]);
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — the regression this test guards needs cs-a BEFORE
+        // cs-b in the row list (an earlier row's insertion shifting a later row's index); the
+        // new HeadFirst default would put cs-b (head) first instead, inverting the scenario.
+        app.outline.order = OutlineOrder::BaseFirst;
         assert_eq!(
             app.current_cs(),
             1,
@@ -7155,6 +8473,7 @@ mod tests {
                 file_idx: 0,
                 path: "c1.txt".to_string(),
                 status: StagedStatus::None,
+                change: FileStatus::Added,
                 guides: Vec::new(),
             },
             "a committed changeset's file must carry no staged-ness status"
@@ -7170,10 +8489,39 @@ mod tests {
         );
     }
 
+    /// CS5: `outline_snapshot`'s `change` field is lifted from the owning `FileChange::status`,
+    /// a wholly separate axis from `status` (staged-ness — see `outline::OutlineFile::change`'s
+    /// doc comment). `c1.txt` is a new file introduced by the committed changeset's head commit
+    /// (`Added`); `u1.txt` is an untracked worktree file (`Untracked`) — distinct FileStatus
+    /// values, confirming this isn't just always defaulting to one variant.
+    #[test]
+    fn outline_snapshot_lifts_change_status_from_the_file_model_independent_of_staged_status() {
+        let mut app = committed_and_uncommitted_stack();
+        app.outline.mode = OutlineMode::Stack;
+        let items = app.outline_items();
+
+        let change_for = |path: &str| {
+            items
+                .iter()
+                .find_map(|it| match it {
+                    OutlineItem::File {
+                        path: p, change, ..
+                    } if p == path => Some(*change),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{path}'s file row present"))
+        };
+        assert_eq!(change_for("c1.txt"), FileStatus::Added);
+        assert_eq!(change_for("u1.txt"), FileStatus::Untracked);
+    }
+
     #[test]
     fn outline_move_by_on_a_file_row_jumps_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Flat;
+        // CS3: pin BaseFirst explicitly — this test exercises `outline_move_by`'s row-crossing
+        // mechanics via hardcoded Flat-mode indices, not display order.
+        app.outline.order = OutlineOrder::BaseFirst;
         app.outline.cursor = 0;
         assert_eq!(app.current_cs(), 0);
         assert_eq!(app.current, 0);
@@ -7193,6 +8541,10 @@ mod tests {
     fn outline_move_by_on_a_header_row_does_not_jump_the_diff() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — this test's hardcoded row indices assume base -> head
+        // order (header, a1, a2, header, b1); the new HeadFirst default is a display-order
+        // concern orthogonal to what's under test here (whether a header move jumps the diff).
+        app.outline.order = OutlineOrder::BaseFirst;
         // Header rows sit at indices 0 (cs-a) and 3 (cs-b) in Stack mode (header, a1, a2,
         // header, b1). Park the diff on a2, cursor on its row.
         app.outline.cursor = 2;
@@ -7218,11 +8570,16 @@ mod tests {
         // header row (the LAST file crossed, exactly where unit presses leave it).
         let mut coalesced = two_committed_changesets_two_and_one_files();
         coalesced.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — the burst-vs-sequential equivalence under test doesn't
+        // depend on which end of the stack displays first, and the inline comments below assume
+        // base -> head row order.
+        coalesced.outline.order = OutlineOrder::BaseFirst;
         coalesced.outline.cursor = 0;
         coalesced.outline_move_by(3); // header -> a1 -> a2 -> cs-b header
 
         let mut sequential = two_committed_changesets_two_and_one_files();
         sequential.outline.mode = OutlineMode::Stack;
+        sequential.outline.order = OutlineOrder::BaseFirst;
         sequential.outline.cursor = 0;
         for _ in 0..3 {
             sequential.outline_move_by(1);
@@ -7246,6 +8603,9 @@ mod tests {
     fn outline_confirm_on_a_header_row_jumps_to_its_first_file_and_returns_focus() {
         let mut app = two_committed_changesets_two_and_one_files();
         app.outline.mode = OutlineMode::Stack;
+        // CS3: pin BaseFirst explicitly — cursor 3 is hardcoded to cs-b's header under base ->
+        // head row order; the confirm mechanic under test is order-agnostic.
+        app.outline.order = OutlineOrder::BaseFirst;
         app.outline.open = true;
         app.outline.focused = true;
         app.outline.cursor = 3; // cs-b's header row
@@ -7283,6 +8643,7 @@ mod tests {
                 file_idx: 0,
                 path: "b1.txt".to_string(),
                 status: StagedStatus::None,
+                change: FileStatus::Added,
                 guides: Vec::new(),
             },
             "the outline cursor must follow the diff's new position"
@@ -7310,6 +8671,7 @@ mod tests {
                 file_idx: 0,
                 path: "b1.txt".to_string(),
                 status: StagedStatus::None,
+                change: FileStatus::Added,
                 guides: vec![true],
             },
             "the outline cursor must follow the diff's new position, landing on b1.txt's row \
@@ -7409,11 +8771,209 @@ mod tests {
         // contract `render::render` reads (`outline_open`), so a regression there is caught at
         // the state layer too.
         let mut app = two_committed_changesets_two_and_one_files();
-        // Default state is open+unfocused (locked design), so a single `o` here hits the
-        // "open, diff has focus" branch of the cycle, which closes the pane.
+        // Default state is open+unfocused (locked design); the pure toggle closes it regardless
+        // of focus.
         assert!(app.outline_open() && !app.outline_focused());
         app.toggle_outline();
         assert!(!app.outline_open());
+    }
+
+    // ── CS2: outline scrolloff viewport + g/G jumps ─────────────────────────────
+
+    /// Four committed changesets of three files each — Stack mode (the default) yields 16 rows
+    /// (header + 3 files, ×4), long enough to exercise [`App::derive_outline_scroll`]'s margin
+    /// behavior against a small `outline_height`, unlike the 5-row
+    /// [`two_committed_changesets_two_and_one_files`] fixture used elsewhere in this module.
+    fn four_committed_changesets_three_files_each() -> App {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut base = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mut changesets = Vec::new();
+        for cs_num in 0..4 {
+            let head = fixture
+                .commit("main")
+                .file(&format!("cs{cs_num}_a.txt"), "a\n")
+                .file(&format!("cs{cs_num}_b.txt"), "b\n")
+                .file(&format!("cs{cs_num}_c.txt"), "c\n")
+                .create(&format!("cs{cs_num}"))
+                .unwrap();
+            changesets.push(Changeset {
+                name: format!("cs-{cs_num}"),
+                span: ChangesetSpan::Committed { base, head },
+                title: None,
+                current: cs_num == 0,
+                needs_restack: false,
+            });
+            base = head;
+        }
+        let repo = fixture.repo().unwrap();
+        let views = changesets
+            .into_iter()
+            .map(|cs| {
+                let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+                ChangesetView::from_changeset_diff(cs, diff)
+            })
+            .collect();
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, views);
+        app.open_current();
+        app.outline.mode = OutlineMode::Stack;
+        assert_eq!(app.outline_items().len(), 16, "4 x (1 header + 3 files)");
+        app
+    }
+
+    #[test]
+    fn outline_move_by_keeps_cursor_within_the_scrolloff_margin() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5; // bottom_margin = 5 - 1 - SCROLLOFF(2) = 2
+        app.outline.cursor = 0;
+        app.derive_outline_scroll(app.outline_items().len());
+        assert_eq!(app.outline_scroll(), 0);
+
+        // Walk down one row at a time; the scroll must follow to keep the cursor within
+        // `[scroll, scroll + bottom_margin]`, never snapping straight to the cursor.
+        for _ in 0..8 {
+            app.outline_move_by(1);
+            let scroll = app.outline_scroll();
+            let cursor = app.outline_cursor();
+            assert!(
+                cursor >= scroll && cursor <= scroll + 2,
+                "cursor {cursor} must stay within the scrolloff-margined viewport at scroll {scroll}"
+            );
+        }
+        assert!(
+            app.outline_scroll() > 0,
+            "scrolling down must have moved the viewport"
+        );
+
+        // Walking back up must scroll up minimally, not snap to zero.
+        let scroll_at_bottom = app.outline_scroll();
+        app.outline_move_by(-1);
+        assert!(
+            app.outline_scroll() <= scroll_at_bottom,
+            "moving up must not increase scroll"
+        );
+        assert!(
+            app.outline_scroll() > 0,
+            "a single step up from deep in the list must not snap scroll to zero"
+        );
+    }
+
+    #[test]
+    fn outline_scroll_clamps_at_both_ends() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 5;
+
+        app.outline.cursor = 0;
+        app.derive_outline_scroll(app.outline_items().len());
+        assert_eq!(
+            app.outline_scroll(),
+            0,
+            "top row 0 must be visible at start"
+        );
+
+        let last = app.outline_items().len() - 1;
+        app.outline.cursor = last;
+        app.derive_outline_scroll(app.outline_items().len());
+        let scroll = app.outline_scroll();
+        assert!(
+            last >= scroll && last < scroll + app.outline_height,
+            "the last row must be visible once the cursor reaches it"
+        );
+        assert!(
+            scroll <= app.outline_items().len().saturating_sub(app.outline_height),
+            "scroll must never run past the point where the last row leaves the viewport"
+        );
+    }
+
+    #[test]
+    fn outline_top_lands_cursor_zero_and_does_not_jump_a_header() {
+        // CS3: the outline's default order is now HeadFirst, so Stack mode's row 0 is cs-b's
+        // (the head changeset's) header, not cs-a's — see
+        // `stack_mode_head_first_shows_last_changesets_header_first_with_true_cs_idx` in
+        // outline.rs for the row-order pin. `outline_top`'s own contract (row 0, no diff jump)
+        // is order-agnostic, so only the "which header" framing below changes.
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline_height = 3;
+        app.next_changeset(); // move the diff off its start so a stray jump would be observable
+        let (cs_before, file_before) = (app.current_cs(), app.current);
+
+        app.outline.cursor = 4; // a2.txt's row under head-first order (cs-a's last file)
+        app.outline_top();
+
+        assert_eq!(app.outline_cursor(), 0, "g lands on row 0");
+        assert!(
+            matches!(app.outline_items()[0], OutlineItem::Header { .. }),
+            "row 0 in Stack mode is a header (cs-b's, the head changeset, under head-first order)"
+        );
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (cs_before, file_before),
+            "landing on a Header must not jump the diff"
+        );
+    }
+
+    #[test]
+    fn outline_bottom_lands_on_the_last_row_and_jumps_a_file() {
+        // CS3: under the new HeadFirst default, Stack mode's row order is cs-b's header/file(s)
+        // first, then cs-a's — so the LAST row is cs-a's last file (a2.txt, cs_idx 0, file_idx
+        // 1), not cs-b's only file as it was under the old base-first order.
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.mode = OutlineMode::Stack;
+        app.outline_height = 3;
+        assert_eq!(app.current_cs(), 0, "starts on cs-a");
+
+        app.outline_bottom();
+
+        let last = app.outline_items().len() - 1;
+        assert_eq!(app.outline_cursor(), last, "G lands on the last row");
+        assert!(
+            matches!(app.outline_items()[last], OutlineItem::File { .. }),
+            "the last row in Stack mode under head-first order is cs-a's last file, a2.txt"
+        );
+        assert_eq!(
+            (app.current_cs(), app.current),
+            (0, 1),
+            "landing on a File must switch the diff there"
+        );
+    }
+
+    #[test]
+    fn outline_cycle_mode_and_sync_leave_scroll_consistent() {
+        let mut app = four_committed_changesets_three_files_each();
+        app.outline_height = 4;
+        // Push the cursor (and scroll) deep into Stack mode's row list first.
+        for _ in 0..10 {
+            app.outline_move_by(1);
+        }
+        assert!(
+            app.outline_scroll() > 0,
+            "precondition: scrolled away from the top"
+        );
+
+        app.outline_cycle_mode(); // -> Tree
+        let cursor = app.outline_cursor();
+        let scroll = app.outline_scroll();
+        assert!(
+            cursor >= scroll && cursor < scroll + app.outline_height,
+            "outline_cycle_mode must leave the cursor visible within the new mode's scroll"
+        );
+
+        app.next_changeset(); // diff-initiated nav -> sync_outline_to_current
+        let cursor = app.outline_cursor();
+        let scroll = app.outline_scroll();
+        assert!(
+            cursor >= scroll && cursor < scroll + app.outline_height,
+            "sync_outline_to_current must leave the cursor visible within scroll"
+        );
     }
 
     // ── CS7: view-config (`apply_view_config`) ─────────────────────────────────
@@ -7429,6 +8989,8 @@ mod tests {
         assert!(warnings.is_empty());
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(app.outline_mode(), OutlineMode::default());
+        assert_eq!(app.outline_order(), OutlineOrder::default());
+        assert_eq!(app.outline_icons(), OutlineIcons::default());
         assert_eq!(app.layout, Layout::default());
         assert_eq!(app.zoom, Zoom::default());
     }
@@ -7496,6 +9058,68 @@ mod tests {
     }
 
     #[test]
+    fn outline_order_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.order", "base-first")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_order(), OutlineOrder::BaseFirst);
+    }
+
+    #[test]
+    fn outline_order_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.order", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.outline_order(), OutlineOrder::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outline.order"));
+    }
+
+    #[test]
+    fn outline_icons_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.icons", "nerd")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_icons(), OutlineIcons::Nerd);
+    }
+
+    #[test]
+    fn outline_icons_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.outline.icons", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.outline_icons(), OutlineIcons::default());
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("outline.icons"));
+    }
+
+    #[test]
     fn diff_layout_overrides_default_when_set() {
         let fixture = FixtureBuilder::new()
             .config("workon.review.diff.layout", "inline")
@@ -7555,5 +9179,882 @@ mod tests {
         assert_eq!(app.zoom, Zoom::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("diff.zoom"));
+    }
+
+    // ── CS4: summary panel ───────────────────────────────────────────────────────
+
+    /// Force the outline open+focused with `mode` and `cursor`, matching the state
+    /// `summary_target` requires — the individual state-transition tests below build off this
+    /// instead of repeating the three-field setup. Pins `order` to `BaseFirst` so a fixture's
+    /// base -> head file/changeset indices line up with display order (the default `HeadFirst`
+    /// reverses the header row sequence — irrelevant to what's under test here, see CS3).
+    fn open_focused_outline(app: &mut App, mode: OutlineMode, cursor: usize) {
+        app.outline.open = true;
+        app.outline.focused = true;
+        app.outline.mode = mode;
+        app.outline.cursor = cursor;
+        app.outline.order = OutlineOrder::BaseFirst;
+    }
+
+    #[test]
+    fn summary_target_is_none_when_the_outline_is_closed() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.open = false;
+        app.outline.focused = false;
+        assert_eq!(app.summary_target(), None);
+    }
+
+    #[test]
+    fn summary_target_is_none_when_the_outline_is_open_but_unfocused() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.open = true;
+        app.outline.focused = false;
+        app.outline.mode = OutlineMode::Stack;
+        app.outline.cursor = 0; // a Header row
+        assert_eq!(
+            app.summary_target(),
+            None,
+            "an unfocused open outline must never override the diff area (locked design)"
+        );
+    }
+
+    #[test]
+    fn summary_target_is_none_when_the_cursor_is_on_a_file_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 1); // cs-a's first file row
+        let items = app.outline_items();
+        assert!(matches!(items[1], OutlineItem::File { .. }));
+        assert_eq!(app.summary_target(), None);
+    }
+
+    #[test]
+    fn summary_target_is_some_changeset_on_a_header_row() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0); // cs-a's header row
+        let items = app.outline_items();
+        assert!(matches!(items[0], OutlineItem::Header { cs_idx: 0, .. }));
+        assert_eq!(app.summary_target(), Some(SummaryTarget::Changeset(0)));
+    }
+
+    #[test]
+    fn summary_target_is_some_dir_with_cs_idx_none_in_tree_mode() {
+        let mut app = single_changeset_with_nested_paths();
+        let items = {
+            app.outline.mode = OutlineMode::Tree;
+            app.outline_items()
+        };
+        let dir_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ dir row present in Tree mode");
+        open_focused_outline(&mut app, OutlineMode::Tree, dir_idx);
+        assert_eq!(
+            app.summary_target(),
+            Some(SummaryTarget::Dir {
+                cs_idx: None,
+                path: "src".to_string(),
+            }),
+            "Tree mode's single cross-stack trie has no owning changeset"
+        );
+    }
+
+    #[test]
+    fn summary_target_is_some_dir_with_cs_idx_some_in_stack_tree_mode() {
+        let mut app = single_changeset_with_nested_paths();
+        let items = {
+            app.outline.mode = OutlineMode::StackTree;
+            app.outline_items()
+        };
+        let dir_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+        assert_eq!(
+            app.summary_target(),
+            Some(SummaryTarget::Dir {
+                cs_idx: Some(0),
+                path: "src".to_string(),
+            }),
+            "StackTree mode's dir row belongs to the single changeset in this fixture"
+        );
+    }
+
+    #[test]
+    fn summary_target_returns_none_again_after_focus_diff() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        assert!(app.summary_target().is_some());
+        app.focus_diff();
+        assert_eq!(
+            app.summary_target(),
+            None,
+            "losing outline focus must immediately fall back to the diff body"
+        );
+    }
+
+    #[test]
+    fn summary_for_changeset_reflects_the_changesets_flags_and_files() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        let target = app.summary_target().unwrap();
+        let Summary::Changeset(summary) = app.summary_for(target) else {
+            panic!("expected a Changeset summary for a Header target");
+        };
+        assert!(summary.current, "cs-a is the current changeset");
+        assert!(!summary.needs_restack);
+        assert!(!summary.loading);
+        assert!(!summary.failed);
+        assert_eq!(summary.files.len(), 2, "cs-a touches a1.txt and a2.txt");
+        assert!(summary.total_adds + summary.total_dels > 0);
+    }
+
+    #[test]
+    fn summary_for_dir_in_tree_mode_aggregates_the_deduped_cross_stack_set() {
+        let mut app = single_changeset_with_nested_paths();
+        app.outline.mode = OutlineMode::Tree;
+        let items = app.outline_items();
+        let dir_idx = items
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { name, .. } if name == "src"))
+            .unwrap();
+        open_focused_outline(&mut app, OutlineMode::Tree, dir_idx);
+        let target = app.summary_target().unwrap();
+        let Summary::Dir(summary) = app.summary_for(target) else {
+            panic!("expected a Dir summary for a Dir target");
+        };
+        assert_eq!(summary.path, "src");
+        let paths: Vec<&str> = summary.files.iter().map(|r| r.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/a.txt", "src/b.txt"]);
+    }
+
+    // ── CS7: stage/unstage/discard from outline rows ─────────────────────────────
+
+    /// Find the [`OutlineItem::File`] row index whose full path is `path` (in the CURRENT outline
+    /// mode/order) — the CS7 tests' stand-in for "click the row named X", since a row's raw index
+    /// shifts with mode/order and none of these tests want to hardcode it.
+    fn outline_file_row(app: &App, path: &str) -> usize {
+        app.outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::File { path: p, .. } if p == path))
+            .unwrap_or_else(|| panic!("no outline File row for {path:?}"))
+    }
+
+    #[test]
+    fn outline_stage_on_an_unstaged_file_row_stages_it_and_keeps_the_cursor_there() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "a.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_stage();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_staged_file("a.txt"));
+        assert!(
+            app.outline_focused(),
+            "outline must keep focus across the op"
+        );
+        match &app.outline_items()[app.outline_cursor()] {
+            OutlineItem::File { path, status, .. } => {
+                assert_eq!(path, "a.txt");
+                assert_eq!(
+                    *status,
+                    StagedStatus::Staged,
+                    "row now shows the staged glyph"
+                );
+            }
+            other => panic!("expected the cursor to stay on a.txt's File row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outline_stage_on_a_staged_file_row_unstages_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .staged_file("new.txt", "hello\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "new.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_stage();
+
+        assert!(
+            app.notice.is_none(),
+            "unstage must succeed: {:?}",
+            app.notice
+        );
+        let repo = fixture.repo().unwrap();
+        // An Added file has no HEAD entry, so unstaging it lands as untracked — same outcome
+        // `stage_file_in_staged_pane_unstages_whole_file` pins for the diff-pane path.
+        repo.assert(predicate::repo::has_untracked_file("new.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_a_dir_row_stages_every_unstaged_file_under_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("src/a.txt", "a\n", "a\nCHANGED\n")
+            .unstaged_file("src/b.txt", "b\n", "b\nCHANGED\n")
+            .unstaged_file("top.txt", "t\n", "t\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.mode = OutlineMode::StackTree;
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { path, .. } if path == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+
+        app.outline_stage();
+
+        assert!(
+            app.notice.is_none(),
+            "dir stage must succeed: {:?}",
+            app.notice
+        );
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_staged_file("src/a.txt"));
+        repo.assert(predicate::repo::has_staged_file("src/b.txt"));
+        // The file outside `src/` must be left alone.
+        repo.assert(predicate::repo::has_unstaged_file("top.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_a_dir_row_applies_each_files_own_verb_under_mixed_status() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("src/a.txt", "a\n", "a\nCHANGED\n")
+            .staged_file("src/b.txt", "b\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.mode = OutlineMode::StackTree;
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { path, .. } if path == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+
+        app.outline_stage();
+
+        assert!(
+            app.notice.is_none(),
+            "mixed-status dir stage must succeed: {:?}",
+            app.notice
+        );
+        let repo = fixture.repo().unwrap();
+        // The unstaged file stages...
+        repo.assert(predicate::repo::has_staged_file("src/a.txt"));
+        // ...and the already-staged (Added, no HEAD entry) file unstages to untracked — each
+        // file's own verb, not a single direction applied to the whole directory.
+        repo.assert(predicate::repo::has_untracked_file("src/b.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_the_header_row_refuses_without_touching_the_index() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        // Index 0 in Stack mode is always the changeset Header row.
+        open_focused_outline(&mut app, OutlineMode::Stack, 0);
+        assert!(matches!(app.outline_items()[0], OutlineItem::Header { .. }));
+
+        app.outline_stage();
+
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("staging a Header row must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::has_unstaged_file("a.txt"));
+    }
+
+    #[test]
+    fn outline_stage_on_a_committed_changesets_file_row_refuses_with_committed_wording() {
+        let mut app = committed_and_uncommitted_stack();
+        // `BaseFirst` order + Stack mode: Header(committed) 0, File(committed/c1.txt) 1,
+        // Header(uncommitted) 2, File(uncommitted/u1.txt) 3.
+        open_focused_outline(&mut app, OutlineMode::Stack, 1);
+        assert!(matches!(
+            &app.outline_items()[1],
+            OutlineItem::File { cs_idx, path, .. } if *cs_idx == 0 && path == "c1.txt"
+        ));
+
+        app.outline_stage();
+
+        let notice = app
+            .notice
+            .as_ref()
+            .expect("staging a committed changeset's row must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(
+            notice.text.contains("already committed"),
+            "got: {:?}",
+            notice.text
+        );
+    }
+
+    #[test]
+    fn outline_discard_on_a_file_row_requests_confirm_then_y_reverts_the_worktree() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "ONE\ntwo\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "a.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_discard();
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("discard must request a confirm");
+        assert!(
+            confirm.prompt.contains("a.txt"),
+            "got: {:?}",
+            confirm.prompt
+        );
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "ONE\ntwo\n"));
+
+        app.resolve_confirm(true);
+
+        assert!(app.pending_confirm.is_none(), "y must clear the confirm");
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "one\ntwo\n"));
+    }
+
+    #[test]
+    fn outline_discard_survives_an_intervening_refresh_that_shifts_file_indices() {
+        // The confirm modal doesn't stop the tick beat: an external index change can trigger a
+        // full refresh between `d` and `y`, shifting every (cs_idx, file_idx). The pending op
+        // stores (changeset name, path) pairs and re-resolves at answer time, so the discard
+        // must still hit the file it was requested on — not whatever now sits at its old index.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("b.txt", "one\ntwo\n", "ONE\ntwo\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "b.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_discard();
+        assert!(app.pending_confirm.is_some());
+
+        // A new modified file that sorts BEFORE b.txt enters the diff while the confirm is up,
+        // then a refresh rebuilds the file lists — b.txt's file_idx shifts by one.
+        let repo = fixture.repo().unwrap();
+        let workdir = repo.workdir().unwrap();
+        std::fs::write(workdir.join("a.txt"), "NEW\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("a.txt")).unwrap();
+        index.write().unwrap();
+        std::fs::write(workdir.join("a.txt"), "NEW\nCHANGED\n").unwrap();
+        app.refresh();
+        assert!(
+            app.pending_confirm.is_some(),
+            "the refresh must not consume the pending confirm"
+        );
+
+        app.resolve_confirm(true);
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("b.txt", "one\ntwo\n"));
+        repo.assert(predicate::repo::workdir_file_equals(
+            "a.txt",
+            "NEW\nCHANGED\n",
+        ));
+    }
+
+    #[test]
+    fn outline_discard_confirm_n_cancels_and_leaves_the_worktree_unchanged() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "ONE\ntwo\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let idx = outline_file_row(&app, "a.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_discard();
+        app.resolve_confirm(false);
+
+        assert!(app.pending_confirm.is_none(), "n must clear the confirm");
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("a.txt", "ONE\ntwo\n"));
+    }
+
+    #[test]
+    fn outline_discard_on_a_dir_row_names_the_scope_then_y_discards_every_file_under_it() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("src/a.txt", "a\n", "A\n")
+            .unstaged_file("src/b.txt", "b\n", "B\n")
+            .unstaged_file("top.txt", "t\n", "T\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.outline.mode = OutlineMode::StackTree;
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { path, .. } if path == "src"))
+            .expect("src/ dir row present in StackTree mode");
+        open_focused_outline(&mut app, OutlineMode::StackTree, dir_idx);
+
+        app.outline_discard();
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("dir discard must request a confirm");
+        assert!(
+            confirm.prompt.contains('2') && confirm.prompt.contains("src"),
+            "prompt must name the file count and the scoped path, got: {:?}",
+            confirm.prompt
+        );
+
+        app.resolve_confirm(true);
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::workdir_file_equals("src/a.txt", "a\n"));
+        repo.assert(predicate::repo::workdir_file_equals("src/b.txt", "b\n"));
+        // The file outside `src/` must be left untouched.
+        repo.assert(predicate::repo::workdir_file_equals("top.txt", "T\n"));
+    }
+
+    #[test]
+    fn outline_stage_in_a_multi_file_outline_keeps_the_cursor_on_the_acted_on_row_not_the_diffs_current_file(
+    ) {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "a\n", "a\nCHANGED\n")
+            .unstaged_file("b.txt", "b\n", "b\nCHANGED\n")
+            .unstaged_file("c.txt", "c\n", "c\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.files()[app.current].path,
+            "a.txt",
+            "the diff opens on the first file, a.txt — never touched by this test"
+        );
+        let idx = outline_file_row(&app, "b.txt");
+        open_focused_outline(&mut app, OutlineMode::Stack, idx);
+
+        app.outline_stage();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        match &app.outline_items()[app.outline_cursor()] {
+            OutlineItem::File { path, status, .. } => {
+                assert_eq!(
+                    path, "b.txt",
+                    "the cursor must stay on the acted-on row, not drift to the diff's own \
+                     current file (a.txt, via sync_outline_to_current inside coordinated_refresh)"
+                );
+                assert_eq!(*status, StagedStatus::Staged);
+            }
+            other => panic!("expected the cursor on b.txt's File row, got {other:?}"),
+        }
+    }
+
+    // ── CS8: progressive gap expansion ──────────────────────────────────────
+
+    /// A single-file fixture with two hunks separated by a wide (40-line) unchanged run — wide
+    /// enough that even a full 10/10 [`App::expand_gap_at_cursor`] press still leaves a
+    /// surviving [`DisplayRow::Gap`] (`40 - 2*3 - 2*10 = 14` rows still hidden), unlike
+    /// [`two_hunk_fixture`]'s much narrower gap.
+    fn two_hunks_with_a_wide_gap_fixture() -> Fixture {
+        let mut committed = String::from("OLD_HUNK_A\n");
+        let mut modified = String::from("NEW_HUNK_A\n");
+        for i in 1..=40 {
+            committed.push_str(&format!("ctx{i}\n"));
+            modified.push_str(&format!("ctx{i}\n"));
+        }
+        committed.push_str("OLD_HUNK_B\n");
+        modified.push_str("NEW_HUNK_B\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.txt", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    /// The display-row index of the current file's ONLY gap row — the fixture shape every CS8
+    /// expansion test below relies on.
+    fn only_gap_row(app: &App) -> usize {
+        app.current_view_ref()
+            .expect("loaded view")
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Gap { .. }))
+            .expect("expected exactly one gap row")
+    }
+
+    #[test]
+    fn expand_gap_cancels_an_active_selection_but_a_non_gap_press_leaves_it_alone() {
+        // An expansion reshapes the focused pane's row space, so `selection_anchor`'s invariant
+        // (cancel, never translate) applies — a selection made before the expand would silently
+        // cover different lines after it. The non-gap no-op path must NOT cancel: nothing
+        // reshaped.
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.start_selection();
+        assert!(app.selection_anchor.is_some(), "selection must start");
+        app.expand_gap_at_cursor(false); // cursor sits on the first hunk, not a gap: no-op
+        assert!(
+            app.selection_anchor.is_some(),
+            "a no-op press on a non-gap row must leave the selection alone"
+        );
+
+        app.cursor = only_gap_row(&app);
+        app.expand_gap_at_cursor(false);
+        assert!(
+            app.selection_anchor.is_none(),
+            "an actual expansion reshapes the row space and must cancel the selection"
+        );
+    }
+
+    #[test]
+    fn expand_gap_at_cursor_on_a_gap_row_reveals_more_rows() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        let before_len = app.current_view_ref().unwrap().display.len();
+        app.cursor = gap_row;
+
+        app.expand_gap_at_cursor(false);
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            view.display.len() > before_len,
+            "expanding must reveal more rows: {before_len} -> {}",
+            view.display.len()
+        );
+        assert!(
+            app.cursor < view.display.len(),
+            "cursor must stay in bounds"
+        );
+        assert!(
+            matches!(view.display[app.cursor], DisplayRow::Row(_)),
+            "the cursor's old index (the gap's leading edge) must now hold a revealed row, not \
+             the gap marker: {:?}",
+            view.display[app.cursor]
+        );
+        // The gap is wide enough (40 hidden rows) that a single 10/10 press doesn't consume it.
+        assert!(
+            view.display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "a partial expansion of this fixture must still leave a gap row"
+        );
+    }
+
+    #[test]
+    fn expand_gap_at_cursor_on_a_non_gap_row_is_a_no_op() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // cursor lands on hunk A's row, not the gap
+
+        let before_len = app.current_view_ref().unwrap().display.len();
+        let before_cursor = app.cursor;
+        assert!(
+            !matches!(
+                app.current_view_ref().unwrap().display[before_cursor],
+                DisplayRow::Gap { .. }
+            ),
+            "precondition: cursor starts on hunk A, not the gap"
+        );
+
+        app.expand_gap_at_cursor(false);
+
+        assert_eq!(app.cursor, before_cursor, "no-op must not move the cursor");
+        assert_eq!(
+            app.current_view_ref().unwrap().display.len(),
+            before_len,
+            "no-op must not change the row count"
+        );
+        assert!(app.notice.is_none(), "a no-op must not raise a notice");
+    }
+
+    #[test]
+    fn stage_hunk_after_expanding_a_gap_stages_the_intended_hunk() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+
+        // Move to hunk B (the LATER hunk) through the freshly rebuilt `display`/`display_hunk` —
+        // this is the coordinate-space desync CS8 must not introduce: `display_hunk` is
+        // recomputed by `rebuild_rows` from the SAME `aligned`/`hunks` every time, so the row
+        // under the cursor must still resolve to the right hunk index after an expansion.
+        app.next_hunk_row();
+        app.stage_hunk();
+
+        assert!(app.notice.is_none(), "stage must succeed: {:?}", app.notice);
+        let repo = fixture.repo().unwrap();
+        let mut expected_index = String::from("OLD_HUNK_A\n");
+        let mut expected_workdir = String::from("NEW_HUNK_A\n");
+        for i in 1..=40 {
+            expected_index.push_str(&format!("ctx{i}\n"));
+            expected_workdir.push_str(&format!("ctx{i}\n"));
+        }
+        expected_index.push_str("NEW_HUNK_B\n");
+        expected_workdir.push_str("NEW_HUNK_B\n");
+        // The index picks up ONLY hunk B; hunk A must stay unstaged.
+        repo.assert(predicate::repo::index_blob_equals(
+            "f.txt",
+            expected_index.as_str(),
+        ));
+        repo.assert(predicate::repo::workdir_file_equals(
+            "f.txt",
+            expected_workdir.as_str(),
+        ));
+    }
+
+    #[test]
+    fn expanding_a_gap_clears_the_row_keyed_word_span_cache() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current(); // cursor on hunk A's row — a word-diff pair
+
+        let hunk_a_row = app.cursor;
+        app.current_view().unwrap().word_spans_for_row(hunk_a_row);
+        assert!(
+            !app.current_view_ref().unwrap().word_spans.is_empty(),
+            "precondition: the cache must be populated before expanding"
+        );
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+
+        assert!(
+            app.current_view_ref().unwrap().word_spans.is_empty(),
+            "rebuild_rows must clear the row-keyed word-span cache — a stale entry would \
+             mismatch the row it renders under post-expansion"
+        );
+        // The cache is still USABLE post-clear, not just permanently empty — re-populating it
+        // must not panic and must produce a non-empty span for the still-word-diffable row.
+        let (old_spans, new_spans) = app.current_view().unwrap().word_spans_for_row(hunk_a_row);
+        assert!(
+            !old_spans.is_empty() || !new_spans.is_empty(),
+            "hunk A is still a word-diff pair after the rebuild"
+        );
+    }
+
+    #[test]
+    fn refresh_resets_a_files_gap_expansions() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+        let expanded_len = app.current_view_ref().unwrap().display.len();
+
+        app.refresh(); // ends with its own `open_current`, same as every other refresh path
+
+        let view = app.current_view_ref().expect("view survives refresh");
+        assert!(
+            view.display.len() < expanded_len,
+            "a fresh view must re-collapse to the base gap window, not carry over the prior \
+             expansion: expanded {expanded_len}, post-refresh {}",
+            view.display.len()
+        );
+        assert!(
+            view.display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "the gap must be back in its base (still-collapsed) form"
+        );
+    }
+
+    // ── CS9: reveal gaps to the enclosing tree-sitter scope ─────────────────
+
+    /// A `.rs` fixture where both edits sit inside the SAME long function, with a 40-line
+    /// unchanged run between them wide enough that even a +10/+10 press would still leave a
+    /// gap (mirrors [`two_hunks_with_a_wide_gap_fixture`]'s width) — but because the whole
+    /// hidden run lies inside `long_function`'s body, a scope-reveal press should uncover it
+    /// ENTIRELY (the function encloses the whole gap), unlike +10/+10.
+    fn function_with_a_wide_internal_gap_fixture() -> Fixture {
+        let mut committed = String::from("fn long_function() {\n    let a = OLD_A;\n");
+        let mut modified = String::from("fn long_function() {\n    let a = NEW_A;\n");
+        for i in 1..=40 {
+            committed.push_str(&format!("    ctx{i}();\n"));
+            modified.push_str(&format!("    ctx{i}();\n"));
+        }
+        committed.push_str("    let b = OLD_B;\n}\n");
+        modified.push_str("    let b = NEW_B;\n}\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.rs", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    /// A `.rs` fixture where both edits sit at the TOP LEVEL (no enclosing function/impl/etc —
+    /// only comment lines separate them), so [`crate::scope::enclosing_scope_lines`] finds no
+    /// allowlisted ancestor around the anchor and a press must fall back to +10/+10 exactly like
+    /// a grammar-less file.
+    fn top_level_edits_with_a_wide_gap_fixture() -> Fixture {
+        let mut committed = String::from("static A: i32 = OLD_A;\n");
+        let mut modified = String::from("static A: i32 = NEW_A;\n");
+        for i in 1..=40 {
+            committed.push_str(&format!("// ctx{i}\n"));
+            modified.push_str(&format!("// ctx{i}\n"));
+        }
+        committed.push_str("static B: i32 = OLD_B;\n");
+        modified.push_str("static B: i32 = NEW_B;\n");
+
+        FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("f.rs", &committed, &modified)
+            .build()
+            .unwrap()
+    }
+
+    /// The `skipped` count of the current file's only [`DisplayRow::Gap`], found by scanning
+    /// `display` (NOT via `app.cursor` — expanding the gap's leading edge shifts the gap marker
+    /// to a later index, same as [`only_gap_row`] re-finds it after an expansion in the CS8
+    /// tests above). Panics if there isn't exactly one gap row.
+    fn gap_skipped(app: &App) -> usize {
+        let row = only_gap_row(app);
+        match app.current_view_ref().expect("loaded view").display[row] {
+            DisplayRow::Gap { skipped, .. } => skipped,
+            other => panic!("expected a Gap row, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_reveal_uncovers_the_whole_gap_when_the_enclosing_function_covers_it() {
+        let fixture = function_with_a_wide_internal_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+
+        app.expand_gap_at_cursor(false);
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "the enclosing function covers the ENTIRE hidden run, so a single scope-reveal press \
+             must consume the gap completely — unlike a flat +10/+10 press, which would still \
+             leave one on this fixture's 40-row gap: {:?}",
+            view.display
+        );
+    }
+
+    #[test]
+    fn a_grammarless_file_falls_back_to_the_flat_plus_ten_reveal() {
+        // Reuse CS8's `.txt` fixture (no bundled grammar for that extension) — the scope-reveal
+        // path must find no lang key and fall straight through to +10/+10, same as before CS9.
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        let skipped_before = gap_skipped(&app);
+
+        app.expand_gap_at_cursor(false);
+
+        let skipped_after = gap_skipped(&app);
+        assert_eq!(
+            skipped_before - skipped_after,
+            20,
+            "no grammar for .txt: exactly the flat 10-before/10-after reveal, same as CS8"
+        );
+    }
+
+    #[test]
+    fn a_scope_with_nothing_new_falls_back_to_the_flat_plus_ten_reveal() {
+        // Both edits are top-level `static`s with no enclosing function/impl/etc — the anchor
+        // line has no allowlisted ancestor, so scope-reveal finds nothing and must fall back to
+        // +10/+10 exactly like the grammarless case, even though this file DOES have a grammar.
+        let fixture = top_level_edits_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        let skipped_before = gap_skipped(&app);
+
+        app.expand_gap_at_cursor(false);
+
+        let skipped_after = gap_skipped(&app);
+        assert_eq!(
+            skipped_before - skipped_after,
+            20,
+            "no enclosing scope at the top level: falls back to the flat 10-before/10-after reveal"
+        );
+    }
+
+    #[test]
+    fn full_expand_ignores_scope_reveal_regardless_of_grammar() {
+        // `E` (full=true) must stay pure CS8 behavior even on a file with a grammar and a scope
+        // that would otherwise apply — scope-reveal is an `Enter`-only (CS9) refinement.
+        let fixture = function_with_a_wide_internal_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+
+        app.expand_gap_at_cursor(true);
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "E must fully expand the gap: {:?}",
+            view.display
+        );
     }
 }

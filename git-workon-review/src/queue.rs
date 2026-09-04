@@ -68,6 +68,16 @@ pub trait StagingOp: Send {
     fn run(&mut self, ctx: &OpContext<'_>) -> Result<(), ApplyError>;
 }
 
+/// Lets an already-boxed trait object be re-enqueued through [`StagingQueue::enqueue`] (which
+/// takes `impl StagingOp + 'static` and boxes internally) without unboxing first — CS7's
+/// `App::run_ops` collects a `Vec<Box<dyn StagingOp>>` of heterogeneous per-file ops (one
+/// [`crate::stage_op::FileStagingOp`] per outline target) and enqueues them one at a time.
+impl StagingOp for Box<dyn StagingOp> {
+    fn run(&mut self, ctx: &OpContext<'_>) -> Result<(), ApplyError> {
+        (**self).run(ctx)
+    }
+}
+
 /// The result of running one queued op.
 #[derive(Debug)]
 pub enum OpOutcome {

@@ -21,6 +21,20 @@
 //! (`Patch::line_in_hunk`'s `old_lineno`/`new_lineno`), not something this module can violate,
 //! so the pairing code below `expect()`s the lineno for the side each kind is documented to
 //! carry.
+//!
+//! ## Progressive gap expansion (CS8)
+//!
+//! [`collapse_gaps`]'s collapsed [`DisplayRow::Gap`]/[`InlineRow::Gap`] markers each carry a
+//! `key` — the hidden run's start index in the pre-collapse [`AlignedRow`] space — so a caller
+//! can ask for MORE of that specific run to be revealed without losing track of it as it widens.
+//! [`collapse_gaps_with_expansions`] takes a `key -> `[`GapExpansion`]` map and re-collapses each
+//! run against its entry (if any): `before`/`after` grow the kept window at that edge, `full`
+//! reveals the whole run. `collapse_gaps` itself is the empty-map case. State ownership (which
+//! gaps are expanded, and by how much) lives OUTSIDE this module, in
+//! [`crate::app::FileView::expansions`] — this module stays pure, taking the map as input rather
+//! than mutating anything.
+
+use std::collections::HashMap;
 
 use crate::model::{Hunk, HunkLine, LineKind};
 
@@ -183,15 +197,36 @@ pub fn align_file(hunks: &[Hunk], old_line_count: usize, new_line_count: usize) 
 ///
 /// Unchanged stretches longer than `2 * CONTEXT_LINES` collapse to a single [`DisplayRow::Gap`]
 /// so the view doesn't scroll through pages of untouched code. Gap rows are layout-agnostic —
-/// they span both panes in SBS.
+/// they span both panes in SBS. `key` identifies the collapsed run so a caller can request it be
+/// progressively revealed — see [`GapExpansion`] and [`collapse_gaps_with_expansions`].
 #[derive(Debug, Clone, Copy)]
 pub enum DisplayRow {
     Row(AlignedRow),
-    Gap { skipped: usize },
+    Gap { key: usize, skipped: usize },
 }
 
 /// Number of context lines kept around hunk content on each side of a gap.
 pub const CONTEXT_LINES: usize = 3;
+
+/// How far a single collapsed gap has been expanded (CS8). Accumulates across repeated `Enter`
+/// presses: `before`/`after` each independently widen how many rows are revealed at that edge of
+/// the gap, and `full` — once set — reveals the whole run regardless of `before`/`after`.
+///
+/// Keyed in the caller's map by the SAME `key` [`DisplayRow::Gap`]/[`InlineRow::Gap`] carry: the
+/// hidden run's start index in the pre-collapse [`AlignedRow`] space. That space never changes
+/// shape as a gap widens (only how much of it stays hidden changes), so the key stays valid
+/// across repeated expansion requests for the same gap.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GapExpansion {
+    /// Extra rows revealed at the gap's leading edge (extends the visible context below the
+    /// preceding hunk downward, growing the row range kept immediately after `run_start`).
+    pub before: usize,
+    /// Extra rows revealed at the gap's trailing edge (extends the visible context above the
+    /// following hunk upward, growing the row range kept immediately before `run_end`).
+    pub after: usize,
+    /// Reveal every row in the run, ignoring `before`/`after`.
+    pub full: bool,
+}
 
 /// Collapse long unchanged stretches in `rows` into [`DisplayRow::Gap`] markers, keeping
 /// [`CONTEXT_LINES`] rows of context immediately around hunk content (Del/Add/Filler rows).
@@ -200,12 +235,33 @@ pub const CONTEXT_LINES: usize = 3;
 /// (enough to keep `CONTEXT_LINES` on both sides of the gap); shorter stretches, including ones
 /// between two hunks that are close together, are left as-is (no gap row — the hunks
 /// effectively merge under one continuous context run).
+///
+/// Thin wrapper over [`collapse_gaps_with_expansions`] with no expansions applied.
 pub fn collapse_gaps(rows: &[AlignedRow]) -> Vec<DisplayRow> {
-    collapse_gaps_with(rows, CONTEXT_LINES)
+    collapse_gaps_with_expansions(rows, &HashMap::new())
 }
 
-/// Same as [`collapse_gaps`] but with an explicit context-line count, for testing.
+/// Same as [`collapse_gaps`], but a gap whose key has an entry in `expansions` reveals extra rows
+/// at its edges (or its whole run) instead of collapsing to the base [`CONTEXT_LINES`] window —
+/// see [`GapExpansion`].
+pub fn collapse_gaps_with_expansions(
+    rows: &[AlignedRow],
+    expansions: &HashMap<usize, GapExpansion>,
+) -> Vec<DisplayRow> {
+    collapse_gaps_inner(rows, CONTEXT_LINES, expansions)
+}
+
+/// Same as [`collapse_gaps_with_expansions`] but with an explicit context-line count, for testing.
+#[cfg(test)]
 fn collapse_gaps_with(rows: &[AlignedRow], context: usize) -> Vec<DisplayRow> {
+    collapse_gaps_inner(rows, context, &HashMap::new())
+}
+
+fn collapse_gaps_inner(
+    rows: &[AlignedRow],
+    context: usize,
+    expansions: &HashMap<usize, GapExpansion>,
+) -> Vec<DisplayRow> {
     let is_context = |row: &AlignedRow| {
         matches!(
             (row.old_kind, row.new_kind),
@@ -243,13 +299,31 @@ fn collapse_gaps_with(rows: &[AlignedRow], context: usize) -> Vec<DisplayRow> {
             for row in &rows[run_start..run_end] {
                 out.push(DisplayRow::Row(*row));
             }
-        } else {
-            for row in &rows[run_start..run_start + keep_before] {
+            i = run_end;
+            continue;
+        }
+
+        // This run collapses to a gap (before any expansion is applied) — the key is stable
+        // across future expansion requests, so compute it once here.
+        let key = run_start;
+        let expansion = expansions.get(&key).copied().unwrap_or_default();
+
+        let effective_before = (keep_before + expansion.before).min(run_len);
+        let effective_after = (keep_after + expansion.after).min(run_len - effective_before);
+
+        if expansion.full || effective_before + effective_after >= run_len {
+            // The expansion consumes the whole run (or was asked to): no gap left worth
+            // collapsing, emit every row.
+            for row in &rows[run_start..run_end] {
                 out.push(DisplayRow::Row(*row));
             }
-            let skipped = run_len - keep_before - keep_after;
-            out.push(DisplayRow::Gap { skipped });
-            for row in &rows[run_end - keep_after..run_end] {
+        } else {
+            for row in &rows[run_start..run_start + effective_before] {
+                out.push(DisplayRow::Row(*row));
+            }
+            let skipped = run_len - effective_before - effective_after;
+            out.push(DisplayRow::Gap { key, skipped });
+            for row in &rows[run_end - effective_after..run_end] {
                 out.push(DisplayRow::Row(*row));
             }
         }
@@ -257,6 +331,59 @@ fn collapse_gaps_with(rows: &[AlignedRow], context: usize) -> Vec<DisplayRow> {
         i = run_end;
     }
     out
+}
+
+/// The currently-hidden [`AlignedRow`] sub-range `[start, end)` for the gap keyed `key`, given
+/// its current `expansion` (if any) — used by [`crate::app::FileView::scope_expand_gap`] (CS9) to
+/// measure how much of a gap's hidden run a candidate tree-sitter scope range would additionally
+/// uncover. `None` when `key` no longer denotes an actual gap: not a context-run start, the run is
+/// too short to have collapsed in the first place, or `expansion` already reveals the whole run.
+///
+/// Mirrors the run-measuring steps in [`collapse_gaps_inner`] (same `keep_before`/`keep_after`/
+/// `effective_before`/`effective_after` derivation) rather than sharing code with it, because that
+/// function additionally needs `run_end` and the row slices themselves to emit `DisplayRow`s,
+/// while this one only needs the hidden index range for a `key` a caller already has — keep both
+/// in sync if the collapse rule ever changes.
+pub(crate) fn gap_hidden_range(
+    rows: &[AlignedRow],
+    key: usize,
+    expansions: &HashMap<usize, GapExpansion>,
+) -> Option<(usize, usize)> {
+    let is_context = |row: &AlignedRow| {
+        matches!(
+            (row.old_kind, row.new_kind),
+            (CellKind::Context, CellKind::Context)
+        )
+    };
+
+    let run_start = key;
+    if run_start >= rows.len() || !is_context(&rows[run_start]) {
+        return None;
+    }
+    let mut run_end = run_start;
+    while run_end < rows.len() && is_context(&rows[run_end]) {
+        run_end += 1;
+    }
+    let run_len = run_end - run_start;
+
+    let keep_before = if run_start == 0 { 0 } else { CONTEXT_LINES };
+    let keep_after = if run_end == rows.len() {
+        0
+    } else {
+        CONTEXT_LINES
+    };
+    if (keep_before == 0 && keep_after == 0) || run_len <= keep_before + keep_after {
+        return None;
+    }
+
+    let expansion = expansions.get(&key).copied().unwrap_or_default();
+    let effective_before = (keep_before + expansion.before).min(run_len);
+    let effective_after = (keep_after + expansion.after).min(run_len - effective_before);
+    if expansion.full || effective_before + effective_after >= run_len {
+        return None;
+    }
+
+    Some((run_start + effective_before, run_end - effective_after))
 }
 
 /// One row of the inline (unified, single-column) display.
@@ -290,6 +417,7 @@ pub enum InlineRow {
         paired_old: Option<usize>,
     },
     Gap {
+        key: usize,
         skipped: usize,
     },
 }
@@ -348,9 +476,12 @@ pub fn inline_rows(display: &[DisplayRow]) -> Vec<InlineRow> {
 
     for row in display {
         match row {
-            DisplayRow::Gap { skipped } => {
+            DisplayRow::Gap { key, skipped } => {
                 flush(&mut run, &mut out);
-                out.push(InlineRow::Gap { skipped: *skipped });
+                out.push(InlineRow::Gap {
+                    key: *key,
+                    skipped: *skipped,
+                });
             }
             DisplayRow::Row(r)
                 if r.old_kind == CellKind::Context && r.new_kind == CellKind::Context =>
@@ -540,7 +671,7 @@ mod tests {
             assert!(matches!(row, DisplayRow::Row(r) if r.old_kind == CellKind::Context));
         }
         match display[4] {
-            DisplayRow::Gap { skipped } => assert_eq!(skipped, 4),
+            DisplayRow::Gap { skipped, .. } => assert_eq!(skipped, 4),
             other => panic!("expected gap row, got {other:?}"),
         }
         for row in &display[5..8] {
@@ -608,7 +739,7 @@ mod tests {
         // gap, 3 ctx, change
         assert_eq!(display.len(), 5);
         match display[0] {
-            DisplayRow::Gap { skipped } => assert_eq!(skipped, 7),
+            DisplayRow::Gap { skipped, .. } => assert_eq!(skipped, 7),
             other => panic!("expected gap row, got {other:?}"),
         }
         for row in &display[1..4] {
@@ -635,7 +766,7 @@ mod tests {
             assert!(matches!(row, DisplayRow::Row(_)));
         }
         match display[4] {
-            DisplayRow::Gap { skipped } => assert_eq!(skipped, 7),
+            DisplayRow::Gap { skipped, .. } => assert_eq!(skipped, 7),
             other => panic!("expected gap row, got {other:?}"),
         }
     }
@@ -739,8 +870,243 @@ mod tests {
         assert!(
             inline
                 .iter()
-                .any(|r| matches!(r, InlineRow::Gap { skipped: 4 })),
+                .any(|r| matches!(r, InlineRow::Gap { skipped: 4, .. })),
             "expected the gap row to survive the inline conversion unchanged: {inline:?}"
         );
+    }
+
+    // ── CS8: progressive gap expansion ──────────────────────────────────────
+
+    /// One change row, a run of `run_len` context rows, one more change row — the shape every
+    /// CS8 expansion test collapses. With `context = 3` the base hidden count is
+    /// `run_len - 2 * 3`.
+    fn change_then_context_run_then_change(run_len: usize) -> Vec<AlignedRow> {
+        let mut rows = vec![change_row(
+            Row::Line(1),
+            Row::Line(1),
+            CellKind::Del,
+            CellKind::Add,
+        )];
+        rows.extend((2..=run_len + 1).map(context_row));
+        rows.push(change_row(
+            Row::Line(run_len + 2),
+            Row::Line(run_len + 2),
+            CellKind::Del,
+            CellKind::Add,
+        ));
+        rows
+    }
+
+    #[test]
+    fn collapse_gaps_matches_collapse_gaps_with_expansions_over_an_empty_map() {
+        // `collapse_gaps` is a thin wrapper — pin that it's byte-for-byte the same output as
+        // calling the expansion-aware entry point with nothing to expand (the pre-CS8 behavior
+        // every other test in this module already exercises via `collapse_gaps_with`).
+        let rows = change_then_context_run_then_change(16);
+        let via_collapse_gaps = collapse_gaps(&rows);
+        let via_expansions = collapse_gaps_with_expansions(&rows, &HashMap::new());
+        assert_eq!(via_collapse_gaps.len(), via_expansions.len());
+        for (a, b) in via_collapse_gaps.iter().zip(via_expansions.iter()) {
+            match (a, b) {
+                (
+                    DisplayRow::Gap {
+                        key: ka,
+                        skipped: sa,
+                    },
+                    DisplayRow::Gap {
+                        key: kb,
+                        skipped: sb,
+                    },
+                ) => {
+                    assert_eq!(ka, kb);
+                    assert_eq!(sa, sb);
+                }
+                (DisplayRow::Row(ra), DisplayRow::Row(rb)) => {
+                    assert_eq!(ra.old, rb.old);
+                    assert_eq!(ra.new, rb.new);
+                }
+                _ => panic!("row kind mismatch: {a:?} vs {b:?}"),
+            }
+        }
+    }
+
+    /// The single [`DisplayRow::Gap`]'s `(key, skipped)` in `display` — the CS8 expansion tests'
+    /// index-free lookup (the gap's display position depends on how much kept context precedes
+    /// it, which is exactly what these tests vary).
+    fn only_gap(display: &[DisplayRow]) -> (usize, usize) {
+        display
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::Gap { key, skipped } => Some((*key, *skipped)),
+                _ => None,
+            })
+            .expect("expected a gap row")
+    }
+
+    #[test]
+    fn partial_expansion_reveals_rows_at_both_edges_and_shrinks_skipped() {
+        // run_len = 16 -> base hidden (K) = 16 - 3 - 3 = 10.
+        let rows = change_then_context_run_then_change(16);
+        let (key, base_skipped) = only_gap(&collapse_gaps(&rows));
+        assert_eq!(base_skipped, 10, "base hidden count (K)");
+
+        let mut expansions = HashMap::new();
+        expansions.insert(
+            key,
+            GapExpansion {
+                before: 3,
+                after: 2,
+                full: false,
+            },
+        );
+        let display = collapse_gaps_with_expansions(&rows, &expansions);
+
+        // change, 3 base + 3 revealed before = 6 kept-before rows, gap, 3 base + 2 revealed
+        // after = 5 kept-after rows, change.
+        assert_eq!(display.len(), 1 + 6 + 1 + 5 + 1);
+        for row in &display[1..7] {
+            assert!(matches!(row, DisplayRow::Row(_)));
+        }
+        match display[7] {
+            DisplayRow::Gap {
+                key: gap_key,
+                skipped,
+            } => {
+                assert_eq!(
+                    gap_key, key,
+                    "the gap's key must not change across expansion"
+                );
+                assert_eq!(skipped, 5, "K - 5 == 10 - (3 + 2)");
+            }
+            other => panic!("expected a gap row, got {other:?}"),
+        }
+        for row in &display[8..13] {
+            assert!(matches!(row, DisplayRow::Row(_)));
+        }
+        assert!(matches!(display[13], DisplayRow::Row(_)));
+    }
+
+    #[test]
+    fn widening_an_expansion_accumulates_and_shrinks_skipped_further() {
+        let rows = change_then_context_run_then_change(20); // K = 20 - 6 = 14
+        let (key, _) = only_gap(&collapse_gaps(&rows));
+
+        // First press: reveal 5 more rows at the leading edge.
+        let mut expansions = HashMap::new();
+        expansions.insert(
+            key,
+            GapExpansion {
+                before: 5,
+                after: 0,
+                full: false,
+            },
+        );
+        let after_first = collapse_gaps_with_expansions(&rows, &expansions);
+        let skipped_after_first = match after_first
+            .iter()
+            .find(|r| matches!(r, DisplayRow::Gap { .. }))
+        {
+            Some(DisplayRow::Gap { skipped, .. }) => *skipped,
+            _ => panic!("expected a surviving gap row after the first press"),
+        };
+        assert_eq!(skipped_after_first, 14 - 5);
+
+        // Second press accumulates on top of the first (mirrors `FileView::expand_gap`'s
+        // `entry.before += more_before`), rather than replacing it.
+        expansions.get_mut(&key).unwrap().before += 5;
+        let after_second = collapse_gaps_with_expansions(&rows, &expansions);
+        let skipped_after_second = match after_second
+            .iter()
+            .find(|r| matches!(r, DisplayRow::Gap { .. }))
+        {
+            Some(DisplayRow::Gap { skipped, .. }) => *skipped,
+            _ => panic!("expected a surviving gap row after the second press"),
+        };
+        assert_eq!(skipped_after_second, 14 - 10);
+        assert!(skipped_after_second < skipped_after_first);
+    }
+
+    #[test]
+    fn full_expansion_removes_the_gap_row_entirely() {
+        let rows = change_then_context_run_then_change(16);
+        let (key, _) = only_gap(&collapse_gaps(&rows));
+        let mut expansions = HashMap::new();
+        expansions.insert(
+            key,
+            GapExpansion {
+                before: 0,
+                after: 0,
+                full: true,
+            },
+        );
+        let display = collapse_gaps_with_expansions(&rows, &expansions);
+        assert!(
+            display.iter().all(|r| matches!(r, DisplayRow::Row(_))),
+            "a full expansion must emit every row, no Gap: {display:?}"
+        );
+        assert_eq!(display.len(), rows.len());
+    }
+
+    #[test]
+    fn expansion_consuming_the_whole_run_removes_the_gap_row_without_full() {
+        // K = 10; before + after (6 + 4 = 10) exactly covers the hidden run without `full`.
+        let rows = change_then_context_run_then_change(16);
+        let (key, _) = only_gap(&collapse_gaps(&rows));
+        let mut expansions = HashMap::new();
+        expansions.insert(
+            key,
+            GapExpansion {
+                before: 6,
+                after: 4,
+                full: false,
+            },
+        );
+        let display = collapse_gaps_with_expansions(&rows, &expansions);
+        assert!(
+            display.iter().all(|r| matches!(r, DisplayRow::Row(_))),
+            "before + after covering the whole run must emit every row, no Gap: {display:?}"
+        );
+        assert_eq!(display.len(), rows.len());
+    }
+
+    #[test]
+    fn inline_mirror_stays_consistent_with_the_same_expansions_map() {
+        let rows = change_then_context_run_then_change(16);
+        let (key, _) = only_gap(&collapse_gaps(&rows));
+        let mut expansions = HashMap::new();
+        expansions.insert(
+            key,
+            GapExpansion {
+                before: 3,
+                after: 2,
+                full: false,
+            },
+        );
+        let display = collapse_gaps_with_expansions(&rows, &expansions);
+        let inline = inline_rows(&display);
+
+        // The SBS gap and the inline gap must carry the same key and skipped count — inline
+        // reuses the same gap-collapsed `display` vector rather than re-deriving gaps itself.
+        let sbs_gap = display
+            .iter()
+            .find_map(|r| match r {
+                DisplayRow::Gap { key, skipped } => Some((*key, *skipped)),
+                _ => None,
+            })
+            .expect("expected a surviving SBS gap");
+        let inline_gap = inline
+            .iter()
+            .find_map(|r| match r {
+                InlineRow::Gap { key, skipped } => Some((*key, *skipped)),
+                _ => None,
+            })
+            .expect("expected a surviving inline gap");
+        assert_eq!(sbs_gap, inline_gap);
+
+        // Context rows revealed at the leading edge (old=2..=4, new=2..=4 in this fixture) show
+        // up as `InlineRow::Context` entries before the inline gap.
+        assert!(inline
+            .iter()
+            .any(|r| matches!(r, InlineRow::Context { old: 4, new: 4 })));
     }
 }

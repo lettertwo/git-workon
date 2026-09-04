@@ -17,9 +17,10 @@
 //!   action names and same-view key collisions are collected as [`Keymap::warnings`].
 //!
 //! **Not handled here** (stays hardcoded in `tui.rs`): the confirm modal (`y`/`n`/`Esc`) and the
-//! whole `Esc`-precedence cascade (confirm > outline-unfocus > selection-cancel > quit). Per
-//! ADR-034 those are conventional and safety-sensitive; they are never routed through the
-//! registry, so `Esc` is not a registry token.
+//! whole `Esc`-precedence cascade (confirm > help > selection-cancel > outline-focused-quit >
+//! focus-outline > quit — see `tui::update`'s doc comment). Per ADR-034 those are conventional
+//! and safety-sensitive; they are never routed through the registry, so `Esc` is not a registry
+//! token.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -61,11 +62,20 @@ pub enum Command {
     PrevHunk,
     NextChangeset,
     PrevChangeset,
+    ExpandGap,
+    ExpandGapAll,
+    // Diff view.
+    FocusOutline,
     // Outline view.
     OutlineDown,
     OutlineUp,
     OutlineConfirm,
     OutlineCycleMode,
+    FocusDiff,
+    OutlineTop,
+    OutlineBottom,
+    OutlineStage,
+    OutlineDiscard,
 }
 
 /// One row of the action registry: a [`Command`] with its stable config identity (`view` +
@@ -101,7 +111,7 @@ pub static REGISTRY: &[Registered] = &[
         view: View::Global,
         name: "toggle-outline",
         default_keys: "o",
-        description: "Toggle the outline pane / focus",
+        description: "Show or hide the outline pane",
     },
     Registered {
         command: Command::ToggleHelp,
@@ -258,6 +268,27 @@ pub static REGISTRY: &[Registered] = &[
         default_keys: "[c",
         description: "Go to the previous changeset",
     },
+    Registered {
+        command: Command::FocusOutline,
+        view: View::Diff,
+        name: "focus-outline",
+        default_keys: "h left",
+        description: "Focus the outline",
+    },
+    Registered {
+        command: Command::ExpandGap,
+        view: View::Diff,
+        name: "expand-gap",
+        default_keys: "enter",
+        description: "Reveal more of the collapsed gap under the cursor",
+    },
+    Registered {
+        command: Command::ExpandGapAll,
+        view: View::Diff,
+        name: "expand-gap-all",
+        default_keys: "E",
+        description: "Reveal the whole collapsed gap under the cursor",
+    },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {
         command: Command::OutlineDown,
@@ -286,6 +317,41 @@ pub static REGISTRY: &[Registered] = &[
         name: "cycle-mode",
         default_keys: "i",
         description: "Cycle the outline mode",
+    },
+    Registered {
+        command: Command::FocusDiff,
+        view: View::Outline,
+        name: "focus-diff",
+        default_keys: "l right",
+        description: "Focus the diff view",
+    },
+    Registered {
+        command: Command::OutlineTop,
+        view: View::Outline,
+        name: "scroll-top",
+        default_keys: "g",
+        description: "Jump to the top of the outline",
+    },
+    Registered {
+        command: Command::OutlineBottom,
+        view: View::Outline,
+        name: "scroll-bottom",
+        default_keys: "G",
+        description: "Jump to the bottom of the outline",
+    },
+    Registered {
+        command: Command::OutlineStage,
+        view: View::Outline,
+        name: "stage",
+        default_keys: "s",
+        description: "Stage or unstage the file/directory under the cursor",
+    },
+    Registered {
+        command: Command::OutlineDiscard,
+        view: View::Outline,
+        name: "discard",
+        default_keys: "d",
+        description: "Discard the file/directory under the cursor",
     },
 ];
 
