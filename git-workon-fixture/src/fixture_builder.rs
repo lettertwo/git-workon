@@ -230,6 +230,9 @@ pub struct FixtureBuilder<'fixture> {
     untracked_files: Vec<(String, String)>, // (path, content)
     deleted_files: Vec<(String, String)>, // (path, committed)
     gh_stack_ops: Vec<GhStackOp>,
+    partially_staged_files: Vec<(String, String, String, String)>, // (path, committed, staged, workdir)
+    untracked_symlinks: Vec<(String, String)>, // (path, target) — target need not exist
+    executable_unstaged_files: Vec<(String, String, String)>, // (path, committed, modified), mode 0o100755
 }
 
 impl<'fixture> FixtureBuilder<'fixture> {
@@ -252,6 +255,9 @@ impl<'fixture> FixtureBuilder<'fixture> {
             untracked_files: Vec::new(),
             deleted_files: Vec::new(),
             gh_stack_ops: Vec::new(),
+            partially_staged_files: Vec::new(),
+            untracked_symlinks: Vec::new(),
+            executable_unstaged_files: Vec::new(),
         }
     }
 
@@ -600,6 +606,63 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self
     }
 
+    /// Commit `path` with `committed` content on the cwd repo's branch during `build()` (same
+    /// baseline-commit block as [`unstaged_file`](Self::unstaged_file)/[`deleted_file`](Self::deleted_file)),
+    /// then stage `staged` content (index entry differs from `HEAD`), then rewrite the working
+    /// tree copy to `workdir` (differs from BOTH `HEAD` and the index) — three genuinely
+    /// distinct states for `HEAD`/index/workdir, needed to test operations (like `discard`) that
+    /// must revert to the INDEX's content specifically, not `HEAD`'s.
+    ///
+    /// Applies to the LAST worktree added, or the main repo if none. Errors at
+    /// [`build`](Self::build) if the fixture is `bare(true)` with no worktree.
+    pub fn partially_staged_file(
+        mut self,
+        path: &str,
+        committed: &str,
+        staged: &str,
+        workdir: &str,
+    ) -> Self {
+        self.partially_staged_files.push((
+            path.to_string(),
+            committed.to_string(),
+            staged.to_string(),
+            workdir.to_string(),
+        ));
+        self
+    }
+
+    /// Like [`unstaged_file`](Self::unstaged_file), but `path` is committed and rewritten with
+    /// the executable bit set (`chmod 0o755`) at BOTH baseline commit time and after the
+    /// working-tree rewrite — so `HEAD`'s (and the starting index's) mode is really
+    /// `0o100755`, not just the working tree's. Needed to pin the exec-bit-preserving fix: a
+    /// hunk stage of an executable file must not clobber its index mode back to `0o100644`.
+    ///
+    /// Unix-only ([`std::os::unix::fs::PermissionsExt`]); applies to the LAST worktree added, or
+    /// the main repo if none. Errors at [`build`](Self::build) if the fixture is `bare(true)`
+    /// with no worktree.
+    pub fn executable_unstaged_file(mut self, path: &str, committed: &str, modified: &str) -> Self {
+        self.executable_unstaged_files.push((
+            path.to_string(),
+            committed.to_string(),
+            modified.to_string(),
+        ));
+        self
+    }
+
+    /// Create a symlink at `path` pointing at `target` in the fixture's cwd repo working tree;
+    /// never staged (untracked). `target` need not exist — a dangling/broken symlink is still a
+    /// real working-tree entry (`symlink_metadata`/lstat sees it; `Path::exists`, which follows
+    /// the link, does not).
+    ///
+    /// Unix-only ([`std::os::unix::fs::symlink`]); applies to the LAST worktree added, or the
+    /// main repo if none. Errors at [`build`](Self::build) if the fixture is `bare(true)` with
+    /// no worktree.
+    pub fn untracked_symlink(mut self, path: &str, target: &str) -> Self {
+        self.untracked_symlinks
+            .push((path.to_string(), target.to_string()));
+        self
+    }
+
     pub fn build(self) -> Result<Fixture> {
         isolate_ambient_git_config();
         let tmpdir = TempDir::new()?;
@@ -707,20 +770,28 @@ impl<'fixture> FixtureBuilder<'fixture> {
         let has_index_state = !self.staged_files.is_empty()
             || !self.unstaged_files.is_empty()
             || !self.untracked_files.is_empty()
-            || !self.deleted_files.is_empty();
+            || !self.deleted_files.is_empty()
+            || !self.partially_staged_files.is_empty()
+            || !self.untracked_symlinks.is_empty()
+            || !self.executable_unstaged_files.is_empty();
         if has_index_state && self.bare && self.worktrees.is_empty() {
             return Err(
-                "staged_file/unstaged_file/untracked_file/deleted_file require a working tree: \
-                 fixture is bare(true) with no worktree"
+                "staged_file/unstaged_file/untracked_file/deleted_file/partially_staged_file/\
+                 untracked_symlink/executable_unstaged_file require a working tree: fixture is \
+                 bare(true) with no worktree"
                     .into(),
             );
         }
 
-        // `unstaged_file`/`deleted_file` baseline commits land BEFORE Graphite-metadata
-        // live-tip resolution below: they move the cwd branch's tip, and any metadata entry
-        // recording that tip must reflect the moved one, not the pre-baseline commit. Both
-        // builders share one baseline commit.
-        if !self.unstaged_files.is_empty() || !self.deleted_files.is_empty() {
+        // `unstaged_file`/`deleted_file`/`partially_staged_file`/`executable_unstaged_file`
+        // baseline commits land BEFORE Graphite-metadata live-tip resolution below: they move
+        // the cwd branch's tip, and any metadata entry recording that tip must reflect the
+        // moved one, not the pre-baseline commit. All four builders share one baseline commit.
+        if !self.unstaged_files.is_empty()
+            || !self.deleted_files.is_empty()
+            || !self.partially_staged_files.is_empty()
+            || !self.executable_unstaged_files.is_empty()
+        {
             let cwd_repo = Repository::open(&cwd_path)?;
             let mut index = cwd_repo.index()?;
             for (file_path, committed, _modified) in &self.unstaged_files {
@@ -738,6 +809,29 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 }
                 std::fs::write(&abs_path, committed)?;
                 index.add_path(Path::new(file_path))?;
+            }
+            for (file_path, committed, _staged, _workdir) in &self.partially_staged_files {
+                let abs_path = cwd_path.join(file_path);
+                if let Some(parent) = abs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&abs_path, committed)?;
+                index.add_path(Path::new(file_path))?;
+            }
+            #[cfg(unix)]
+            for (file_path, committed, _modified) in &self.executable_unstaged_files {
+                use std::os::unix::fs::PermissionsExt;
+                let abs_path = cwd_path.join(file_path);
+                if let Some(parent) = abs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&abs_path, committed)?;
+                std::fs::set_permissions(&abs_path, std::fs::Permissions::from_mode(0o755))?;
+                index.add_path(Path::new(file_path))?;
+            }
+            #[cfg(not(unix))]
+            if !self.executable_unstaged_files.is_empty() {
+                return Err("executable_unstaged_file is unix-only".into());
             }
             index.write()?;
 
@@ -1125,7 +1219,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
         if has_index_state {
             let cwd_repo = Repository::open(&cwd_path)?;
 
-            if !self.staged_files.is_empty() {
+            if !self.staged_files.is_empty() || !self.partially_staged_files.is_empty() {
                 let mut index = cwd_repo.index()?;
                 for (file_path, content) in &self.staged_files {
                     let abs_path = cwd_path.join(file_path);
@@ -1135,11 +1229,33 @@ impl<'fixture> FixtureBuilder<'fixture> {
                     std::fs::write(&abs_path, content)?;
                     index.add_path(Path::new(file_path))?;
                 }
+                for (file_path, _committed, staged, _workdir) in &self.partially_staged_files {
+                    let abs_path = cwd_path.join(file_path);
+                    std::fs::write(&abs_path, staged)?;
+                    index.add_path(Path::new(file_path))?;
+                }
                 index.write()?;
             }
 
             for (file_path, _committed, modified) in &self.unstaged_files {
                 std::fs::write(cwd_path.join(file_path), modified)?;
+            }
+
+            // Rewrite the working tree copy to `modified` content, then restore the exec bit —
+            // `std::fs::write` truncates+rewrites the file rather than editing it in place, so
+            // the mode set during the baseline commit above does not necessarily survive.
+            #[cfg(unix)]
+            for (file_path, _committed, modified) in &self.executable_unstaged_files {
+                use std::os::unix::fs::PermissionsExt;
+                let abs_path = cwd_path.join(file_path);
+                std::fs::write(&abs_path, modified)?;
+                std::fs::set_permissions(&abs_path, std::fs::Permissions::from_mode(0o755))?;
+            }
+
+            // Rewrite the working tree copy to `workdir` content AFTER the index has `staged`
+            // — the index entry must stay at `staged`, only the on-disk file moves further.
+            for (file_path, _committed, _staged, workdir) in &self.partially_staged_files {
+                std::fs::write(cwd_path.join(file_path), workdir)?;
             }
 
             for (file_path, content) in &self.untracked_files {
@@ -1152,6 +1268,19 @@ impl<'fixture> FixtureBuilder<'fixture> {
 
             for (file_path, _committed) in &self.deleted_files {
                 std::fs::remove_file(cwd_path.join(file_path))?;
+            }
+
+            #[cfg(unix)]
+            for (file_path, target) in &self.untracked_symlinks {
+                let abs_path = cwd_path.join(file_path);
+                if let Some(parent) = abs_path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::os::unix::fs::symlink(target, &abs_path)?;
+            }
+            #[cfg(not(unix))]
+            if !self.untracked_symlinks.is_empty() {
+                return Err("untracked_symlink is unix-only".into());
             }
         }
 
