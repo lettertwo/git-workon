@@ -9,16 +9,21 @@
 //! - [`FileStatus::Modified`]/[`FileStatus::Renamed`]/[`FileStatus::Copied`], non-binary: a
 //!   hunk patch can express both a preimage and a postimage, so `apply_hunk`/`apply_lines`
 //!   synthesize one and hand it to the `Applier`.
-//! - Everything else ([`FileStatus::Added`]/[`FileStatus::Deleted`]/[`FileStatus::Untracked`]/
-//!   [`FileStatus::Unmerged`], or a binary file of any status): there is no two-sided hunk to
-//!   patch — a hunk of one of these files IS the whole file. `apply_hunk` falls back to the
-//!   file-level op for the verb. `apply_lines` does NOT fall back: line selection on a
-//!   whole-file change is a different operation the caller asked for by mistake, so it must
-//!   REFUSE with a typed error rather than silently widen the selection to "the whole file"
-//!   behind the caller's back. The cleanest way to get that refusal is to call
+//! - [`FileStatus::Deleted`]/[`FileStatus::Unmerged`], or a binary file of any status: there is
+//!   no two-sided hunk to patch — a hunk of one of these files IS the whole file. `apply_hunk`
+//!   falls back to the file-level op for the verb. `apply_lines` does NOT fall back: line
+//!   selection on a whole-file change is a different operation the caller asked for by mistake,
+//!   so it must REFUSE with a typed error rather than silently widen the selection to "the whole
+//!   file" behind the caller's back. The cleanest way to get that refusal is to call
 //!   `partial_hunk_patch` unconditionally and propagate its `Result` — it already contains
 //!   exactly this guard (see `synthesis.rs`), so `apply_lines` doesn't duplicate the status
 //!   check.
+//! - [`FileStatus::Untracked`]/[`FileStatus::Added`], non-binary: no `HEAD`/index preimage
+//!   exists, but `partial_hunk_patch` synthesizes a one-sided (creation) patch for these — line
+//!   ops ARE supported ([`supports_line_ops`]), just not through `apply_hunk`'s whole-hunk path:
+//!   `is_hunk_patchable` (and therefore `apply_hunk`'s routing) is UNCHANGED for these statuses,
+//!   since a hunk-level `s`/`d` on one of these files still means "the whole file", not "the
+//!   whole hunk" — there's nothing hunk-shaped left once you're not slicing by line.
 
 use git2::Repository;
 
@@ -42,6 +47,19 @@ pub fn is_hunk_patchable(file: &FileChange) -> bool {
             file.status,
             FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied
         )
+}
+
+/// Whether `file` supports LINE-precise stage/discard — the gate `App::stage_selection`/
+/// `App::discard_selection` (m4-staging) check before offering a line selection, per the
+/// line-ops-on-one-sided-files handoff. Broader than [`is_hunk_patchable`]: a non-binary
+/// `Untracked`/`Added` file has no two-sided hunk (so hunk-LEVEL `s`/`d` still falls back to the
+/// whole file, unchanged — see this module's doc comment), but `partial_hunk_patch` CAN
+/// synthesize a one-sided (creation) patch from a selection of its lines, so line ops on it are
+/// not a refusal. Deliberately does NOT touch [`is_hunk_patchable`] itself: that predicate has
+/// other callers (hunk routing, zoom gating) whose semantics must not change.
+pub fn supports_line_ops(file: &FileChange) -> bool {
+    is_hunk_patchable(file)
+        || (!file.is_binary && matches!(file.status, FileStatus::Untracked | FileStatus::Added))
 }
 
 /// Apply `verb` to the WHOLE of `file`'s hunk at `hunk_idx`.

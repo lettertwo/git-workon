@@ -1,9 +1,11 @@
-//! Shared PTY-test support for the `pty_smoke` and `pty_responsiveness` test binaries.
+//! Shared PTY-test support for the `pty_smoke` and `pty_responsiveness` modules of the `pty`
+//! integration-test binary (`tests/pty/main.rs`).
 //!
-//! A `tests/<name>/mod.rs` directory module so cargo does not build it as a test binary of its
-//! own; each PTY suite declares `mod pty_support;`. Keeping the spawn setup in one place means
-//! a change to the window size, `TERM`, or expect timeout applies to every PTY suite at once —
-//! the two suites guard related regressions, so silent drift here would matter.
+//! A `tests/pty/<name>/mod.rs` directory module so cargo does not build it as a test binary of
+//! its own; `main.rs` declares `mod pty_support;` once and the suite modules reach it via
+//! `crate::pty_support`. Keeping the spawn setup in one place means a change to the window size,
+//! `TERM`, or expect timeout applies to every PTY suite at once — the two suites guard related
+//! regressions, so silent drift here would matter.
 
 use std::time::Duration;
 
@@ -26,9 +28,8 @@ use git_workon_fixture::prelude::*;
 /// fixture's workdir means repeat `spawn_review` calls against the SAME fixture share one cache
 /// file, while different fixtures — different tempdirs — never collide.
 pub fn spawn_review(fixture: &Fixture) -> Session<OsProcess, OsStream> {
-    let repo = fixture.repo().expect("fixture repo");
-    let workdir = repo.workdir().expect("fixture workdir").to_path_buf();
-    let probe_cache = workdir.join(".git-workon-review-probe-cache.json");
+    let workdir = fixture_workdir(fixture);
+    let probe_cache = probe_cache_path(fixture);
 
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_git-workon-review"));
     cmd.current_dir(&workdir)
@@ -42,4 +43,16 @@ pub fn spawn_review(fixture: &Fixture) -> Session<OsProcess, OsStream> {
         .expect("size PTY");
     session.set_expect_timeout(Some(Duration::from_secs(15)));
     session
+}
+
+/// The probe-cache file [`spawn_review`] pins for `fixture` — one shared definition so a test
+/// that inspects what the binary recorded reads the same path the spawn wired up.
+pub fn probe_cache_path(fixture: &Fixture) -> std::path::PathBuf {
+    fixture_workdir(fixture).join(".git-workon-review-probe-cache.json")
+}
+
+fn fixture_workdir(fixture: &Fixture) -> std::path::PathBuf {
+    let repo = fixture.repo().expect("fixture repo");
+    let workdir = repo.workdir().expect("fixture workdir");
+    workdir.to_path_buf()
 }

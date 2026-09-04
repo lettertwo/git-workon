@@ -1,4 +1,4 @@
-//! Frame rendering: header, side-by-side diff body, footer.
+//! Frame rendering: per-pane headers, side-by-side diff body, footer.
 //!
 //! Ported from the `review-tui-spike` prototype's `ui.rs`, adapted to render [`App`]'s
 //! gap-collapsed [`crate::align::DisplayRow`]s instead of a flat aligned-row list, and extended
@@ -15,7 +15,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::align::{CellKind, DisplayRow, InlineRow, Row};
 use crate::app::{
-    App, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role, Severity, Summary,
+    App, DiffTextMode, EffectiveZoom, FileView, Layout as AppLayout, Notice, Region, Role,
+    Severity, Summary,
 };
 use crate::attribute::Attribution;
 use crate::config::View;
@@ -60,9 +61,9 @@ const NERD_DIFF_ADDED: char = '\u{f457}'; // nf-oct-diff-added
 const NERD_DIFF_REMOVED: char = '\u{f458}'; // nf-oct-diff-removed
 
 /// The current-changeset marker for the active icon strategy. These four one-switch helpers are
-/// the single source of each semantic marker's glyph pair — the outline's Header arm and the
-/// summary panel (and, upstack, the winbar) deliberately draw the SAME markers, so the selection
-/// lives in one place instead of a hand-synced `match` per call site.
+/// the single source of each semantic marker's glyph pair — the outline's Header arm, the summary
+/// panel, and the diff/outline pane headers (CS1, `pane-headers`) deliberately draw the SAME
+/// markers, so the selection lives in one place instead of a hand-synced `match` per call site.
 fn current_marker(icons: IconMode) -> char {
     match icons {
         IconMode::Nerd => NERD_CURRENT_MARKER,
@@ -104,6 +105,36 @@ fn diffstat_prefixes(icons: IconMode) -> (String, String) {
         ),
         IconMode::None => ("+".to_string(), "-".to_string()),
     }
+}
+
+/// The pane headers' bold `  +A -D` diffstat span run (leading two-space spacer included) —
+/// single-sourced for [`render_outline_header`] (changeset total) and [`file_segment_spans`]
+/// (per-file), so the styling (spacing, boldness, glyph prefixes) can't drift between the two.
+/// The summary panel's totals line deliberately keeps its own non-bold variant
+/// ([`push_summary_body`]).
+fn diffstat_spans(
+    adds: usize,
+    dels: usize,
+    theme: &Palette,
+    icons: IconMode,
+) -> Vec<TSpan<'static>> {
+    let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
+    vec![
+        TSpan::styled("  ".to_string(), Style::default().fg(theme.foreground)),
+        TSpan::styled(
+            format!("{added_prefix}{adds}"),
+            Style::default()
+                .fg(theme.add_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TSpan::styled(" ".to_string(), Style::default().fg(theme.foreground)),
+        TSpan::styled(
+            format!("{removed_prefix}{dels}"),
+            Style::default()
+                .fg(theme.del_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]
 }
 
 /// The shared changeset-title span run — `[current-marker] [branch-icon] ([i/n] )label
@@ -201,9 +232,29 @@ fn apply_row_tint(mut line: Line<'static>, width: u16, tint: Color) -> Line<'sta
     line
 }
 
-/// Wash the cursor row with the theme's cursor tint.
-fn apply_cursor_row(line: Line<'static>, width: u16, theme: &Palette) -> Line<'static> {
-    apply_row_tint(line, width, theme.cursor_bg)
+/// The cursor row's tint — full [`Palette::cursor_bg`] when `focused` is true (this pane holds
+/// focus), or the dimmer [`Palette::cursor_unfocused_bg`] otherwise. Shared by [`apply_cursor_row`]
+/// and `render_pane_sbs`'s divider-cell re-tint so the row wash and the divider it crosses never
+/// drift apart.
+fn cursor_tint(theme: &Palette, focused: bool) -> Color {
+    if focused {
+        theme.cursor_bg
+    } else {
+        theme.cursor_unfocused_bg
+    }
+}
+
+/// Wash the cursor row with the theme's cursor tint — full [`Palette::cursor_bg`] when `focused`
+/// is true (this pane holds focus), or the dimmer [`Palette::cursor_unfocused_bg`] otherwise (CS1,
+/// `unfocused-cursor-wash`: the uniform model every pane's remembered cursor row now follows,
+/// matching the outline's pre-existing focused/unfocused split).
+fn apply_cursor_row(
+    line: Line<'static>,
+    width: u16,
+    theme: &Palette,
+    focused: bool,
+) -> Line<'static> {
+    apply_row_tint(line, width, cursor_tint(theme, focused))
 }
 
 /// Wash a selected (line-selection) row with the theme's selection tint.
@@ -235,22 +286,32 @@ fn apply_right_edge_marker(
     }
 }
 
-/// One resolved (bg, fg) pair for a byte range of a line.
+/// One resolved (bg, fg, italic) triple for a byte range of a line.
 struct Segment {
     start: usize,
     end: usize,
     bg: Option<Color>,
     fg: Color,
+    /// Whether the covering syntax capture renders in italics (`theme::syntax_italic` — comments).
+    italic: bool,
 }
 
-/// Merge background-role spans and syntax fg spans into a flat list of non-overlapping
-/// segments covering `[0, len)`. A syntax span carries only its capture index; its color is
-/// resolved HERE against `theme` (ADR-035's render-time resolution) — a segment with no covering
-/// syntax span falls back to [`Palette::foreground`].
+/// Merge background-role spans, syntax fg spans, and `workon.review.diff.text` tint-foreground
+/// override spans into a flat list of non-overlapping segments covering `[0, len)`. A syntax span
+/// carries only its capture index; its color is resolved HERE against `theme` (ADR-035's
+/// render-time resolution) — a segment with no covering syntax span falls back to
+/// [`Palette::foreground`].
+///
+/// `fg_override_spans` (CS11, `content_spans`' `text_mode`) wins over the syntax-resolved color
+/// wherever it covers a byte range — `syntax` mode passes an empty slice, so this stays a no-op
+/// and the segment's color/italic resolution is byte-identical to before CS11 (the changeset's
+/// pixel-identity gate). Italic still resolves from the covering syntax capture regardless of
+/// which foreground wins — the two are orthogonal (a tinted comment stays italic).
 fn compose_segments(
     len: usize,
     bg_spans: &[(usize, usize, Color)],
     fg_spans: Option<&Vec<FgSpan>>,
+    fg_override_spans: &[(usize, usize, Color)],
     theme: &Palette,
 ) -> Vec<Segment> {
     let mut boundaries: Vec<usize> = vec![0, len];
@@ -264,6 +325,10 @@ fn compose_segments(
             boundaries.push(span.end.min(len));
         }
     }
+    for (s, e, _) in fg_override_spans {
+        boundaries.push((*s).min(len));
+        boundaries.push((*e).min(len));
+    }
     boundaries.sort_unstable();
     boundaries.dedup();
 
@@ -274,20 +339,40 @@ fn compose_segments(
             continue;
         }
         let mid = start;
-        // Later-pushed bg spans are more specific (word-level strong emphasis is pushed after
-        // the whole-line subtle span in `content_spans`) and must win, so the lookup scans in
+        // Later-pushed bg spans are more specific (the word-level edit emphasis is pushed after
+        // the whole-line emphasis in `content_spans`) and must win, so the lookup scans in
         // REVERSE push order. The spike's forward `find` silently dropped word-level emphasis:
-        // the whole-line subtle span contains every offset, so it always matched first.
+        // the whole-line span contains every offset, so it always matched first.
         let bg = bg_spans
             .iter()
             .rev()
             .find(|(s, e, _)| mid >= *s && mid < *e)
             .map(|(_, _, c)| *c);
-        let fg = fg_spans
-            .and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end))
-            .map(|s| theme.syntax(s.capture))
-            .unwrap_or(theme.foreground);
-        segments.push(Segment { start, end, bg, fg });
+        // One lookup, two consumers: italic and the syntax color must come from the SAME capture,
+        // and a tint override (CS11's `diff.text`) replaces only the color — italics stay
+        // structural, so a tinted comment is still italic.
+        let syntax_hit =
+            fg_spans.and_then(|fgs| fgs.iter().find(|s| mid >= s.start && mid < s.end));
+        let italic = syntax_hit
+            .map(|s| crate::theme::syntax_italic(s.capture))
+            .unwrap_or(false);
+        let fg = fg_override_spans
+            .iter()
+            .rev()
+            .find(|(s, e, _)| mid >= *s && mid < *e)
+            .map(|(_, _, c)| *c)
+            .unwrap_or_else(|| {
+                syntax_hit
+                    .map(|s| theme.syntax(s.capture))
+                    .unwrap_or(theme.foreground)
+            });
+        segments.push(Segment {
+            start,
+            end,
+            bg,
+            fg,
+            italic,
+        });
     }
     segments
 }
@@ -296,7 +381,7 @@ fn gutter_width(max_lineno: usize) -> usize {
     max_lineno.to_string().len().max(3)
 }
 
-/// How a rendered pane resolves a changed cell's (subtle, strong) background pair — one per
+/// How a rendered pane resolves a changed cell's (line, edit) background pair — one per
 /// [`Role`] (locked decision #7): the combined view is the only one that needs a per-cell lookup,
 /// since it's the only role that fuses staged and unstaged content into one set of rows.
 #[derive(Clone, Copy)]
@@ -342,39 +427,68 @@ fn attribution_mode(role: Role, attribution: &Option<Attribution>) -> Attributio
     }
 }
 
-/// The (subtle, strong) background pair for a Del cell at `old_lnum`, given `mode`, resolved from
-/// `theme`'s bright vs. staged Del tints.
-fn del_bg_pair(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> (Color, Color) {
-    let bright = (theme.del_subtle, theme.del_strong);
-    let staged = (theme.del_staged_subtle, theme.del_staged_strong);
+/// Whether a Del cell at `old_lnum` is staged, given `mode` — the single staged-ness decision
+/// shared by [`del_bg_pair`] and [`del_tint_fg`] (locked decision #6: staged-ness must resolve
+/// identically for background and foreground, not through a second path).
+fn del_is_staged(mode: AttributionMode, old_lnum: u32) -> bool {
     match mode {
-        AttributionMode::Plain => bright,
-        AttributionMode::StagedUniform => staged,
-        AttributionMode::Attributed(attribution) => {
-            if attribution.del_is_staged(old_lnum) {
-                staged
-            } else {
-                bright
-            }
-        }
+        AttributionMode::Plain => false,
+        AttributionMode::StagedUniform => true,
+        AttributionMode::Attributed(attribution) => attribution.del_is_staged(old_lnum),
     }
 }
 
-/// The (subtle, strong) background pair for an Add cell at `new_lnum`, given `mode`, resolved from
-/// `theme`'s bright vs. staged Add tints.
-fn add_bg_pair(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> (Color, Color) {
-    let bright = (theme.add_subtle, theme.add_strong);
-    let staged = (theme.add_staged_subtle, theme.add_staged_strong);
+/// Whether an Add cell at `new_lnum` is staged, given `mode` — the single staged-ness decision
+/// shared by [`add_bg_pair`] and [`add_tint_fg`] (locked decision #6).
+fn add_is_staged(mode: AttributionMode, new_lnum: u32) -> bool {
     match mode {
-        AttributionMode::Plain => bright,
-        AttributionMode::StagedUniform => staged,
-        AttributionMode::Attributed(attribution) => {
-            if attribution.add_is_unstaged(new_lnum) {
-                bright
-            } else {
-                staged
-            }
-        }
+        AttributionMode::Plain => false,
+        AttributionMode::StagedUniform => true,
+        AttributionMode::Attributed(attribution) => !attribution.add_is_unstaged(new_lnum),
+    }
+}
+
+/// The (line, edit) background pair for a Del cell at `old_lnum`, given `mode`, resolved from
+/// `theme`'s unstaged vs. staged Del tints.
+fn del_bg_pair(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> (Color, Color) {
+    let unstaged = (theme.del_line_bg, theme.del_edit_bg);
+    let staged = (theme.del_staged_line_bg, theme.del_staged_edit_bg);
+    if del_is_staged(mode, old_lnum) {
+        staged
+    } else {
+        unstaged
+    }
+}
+
+/// The (line, edit) background pair for an Add cell at `new_lnum`, given `mode`, resolved from
+/// `theme`'s unstaged vs. staged Add tints.
+fn add_bg_pair(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> (Color, Color) {
+    let unstaged = (theme.add_line_bg, theme.add_edit_bg);
+    let staged = (theme.add_staged_line_bg, theme.add_staged_edit_bg);
+    if add_is_staged(mode, new_lnum) {
+        staged
+    } else {
+        unstaged
+    }
+}
+
+/// The tint foreground for a Del cell at `old_lnum`, given `mode`, resolved from `theme`'s
+/// unstaged vs. staged Del foreground fields ([`Palette::del_fg`]/[`Palette::del_staged_fg`]).
+fn del_tint_fg(mode: AttributionMode, old_lnum: u32, theme: &Palette) -> Color {
+    if del_is_staged(mode, old_lnum) {
+        theme.del_staged_fg
+    } else {
+        theme.del_fg
+    }
+}
+
+/// The tint foreground for an Add cell at `new_lnum`, given `mode`, resolved from `theme`'s
+/// unstaged vs. staged Add foreground fields ([`Palette::add_fg`]/[`Palette::add_staged_fg`]).
+fn add_tint_fg(mode: AttributionMode, new_lnum: u32, theme: &Palette) -> Color {
+    if add_is_staged(mode, new_lnum) {
+        theme.add_staged_fg
+    } else {
+        theme.add_fg
     }
 }
 
@@ -484,14 +598,34 @@ fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TS
     out
 }
 
+/// A `Del`/`Add` line's background+foreground emphasis (CS11, `workon.review.diff.text`) —
+/// bundles the `(line, edit)` background pair with the tint foreground that travels alongside it,
+/// so [`content_spans`]'s "both present or both absent" invariant holds by construction instead of
+/// through parallel `Option`s at every call site.
+struct LineEmphasis {
+    line_bg: Color,
+    edit_bg: Color,
+    tint_fg: Color,
+}
+
 /// Build the styled content spans (everything after the gutter) for one line of text, shared by
 /// [`build_pane_line`] (SBS) and [`build_inline_line`] (inline) — the two differ only in how they
 /// resolve `text`/`hl`/`emphasis` from a [`Row`] vs an [`InlineRow`] and in their gutter, not in
 /// how a resolved line gets colored.
 ///
-/// `emphasis` is `Some((subtle, strong))` for a `Del`/`Add` line (whole-line subtle background,
-/// plus per-`word_spans` strong background when `is_word_pair`; whole-line strong when not paired
-/// — an unpaired excess line) and `None` for `Context`/`Filler` (no background emphasis at all).
+/// `emphasis` is `Some(LineEmphasis { line_bg, edit_bg, .. })` for a `Del`/`Add` line (whole-line
+/// background, plus per-`word_spans` edit background when `is_word_pair`; whole-line edit
+/// background when not paired — an unpaired excess line) and `None` for `Context`/`Filler` (no
+/// background emphasis at all).
+///
+/// `text_mode` (CS11) selects which foreground a `Del`/`Add` line renders with, on top of the
+/// background `emphasis` already governs: `Syntax` never touches the foreground (`emphasis`'s
+/// `tint_fg` is ignored, keeping this byte-identical to before CS11 — the changeset's
+/// pixel-identity gate); `Tint` paints `tint_fg` across the line's full width, exactly where
+/// `emphasis`'s line background is painted; `Edit` paints `tint_fg` over the SAME ranges
+/// `emphasis`'s edit background is painted — `word_spans` when `is_word_pair`, the full line when
+/// not (the invariant this mode exists to hold: wherever the edit wash is painted, the tint
+/// foreground is painted).
 ///
 /// `hscroll` (display columns, [`App::hscroll`]) pans the returned spans via [`pan_spans`] — the
 /// segments below are always composed over the FULL, unsliced `text` first (byte-identical to the
@@ -500,26 +634,53 @@ fn pan_spans(spans: Vec<TSpan<'static>>, cols: usize, theme: &Palette) -> Vec<TS
 fn content_spans(
     text: &str,
     hl: Option<&Vec<FgSpan>>,
-    emphasis: Option<(Color, Color)>,
+    emphasis: Option<LineEmphasis>,
     word_spans: &[WordSpan],
     is_word_pair: bool,
     theme: &Palette,
     hscroll: usize,
+    text_mode: DiffTextMode,
 ) -> Vec<TSpan<'static>> {
     let mut bg_spans: Vec<(usize, usize, Color)> = Vec::new();
-    if let Some((subtle_bg, strong_bg)) = emphasis {
+    let mut fg_override_spans: Vec<(usize, usize, Color)> = Vec::new();
+    if let Some(LineEmphasis {
+        line_bg,
+        edit_bg,
+        tint_fg,
+    }) = emphasis
+    {
         if is_word_pair {
-            bg_spans.push((0, text.len(), subtle_bg));
+            bg_spans.push((0, text.len(), line_bg));
             for s in word_spans {
-                bg_spans.push((s.start, s.end, strong_bg));
+                bg_spans.push((s.start, s.end, edit_bg));
             }
         } else {
-            // Unpaired excess line: whole-line strong emphasis.
-            bg_spans.push((0, text.len(), strong_bg));
+            // Unpaired excess line: no word-diff spans, so the whole line takes the edit wash
+            // full width — the line "is" the edit here (ADR-035's CS11 section: "edit" is the
+            // domain term precisely because this branch would falsify "word").
+            bg_spans.push((0, text.len(), edit_bg));
+        }
+
+        match text_mode {
+            DiffTextMode::Syntax => {}
+            DiffTextMode::Tint => {
+                fg_override_spans.push((0, text.len(), tint_fg));
+            }
+            DiffTextMode::Edit => {
+                // Mirrors the edit-background branch above exactly (same condition, same
+                // ranges) — the invariant this mode exists to hold.
+                if is_word_pair {
+                    for s in word_spans {
+                        fg_override_spans.push((s.start, s.end, tint_fg));
+                    }
+                } else {
+                    fg_override_spans.push((0, text.len(), tint_fg));
+                }
+            }
         }
     }
 
-    let segments = compose_segments(text.len(), &bg_spans, hl, theme);
+    let segments = compose_segments(text.len(), &bg_spans, hl, &fg_override_spans, theme);
     let mut spans = Vec::with_capacity(segments.len().max(1));
     if segments.is_empty() && !text.is_empty() {
         spans.push(TSpan::styled(
@@ -531,6 +692,9 @@ fn content_spans(
         let mut style = Style::default().fg(seg.fg);
         if let Some(bg) = seg.bg {
             style = style.bg(bg);
+        }
+        if seg.italic {
+            style = style.add_modifier(Modifier::ITALIC);
         }
         spans.push(TSpan::styled(text[seg.start..seg.end].to_string(), style));
     }
@@ -551,11 +715,12 @@ fn build_pane_line(
     content_w: usize,
     theme: &Palette,
     hscroll: usize,
+    text_mode: DiffTextMode,
 ) -> Line<'static> {
     match row {
         Row::Filler => {
             let pattern: String = "╱".repeat(content_w + gutter_w + 1);
-            Line::from(TSpan::styled(pattern, Style::default().fg(theme.dim)))
+            Line::from(TSpan::styled(pattern, Style::default().fg(theme.filler_fg)))
         }
         Row::Line(n) => {
             let text = match side {
@@ -572,8 +737,22 @@ fn build_pane_line(
             let mut spans = vec![TSpan::styled(gutter, Style::default().fg(theme.gutter))];
 
             let emphasis = match kind {
-                CellKind::Del => Some(del_bg_pair(mode, n as u32, theme)),
-                CellKind::Add => Some(add_bg_pair(mode, n as u32, theme)),
+                CellKind::Del => {
+                    let (line_bg, edit_bg) = del_bg_pair(mode, n as u32, theme);
+                    Some(LineEmphasis {
+                        line_bg,
+                        edit_bg,
+                        tint_fg: del_tint_fg(mode, n as u32, theme),
+                    })
+                }
+                CellKind::Add => {
+                    let (line_bg, edit_bg) = add_bg_pair(mode, n as u32, theme);
+                    Some(LineEmphasis {
+                        line_bg,
+                        edit_bg,
+                        tint_fg: add_tint_fg(mode, n as u32, theme),
+                    })
+                }
                 CellKind::Context | CellKind::Filler => None,
             };
             spans.extend(content_spans(
@@ -584,15 +763,17 @@ fn build_pane_line(
                 is_word_pair,
                 theme,
                 hscroll,
+                text_mode,
             ));
             Line::from(spans)
         }
     }
 }
 
-/// Render one frame: header, SBS body, footer, and (when [`App::help_visible`]) the `?` overlay
-/// on top of everything else. `keymap` is the resolved, possibly-rebound keymap — the footer hint
-/// and help overlay render its ACTUAL bindings (see [`crate::keymap::footer_hint`]/
+/// Render one frame: SBS body (each pane painting its own 1-row header — CS1, `pane-headers`;
+/// there's no more global header/winbar row), footer, and (when [`App::help_visible`]) the `?`
+/// overlay on top of everything else. `keymap` is the resolved, possibly-rebound keymap — the
+/// footer hint and help overlay render its ACTUAL bindings (see [`crate::keymap::footer_hint`]/
 /// [`crate::keymap::help_sections`]), never a hardcoded key string. `theme` is the resolved
 /// on-tint palette — see [`crate::theme`]; the diff body, syntax foreground, and cursor/selection
 /// washes all resolve their colors against it at paint time, as do the canvas background and the
@@ -617,20 +798,19 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
         );
     }
 
+    // CS1 (`pane-headers`): no more standalone header row — the outline pane and the diff pane
+    // each paint their own 1-row header at the top of their own rect (`render_outline`/
+    // `render_body`), so `body_area` now claims the row the old global header/winbar used to
+    // occupy. Every content row below keeps its exact prior y-coordinate: the row that moved out
+    // of the top-level layout reappears as the per-pane header carve-out inside `body_area`.
     let vlayout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(area);
 
-    let header_area = vlayout[0];
-    let body_area = vlayout[1];
-    let footer_area = vlayout[2];
+    let body_area = vlayout[0];
+    let footer_area = vlayout[1];
 
-    render_header(frame, app, header_area, theme);
     render_footer(frame, app, footer_area, keymap, theme);
 
     if app.outline_open() {
@@ -646,6 +826,9 @@ pub fn render(frame: &mut Frame, app: &mut App, keymap: &Keymap, theme: &Palette
         let div_area = hlayout[1];
         let diff_area = hlayout[2];
         render_outline(frame, app, outline_area, theme);
+        // Spans the FULL body height, including row 0 — it now divides the two pane headers
+        // (outline header vs. diff header) as well as the content rows below them; this reads
+        // fine in practice (CS1 risk noted, revisit if it looks heavy at review).
         for y in div_area.y..div_area.y + div_area.height {
             frame
                 .buffer_mut()
@@ -731,11 +914,98 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);
 }
 
-/// Render the outline side pane's rows into `area`: [`OutlineItem::Header`]s (Stack mode only)
-/// carry the changeset's position marker (green • for `cs.current`), a `[i/n]` TRUE-stack-position
-/// counter, an accented ([`Palette::heading_fg`]) bold label (CS1, `outline-header-polish` — see
-/// [`changeset_title_spans`]'s doc comment), and needs-restack glyph (amber ⚠,
-/// [`crate::theme::Palette::warn_fg`] — locked decision #9's outline half); [`OutlineItem::File`]s carry an
+/// The style for a pane header/caption LABEL word (CS1, `focused-pane-header`), and — since
+/// `header-chrome-follows-focus` — the structural "identity" chrome that travels with it: the
+/// outline header's `[i/n]` counter, the diff header's `[fidx/nfiles]` counter, and the
+/// changeset-prefix segment's `[i/n] {title}` text. The SEMANTIC spans (diffstats, the
+/// needs-restack `⚠`, the current-changeset `●` marker, the pan-offset indicator) never use this
+/// style — they keep their own colors regardless of focus (locked decision #2). `focused` selects
+/// between [`Palette::pane_header_focused_fg`] with a structural, unconditional BOLD (locked
+/// decision #3 — under [`Palette::mono`], where that color and `theme.dim` both collapse to
+/// `Color::Reset`, this BOLD is the only thing that still marks the focused label) and the plain
+/// [`Palette::dim`] every unfocused label already used before this changeset. Exactly one
+/// header/caption across a frame's outline header / diff header / split captions should ever
+/// receive `focused == true` (the exactly-one-lit-label invariant — see the module's
+/// `focused-pane-header` handoff); since `header-chrome-follows-focus` that one header may style
+/// several spans (counter + label + changeset-prefix text) through this function with the same
+/// flag, so the invariant counts lit headers, not call sites.
+fn pane_header_label_style(theme: &Palette, focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(theme.pane_header_focused_fg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.dim)
+    }
+}
+
+/// The outline pane's own top row (CS1, `pane-headers`): `[i/n] {display_label}` (the active
+/// changeset's TRUE stack position, the counter and display label both styled via
+/// [`pane_header_label_style`] (the counter joined the toggle in `header-chrome-follows-focus`) —
+/// lit ([`Palette::pane_header_focused_fg`] + bold) while the outline has focus, dim otherwise
+/// (CS1, `focused-pane-header` — locked decision #5's "outline focused" case); no current-marker
+/// glyph, since this header is always describing the currently-active changeset, a redundant
+/// thing to mark), ` {warn_marker} needs restack` (`theme.warn_fg`, full text unlike the diff
+/// header's glyph-only prefix — see [`changeset_prefix_spans`]) when
+/// [`workon::Changeset::needs_restack`], and a changeset-total `+A -D` diffstat (the fold
+/// `render_winbar` used to own, pre-CS1) skipped when [`App::files`] is empty (a Pending/Failed
+/// changeset, ADR-037). Truncated to the outline's own width via [`Buffer::set_line`], exactly
+/// like every outline item row below it.
+///
+/// CS1 risk (accepted, not fixed here): in [`crate::outline::OutlineMode::Flat`], the item rows
+/// below dedupe a file across every changeset that touches it, with no changeset context of their
+/// own — this header still names only the single ACTIVE changeset, so it can read as narrower
+/// than what the (deduped, cross-stack) row list actually shows. Acceptable for now; a future
+/// changeset could soften this (e.g. suppress the header in Flat mode) if it proves confusing in
+/// practice.
+fn render_outline_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette, focused: bool) {
+    let cs = app.current_changeset();
+    let i = app.current_cs() + 1;
+    let n = app.changeset_count();
+    let title = crate::app::display_label(cs);
+    let icons = app.icon_mode();
+
+    let mut spans = vec![
+        TSpan::styled(
+            format!("[{i}/{n}] "),
+            pane_header_label_style(theme, focused),
+        ),
+        TSpan::styled(title, pane_header_label_style(theme, focused)),
+    ];
+    if cs.needs_restack {
+        spans.push(TSpan::styled(
+            format!("  {} needs restack", warn_marker(icons)),
+            Style::default()
+                .fg(theme.warn_fg)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // A pending/failed changeset's `files()` is always empty (ADR-037) — skip the diffstat
+    // segment entirely rather than show a misleading "+0 -0" (same gate `render_winbar` used).
+    if !app.files().is_empty() {
+        let (adds, dels) = app
+            .files()
+            .iter()
+            .map(crate::summary::file_diffstat)
+            .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
+        spans.extend(diffstat_spans(adds, dels, theme, icons));
+    }
+    let line = Line::from(spans);
+    frame
+        .buffer_mut()
+        .set_line(area.x, area.y, &line, area.width);
+}
+
+/// Render the outline pane into `area`: row 0 is the pane's own header (CS1, `pane-headers` — see
+/// [`render_outline_header`]), skipped only when `area.height < 2` (a degenerate terminal has no
+/// room to spare); every row below is an outline item exactly as before this changeset — the
+/// header carve-out is why an item's absolute screen row hasn't moved (it used to start one row
+/// below the OLD global header, now it starts one row below the pane's OWN header instead).
+/// [`OutlineItem::Header`]s (Stack mode only) carry the changeset's position marker (green • for
+/// `cs.current`), a `[i/n]` TRUE-stack-position counter, an accented ([`Palette::heading_fg`])
+/// bold label (CS1, `outline-header-polish` — see [`changeset_title_spans`]'s doc comment), and
+/// needs-restack glyph (amber ⚠, [`crate::theme::Palette::warn_fg`] — locked decision #9's outline
+/// half); [`OutlineItem::File`]s carry an
 /// indent, a two-column git-porcelain-style status matrix (CS3, `outline-status-xy` — see
 /// [`outline_status_spans`]'s doc comment for the X/Y-vs-single-letter split), and
 /// the path — Flat/Stack rows (CS2) split it into `basename  dim/dirname` (no suffix for a
@@ -745,13 +1015,21 @@ fn render_help_overlay(frame: &mut Frame, app: &App, keymap: &Keymap, area: Rect
 /// only), from [`App::outline_items_with_hidden_counts`]'s per-row marker count — an expanded row
 /// gets no chevron at all. The cursor row (the outline's OWN cursor — a separate coordinate space from the
 /// diff's [`App::cursor`]) gets the theme's cursor tint while the outline has focus, or the dimmer
-/// [`Palette::outline_cursor_unfocused_bg`] while it's merely open (so the remembered position stays
+/// [`Palette::cursor_unfocused_bg`] while it's merely open (so the remembered position stays
 /// legible even after focus returns to the diff). `&mut App` (CS2, precedent: [`render_body`]
 /// writing [`App::pane_height`]) — writes [`App::outline_height`] and re-derives
 /// [`App::derive_outline_scroll`] before painting from `app.outline.scroll`, giving the outline
 /// the same stateful scrolloff-margined viewport the diff panes already have, instead of the old
 /// transient bottom-anchor scroll computed fresh each frame.
 fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
+    // CS1 risk: this `>= 2` guard must exist in BOTH pane renderers (see `render_body`'s matching
+    // carve-out) — a 1-row (or shorter) terminal has no room to spare for a header at all.
+    let area = if area.height >= 2 {
+        render_outline_header(frame, app, area, theme, app.outline_focused());
+        Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+    } else {
+        area
+    };
     app.outline_height = area.height as usize;
     app.hit_regions.outline = Some(region_from(area));
     let (items, hidden_counts) = app.outline_items_with_hidden_counts();
@@ -787,10 +1065,8 @@ fn render_outline(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette)
         let is_cursor = item_idx == cursor;
         let line = build_outline_line(item, theme, icons, hidden);
         let line = Line::from(pan_spans(line.spans, hscroll, theme));
-        let line = if is_cursor && focused {
-            apply_cursor_row(line, area.width, theme)
-        } else if is_cursor {
-            apply_row_tint(line, area.width, theme.outline_cursor_unfocused_bg)
+        let line = if is_cursor {
+            apply_cursor_row(line, area.width, theme, focused)
         } else {
             line
         };
@@ -829,15 +1105,15 @@ fn tree_prefix(guides: &[bool]) -> String {
 /// a ragged single-letter row.
 const STATUS_PLACEHOLDER: char = '\u{b7}';
 
-/// A committed changeset's single-letter status color (CS3): A green (`add_strong`), D red
-/// (`del_strong`), M/R/C (a change to EXISTING content, not a create/destroy) the dedicated amber
-/// [`Palette::modified_fg`], and `?`/`U` dim (Untracked never reaches here — see
+/// A committed changeset's single-letter status color (CS3, CS11): A green ([`Palette::add_fg`]),
+/// D red ([`Palette::del_fg`]), M/R/C (a change to EXISTING content, not a create/destroy) the
+/// dedicated amber [`Palette::modified_fg`], and `?`/`U` dim (Untracked never reaches here — see
 /// [`outline_status_spans`]'s doc comment — and Unmerged is a worktree-only conflict state a
 /// committed changeset can't carry; both fold to `dim` only so this match stays exhaustive).
 fn committed_letter_color(change: FileStatus, theme: &Palette) -> Color {
     match change {
-        FileStatus::Added => theme.add_strong,
-        FileStatus::Deleted => theme.del_strong,
+        FileStatus::Added => theme.add_fg,
+        FileStatus::Deleted => theme.del_fg,
         FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => theme.modified_fg,
         FileStatus::Untracked | FileStatus::Unmerged => theme.dim,
     }
@@ -857,8 +1133,10 @@ fn committed_letter_color(change: FileStatus, theme: &Palette) -> Color {
 /// - `Unstaged`/`Staged`/`Partial` render the git-porcelain X/Y matrix: `letter` (from the SAME
 ///   underlying [`FileStatus`] — there's only one change kind per file, not separate staged/
 ///   unstaged kinds) in whichever column(s) that axis has a change, [`STATUS_PLACEHOLDER`] in the
-///   other; X (staged/index) is `add_strong` green, Y (worktree) is `del_strong` red, matching
-///   git's own status convention.
+///   other; X (staged/index) is [`Palette::add_fg`] green, Y (worktree) is [`Palette::del_fg`]
+///   red, matching git's own status convention. (CS11: these were the intensity-named edit-wash
+///   background fields used as a foreground — read at ~1.6:1 contrast on a dark-wash theme; see
+///   ADR-035's CS11 section.)
 fn outline_status_spans(
     status: crate::outline::StagedStatus,
     change: FileStatus,
@@ -889,12 +1167,8 @@ fn outline_status_spans(
             let unstaged = matches!(status, StagedStatus::Unstaged | StagedStatus::Partial);
             let x_char = if staged { letter } else { STATUS_PLACEHOLDER };
             let y_char = if unstaged { letter } else { STATUS_PLACEHOLDER };
-            let x_color = if staged { theme.add_strong } else { theme.dim };
-            let y_color = if unstaged {
-                theme.del_strong
-            } else {
-                theme.dim
-            };
+            let x_color = if staged { theme.add_fg } else { theme.dim };
+            let y_color = if unstaged { theme.del_fg } else { theme.dim };
             vec![
                 TSpan::styled(x_char.to_string(), Style::default().fg(x_color)),
                 TSpan::styled(y_char.to_string(), Style::default().fg(y_color)),
@@ -1015,9 +1289,18 @@ fn build_outline_line(
                     path,
                     crate::theme::is_light_background(theme.background),
                 );
+                // Nerd-font icon colors are palette-external (hardcoded per-filetype `Rgb` from
+                // `icons::icon_for_path`, not a `Palette` field), so a colorless (NO_COLOR) theme
+                // must collapse them to `foreground` itself — see `Palette::colorless`'s doc
+                // comment.
+                let icon_fg = if theme.colorless {
+                    theme.foreground
+                } else {
+                    color.unwrap_or(theme.foreground)
+                };
                 spans.push(TSpan::styled(
                     format!("{icon} "),
-                    Style::default().fg(color.unwrap_or(theme.foreground)),
+                    Style::default().fg(icon_fg),
                 ));
             }
             // Flat/Stack rows (empty `guides`) split `path` at render time into `basename  dim/
@@ -1053,9 +1336,9 @@ fn build_outline_line(
     }
 }
 
-/// The current file's label for the top status row: its path, or a rename's `old @ base ->
-/// path` form — shared by the lone-changeset header and the multi-changeset winbar (they differ
-/// only in what wraps this).
+/// The current file's label for the diff pane header: its path, or a rename's `old @ base ->
+/// path` form — shared by every diff-header state ([`file_segment_spans`]) and the summary
+/// panel's own current-changeset-independent uses.
 fn current_file_label(app: &App) -> String {
     match app.files().get(app.current) {
         Some(f) if f.status == FileStatus::Renamed || f.status == FileStatus::Copied => {
@@ -1071,32 +1354,8 @@ fn current_file_label(app: &App) -> String {
     }
 }
 
-/// The top status row: `[fidx/nfiles] path` for a lone changeset (the M4 look, unchanged), or the
-/// changeset-aware winbar (locked decision #8) once the stack has more than one changeset — the
-/// winbar's own `[i/n]` is the CHANGESET counter, so showing both here would render two different
-/// counters under the same bracket notation. Never both at once.
-fn render_header(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
-    if app.changeset_count() > 1 {
-        render_winbar(frame, app, area, theme);
-        return;
-    }
-    let idx = app.current + 1;
-    let n = app.files().len();
-    let text = format!("[{idx}/{n}] {}", current_file_label(app));
-    let mut spans = vec![TSpan::styled(
-        text,
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if let Some(span) = hscroll_indicator_span(app, theme) {
-        spans.push(span);
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-/// While [`App::hscroll`] is panned, a small dim `»42` (the column offset) appended to the header/
-/// winbar (locked decision #8) — `None` at column `0`, matching the diffstat span's own
+/// While [`App::hscroll`] is panned, a small dim `»42` (the column offset) appended to the diff
+/// pane header (locked decision #8) — `None` at column `0`, matching the diffstat span's own
 /// present-or-absent pattern above/below.
 fn hscroll_indicator_span(app: &App, theme: &Palette) -> Option<TSpan<'static>> {
     if app.hscroll == 0 {
@@ -1108,97 +1367,155 @@ fn hscroll_indicator_span(app: &App, theme: &Palette) -> Option<TSpan<'static>> 
     ))
 }
 
-/// The multi-changeset winbar (locked decisions #8 + #9): `[i/n] <title-or-name>
-/// <restack-marker>  <diffstat>  —  <path> (fidx/nfiles)`, where `i/n` is the changeset's position
-/// in the stack and `fidx/nfiles` the active file's position within it. Only reached when
-/// [`App::changeset_count`] > 1 (see [`render_header`]) — a lone uncommitted changeset never
-/// shows this, keeping the M4 full-width look.
-///
-/// CS4 polish: a tight `+A -D` diffstat for the ACTIVE changeset (there wasn't one before),
-/// tinted with the same [`Palette::add_strong`]/[`Palette::del_strong`] the summary panel's own
-/// totals line uses; in [`IconMode::Nerd`] mode the restack marker and diffstat prefixes swap
-/// to their nerd glyphs (same consts `build_outline_line`/`push_summary_body` use), and the
-/// active file's path gets its devicons file icon.
-fn render_winbar(frame: &mut Frame, app: &App, area: Rect, theme: &Palette) {
+/// CS1 (`pane-headers`)'s changeset-position prefix, prepended to the diff pane header only when
+/// the outline is CLOSED and the stack has more than one changeset (see [`diff_header_line`]) —
+/// with the outline open, the outline pane's own header ([`render_outline_header`]) already
+/// carries this information, so showing it twice would be redundant. `[i/n] {display_label}`,
+/// plus a glyph-ONLY (no "needs restack" text — that's the outline header's fuller treatment) `⚠`
+/// in `theme.warn_fg` when [`workon::Changeset::needs_restack`]. Ported verbatim from the old
+/// `render_winbar`'s equivalent prefix (locked decisions #8 + #9), minus the diffstat/path/icon
+/// tail that moved into [`file_segment_spans`]. `focused` (CS1, `header-chrome-follows-focus`)
+/// is the same flag [`diff_header_line`]'s own label receives — the `[i/n] {title}` text lights
+/// and dims with it via [`pane_header_label_style`], while the warn glyph keeps its semantic
+/// `theme.warn_fg` regardless (locked decision #2).
+fn changeset_prefix_spans(
+    app: &App,
+    theme: &Palette,
+    icons: IconMode,
+    focused: bool,
+) -> Vec<TSpan<'static>> {
     let cs = app.current_changeset();
     let i = app.current_cs() + 1;
     let n = app.changeset_count();
     let title = crate::app::display_label(cs);
-    let icons = app.icon_mode();
 
     let mut spans = vec![TSpan::styled(
         format!("[{i}/{n}] {title}"),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
+        pane_header_label_style(theme, focused),
     )];
     // A boolean-driven glyph + color (locked decision #9), not a title-string suffix — distinct
     // from the plain title so a stale-parent changeset reads as a heads-up at a glance.
     if cs.needs_restack {
         spans.push(TSpan::styled(
-            format!("  {} needs restack", warn_marker(icons)),
+            format!(" {}", warn_marker(icons)),
             Style::default()
                 .fg(theme.warn_fg)
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // A pending/failed changeset's `files()` is always empty (ADR-037) — skip the diffstat
-    // segment entirely rather than show a misleading "+0 -0".
-    if !app.files().is_empty() {
-        let (adds, dels) = app
-            .files()
-            .iter()
-            .map(crate::summary::file_diffstat)
-            .fold((0, 0), |(a, d), (fa, fd)| (a + fa, d + fd));
-        let (added_prefix, removed_prefix) = diffstat_prefixes(icons);
-        spans.push(TSpan::raw("  "));
-        spans.push(TSpan::styled(
-            format!("{added_prefix}{adds}"),
-            Style::default()
-                .fg(theme.add_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
-        spans.push(TSpan::raw(" "));
-        spans.push(TSpan::styled(
-            format!("{removed_prefix}{dels}"),
-            Style::default()
-                .fg(theme.del_strong)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    let fidx = app.current + 1;
-    let nfiles = app.files().len();
-    spans.push(TSpan::styled(
-        "  —  ".to_string(),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
-    ));
+    spans
+}
+
+/// The diff pane header's shared "current file" segment (CS1, `pane-headers`): `[fidx/nfiles] `
+/// and [`current_file_label`] both styled via [`pane_header_label_style`] (lit while `focused`,
+/// dim otherwise — CS1, `focused-pane-header`; the counter joined the label's lit/dim toggle in
+/// `header-chrome-follows-focus`, having previously stayed unconditionally bold), an optional
+/// nerd devicons file icon, a tight `+N -M` per-file diffstat (new: the old winbar only ever
+/// showed a CHANGESET-total
+/// diffstat, never a per-file one — [`crate::summary::file_diffstat`] gives the same recorded
+/// counts for a binary file as a text one, so this segment needs no binary special-case), and the
+/// pan-offset indicator. Used verbatim whether the outline is open, closed+lone, or closed+multi
+/// (with the changeset prefix ahead of it) — see [`diff_header_line`]'s state table. `focused` is
+/// resolved by the caller from [`EffectiveZoom`] + focus state, not computed here (locked
+/// decision #5: this segment is the diff pane header's own label, lit only when the diff has
+/// focus AND the effective zoom is [`EffectiveZoom::Single`] — under [`EffectiveZoom::Split`] a
+/// caption is the lit label instead, so this stays dim, EXCEPT when `render_body_split`'s own
+/// short-area fallback drops both captions, in which case this label lights up instead).
+fn file_segment_spans(
+    app: &App,
+    theme: &Palette,
+    icons: IconMode,
+    focused: bool,
+) -> Vec<TSpan<'static>> {
+    let idx = app.current + 1;
+    let n = app.files().len();
+    let mut spans = vec![TSpan::styled(
+        format!("[{idx}/{n}] "),
+        pane_header_label_style(theme, focused),
+    )];
     if icons == IconMode::Nerd {
         if let Some(f) = app.files().get(app.current) {
             let (icon, color) = crate::icons::icon_for_path(
                 &f.path,
                 crate::theme::is_light_background(theme.background),
             );
+            // Same palette-external collapse as the outline's icon paint site above — see
+            // `Palette::colorless`'s doc comment.
+            let icon_fg = if theme.colorless {
+                theme.foreground
+            } else {
+                color.unwrap_or(theme.foreground)
+            };
             spans.push(TSpan::styled(
                 format!("{icon} "),
-                Style::default()
-                    .fg(color.unwrap_or(theme.foreground))
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(icon_fg).add_modifier(Modifier::BOLD),
             ));
         }
     }
     spans.push(TSpan::styled(
-        format!("{} ({fidx}/{nfiles})", current_file_label(app)),
-        Style::default()
-            .fg(theme.foreground)
-            .add_modifier(Modifier::BOLD),
+        current_file_label(app),
+        pane_header_label_style(theme, focused),
     ));
+    if let Some(f) = app.files().get(app.current) {
+        let (adds, dels) = crate::summary::file_diffstat(f);
+        spans.extend(diffstat_spans(adds, dels, theme, icons));
+    }
     if let Some(span) = hscroll_indicator_span(app, theme) {
         spans.push(span);
     }
+    spans
+}
 
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+/// The diff pane's own top-row header (CS1, `pane-headers` — replacing the old global
+/// header/winbar row; see `render_body`'s header carve-out). Only covers the NON-summary states —
+/// [`render_body`] handles the summary-panel title separately, since that title comes from
+/// [`App::summary_for`] (called once per frame, not re-derived here). State table:
+///
+/// - Outline open: [`file_segment_spans`] alone (the outline pane's own header already carries
+///   the changeset-position context, so this stays file-focused).
+/// - Outline closed + `changeset_count() > 1`: [`changeset_prefix_spans`], then a bold `  —  `
+///   separator, then [`file_segment_spans`] — the closed outline hides `]c`/`[c`'s (Diff-view
+///   bindings, `keymap.rs`) changeset-nav feedback, so this prefix keeps it visible.
+/// - Outline closed + lone changeset: [`file_segment_spans`] alone (the pre-CS1 M4 look, now with
+///   a per-file diffstat it never had before).
+/// - Pending/failed/empty `files()` (ADR-037): the changeset prefix alone if
+///   `changeset_count() > 1 && !outline_open()`, else a blank row — never a misleading `[1/0]`.
+///   "Blank" still carries an explicit `theme.foreground`-styled space (not a zero-span [`Line`])
+///   — an empty span list leaves the row's cells at whatever style predates this frame's paint
+///   (`Style::default()`'s `Reset` fg, even under a painted canvas, since [`Buffer::set_line`]
+///   writes nothing for zero-width content) rather than the theme's own baseline (regression:
+///   `header_text_carries_the_theme_foreground_not_the_terminal_default`).
+///
+/// `focused` is `true` only when the diff pane's OWN header label should be lit — the caller
+/// ([`render_body`]) resolves this from the diff's focus state AND [`EffectiveZoom`] (locked
+/// decision #5): a Split zoom lights a caption instead (see [`render_body_split`]), so this stays
+/// dim even while the diff has focus in that case.
+fn diff_header_line(app: &App, theme: &Palette, icons: IconMode, focused: bool) -> Line<'static> {
+    let show_prefix = app.changeset_count() > 1 && !app.outline_open();
+
+    if app.current_failure().is_some() || app.is_current_pending() || app.files().is_empty() {
+        return if show_prefix {
+            Line::from(changeset_prefix_spans(app, theme, icons, focused))
+        } else {
+            Line::from(TSpan::styled(
+                " ".to_string(),
+                Style::default().fg(theme.foreground),
+            ))
+        };
+    }
+
+    let mut spans = Vec::new();
+    if show_prefix {
+        spans.extend(changeset_prefix_spans(app, theme, icons, focused));
+        spans.push(TSpan::styled(
+            "  —  ".to_string(),
+            Style::default()
+                .fg(theme.foreground)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    spans.extend(file_segment_spans(app, theme, icons, focused));
+    Line::from(spans)
 }
 
 /// Footer priority: a pending discard confirm's prompt (warn-toned) wins over a transient notice,
@@ -1245,6 +1562,7 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect, keymap: &Keymap, them
 /// Write a gap row's `··· N unchanged lines (Enter to expand) ···` marker across the FULL body
 /// width (both panes and the divider column) — unlike a per-pane content row, a gap hides the
 /// same span on both sides, so it isn't "about" one side or the other.
+#[allow(clippy::too_many_arguments)]
 fn render_gap_row(
     buf: &mut Buffer,
     area: Rect,
@@ -1253,12 +1571,13 @@ fn render_gap_row(
     is_cursor: bool,
     is_selected: bool,
     theme: &Palette,
+    focused: bool,
 ) {
     let msg = format!("··· {skipped} unchanged lines (Enter to expand) ···");
     let line = Line::from(TSpan::styled(msg, Style::default().fg(theme.dim)));
     // Cursor wins over selection on the same row.
     let line = if is_cursor {
-        apply_cursor_row(line, area.width, theme)
+        apply_cursor_row(line, area.width, theme, focused)
     } else if is_selected {
         apply_selection_row(line, area.width, theme)
     } else {
@@ -1307,23 +1626,17 @@ fn render_loading_placeholder(
 }
 
 /// Push a `"path  +N -M"` file row's spans onto `lines`: the path in the theme foreground, the
-/// add/del counts tinted with the theme's own diff-add/diff-del colors (the strong variants — the
-/// same tint a hunk's `+`/`-` gutter itself uses, see [`Palette::add_strong`]/
-/// [`Palette::del_strong`]) so the panel's diffstat reads consistently with the diff body it's
+/// add/del counts tinted with the theme's own diff-add/diff-del foregrounds ([`Palette::add_fg`]/
+/// [`Palette::del_fg`] — the same tint the outline's X/Y status letters use, see
+/// [`committed_letter_color`]) so the panel's diffstat reads consistently with the diff body it's
 /// standing in for.
 fn push_summary_file_row(lines: &mut Vec<Line<'static>>, row: &SummaryFileRow, theme: &Palette) {
     lines.push(Line::from(vec![
         TSpan::styled(row.path.clone(), Style::default().fg(theme.foreground)),
         TSpan::raw("  "),
-        TSpan::styled(
-            format!("+{}", row.adds),
-            Style::default().fg(theme.add_strong),
-        ),
+        TSpan::styled(format!("+{}", row.adds), Style::default().fg(theme.add_fg)),
         TSpan::raw(" "),
-        TSpan::styled(
-            format!("-{}", row.dels),
-            Style::default().fg(theme.del_strong),
-        ),
+        TSpan::styled(format!("-{}", row.dels), Style::default().fg(theme.del_fg)),
     ]));
 }
 
@@ -1379,38 +1692,39 @@ fn push_summary_body(
         TSpan::raw("  "),
         TSpan::styled(
             format!("{added_prefix}{total_adds}"),
-            Style::default().fg(theme.add_strong),
+            Style::default().fg(theme.add_fg),
         ),
         TSpan::raw(" "),
         TSpan::styled(
             format!("{removed_prefix}{total_dels}"),
-            Style::default().fg(theme.del_strong),
+            Style::default().fg(theme.del_fg),
         ),
     ]));
 }
 
-/// Build a [`ChangesetSummary`]'s lines: title line (the same current/needs-restack markers
+/// Build a [`ChangesetSummary`]'s title spans (the same current/needs-restack markers
 /// `build_outline_line`'s Header arm draws, structurally shared via [`changeset_title_spans`] —
 /// but passing `None` for that fn's `counter` param, so this title keeps its pre-CS1 plain-
-/// foreground look with no `[i/n]` counter; see [`changeset_title_spans`]'s doc comment), a
-/// loading/failed line OR the per-file list + totals line.
+/// foreground look with no `[i/n]` counter; see [`changeset_title_spans`]'s doc comment) and its
+/// body lines: a loading/failed line OR the per-file list + totals line. CS1 (`pane-headers`)
+/// split the return into `(title, body)` — the title now paints the diff pane's header row
+/// ([`render_body`]), and the body no longer duplicates it as its own first line.
 fn changeset_summary_lines(
     summary: &ChangesetSummary,
     height: usize,
     theme: &Palette,
     icons: IconMode,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-
-    lines.push(Line::from(changeset_title_spans(
+) -> (Vec<TSpan<'static>>, Vec<Line<'static>>) {
+    let title = changeset_title_spans(
         &summary.label,
         summary.current,
         summary.needs_restack,
         theme,
         icons,
         None,
-    )));
+    );
 
+    let mut lines = Vec::new();
     if summary.failed {
         let msg = summary
             .failure_message
@@ -1420,14 +1734,14 @@ fn changeset_summary_lines(
             format!("{} {msg}", error_marker(icons)),
             Style::default().fg(theme.error_fg),
         )));
-        return lines;
+        return (title, lines);
     }
     if summary.loading {
         lines.push(Line::from(TSpan::styled(
             format!("Loading{}", loading_marker(icons)),
             Style::default().fg(theme.dim),
         )));
-        return lines;
+        return (title, lines);
     }
 
     push_summary_body(
@@ -1439,29 +1753,32 @@ fn changeset_summary_lines(
         theme,
         icons,
     );
-    lines
+    (title, lines)
 }
 
-/// Build a [`DirSummary`]'s lines: a bold path title, a blank line, the per-file list, and the
-/// totals line — no current/restack/loading/failed markers (a directory carries none of those).
-/// The title gets [`crate::icons::DIR_ICON`] in [`IconMode::Nerd`] mode, matching the
-/// outline's own [`OutlineItem::Dir`] row (`build_outline_line`).
+/// Build a [`DirSummary`]'s title spans (a bold path line — no current/restack/loading/failed
+/// markers, a directory carries none of those; the title gets [`crate::icons::DIR_ICON`] in
+/// [`IconMode::Nerd`] mode, matching the outline's own [`OutlineItem::Dir`] row
+/// (`build_outline_line`)) and its body lines (the per-file list + totals line). CS1
+/// (`pane-headers`): see [`changeset_summary_lines`]'s doc comment for why this returns a
+/// `(title, body)` tuple now instead of one combined line list.
 fn dir_summary_lines(
     summary: &DirSummary,
     height: usize,
     theme: &Palette,
     icons: IconMode,
-) -> Vec<Line<'static>> {
+) -> (Vec<TSpan<'static>>, Vec<Line<'static>>) {
     let dir_icon = match icons {
         IconMode::Nerd => format!("{} ", crate::icons::DIR_ICON),
         IconMode::None => String::new(),
     };
-    let mut lines = vec![Line::from(TSpan::styled(
+    let title = vec![TSpan::styled(
         format!("{dir_icon}{}/", summary.path),
         Style::default()
             .fg(theme.foreground)
             .add_modifier(Modifier::BOLD),
-    ))];
+    )];
+    let mut lines = Vec::new();
     push_summary_body(
         &mut lines,
         &summary.files,
@@ -1471,38 +1788,91 @@ fn dir_summary_lines(
         theme,
         icons,
     );
-    lines
+    (title, lines)
 }
 
 /// CS4's summary panel: renders in place of the diff body while the outline is open and focused
-/// with its cursor on a Header/Dir row (see [`App::summary_target`]) — a title line, a blank
-/// line, per-file `"path  +N -M"` rows (truncated to the pane height), and a totals line. A
-/// loading/failed Header shows its own inline state instead of a file list (see
-/// [`changeset_summary_lines`]).
+/// with its cursor on a Header/Dir row (see [`App::summary_target`]) — per-file `"path  +N -M"`
+/// rows (truncated to the pane height) and a totals line, painted into `area` (the diff pane's
+/// header row is carved out by the caller, [`render_body`], before this ever runs — CS1,
+/// `pane-headers`). Returns the title [`Line`] so the caller can paint it into that header row;
+/// this fn itself paints only the body. A loading/failed Header shows its own inline state
+/// instead of a file list (see [`changeset_summary_lines`]).
 fn render_summary(
     frame: &mut Frame,
     summary: &Summary,
     area: Rect,
     theme: &Palette,
     icons: IconMode,
-) {
+) -> Line<'static> {
     let height = area.height as usize;
-    let lines = match summary {
+    let (title, lines) = match summary {
         Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme, icons),
         Summary::Dir(dir) => dir_summary_lines(dir, height, theme, icons),
     };
     frame.render_widget(Paragraph::new(lines), area);
+    Line::from(title)
 }
 
 fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
+    let icons = app.icon_mode();
+
+    // CS1 (`pane-headers`): row 0 of the diff pane's own rect is its header — every branch below
+    // (summary panel, pending/failed/empty, binary, normal file) shares this same carve-out, so
+    // it happens once, up front. CS1 risk: this `>= 2` guard must exist in BOTH pane renderers
+    // (see `render_outline`'s matching carve-out) — a 1-row (or shorter) terminal has no room to
+    // spare for a header at all, so `header_area` is `None` and `area` (shadowed below) stays the
+    // full rect. Every content row keeps its exact prior y-coordinate: the row that moved out of
+    // `render`'s top-level layout reappears as this per-pane carve-out.
+    let (header_area, area) = if area.height >= 2 {
+        (
+            Some(Rect::new(area.x, area.y, area.width, 1)),
+            Rect::new(area.x, area.y + 1, area.width, area.height - 1),
+        )
+    } else {
+        (None, area)
+    };
+
     // CS4: the outline is open AND focused, and its cursor rests on a Header/Dir row — show that
     // row's summary instead of a file's diff. Checked before every other body gate below (an
     // unfocused open outline, or the cursor on a File row, falls straight through to the usual
     // diff-body rendering; `summary_target` returns `None` in both cases).
     if let Some(target) = app.summary_target() {
+        // Built exactly once per frame (CS1 risk: never call `summary_for` twice) — its title
+        // spans paint the header row below, its body-only lines paint `render_summary`'s content.
         let summary = app.summary_for(target);
-        render_summary(frame, &summary, area, theme, app.icon_mode());
+        let title = render_summary(frame, &summary, area, theme, icons);
+        if let Some(header_area) = header_area {
+            frame
+                .buffer_mut()
+                .set_line(header_area.x, header_area.y, &title, header_area.width);
+        }
         return;
+    }
+
+    if let Some(header_area) = header_area {
+        // CS1 (`focused-pane-header`, locked decision #5): the diff header label lights up only
+        // when the diff has focus AND its effective (not requested) zoom is `Single` — a `Split`
+        // zoom lights the focused half's caption instead (see `render_body_split`), and the
+        // outline holding focus dims every diff-side label. `effective_zoom_for` is cheap and
+        // already re-derived every frame elsewhere in this fn (locked decision #3), so no caching
+        // concern here either.
+        //
+        // Exception: `render_body_split`'s own short-area fallback (`area.height < 4`) renders
+        // only the focused pane and returns before either caption is drawn — no split caption
+        // survives to be the frame's lit label. `area` here is the exact same rect that fallback
+        // gates on (both derive from the header carve-out above), so this branch mirrors that
+        // check and lights the diff header instead, preserving the exactly-one-lit-label
+        // invariant.
+        let diff_header_focused = !app.outline_focused()
+            && match app.effective_zoom_for(app.current) {
+                EffectiveZoom::Single(_) => true,
+                EffectiveZoom::Split => area.height < 4,
+            };
+        let line = diff_header_line(app, theme, icons, diff_header_focused);
+        frame
+            .buffer_mut()
+            .set_line(header_area.x, header_area.y, &line, header_area.width);
     }
     // ADR-037: the active changeset's diff hasn't been acquired (or failed to acquire) yet —
     // both cases have an empty `files()` list, so they must be checked BEFORE the "(no changes)"
@@ -1560,12 +1930,16 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
             let cursor = Some(app.cursor);
             // The single pane is the focused one, so it shows any active selection.
             let selection = app.selection_range();
+            // CS1 (`unfocused-cursor-wash`, locked decision #1): the single/combined diff body's
+            // cursor dims to the unfocused wash while the outline holds focus instead — it never
+            // holds real focus itself in that state.
+            let focused = !app.outline_focused();
             match app.layout {
                 AppLayout::Sbs => render_pane_sbs(
-                    frame, app, area, idx, role, scroll, cursor, selection, theme,
+                    frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
                 ),
                 AppLayout::Inline => render_pane_inline(
-                    frame, app, area, idx, role, scroll, cursor, selection, theme,
+                    frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
                 ),
             }
         }
@@ -1579,6 +1953,12 @@ fn render_body(frame: &mut Frame, app: &mut App, area: Rect, theme: &Palette) {
 /// unstaged-content + caption(1) + staged-content, with the remainder halved between the two
 /// content panes (even split).
 fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, theme: &Palette) {
+    // CS1 (`focused-pane-header`, locked decision #5's split case): the outline holding focus
+    // dims BOTH captions (the outline header is the frame's one lit label); otherwise exactly the
+    // focused half's caption lights up, matching `split_focus_role()` — never derived from the
+    // requested `Zoom`, since this fn only ever runs once `effective_zoom_for` has already
+    // resolved to `Split` (see `render_body`'s caller).
+    let outline_focused = app.outline_focused();
     // Too short to fit two captions plus a content line each: fall back to the focused pane alone,
     // rendered over the whole area, so the user still sees SOMETHING navigable.
     if area.height < 4 {
@@ -1586,12 +1966,15 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
         app.pane_height = area.height as usize;
         let (scroll, cursor) = app.pane_render_state(role);
         let selection = app.selection_range();
+        // `split_focus_role()`'s pane is only the frame's REAL focus while the outline doesn't
+        // hold it (same rule as the split's two-caption branch below).
+        let focused = !outline_focused;
         match app.layout {
             AppLayout::Sbs => render_pane_sbs(
-                frame, app, area, idx, role, scroll, cursor, selection, theme,
+                frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
             ),
             AppLayout::Inline => render_pane_inline(
-                frame, app, area, idx, role, scroll, cursor, selection, theme,
+                frame, app, area, idx, role, scroll, cursor, selection, theme, focused,
             ),
         }
         return;
@@ -1622,16 +2005,35 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
     app.clamp_scroll();
     app.clamp_alt_scroll();
 
-    render_caption(frame.buffer_mut(), unstaged_caption, "UNSTAGED", theme);
-    render_caption(frame.buffer_mut(), staged_caption, "STAGED", theme);
+    // Each half's REAL focus (CS1, `unfocused-cursor-wash` — locked decisions #1/#5): the outline
+    // holding focus means neither half does. Computed once here and reused by both
+    // `render_caption` calls below and the pane render calls further down; a selection lives in
+    // the focused pane only, so it gates on `focused` too (not on `cursor`, which the unfocused
+    // half now always carries — its remembered position, per `App::pane_render_state`'s updated
+    // doc comment).
+    let u_focused = !outline_focused && app.split_focus_role() == Role::Unstaged;
+    let s_focused = !outline_focused && app.split_focus_role() == Role::Staged;
+
+    render_caption(
+        frame.buffer_mut(),
+        unstaged_caption,
+        "UNSTAGED",
+        theme,
+        u_focused,
+    );
+    render_caption(
+        frame.buffer_mut(),
+        staged_caption,
+        "STAGED",
+        theme,
+        s_focused,
+    );
 
     let (u_scroll, u_cursor) = app.pane_render_state(Role::Unstaged);
     let (s_scroll, s_cursor) = app.pane_render_state(Role::Staged);
-    // A selection lives in the focused pane only — the one whose `pane_render_state` yields a
-    // cursor. Show it there, `None` in the unfocused pane.
     let range = app.selection_range();
-    let u_selection = u_cursor.and(range);
-    let s_selection = s_cursor.and(range);
+    let u_selection = if u_focused { range } else { None };
+    let s_selection = if s_focused { range } else { None };
     match app.layout {
         AppLayout::Sbs => {
             render_pane_sbs(
@@ -1644,6 +2046,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 u_cursor,
                 u_selection,
                 theme,
+                u_focused,
             );
             render_pane_sbs(
                 frame,
@@ -1655,6 +2058,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 s_cursor,
                 s_selection,
                 theme,
+                s_focused,
             );
         }
         AppLayout::Inline => {
@@ -1668,6 +2072,7 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 u_cursor,
                 u_selection,
                 theme,
+                u_focused,
             );
             render_pane_inline(
                 frame,
@@ -1679,22 +2084,37 @@ fn render_body_split(frame: &mut Frame, app: &mut App, area: Rect, idx: usize, t
                 s_cursor,
                 s_selection,
                 theme,
+                s_focused,
             );
         }
     }
 }
 
-/// Write a split pane's role caption (`── LABEL ──`) across the pane width, styled like the dim
-/// gap-row markers.
-fn render_caption(buf: &mut Buffer, area: Rect, label: &str, theme: &Palette) {
-    let text = format!("── {label} ──");
-    let line = Line::from(TSpan::styled(text, Style::default().fg(theme.dim)));
+/// Write a split pane's role caption (`── LABEL ────…`) across the FULL pane width — the rule
+/// runs to the right edge so the staged pane's caption row doubles as the horizontal divider
+/// between the split's two panes, matching the outline↔diff and side-by-side `│` rules (same
+/// `theme.dim`) without spending a dedicated divider row. The `──` rule characters always stay
+/// `theme.dim` (locked decision #4, `focused-pane-header` — label text only); only the label
+/// word itself takes [`pane_header_label_style`], lit while `focused`.
+fn render_caption(buf: &mut Buffer, area: Rect, label: &str, theme: &Palette, focused: bool) {
+    let rule_style = Style::default().fg(theme.dim);
+    let used = 3 + label.chars().count() + 1; // "── " + label + " "
+    let fill = (area.width as usize).saturating_sub(used);
+    let line = Line::from(vec![
+        TSpan::styled("── ", rule_style),
+        TSpan::styled(label.to_string(), pane_header_label_style(theme, focused)),
+        TSpan::styled(format!(" {}", "─".repeat(fill)), rule_style),
+    ]);
     buf.set_line(area.x, area.y, &line, area.width);
 }
 
 /// Render one SBS pane of `role`'s view for file `idx` into `area`, scrolled to `scroll`. The
-/// cursor-row highlight draws only when `cursor` is `Some` (the focused pane) and matches a visible
-/// row — a split's unfocused pane passes `None`.
+/// cursor-row highlight draws whenever `cursor` is `Some` and matches a visible row — this now
+/// includes an unfocused split half's REMEMBERED cursor (CS1, `unfocused-cursor-wash`; previously
+/// unfocused passed `None` and drew no cursor at all). `focused` says which wash that row gets:
+/// full [`Palette::cursor_bg`] when this pane holds real focus, the dim
+/// [`Palette::cursor_unfocused_bg`] otherwise — resolved by the caller from app state
+/// (`outline_focused`, `split_focus_role`), never guessed here from `cursor`/`selection` alone.
 #[allow(clippy::too_many_arguments)]
 fn render_pane_sbs(
     frame: &mut Frame,
@@ -1706,6 +2126,7 @@ fn render_pane_sbs(
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
     theme: &Palette,
+    focused: bool,
 ) {
     let left_w = area.width.saturating_sub(1) / 2;
     let right_w = area.width.saturating_sub(1).saturating_sub(left_w);
@@ -1723,6 +2144,8 @@ fn render_pane_sbs(
     // One offset shared by every content pane (locked decision #1) — read once, before any of
     // the `app` borrows below.
     let hscroll = app.hscroll;
+    // `workon.review.diff.text` (CS11) — read once per frame, same posture as `hscroll` above.
+    let text_mode = app.diff_text;
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), old_area);
@@ -1777,6 +2200,7 @@ fn render_pane_sbs(
                     is_cursor,
                     is_selected,
                     theme,
+                    focused,
                 );
             }
             DisplayRow::Row(row) => {
@@ -1799,6 +2223,7 @@ fn render_pane_sbs(
                     old_area.width as usize,
                     theme,
                     hscroll,
+                    text_mode,
                 );
                 let new_line = build_pane_line(
                     view,
@@ -1812,12 +2237,13 @@ fn render_pane_sbs(
                     new_area.width as usize,
                     theme,
                     hscroll,
+                    text_mode,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let (old_line, new_line) = if is_cursor {
                     (
-                        apply_cursor_row(old_line, old_area.width, theme),
-                        apply_cursor_row(new_line, new_area.width, theme),
+                        apply_cursor_row(old_line, old_area.width, theme, focused),
+                        apply_cursor_row(new_line, new_area.width, theme, focused),
                     )
                 } else if is_selected {
                     (
@@ -1842,12 +2268,15 @@ fn render_pane_sbs(
                 // The divider column was painted once for the whole pane height above, with the
                 // default background; re-tint just this row's divider cell so the cursor wash
                 // covers the full width (panes AND the `│` between them), like `render_gap_row`.
+                // Must carry whichever wash the row actually got — full when `focused`, dim
+                // otherwise — or the divider cell stays bright on a dimmed row.
                 if is_cursor {
+                    let tint = cursor_tint(theme, focused);
                     frame.buffer_mut().set_string(
                         div_area.x,
                         y,
                         "│",
-                        Style::default().fg(theme.dim).bg(theme.cursor_bg),
+                        Style::default().fg(theme.dim).bg(tint),
                     );
                 }
             }
@@ -1881,6 +2310,7 @@ fn build_inline_line(
     new_gutter_w: usize,
     theme: &Palette,
     hscroll: usize,
+    text_mode: DiffTextMode,
 ) -> Line<'static> {
     let (old_opt, new_opt, text, hl, kind) = match *row {
         InlineRow::Context { old, new } => (
@@ -1920,8 +2350,22 @@ fn build_inline_line(
     // `kind` is always Del/Add/Context here — inline has no Filler rows. `old_opt`/`new_opt`
     // carry the exact lineno each kind is documented to have (see this fn's own match above).
     let emphasis = match kind {
-        CellKind::Del => old_opt.map(|n| del_bg_pair(mode, n as u32, theme)),
-        CellKind::Add => new_opt.map(|n| add_bg_pair(mode, n as u32, theme)),
+        CellKind::Del => old_opt.map(|n| {
+            let (line_bg, edit_bg) = del_bg_pair(mode, n as u32, theme);
+            LineEmphasis {
+                line_bg,
+                edit_bg,
+                tint_fg: del_tint_fg(mode, n as u32, theme),
+            }
+        }),
+        CellKind::Add => new_opt.map(|n| {
+            let (line_bg, edit_bg) = add_bg_pair(mode, n as u32, theme);
+            LineEmphasis {
+                line_bg,
+                edit_bg,
+                tint_fg: add_tint_fg(mode, n as u32, theme),
+            }
+        }),
         CellKind::Context | CellKind::Filler => None,
     };
     spans.extend(content_spans(
@@ -1932,6 +2376,7 @@ fn build_inline_line(
         is_word_pair,
         theme,
         hscroll,
+        text_mode,
     ));
     Line::from(spans)
 }
@@ -1950,10 +2395,13 @@ fn render_pane_inline(
     cursor: Option<usize>,
     selection: Option<(usize, usize)>,
     theme: &Palette,
+    focused: bool,
 ) {
     // One offset shared by every content pane (locked decision #1) — read once, before any of
     // the `app` borrows below.
     let hscroll = app.hscroll;
+    // `workon.review.diff.text` (CS11) — read once per frame, same posture as `hscroll` above.
+    let text_mode = app.diff_text;
 
     let Some(view) = app.role_view_ref(idx, role) else {
         frame.render_widget(Paragraph::new("(failed to load file)"), area);
@@ -1995,6 +2443,7 @@ fn render_pane_inline(
                     is_cursor,
                     is_selected,
                     theme,
+                    focused,
                 );
             }
             row => {
@@ -2017,10 +2466,11 @@ fn render_pane_inline(
                     new_gutter_w,
                     theme,
                     hscroll,
+                    text_mode,
                 );
                 // Cursor wins over selection on the same row (see [`Palette::selection_bg`]).
                 let line = if is_cursor {
-                    apply_cursor_row(line, area.width, theme)
+                    apply_cursor_row(line, area.width, theme, focused)
                 } else if is_selected {
                     apply_selection_row(line, area.width, theme)
                 } else {
@@ -2039,20 +2489,25 @@ fn render_pane_inline(
 mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
-    use ratatui::style::Style;
+    use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::Span as TSpan;
     use ratatui::Terminal;
 
     use git_workon_fixture::prelude::*;
     use unicode_width::UnicodeWidthChar;
 
-    use super::{hscroll_cut, pan_spans, render, STATUS_PLACEHOLDER};
+    use super::{
+        changeset_prefix_spans, compose_segments, content_spans, hscroll_cut, pan_spans,
+        pane_header_label_style, render, LineEmphasis, STATUS_PLACEHOLDER,
+    };
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
-    use crate::app::App;
+    use crate::app::{App, DiffTextMode, EffectiveZoom, Role};
+    use crate::highlight::FgSpan;
     use crate::keymap::Keymap;
     use crate::outline::OutlineItem;
     use crate::theme::Palette;
+    use crate::wordiff::Span as WordSpan;
 
     /// Render one frame against the default (unrebound) keymap and the dark theme — the vast
     /// majority of `render.rs` tests don't care about keybindings and only ever ran dark. Tests
@@ -2066,6 +2521,210 @@ mod tests {
         let theme = Palette::dark();
         terminal.draw(|f| render(f, app, &keymap, &theme)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn compose_segments_marks_comment_captures_italic() {
+        // The italics are structural (crate::theme::SYNTAX_ITALICS), resolved per capture at the
+        // same place the syntax color is — a comment segment carries italic, its neighbors don't.
+        let theme = Palette::dark();
+        let comment = crate::highlight::capture_index("comment").unwrap();
+        let keyword = crate::highlight::capture_index("keyword").unwrap();
+        let fgs = vec![
+            FgSpan {
+                start: 0,
+                end: 4,
+                capture: comment,
+            },
+            FgSpan {
+                start: 4,
+                end: 8,
+                capture: keyword,
+            },
+        ];
+        let segments = compose_segments(8, &[], Some(&fgs), &[], &theme);
+        assert!(segments[0].italic, "comment segment renders italic");
+        assert!(!segments[1].italic, "keyword segment stays upright");
+    }
+
+    // ── CS11: `workon.review.diff.text` (`DiffTextMode`) foreground selection ──────────
+
+    /// Every span's resolved foreground, in order — the shape these `content_spans` tests
+    /// assert on, since `Style` doesn't expose its fg as a bare `Color` any other way.
+    fn fgs_of(spans: &[TSpan<'static>]) -> Vec<Option<Color>> {
+        spans.iter().map(|s| s.style.fg).collect()
+    }
+
+    #[test]
+    fn content_spans_syntax_mode_ignores_tint_fg_entirely() {
+        // The changeset's primary gate (ADR-035 CS11): with `text_mode: Syntax`, `tint_fg` must
+        // never reach the output — a `Del`/`Add` line renders byte-identically whether `tint_fg`
+        // is `Some` or `None`, for both a paired (word-diff) and an unpaired (excess) line.
+        let theme = Palette::dark();
+        let emphasis = |tint_fg| {
+            Some(LineEmphasis {
+                line_bg: theme.del_line_bg,
+                edit_bg: theme.del_edit_bg,
+                tint_fg,
+            })
+        };
+        let word_spans = [WordSpan { start: 0, end: 2 }];
+
+        for (is_word_pair, words) in [(true, word_spans.as_slice()), (false, &[])] {
+            let with_tint = content_spans(
+                "hello",
+                None,
+                emphasis(theme.del_fg),
+                words,
+                is_word_pair,
+                &theme,
+                0,
+                DiffTextMode::Syntax,
+            );
+            let without_tint = content_spans(
+                "hello",
+                None,
+                emphasis(theme.foreground),
+                words,
+                is_word_pair,
+                &theme,
+                0,
+                DiffTextMode::Syntax,
+            );
+            assert_eq!(
+                with_tint, without_tint,
+                "Syntax mode must ignore tint_fg (is_word_pair={is_word_pair})"
+            );
+            // And it must actually resolve through syntax/theme.foreground, not the tint, so
+            // this isn't vacuously true from both sides being untinted the same wrong way.
+            assert!(
+                fgs_of(&with_tint)
+                    .iter()
+                    .all(|fg| *fg != Some(theme.del_fg)),
+                "Syntax mode must never paint the tint foreground"
+            );
+        }
+    }
+
+    #[test]
+    fn content_spans_context_lines_never_take_tint_fg_in_any_mode() {
+        // Locked decision #3: the knob governs changed lines only. `emphasis: None` is what
+        // marks a Context/Filler line — since `LineEmphasis` bundles the tint foreground with the
+        // background wash it belongs to, `None` rules both out together by construction, so no
+        // mode can paint a tint foreground with no edit/line wash for it to attach meaning to.
+        let theme = Palette::dark();
+        for mode in [DiffTextMode::Syntax, DiffTextMode::Tint, DiffTextMode::Edit] {
+            let spans = content_spans("hello", None, None, &[], false, &theme, 0, mode);
+            assert!(
+                fgs_of(&spans)
+                    .iter()
+                    .all(|fg| *fg == Some(theme.foreground)),
+                "context line must render plain (no tint fg) under {mode:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_spans_tint_mode_paints_the_tint_fg_across_the_full_line() {
+        let theme = Palette::dark();
+        let emphasis = Some(LineEmphasis {
+            line_bg: theme.add_line_bg,
+            edit_bg: theme.add_edit_bg,
+            tint_fg: theme.add_fg,
+        });
+        let spans = content_spans(
+            "hello",
+            None,
+            emphasis,
+            &[WordSpan { start: 0, end: 2 }],
+            true,
+            &theme,
+            0,
+            DiffTextMode::Tint,
+        );
+        assert!(
+            fgs_of(&spans).iter().all(|fg| *fg == Some(theme.add_fg)),
+            "Tint mode must paint every segment of a changed line with the tint fg: {:?}",
+            fgs_of(&spans)
+        );
+    }
+
+    #[test]
+    fn content_spans_edit_mode_paints_only_the_word_span_on_a_paired_line() {
+        let theme = Palette::dark();
+        let emphasis = Some(LineEmphasis {
+            line_bg: theme.add_line_bg,
+            edit_bg: theme.add_edit_bg,
+            tint_fg: theme.add_fg,
+        });
+        // "hello" with the word span covering only "he" (bytes 0..2) — the rest of the line
+        // should keep its syntax/plain foreground, not the tint.
+        let spans = content_spans(
+            "hello",
+            None,
+            emphasis,
+            &[WordSpan { start: 0, end: 2 }],
+            true,
+            &theme,
+            0,
+            DiffTextMode::Edit,
+        );
+        let tinted: Vec<&TSpan> = spans
+            .iter()
+            .filter(|s| s.style.fg == Some(theme.add_fg))
+            .collect();
+        let plain: Vec<&TSpan> = spans
+            .iter()
+            .filter(|s| s.style.fg != Some(theme.add_fg))
+            .collect();
+        assert!(!tinted.is_empty(), "the word span itself must be tinted");
+        assert!(
+            !plain.is_empty(),
+            "the rest of a paired line must NOT be tinted in Edit mode"
+        );
+        assert_eq!(
+            tinted
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "he",
+            "only the word-diff range takes the tint fg"
+        );
+    }
+
+    #[test]
+    fn content_spans_edit_mode_paints_the_full_unpaired_line_matching_the_edit_wash() {
+        // Locked decision #4, the invariant this changeset exists to hold: an unpaired line (no
+        // word-diff counterpart) takes the edit background wash across its FULL width
+        // (`content_spans`' own `is_word_pair == false` branch) — so in Edit mode it must take
+        // the tint foreground across that exact same full width, never a subset and never none.
+        let theme = Palette::dark();
+        let emphasis = Some(LineEmphasis {
+            line_bg: theme.del_line_bg,
+            edit_bg: theme.del_edit_bg,
+            tint_fg: theme.del_fg,
+        });
+        let spans = content_spans(
+            "hello",
+            None,
+            emphasis,
+            &[], // no word spans: this line has no pair to word-diff against
+            false,
+            &theme,
+            0,
+            DiffTextMode::Edit,
+        );
+        assert!(
+            fgs_of(&spans).iter().all(|fg| *fg == Some(theme.del_fg)),
+            "wherever the edit wash is painted (here: the whole unpaired line), the tint \
+             foreground must be painted too: {:?}",
+            fgs_of(&spans)
+        );
+        // And the background side of the same invariant, unchanged by this changeset — the edit
+        // wash really does cover the full width here, which is what makes the fg assertion above
+        // meaningful rather than accidental.
+        let segments = compose_segments(5, &[(0, 5, theme.del_edit_bg)], None, &[], &theme);
+        assert!(segments.iter().all(|s| s.bg == Some(theme.del_edit_bg)));
     }
 
     /// Like [`render_once`] but with a caller-chosen theme — for the canvas-paint tests, which
@@ -2086,6 +2745,48 @@ mod tests {
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| cell_text(buf, x, y)).collect())
             .collect()
+    }
+
+    /// Find the row (by line index) whose caption reads `label` — e.g. "UNSTAGED" or "STAGED".
+    /// The `label != "STAGED" || !line.contains("UNSTAGED")` guard disambiguates the two: the
+    /// UNSTAGED caption row's tail can itself contain the substring "STAGED".
+    fn caption_row(content: &[String], label: &str) -> usize {
+        content
+            .iter()
+            .position(|line| {
+                line.contains(label) && (label != "STAGED" || !line.contains("UNSTAGED"))
+            })
+            .unwrap_or_else(|| panic!("{label} caption present"))
+    }
+
+    /// Find the first row in `start..end` whose text (columns `x0..buf.area.width`, so callers can
+    /// exclude an outline/gutter to the left) contains `text`. Used by the split-half cursor-wash
+    /// tests to locate each pane's cursor row bounded to that pane's own row range, disambiguating
+    /// text that appears once per pane.
+    fn find_row(buf: &Buffer, x0: u16, start: usize, end: usize, text: &str) -> u16 {
+        (start..end)
+            .find(|&y| {
+                (x0..buf.area.width)
+                    .map(|x| cell_text(buf, x, y as u16))
+                    .collect::<String>()
+                    .contains(text)
+            })
+            .unwrap_or_else(|| panic!("row containing {text:?} not found in {start}..{end}"))
+            as u16
+    }
+
+    /// Find `label`'s starting display COLUMN within `row` — a `chars()` window search (not
+    /// `String::find`'s byte offset), matching the convention several outline/summary-header tests
+    /// already use for a row that may carry multi-byte glyphs (`•`/`⚠`) ahead of the label; every
+    /// rendered cell here is exactly one column wide, so a `chars()` position IS the display
+    /// column, as long as `row` starts at buffer column 0 (true for every `buf_lines` row).
+    fn find_label_x(row: &str, label: &str) -> u16 {
+        let label_chars: Vec<char> = label.chars().collect();
+        let row_chars: Vec<char> = row.chars().collect();
+        row_chars
+            .windows(label_chars.len())
+            .position(|w| w == label_chars.as_slice())
+            .unwrap_or_else(|| panic!("label {label:?} not found in row {row:?}")) as u16
     }
 
     #[test]
@@ -2126,8 +2827,8 @@ mod tests {
             content.join("\n")
         );
 
-        // Word-diff emphasis: the changed word ("old"/"new") on the paired row should carry a
-        // strong background distinct from the rest of the line's subtle background.
+        // Word-diff emphasis: the changed word ("old"/"new") on the paired row should carry the
+        // edit background distinct from the rest of the line's line background.
         let changed_row_y = content
             .iter()
             .position(|line| line.contains("old word here"))
@@ -2147,22 +2848,22 @@ mod tests {
             "expected the word-diff row to carry a background style distinct from plain context"
         );
 
-        // The changed word ("old", bytes 0..3 → columns 4..7) must carry the STRONG emphasis
+        // The changed word ("old", bytes 0..3 → columns 4..7) must carry the EDIT emphasis
         // while the unchanged remainder of the same paired line ("word here", from column 8)
-        // stays subtle — three distinct backgrounds: strong word, subtle line, unstyled
+        // stays at the line wash — three distinct backgrounds: edit word, line, unstyled
         // context. This pins the compositor's span precedence (specific-over-whole-line); a
-        // first-match lookup renders the whole line subtle and only the ctx comparison above
-        // would still pass.
+        // first-match lookup renders the whole line at the line wash and only the ctx comparison
+        // above would still pass.
         let rest_cell = buf.cell((8, changed_row_y)).unwrap();
         assert_ne!(
             word_cell.style().bg,
             rest_cell.style().bg,
-            "expected the changed word's strong bg to differ from the line's subtle bg"
+            "expected the changed word's edit bg to differ from the line's bg"
         );
         assert_ne!(
             rest_cell.style().bg,
             ctx_cell.style().bg,
-            "expected the paired line's subtle bg to differ from plain context"
+            "expected the paired line's bg to differ from plain context"
         );
     }
 
@@ -2505,7 +3206,7 @@ mod tests {
     #[test]
     fn cursor_row_tint_composites_with_word_diff_emphasis_rather_than_replacing_it() {
         // The cursor starts on the file's first hunk (a word-diff paired row) after
-        // `open_current` — confirm the strong word-level bg and the whole-line subtle bg on that
+        // `open_current` — confirm the edit word-level bg and the whole-line bg on that
         // SAME row both stay visually distinct from each other even with the cursor tint
         // layered on top, i.e. the tint composites rather than flattening the existing emphasis.
         let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nold word here\nl10\nl11\nl12\nl13\nl14\n";
@@ -2532,7 +3233,7 @@ mod tests {
         let rest_bg = buf.cell((8, changed_row_y)).unwrap().style().bg;
         assert_ne!(
             word_bg, rest_bg,
-            "the cursor tint must not flatten the word-diff strong/subtle distinction on its \
+            "the cursor tint must not flatten the word-diff edit/line distinction on its \
              own row"
         );
     }
@@ -2590,10 +3291,47 @@ mod tests {
     }
 
     #[test]
+    fn split_captions_rule_runs_the_full_pane_width_as_the_pane_divider() {
+        // The staged caption row is the only seam between the split's two panes — its rule must
+        // reach the right edge to read as a divider (dogfood feedback: the split lacked a rule
+        // like the outline↔diff and side-by-side ones).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let buf = render_once(&mut app, 80, 24);
+        let content = buf_lines(&buf);
+
+        for label in ["UNSTAGED", "STAGED"] {
+            let cap = caption_row(&content, label);
+            let row = content[cap].trim_end();
+            assert_eq!(
+                row.chars().count(),
+                80,
+                "{label} caption must span the full pane width, got: {row:?}"
+            );
+            assert_eq!(
+                row.chars().last(),
+                Some('─'),
+                "{label} caption must end in the rule glyph, got: {row:?}"
+            );
+        }
+    }
+
+    #[test]
     fn single_pane_zoom_is_identical_to_combined_for_an_unstaged_only_file() {
         // The common case: a dirty-but-unstaged file. The default split gate downgrades it to a
         // single unstaged pane, whose view is byte-for-byte the combined view (index == HEAD when
-        // nothing is staged) — so a user who never presses `z` sees exactly the pre-zoom app.
+        // nothing is staged) — so a user who never presses `Z` sees exactly the pre-zoom app.
         let old = "l1\nl2\nl3\nl4\nl5\nold word here\nl7\nl8\nl9\nl10\n";
         let new = "l1\nl2\nl3\nl4\nl5\nnew word here\nl7\nl8\nl9\nl10\n";
         let fixture = FixtureBuilder::new()
@@ -2665,7 +3403,7 @@ mod tests {
             .expect("unstaged change's old-side text visible");
 
         // Old (left) pane, first content column after the gutter — always carries SOME del
-        // emphasis on a changed row, subtle or strong depending on the word-diff split, but
+        // emphasis on a changed row, line or edit depending on the word-diff split, but
         // always from the dim family for a staged row and the bright family for an unstaged one.
         let old_content_x = 4; // gutter width 3 + 1 space, same convention as the other tests
         let staged_del_bg = buf
@@ -2680,8 +3418,8 @@ mod tests {
             .bg;
 
         let t = Palette::dark();
-        let dim_dels = [Some(t.del_staged_subtle), Some(t.del_staged_strong)];
-        let bright_dels = [Some(t.del_subtle), Some(t.del_strong)];
+        let dim_dels = [Some(t.del_staged_line_bg), Some(t.del_staged_edit_bg)];
+        let bright_dels = [Some(t.del_line_bg), Some(t.del_edit_bg)];
         assert!(
             dim_dels.contains(&staged_del_bg),
             "expected the staged row's Del side to use the dim pair, got {staged_del_bg:?}"
@@ -2709,8 +3447,8 @@ mod tests {
             .style()
             .bg;
 
-        let dim_adds = [Some(t.add_staged_subtle), Some(t.add_staged_strong)];
-        let bright_adds = [Some(t.add_subtle), Some(t.add_strong)];
+        let dim_adds = [Some(t.add_staged_line_bg), Some(t.add_staged_edit_bg)];
+        let bright_adds = [Some(t.add_line_bg), Some(t.add_edit_bg)];
         assert!(
             dim_adds.contains(&staged_add_bg),
             "expected the staged row's Add side to use the dim pair, got {staged_add_bg:?}"
@@ -2723,6 +3461,135 @@ mod tests {
             staged_add_bg, unstaged_add_bg,
             "staged and unstaged Add rows must render with visibly distinct backgrounds"
         );
+    }
+
+    #[test]
+    fn combined_view_tint_mode_colors_a_staged_change_dim_fg_and_an_unstaged_change_bright_fg() {
+        // Full-stack companion to `combined_view_colors_a_staged_change_dim_and_an_unstaged_change_
+        // bright`, same fixture/positions, but proving `workon.review.diff.text = tint`'s
+        // foreground threading end-to-end (App -> render_pane_sbs -> build_pane_line ->
+        // content_spans) rather than at the pure-function level: locked decision #6, the staged
+        // vs. unstaged tint foreground must follow the SAME attribution the backgrounds already
+        // use, not a second path.
+        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
+        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
+        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", committed, staged, workdir)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cycle_zoom(); // Split -> Combined
+        assert_eq!(app.zoom, crate::app::Zoom::Combined);
+        app.set_diff_text(DiffTextMode::Tint);
+        app.cursor = 0;
+        app.derive_scroll();
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+
+        let staged_row = content
+            .iter()
+            .position(|line| line.contains("old word here"))
+            .expect("staged change's old-side text visible");
+        let unstaged_row = content
+            .iter()
+            .position(|line| line.contains("old4 word four"))
+            .expect("unstaged change's old-side text visible");
+
+        let old_content_x = 4; // gutter width 3 + 1 space, same convention as the sibling test
+        let staged_del_fg = buf
+            .cell((old_content_x, staged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+        let unstaged_del_fg = buf
+            .cell((old_content_x, unstaged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+
+        let t = Palette::dark();
+        assert_eq!(
+            staged_del_fg,
+            Some(t.del_staged_fg),
+            "the staged row's Del side must take del_staged_fg, not del_fg"
+        );
+        assert_eq!(
+            unstaged_del_fg,
+            Some(t.del_fg),
+            "the unstaged row's Del side must take del_fg, not del_staged_fg"
+        );
+
+        let left_w = (buf.area.width.saturating_sub(1)) / 2;
+        let new_content_x = left_w + 1 + 4;
+        let staged_add_fg = buf
+            .cell((new_content_x, staged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+        let unstaged_add_fg = buf
+            .cell((new_content_x, unstaged_row as u16))
+            .unwrap()
+            .style()
+            .fg;
+
+        assert_eq!(
+            staged_add_fg,
+            Some(t.add_staged_fg),
+            "the staged row's Add side must take add_staged_fg, not add_fg"
+        );
+        assert_eq!(
+            unstaged_add_fg,
+            Some(t.add_fg),
+            "the unstaged row's Add side must take add_fg, not add_staged_fg"
+        );
+    }
+
+    #[test]
+    fn combined_view_syntax_mode_is_pixel_identical_regardless_of_attribution() {
+        // The changeset's primary identity gate, exercised on the exact fixture/positions the two
+        // tint-mode tests above use: with `diff.text` at its default (`Syntax`), the combined
+        // view's per-cell foreground for a staged AND an unstaged changed row must be unaffected
+        // by `DiffTextMode` — rendering under every mode variant applied to the SAME app state
+        // (only `diff_text` flipped) but reading it back to `Syntax` must reproduce the original
+        // frame exactly.
+        let committed = "l1\nold word here\nl3\nold4 word four\nl5\n";
+        let staged = "l1\nnew word here\nl3\nold4 word four\nl5\n";
+        let workdir = "l1\nnew word here\nl3\nnew4 word four\nl5\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("f.txt", committed, staged, workdir)
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.cycle_zoom(); // Split -> Combined
+        app.cursor = 0;
+        app.derive_scroll();
+
+        assert_eq!(
+            app.diff_text,
+            DiffTextMode::default(),
+            "test setup: diff_text must start at its unset/syntax default"
+        );
+        let baseline = render_once(&mut app, 60, 20);
+
+        for mode in [DiffTextMode::Tint, DiffTextMode::Edit] {
+            app.set_diff_text(mode);
+            let _ = render_once(&mut app, 60, 20); // render under a tinting mode, then...
+            app.set_diff_text(DiffTextMode::Syntax); // ...switch back before comparing.
+            let restored = render_once(&mut app, 60, 20);
+            assert_eq!(
+                baseline, restored,
+                "Syntax mode must render identically to the pre-CS11 baseline regardless of \
+                 what DiffTextMode {mode:?} was live before it"
+            );
+        }
     }
 
     #[test]
@@ -2903,9 +3770,9 @@ mod tests {
         );
     }
 
-    // ── M5 CS2: winbar (locked decisions #8 + #9) ─────────────────────────────
+    // ── CS1 (`pane-headers`): outline header + diff header, replacing the old global winbar ────
 
-    /// Build a two-committed-changeset stack for the winbar tests, hand-built the same way as
+    /// Build a two-committed-changeset stack for the pane-header tests, hand-built the same way as
     /// `app.rs`'s M5 CS1 tests (`Changeset` literal + `diff_changeset` +
     /// `ChangesetView::from_changeset_diff`): `cs-a` (`root..mid`, one file) then `cs-b`
     /// (`mid..head`, one file, `current` + `needs_restack`).
@@ -2966,15 +3833,19 @@ mod tests {
     }
 
     #[test]
-    fn winbar_shows_changeset_position_title_path_and_restack_marker() {
+    fn outline_header_shows_changeset_position_title_and_restack_marker() {
+        // CS1: with the outline open (a two-changeset stack's default), the changeset-position
+        // context lives in the OUTLINE pane's own header, not the diff pane's — the outline
+        // columns are x 0..35 at this width (see `OUTLINE_TEST_WIDTH`'s doc comment below).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open(), "a two-changeset stack default-opens");
 
         let buf = render_once(&mut app, 80, 20);
-        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        let header: String = (0..35).map(|x| cell_text(&buf, x, 0)).collect();
 
         assert!(
             header.contains("[2/2]"),
@@ -2988,19 +3859,88 @@ mod tests {
             header.contains("needs restack"),
             "expected the needs-restack marker, got: {header:?}"
         );
-        assert!(
-            header.contains("b.txt") && header.contains("(1/1)"),
-            "expected the active file's path and position, got: {header:?}"
-        );
     }
 
     #[test]
-    fn winbar_restack_marker_carries_the_warning_color() {
+    fn diff_header_shows_the_active_files_position_diffstat_and_path_when_outline_open() {
+        // CS1: with the outline open, the diff header shows ONLY the file segment (no changeset
+        // prefix — the outline's own header already carries that) — diff columns are x 36.. at
+        // this width.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open());
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
+
+        assert!(
+            header.contains("[1/1]") && header.contains("b.txt"),
+            "expected the active file's position and path, got: {header:?}"
+        );
+        // CS4: a tight '+A -D' diffstat for the ACTIVE FILE (b.txt, one-line file, committed
+        // with no prior content, adds one line and deletes nothing) — CS1 is what made this
+        // PER-FILE (the old winbar only ever showed a changeset-total diffstat).
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected a tight '+N -M' per-file diffstat fragment, got: {header:?}"
+        );
+        assert!(
+            !header.contains("[2/2]"),
+            "outline open: the diff header must not repeat the changeset-position prefix, \
+             got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn diff_header_carries_the_changeset_prefix_when_outline_closed() {
+        // CS1: closing the outline removes the pane that carried changeset-position context, so
+        // the diff header grows a `[i/n] <title-or-name> <restack-glyph>  —  ` prefix ahead of
+        // the file segment — this is what the old winbar used to show unconditionally.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline();
+        assert!(!app.outline_open());
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+
+        assert!(
+            header.contains("[2/2]") && header.contains("cs-b"),
+            "expected the changeset position counter and active changeset's name, \
+             got: {header:?}"
+        );
+        // The diff header's changeset prefix is glyph-ONLY (no "needs restack" text — that
+        // fuller treatment is the outline header's, see `changeset_prefix_spans`'s doc comment).
+        assert!(
+            header.contains('⚠'),
+            "expected the needs-restack glyph, got: {header:?}"
+        );
+        assert!(
+            header.contains("[1/1]") && header.contains("b.txt"),
+            "expected the active file's position and path, got: {header:?}"
+        );
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected the per-file diffstat fragment, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn diff_header_restack_marker_carries_the_warning_color_when_outline_closed() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        app.toggle_outline();
 
         let buf = render_once(&mut app, 80, 20);
         let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
@@ -3013,30 +3953,13 @@ mod tests {
     }
 
     #[test]
-    fn winbar_shows_a_tight_diffstat_for_the_active_changeset() {
-        // CS4: the winbar previously showed no diffstat at all — cs-b adds a single line
-        // (`b.txt`, one-line file, committed with no prior content) with nothing deleted.
-        let fixture = FixtureBuilder::new()
-            .config("core.autocrlf", "false")
-            .build()
-            .unwrap();
-        let mut app = two_committed_changesets_app(&fixture);
-
-        let buf = render_once(&mut app, 80, 20);
-        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
-        assert!(
-            header.contains("+1") && header.contains("-0"),
-            "expected a tight '+N -M' diffstat fragment for cs-b's single added file, got: {header:?}"
-        );
-    }
-
-    #[test]
-    fn winbar_nerd_mode_swaps_the_restack_marker_and_diffstat_glyphs_and_shows_a_file_icon() {
+    fn diff_header_nerd_mode_swaps_the_restack_marker_and_diffstat_glyphs_and_shows_a_file_icon() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        app.toggle_outline();
         app.set_icon_mode(crate::icons::IconMode::Nerd);
 
         let buf = render_once(&mut app, 80, 20);
@@ -3047,22 +3970,23 @@ mod tests {
         );
         assert!(
             header.contains(super::NERD_DIFF_ADDED) && header.contains(super::NERD_DIFF_REMOVED),
-            "expected nerd diffstat glyphs in the winbar, got: {header:?}"
+            "expected nerd diffstat glyphs in the diff header, got: {header:?}"
         );
         assert!(
             header.contains(crate::icons::icon_for_path("b.txt", false).0),
-            "expected the active file's (b.txt) devicons icon in the winbar, got: {header:?}"
+            "expected the active file's (b.txt) devicons icon in the diff header, got: {header:?}"
         );
     }
 
     #[test]
-    fn winbar_uses_title_when_present() {
+    fn diff_header_uses_title_when_present() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
             .unwrap();
         let mut app = two_committed_changesets_app(&fixture);
         app.prev_changeset();
+        app.toggle_outline();
 
         let buf = render_once(&mut app, 80, 20);
         let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
@@ -3077,7 +4001,7 @@ mod tests {
     }
 
     #[test]
-    fn winbar_absent_for_a_lone_changeset() {
+    fn diff_header_lone_changeset_shows_file_counter_and_no_changeset_chrome() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
@@ -3093,7 +4017,110 @@ mod tests {
         );
         assert!(
             !header.contains('⚠'),
-            "a lone changeset must not render the winbar chrome, got: {header:?}"
+            "a lone changeset must not render the changeset-prefix chrome, got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn diff_header_shows_a_per_file_diffstat_for_a_lone_changeset() {
+        // CS1: new behavior — pre-CS1, the lone-changeset header never showed a diffstat at all
+        // (only the multi-changeset winbar did, and only a CHANGESET total). The file segment now
+        // carries a per-file diffstat in every state, including this one.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        // The fixture only ADDS a line ("CHANGED", appended after the unchanged "one") — nothing
+        // is deleted, so the per-file diffstat is `+1 -0`.
+        assert!(
+            header.contains("+1") && header.contains("-0"),
+            "expected a per-file '+N -M' diffstat fragment on the lone-changeset header, \
+             got: {header:?}"
+        );
+    }
+
+    #[test]
+    fn pending_changeset_diff_header_shows_no_file_counter() {
+        // ADR-037 + CS1: a Pending changeset's `files()` is always empty — the diff header must
+        // never show a misleading `[1/0]` file counter, whether the outline is open (a blank
+        // row) or closed (the changeset prefix alone, still no file counter).
+        use crate::app::ChangesetView;
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mid = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("mid")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "cs-b".to_string(),
+            span: ChangesetSpan::Committed {
+                base: mid,
+                head: mid,
+            },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::pending(cs_b);
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        assert!(app.is_current_pending());
+
+        // Outline open (this stack's default): a blank diff-header row, never "[1/0]".
+        assert!(app.outline_open());
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
+        assert!(
+            !header.contains("[1/0]"),
+            "must never show a misleading file counter, got: {header:?}"
+        );
+
+        // Outline closed: the changeset prefix alone, still no file counter.
+        app.toggle_outline();
+        let buf = render_once(&mut app, 80, 20);
+        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        assert!(
+            header.contains("cs-b"),
+            "expected the changeset prefix naming the pending changeset, got: {header:?}"
+        );
+        assert!(
+            !header.contains("[1/0]"),
+            "must never show a misleading file counter, got: {header:?}"
         );
     }
 
@@ -3160,8 +4187,8 @@ mod tests {
         let add_bg = buf.cell((new_content_x, row_y)).unwrap().style().bg;
 
         let t = Palette::dark();
-        let bright_adds = [Some(t.add_subtle), Some(t.add_strong)];
-        let dim_adds = [Some(t.add_staged_subtle), Some(t.add_staged_strong)];
+        let bright_adds = [Some(t.add_line_bg), Some(t.add_edit_bg)];
+        let dim_adds = [Some(t.add_staged_line_bg), Some(t.add_staged_edit_bg)];
         assert!(
             bright_adds.contains(&add_bg),
             "expected a committed changeset's Add cell to render the plain (bright) pair, \
@@ -3352,7 +4379,10 @@ mod tests {
     }
 
     #[test]
-    fn winbar_shows_the_pan_offset_indicator_once_panned() {
+    fn diff_header_shows_the_pan_offset_indicator_once_panned() {
+        // CS1: the pan indicator lives in the file segment, which the diff header always shows
+        // (outline open or closed) — with the outline open (this stack's default), that's the
+        // diff columns (x 36..) at this width.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -3361,22 +4391,24 @@ mod tests {
         assert_eq!(app.hscroll, 0);
 
         let buf_unpanned = render_once(&mut app, 80, 20);
-        let header_unpanned: String = (0..buf_unpanned.area.width)
+        let header_unpanned: String = (36..buf_unpanned.area.width)
             .map(|x| cell_text(&buf_unpanned, x, 0))
             .collect();
         assert!(
             !header_unpanned.contains('»'),
-            "no indicator at column 0, got: {header_unpanned:?}"
+            "no indicator at hscroll 0, got: {header_unpanned:?}"
         );
 
-        // The winbar test's fixture files are tiny (`a\n`/`b\n`) — nowhere near wide enough for
+        // The fixture files are tiny (`a\n`/`b\n`) — nowhere near wide enough for
         // `hscroll_right` to actually move `hscroll` off `0`. This checks the indicator's own
         // render logic, not the pan mechanics (covered separately in `app.rs`), so setting the
         // field directly is the more honest test: the indicator must key off `App::hscroll`
         // exactly, with no dependency on how it got there.
         app.hscroll = 42;
         let buf = render_once(&mut app, 80, 20);
-        let header: String = (0..buf.area.width).map(|x| cell_text(&buf, x, 0)).collect();
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
         assert!(
             header.contains("»42"),
             "expected the pan offset indicator, got: {header:?}"
@@ -3562,20 +4594,115 @@ mod tests {
             .iter()
             .position(|r| r.contains("cs-b"))
             .expect("cs-b's header row present (it has no title, so falls back to its name)");
-        // `String::find` returns a BYTE offset, not a display column — the row has multi-byte
-        // glyphs (`•`/`⚠`) ahead of/around the label, so a byte offset would target the wrong
-        // cell. Every rendered cell here is exactly one column wide, so a `chars()` (not byte)
-        // position IS the display column.
-        let label_chars: Vec<char> = "cs-b".chars().collect();
-        let row_chars: Vec<char> = content[row].chars().collect();
-        let label_x = row_chars
-            .windows(label_chars.len())
-            .position(|w| w == label_chars.as_slice())
-            .expect("cs-b's label text present in its own header row") as u16;
+        let label_x = find_label_x(&content[row], "cs-b");
         assert_eq!(
             buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
             Some(Palette::dark().heading_fg),
             "expected the outline header's label to carry Palette::dark().heading_fg"
+        );
+    }
+
+    #[test]
+    fn outline_header_truncates_to_the_pane_width() {
+        // CS1: `render_outline_header` writes via `Buffer::set_line(.., area.width)`, exactly
+        // like every outline item row below it — a long changeset label must not bleed past the
+        // outline's own width into the divider column (x=35 at `OUTLINE_TEST_WIDTH`).
+        use crate::app::ChangesetView;
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let mid = fixture
+            .commit("main")
+            .file("a.txt", "a\n")
+            .create("mid")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("b.txt", "b\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let cs_a = Changeset {
+            name: "cs-a".to_string(),
+            span: ChangesetSpan::Committed {
+                base: root,
+                head: mid,
+            },
+            title: None,
+            current: false,
+            needs_restack: false,
+        };
+        let cs_b = Changeset {
+            name: "x".repeat(100),
+            span: ChangesetSpan::Committed { base: mid, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view_a = ChangesetView::from_changeset_diff(
+            cs_a.clone(),
+            crate::acquire::diff_changeset(repo, &cs_a).unwrap(),
+        );
+        let view_b = ChangesetView::from_changeset_diff(
+            cs_b.clone(),
+            crate::acquire::diff_changeset(repo, &cs_b).unwrap(),
+        );
+
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view_a, view_b]);
+        app.open_current();
+        assert!(app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        assert_ne!(
+            cell_text(&buf, 34, 0),
+            " ",
+            "expected the truncated label to reach all the way to the outline's last column"
+        );
+        assert_eq!(
+            cell_text(&buf, 35, 0),
+            "│",
+            "the outline header must truncate to the pane's own width, not bleed into the \
+             divider column"
+        );
+    }
+
+    #[test]
+    fn outline_items_still_start_at_y_1_below_the_outline_headers_own_row() {
+        // CS1 invariant: carving out row 0 for the outline's own header must not shift outline
+        // ITEM rows at all — they already started at y=1 pre-CS1 (below the OLD global header),
+        // and they still do now (below the outline's OWN header instead). The pane header itself
+        // never shows the current-changeset marker (only an outline ITEM row does — see
+        // `render_outline_header`'s doc comment), which makes the marker a clean signal for where
+        // items actually start.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open());
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let row0 = outline_row(&buf, 0);
+        assert!(
+            !row0.contains('\u{2022}'),
+            "the outline's OWN header never shows the current-changeset marker, got: {row0:?}"
+        );
+        let row1 = outline_row(&buf, 1);
+        assert!(
+            row1.contains('\u{2022}'),
+            "the first outline ITEM row (cs-b's Header row, which IS current) must start at \
+             y=1, got: {row1:?}"
         );
     }
 
@@ -3600,11 +4727,12 @@ mod tests {
         app.focus_outline();
 
         let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
-        // Skip y=0: the full-width winbar spans every column (including the body's 36.. slice),
-        // and it too names the current changeset (cs-b) — same false-positive risk as the outline
-        // tests above. `body_rows`' index `i` is buffer row `i + 1` (the skip), so every `buf`
-        // query below adds 1 back.
-        let body_rows: Vec<String> = (1..buf.area.height)
+        // CS1: the summary panel's title now paints the diff pane's OWN header row (y=0, x
+        // 36..) instead of the body's first line — include y=0 in the scan (no skip needed).
+        // The OUTLINE pane's header (x <35) also shows a `[i/n]` counter for the same active
+        // changeset, so this scan stays scoped to the diff-header/body slice (x 36..) to avoid
+        // that false-positive, same as the outline tests above.
+        let body_rows: Vec<String> = (0..buf.area.height)
             .map(|y| {
                 (36..buf.area.width)
                     .map(|x| cell_text(&buf, x, y))
@@ -3620,20 +4748,17 @@ mod tests {
             .iter()
             .position(|r| r.contains("cs-b"))
             .expect("summary panel's title (cs-b's label) present");
-        // `String::find` is a BYTE offset, not a display column (the title carries a multi-byte
-        // `•` marker ahead of the label, since cs-b is `current`) — a `chars()` position over the
-        // 36.. slice IS the column offset within that slice (every cell here is one column wide),
-        // so add the slice's own start column (36) back to get the absolute buffer column.
-        let label_chars: Vec<char> = "cs-b".chars().collect();
-        let row_chars: Vec<char> = body_rows[row].chars().collect();
-        let label_x = row_chars
-            .windows(label_chars.len())
-            .position(|w| w == label_chars.as_slice())
-            .expect("cs-b's label text present in the summary panel's title")
-            as u16
-            + 36;
         assert_eq!(
-            buf.cell((label_x, row as u16 + 1)).unwrap().style().fg,
+            row, 0,
+            "the summary panel's title now paints the diff pane's header row (y=0), got row \
+             {row} instead:\n{joined}"
+        );
+        // `find_label_x` returns a column offset within the 36.. slice it's given (every cell here
+        // is one column wide, so a `chars()` position IS the display column) — add the slice's own
+        // start column (36) back to get the absolute buffer column.
+        let label_x = find_label_x(&body_rows[row], "cs-b") + 36;
+        assert_eq!(
+            buf.cell((label_x, row as u16)).unwrap().style().fg,
             Some(Palette::dark().foreground),
             "the summary panel's title must keep its plain foreground look, not the outline's \
              heading accent"
@@ -4212,9 +5337,9 @@ mod tests {
     }
 
     #[test]
-    fn outline_unstaged_file_renders_the_y_column_letter_in_del_strong() {
+    fn outline_unstaged_file_renders_the_y_column_letter_in_del_fg() {
         // Unstaged-only (worktree change, no staged one): X is the placeholder, Y carries the
-        // change letter in del_strong (git convention: worktree column is red).
+        // change letter in del_fg (git convention: worktree column is red).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .unstaged_file("a.rs", "one\n", "one\nCHANGED\n")
@@ -4240,16 +5365,16 @@ mod tests {
         );
         assert_eq!(
             buf.cell((x + 1, y)).unwrap().style().fg,
-            Some(Palette::dark().del_strong),
-            "expected the Y column's Modified letter to carry theme.del_strong"
+            Some(Palette::dark().del_fg),
+            "expected the Y column's Modified letter to carry theme.del_fg"
         );
     }
 
     #[test]
-    fn outline_fully_staged_file_renders_the_x_column_letter_in_add_strong() {
+    fn outline_fully_staged_file_renders_the_x_column_letter_in_add_fg() {
         // `staged_file` writes+stages a brand-new path (Added, not Modified — there's no prior
         // commit for it to modify). Fully staged (index change, no worktree one): X carries the
-        // letter in add_strong, Y is the placeholder.
+        // letter in add_fg, Y is the placeholder.
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .staged_file("a.rs", "new content\n")
@@ -4269,8 +5394,8 @@ mod tests {
         );
         assert_eq!(
             buf.cell((x, y)).unwrap().style().fg,
-            Some(Palette::dark().add_strong),
-            "expected the X column's Added letter to carry theme.add_strong"
+            Some(Palette::dark().add_fg),
+            "expected the X column's Added letter to carry theme.add_fg"
         );
         assert_eq!(
             buf.cell((x + 1, y)).unwrap().style().fg,
@@ -4282,7 +5407,7 @@ mod tests {
     #[test]
     fn outline_partially_staged_file_renders_mm_with_green_x_and_red_y() {
         // Partially staged (both a staged AND an unstaged change): both columns show the change
-        // letter, X in add_strong (green), Y in del_strong (red).
+        // letter, X in add_fg (green), Y in del_fg (red).
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .partially_staged_file("a.rs", "one\n", "one\nSTAGED\n", "one\nSTAGED\nWORKTREE\n")
@@ -4302,13 +5427,13 @@ mod tests {
         );
         assert_eq!(
             buf.cell((x, y)).unwrap().style().fg,
-            Some(Palette::dark().add_strong),
-            "expected the X (staged) column's letter to carry theme.add_strong"
+            Some(Palette::dark().add_fg),
+            "expected the X (staged) column's letter to carry theme.add_fg"
         );
         assert_eq!(
             buf.cell((x + 1, y)).unwrap().style().fg,
-            Some(Palette::dark().del_strong),
-            "expected the Y (worktree) column's letter to carry theme.del_strong"
+            Some(Palette::dark().del_fg),
+            "expected the Y (worktree) column's letter to carry theme.del_fg"
         );
     }
 
@@ -4416,7 +5541,7 @@ mod tests {
     }
 
     #[test]
-    fn outline_committed_added_and_deleted_files_render_add_strong_and_del_strong() {
+    fn outline_committed_added_and_deleted_files_render_add_fg_and_del_fg() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
             .build()
@@ -4486,8 +5611,8 @@ mod tests {
                 .unwrap()
                 .style()
                 .fg,
-            Some(Palette::dark().add_strong),
-            "expected a committed Added file's letter to carry theme.add_strong"
+            Some(Palette::dark().add_fg),
+            "expected a committed Added file's letter to carry theme.add_fg"
         );
 
         let deleted_row_idx = content
@@ -4504,8 +5629,8 @@ mod tests {
                 .unwrap()
                 .style()
                 .fg,
-            Some(Palette::dark().del_strong),
-            "expected a committed Deleted file's letter to carry theme.del_strong"
+            Some(Palette::dark().del_fg),
+            "expected a committed Deleted file's letter to carry theme.del_fg"
         );
     }
 
@@ -4576,6 +5701,74 @@ mod tests {
         assert!(
             file_row.contains(crate::icons::icon_for_path("main.rs", false).0),
             "expected the rust file icon before main.rs, got: {file_row:?}"
+        );
+    }
+
+    #[test]
+    fn icon_mode_nerd_collapses_the_file_icon_color_to_foreground_under_a_colorless_theme() {
+        // The `no-color-mono` finding this guards: `icons::icon_for_path`'s hardcoded per-filetype
+        // `Rgb` is palette-EXTERNAL, so it must be collapsed to `foreground` by the render.rs paint
+        // site itself when `Palette::colorless` is set — `mono()`'s own fields (already `Reset`)
+        // can't do this for it. Companion to the theme.rs-level `only_mono_sets_colorless` test.
+        use git2::Repository;
+        use workon::{Changeset, ChangesetSpan};
+
+        use crate::app::ChangesetView;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let root = fixture
+            .commit("main")
+            .file("root.txt", "r\n")
+            .create("root")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("main.rs", "fn main() {}\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "cs".to_string(),
+            span: ChangesetSpan::Committed { base: root, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let view = ChangesetView::from_changeset_diff(
+            cs.clone(),
+            crate::acquire::diff_changeset(repo, &cs).unwrap(),
+        );
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        if !app.outline_open() {
+            app.toggle_outline();
+        }
+        app.set_icon_mode(crate::icons::IconMode::Nerd);
+
+        let mono = Palette::mono(false);
+        let buf = render_once_themed(&mut app, OUTLINE_TEST_WIDTH, 20, &mono);
+        let content: Vec<String> = (0..buf.area.height).map(|y| outline_row(&buf, y)).collect();
+
+        let (row_idx, row) = content
+            .iter()
+            .enumerate()
+            .skip(1) // y=0 is the winbar
+            .find(|(_, r)| r.contains("main.rs"))
+            .expect("main.rs file row present");
+        let icon = crate::icons::icon_for_path("main.rs", false).0;
+        let icon_x = row
+            .chars()
+            .position(|c| c == icon)
+            .expect("icon glyph present in the file row") as u16;
+
+        assert_eq!(
+            buf.cell((icon_x, row_idx as u16)).unwrap().style().fg,
+            Some(mono.foreground),
+            "icon fg must collapse to `foreground` under a colorless theme, got row: {row:?}"
         );
     }
 
@@ -4734,6 +5927,58 @@ mod tests {
     }
 
     #[test]
+    fn summary_header_shows_dir_title_and_body_drops_duplicate() {
+        // CS1: `dir_summary_lines` now returns `(title, body)` — the title paints the diff
+        // pane's header row (y=0), and the body (per-file rows + totals) no longer repeats it as
+        // its own first line.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = changeset_with_nested_paths(&fixture);
+        app.focus_outline(); // opens (a lone changeset defaults closed) and focuses
+        app.outline_cycle_mode(); // Stack -> StackTree
+        app.outline_cycle_mode(); // StackTree -> Flat
+        app.outline_cycle_mode(); // Flat -> Tree, so a Dir row exists to focus
+        assert_eq!(app.outline_mode(), crate::outline::OutlineMode::Tree);
+        let dir_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Dir { .. }))
+            .expect("a Dir row present in Tree mode") as i64;
+        let delta = dir_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        assert!(matches!(
+            app.outline_items()[app.outline_cursor()],
+            OutlineItem::Dir { .. }
+        ));
+
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let header: String = (36..buf.area.width)
+            .map(|x| cell_text(&buf, x, 0))
+            .collect();
+        assert!(
+            header.trim_end().ends_with("src/"),
+            "expected the diff pane's header row to carry the dir summary's title, got: {header:?}"
+        );
+
+        // The exact title text ("src/", nothing else) must not reappear as a whole body line —
+        // a per-file row like "src/a.txt  +1 -0" legitimately CONTAINS "src/" as a substring, so
+        // this checks for an exact-line match, not a substring.
+        for y in 1..buf.area.height {
+            let row: String = (36..buf.area.width)
+                .map(|x| cell_text(&buf, x, y))
+                .collect();
+            assert_ne!(
+                row.trim_end(),
+                "src/",
+                "the summary panel's body must not duplicate the title as its own line, \
+                 got row {y}: {row:?}"
+            );
+        }
+    }
+
+    #[test]
     fn focused_header_selection_renders_the_summary_panel_instead_of_the_diff() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -4866,6 +6111,41 @@ mod tests {
     }
 
     #[test]
+    fn content_rows_carry_the_painted_canvas_background() {
+        // The empty-screen canvas tests above miss the real dogfood surface: rows the diff body
+        // actually writes. A context line's untinted cells (its text and the padding after it)
+        // must sit on the theme's own canvas, not the terminal default — `theme light` in a dark
+        // terminal otherwise renders every content row on a black canvas.
+        // A partially staged file renders the split UNSTAGED/STAGED view — the everyday dogfood
+        // shape, and a different render path from the single-pane view the tests above exercise.
+        let committed = "l1\nl2\nl3\nold word here\nl5\nl6\n";
+        let staged = "l1\nl2\nl3\nstaged word here\nl5\nl6\n";
+        let workdir = "l1\nl2\nl3\nnew word here\nl5\nl6\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file("small.txt", committed, staged, workdir)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let theme = Palette::light();
+        let buf = render_once_themed(&mut app, 60, 20, &theme);
+
+        let content = buf_lines(&buf);
+        let context_y = content
+            .iter()
+            .position(|line| line.contains("l2"))
+            .expect("context row present") as u16;
+        let x = content[context_y as usize].find("l2").unwrap() as u16;
+        let cell = buf.cell((x, context_y)).unwrap();
+        assert_eq!(
+            cell.style().bg,
+            Some(theme.background),
+            "expected a context-row content cell to carry the painted canvas background"
+        );
+    }
+
+    #[test]
     fn dark_theme_paints_the_canvas_with_the_dark_background() {
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -4925,6 +6205,661 @@ mod tests {
             cursor_bg,
             Some(theme.background),
             "the cursor tint must be visually distinct from the flat painted canvas"
+        );
+    }
+
+    // ── focused-pane-header (CS1): exactly-one-lit-label invariant ────────────────
+
+    /// A cell's `(fg, bold?)` pair — the two axes [`pane_header_label_style`] toggles, checked
+    /// together everywhere below since neither alone proves the invariant (a themed fg match with
+    /// no bold, or vice versa, would both be bugs).
+    fn label_style_at(buf: &Buffer, x: u16, y: u16) -> (Option<Color>, bool) {
+        let style = buf.cell((x, y)).unwrap().style();
+        (style.fg, style.add_modifier.contains(Modifier::BOLD))
+    }
+
+    #[test]
+    fn startup_state_lights_the_diff_header_not_the_outline_header() {
+        // Gotcha: `App::from_changesets` defaults the outline open but UNFOCUSED, so at launch the
+        // one lit label must be on the diff side, not the outline's — this is also the general
+        // "diff focused, effective zoom Single" case, since a Committed changeset's file has no
+        // unstaged/staged split (always `EffectiveZoom::Single(Role::Combined)`).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(
+            app.outline_open() && !app.outline_focused(),
+            "locked startup default"
+        );
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Combined)
+        );
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content = buf_lines(&buf);
+
+        // Outline header's own title (row 0) names the current changeset ("cs-b") — dim, no bold.
+        let outline_x = find_label_x(&content[0], "cs-b");
+        assert_eq!(
+            label_style_at(&buf, outline_x, 0),
+            (Some(theme.dim), false),
+            "outline header must stay dim while the outline is unfocused"
+        );
+
+        // Diff header's own label (row 0, right of the divider) names the file ("b.txt") — lit.
+        let diff_x = find_label_x(&content[0], "b.txt");
+        assert_eq!(
+            label_style_at(&buf, diff_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "diff header must be lit at startup, since focus starts on the diff side"
+        );
+    }
+
+    #[test]
+    fn outline_focused_lights_the_outline_header_and_dims_every_diff_side_label() {
+        // Locked decision #5's "outline focused" case: even a Split-zoom file's diff header AND
+        // both of its captions must stay dim — the outline header is the frame's one lit label.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Split,
+            "a partially-staged file defaults to a Split render"
+        );
+        app.focus_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 24);
+        let content = buf_lines(&buf);
+
+        // `app_from_fixture`'s lone changeset is the synthetic uncommitted layer, whose
+        // `display_label` is always "Uncommitted changes" (see `crate::app::display_label`), not
+        // the file's own name.
+        let outline_x = find_label_x(&content[0], "Uncommitted changes");
+        assert_eq!(
+            label_style_at(&buf, outline_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "outline header must be lit while the outline has focus"
+        );
+
+        let unstaged_row = content
+            .iter()
+            .position(|line| line.contains("UNSTAGED"))
+            .expect("unstaged caption present");
+        let staged_row = content
+            .iter()
+            .position(|line| line.contains("STAGED") && !line.contains("UNSTAGED"))
+            .expect("staged caption present");
+        let unstaged_x = find_label_x(&content[unstaged_row], "UNSTAGED");
+        let staged_x = find_label_x(&content[staged_row], "STAGED");
+        assert_eq!(
+            label_style_at(&buf, unstaged_x, unstaged_row as u16),
+            (Some(theme.dim), false),
+            "the unstaged caption must stay dim while the outline holds focus"
+        );
+        assert_eq!(
+            label_style_at(&buf, staged_x, staged_row as u16),
+            (Some(theme.dim), false),
+            "the staged caption must stay dim while the outline holds focus"
+        );
+    }
+
+    #[test]
+    fn split_zoom_lights_only_the_focused_halfs_caption_and_dims_the_diff_header() {
+        // Locked decision #5's "diff focused, effective zoom Split" case: the diff pane's OWN
+        // header stays dim (there's no single file-wide label to light while two panes show), and
+        // exactly the focused half's caption lights up — flipping `split_focus` flips which one.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert!(!app.outline_focused());
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "default split focus"
+        );
+
+        let theme = Palette::dark();
+
+        let check = |app: &mut App, lit_label: &str, dim_label: &str| {
+            let buf = render_once(app, OUTLINE_TEST_WIDTH, 24);
+            let content = buf_lines(&buf);
+            let lit_row = caption_row(&content, lit_label);
+            let dim_row = caption_row(&content, dim_label);
+            let lit_x = find_label_x(&content[lit_row], lit_label);
+            let dim_x = find_label_x(&content[dim_row], dim_label);
+            assert_eq!(
+                label_style_at(&buf, lit_x, lit_row as u16),
+                (Some(theme.pane_header_focused_fg), true),
+                "{lit_label} should be the lit label"
+            );
+            assert_eq!(
+                label_style_at(&buf, dim_x, dim_row as u16),
+                (Some(theme.dim), false),
+                "{dim_label} should stay dim"
+            );
+            // The diff pane's own header (row 0) stays dim under Split, regardless of which half
+            // has focus — there is no single-file label to light while two panes are showing.
+            let file_x = find_label_x(&content[0], "f.txt");
+            assert_eq!(
+                label_style_at(&buf, file_x, 0),
+                (Some(theme.dim), false),
+                "the diff header must stay dim under a Split zoom"
+            );
+        };
+
+        check(&mut app, "UNSTAGED", "STAGED");
+        app.toggle_split_focus();
+        assert_eq!(app.split_focus_role(), Role::Staged);
+        check(&mut app, "STAGED", "UNSTAGED");
+    }
+
+    #[test]
+    fn zoom_collapse_to_single_lights_the_diff_header_not_a_caption() {
+        // Gotcha: a requested `Split` collapses to `EffectiveZoom::Single` for a file lacking one
+        // of the two sub-diffs (here, unstaged-only) — no captions render at all, so the diff
+        // header itself must be the lit label, exactly as the plain-Single case above.
+        let old = "l1\nl2\nl3\n";
+        let new = "l1\nCHANGED\nl3\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("only.txt", old, new)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.zoom,
+            crate::app::Zoom::Split,
+            "default requested zoom is Split"
+        );
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Unstaged),
+            "collapsed down to a single pane — no staged sub-diff to pair it with"
+        );
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+        for line in &content {
+            assert!(
+                !line.contains("UNSTAGED") && !line.contains("STAGED"),
+                "a collapsed Single zoom must not render split captions, got: {line:?}"
+            );
+        }
+        let file_x = find_label_x(&content[0], "only.txt");
+        assert_eq!(
+            label_style_at(&buf, file_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the diff header must be the lit label once Split has collapsed to Single"
+        );
+    }
+
+    #[test]
+    fn split_zoom_short_area_fallback_lights_the_diff_header_not_a_caption() {
+        // Gotcha: `render_body_split`'s own short-area fallback (`area.height < 4`) renders only
+        // the focused pane and returns before either caption is drawn — no split caption survives
+        // to be the frame's lit label, so `render_body` must light the diff header instead. A
+        // 5-row frame leaves a diff pane body area of height 3 after the header carve-out (frame
+        // height 5 - footer 1 = body/diff area height 4, minus the diff header's own 1 row = 3),
+        // which is under the `render_body_split` fallback's `< 4` threshold.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert!(!app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 5);
+        let content = buf_lines(&buf);
+
+        for line in &content {
+            assert!(
+                !line.contains("UNSTAGED") && !line.contains("STAGED"),
+                "the short-area fallback must not render split captions, got: {line:?}"
+            );
+        }
+        let file_x = find_label_x(&content[0], "f.txt");
+        assert_eq!(
+            label_style_at(&buf, file_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the diff header must be the lit label once the split fallback drops both captions"
+        );
+    }
+
+    #[test]
+    fn no_color_bold_is_the_only_focus_differentiator() {
+        // Locked decision #3: under `Palette::mono`, `pane_header_focused_fg` and `dim` both
+        // collapse to `Color::Reset` (see theme.rs's own
+        // `mono_pane_header_focused_fg_collapses_with_dim_leaving_bold_the_only_differentiator`)
+        // — this test proves `render.rs` itself still differentiates the focused label via BOLD
+        // alone when actually painting a frame under that palette.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(!app.outline_focused());
+
+        let theme = Palette::mono(false);
+        let buf = render_once_themed(&mut app, OUTLINE_TEST_WIDTH, 20, &theme);
+        let content = buf_lines(&buf);
+
+        let outline_x = find_label_x(&content[0], "cs-b");
+        let (outline_fg, outline_bold) = label_style_at(&buf, outline_x, 0);
+        let diff_x = find_label_x(&content[0], "b.txt");
+        let (diff_fg, diff_bold) = label_style_at(&buf, diff_x, 0);
+
+        assert_eq!(outline_fg, Some(Color::Reset));
+        assert_eq!(diff_fg, Some(Color::Reset));
+        assert_eq!(
+            outline_fg, diff_fg,
+            "color alone carries no distinction under NO_COLOR"
+        );
+        assert!(
+            !outline_bold,
+            "the dim (unfocused) outline header must not be bold"
+        );
+        assert!(
+            diff_bold,
+            "the lit (focused) diff header must stay bold under NO_COLOR"
+        );
+    }
+
+    // ── unfocused-cursor-wash (CS1): the uniform dim-when-unfocused cursor model ───
+
+    #[test]
+    fn diff_cursor_dims_when_outline_holds_focus_single_zoom() {
+        // Locked decision #1: the diff body (single/combined zoom) paints its cursor row with the
+        // dim unfocused wash, not full `cursor_bg`, whenever the outline (not the diff) holds
+        // focus.
+        let old = "l1\nl2\nl3\n";
+        let new = "l1\nCHANGED\nl3\n";
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("only.txt", old, new)
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(
+            app.effective_zoom_for(app.current),
+            EffectiveZoom::Single(Role::Unstaged)
+        );
+        app.focus_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+
+        // Row 0 of the diff pane's own rect is its header; content starts at row 1. The cursor
+        // row lands at `1 + (cursor - scroll)`, neither of which `render_body`'s Single-zoom arm
+        // mutates (it only reads them), so the values read back after rendering are exactly what
+        // painted the frame.
+        let cursor_y = (1 + app.cursor - app.scroll) as u16;
+        let cell = buf.cell((37, cursor_y)).unwrap();
+        assert_eq!(
+            cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the diff cursor must dim to the unfocused wash while the outline holds focus"
+        );
+        assert_ne!(
+            cell.style().bg,
+            Some(theme.cursor_bg),
+            "the diff cursor must NOT show the full focused wash while the outline holds focus"
+        );
+    }
+
+    #[test]
+    fn both_split_halves_dim_and_the_divider_carries_the_dim_wash_when_outline_holds_focus() {
+        // Locked decision #1's "outline-focused + split zoom" case: neither half holds focus, so
+        // BOTH show the dim wash on their own remembered cursor row — and the gotcha this
+        // changeset must fix, the divider cell re-tint on that row must follow the same wash
+        // (previously hardcoded to full `cursor_bg`).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "default split focus"
+        );
+
+        // Move the (currently focused) unstaged pane's cursor onto its changed row, before the
+        // outline takes focus — the staged pane's `alt` cursor is untouched, so it stays at
+        // `reset_panes`'s first-hunk reseat: the staged pane renders the base->staged diff, whose
+        // only change is "beta" -> "BETAEDIT" (row 1), not row 0 ("alpha"). ("GAMMAEDIT" is the
+        // UNSTAGED pane's own hunk — the index->workdir diff — and never appears in the staged
+        // pane at all.)
+        app.cursor = 1;
+        app.derive_scroll();
+        app.focus_outline();
+        assert!(app.outline_open() && app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 24);
+        let content = buf_lines(&buf);
+
+        let unstaged_caption_row = caption_row(&content, "UNSTAGED");
+        let staged_caption_row = caption_row(&content, "STAGED");
+
+        // "BETAEDIT" appears once in EACH pane at row index 1 — the unstaged pane's unchanged
+        // CONTEXT line (its own hunk is gamma -> GAMMAEDIT, at row 2, which `app.cursor` is never
+        // set to here) and the staged pane's actual hunk (its `alt.cursor`, from `reset_panes`'s
+        // first-hunk reseat) — so each search is bounded to its own pane's row range to
+        // disambiguate which "BETAEDIT" it's finding. Bounded starting at column 36 to skip the
+        // outline to the left of the diff panes.
+        let unstaged_cursor_y = find_row(
+            &buf,
+            36,
+            unstaged_caption_row + 1,
+            staged_caption_row,
+            "BETAEDIT",
+        );
+        let staged_cursor_y = find_row(&buf, 36, staged_caption_row + 1, content.len(), "BETAEDIT");
+
+        // Same left/divider geometry `render_pane_sbs` computes for a `diff_w`-wide pane at
+        // `OUTLINE_TEST_WIDTH` (outline `0..35` + 1-col divider, diff pane `36..`).
+        let diff_x0 = 36u16;
+        let diff_w = OUTLINE_TEST_WIDTH - diff_x0;
+        let left_w = diff_w.saturating_sub(1) / 2;
+        let div_x = diff_x0 + left_w;
+
+        let unstaged_cell = buf.cell((diff_x0 + 1, unstaged_cursor_y)).unwrap();
+        assert_eq!(
+            unstaged_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the unstaged half's cursor must dim while the outline holds focus"
+        );
+        let staged_cell = buf.cell((diff_x0 + 1, staged_cursor_y)).unwrap();
+        assert_eq!(
+            staged_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the staged half's cursor must dim while the outline holds focus"
+        );
+
+        let divider_cell = buf.cell((div_x, unstaged_cursor_y)).unwrap();
+        assert_eq!(
+            divider_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the divider cell on a dimmed cursor row must carry the same dim wash, not stay bright"
+        );
+    }
+
+    #[test]
+    fn unfocused_split_half_shows_the_remembered_dim_cursor_while_the_focused_half_is_full() {
+        // Locked decision #1's diff-focused split case: the half that just LOST focus (`w`
+        // toggled away from it) now shows its remembered cursor position in the dim wash, rather
+        // than no cursor at all (the pre-changeset behavior — `pane_render_state` returned `None`
+        // for the unfocused half).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .partially_staged_file(
+                "f.txt",
+                "alpha\nbeta\ngamma\n",
+                "alpha\nBETAEDIT\ngamma\n",
+                "alpha\nBETAEDIT\nGAMMAEDIT\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        assert_eq!(app.effective_zoom_for(app.current), EffectiveZoom::Split);
+        assert!(!app.outline_focused());
+        assert_eq!(
+            app.split_focus_role(),
+            Role::Unstaged,
+            "default split focus"
+        );
+        if app.outline_open() {
+            app.toggle_outline(); // force closed — a clean full-width diff pane, no outline offset
+        }
+
+        // Land the (currently focused) unstaged pane's cursor on row 1 (a context line in the
+        // unstaged/index->workdir diff — its own hunk, gamma -> GAMMAEDIT, is row 2), then flip
+        // focus to the staged half — `toggle_split_focus` swaps `cursor`/`scroll` with `alt`, so
+        // that position becomes the unstaged half's REMEMBERED `alt` cursor. The staged half's OWN
+        // `alt` (untouched since `reset_panes`'s first-hunk reseat) becomes the newly-focused
+        // `cursor`: the staged pane renders the base->staged diff, whose only hunk is
+        // "beta" -> "BETAEDIT", also row 1 — coincidentally the same row index, different text.
+        app.cursor = 1;
+        app.derive_scroll();
+        app.toggle_split_focus();
+        assert_eq!(app.split_focus_role(), Role::Staged);
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf);
+
+        let unstaged_caption_row = caption_row(&content, "UNSTAGED");
+        let staged_caption_row = caption_row(&content, "STAGED");
+
+        // "BETAEDIT" appears once in EACH pane at row index 1 (see the comment above) — bounded
+        // per pane to disambiguate which one a given search lands on. No outline offset here (the
+        // outline was force-closed above), so the search starts at column 0.
+        let unstaged_cursor_y = find_row(
+            &buf,
+            0,
+            unstaged_caption_row + 1,
+            staged_caption_row,
+            "BETAEDIT",
+        );
+        let staged_cursor_y = find_row(&buf, 0, staged_caption_row + 1, content.len(), "BETAEDIT");
+
+        let unstaged_cell = buf.cell((1, unstaged_cursor_y)).unwrap();
+        assert_eq!(
+            unstaged_cell.style().bg,
+            Some(theme.cursor_unfocused_bg),
+            "the just-unfocused half's remembered cursor must show the dim wash"
+        );
+        assert_ne!(unstaged_cell.style().bg, Some(theme.cursor_bg));
+
+        let staged_cell = buf.cell((1, staged_cursor_y)).unwrap();
+        assert_eq!(
+            staged_cell.style().bg,
+            Some(theme.cursor_bg),
+            "the newly-focused half must show the full cursor wash"
+        );
+    }
+
+    // ── header-chrome-follows-focus (CS1): counters join the label's lit/dim toggle ───
+
+    #[test]
+    fn outline_header_counter_follows_the_labels_focus_toggle() {
+        // The outline header's `[i/n]` counter used to stay unconditionally bold+foreground —
+        // it now lights/dims together with the label beside it (locked decision #1).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open() && !app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[2/2]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.dim), false),
+            "the outline header counter must dim alongside the label while unfocused"
+        );
+
+        app.focus_outline();
+        let buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[2/2]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the outline header counter must light alongside the label while focused"
+        );
+    }
+
+    #[test]
+    fn diff_header_file_counter_follows_the_labels_focus_toggle() {
+        // Same toggle as the outline header's counter above, for the diff header's own
+        // `[fidx/nfiles]` counter ([`super::file_segment_spans`]).
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        assert!(app.outline_open() && !app.outline_focused());
+
+        let theme = Palette::dark();
+        let buf = render_once(&mut app, 80, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[1/1]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.pane_header_focused_fg), true),
+            "the diff header counter must light alongside the label while the diff has focus"
+        );
+
+        app.focus_outline();
+        let buf = render_once(&mut app, 80, 20);
+        let content = buf_lines(&buf);
+        let counter_x = find_label_x(&content[0], "[1/1]");
+        assert_eq!(
+            label_style_at(&buf, counter_x, 0),
+            (Some(theme.dim), false),
+            "the diff header counter must dim alongside the label once focus leaves the diff"
+        );
+    }
+
+    #[test]
+    fn outline_header_diffstat_colors_stay_semantic_across_focus_toggle() {
+        // Locked decision #2: the `+N -M` diffstat span is semantic information, not identity
+        // chrome — it must keep its own color (and bold) regardless of which pane has focus.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        let theme = Palette::dark();
+
+        let unfocused_buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let unfocused_content = buf_lines(&unfocused_buf);
+        let add_x = find_label_x(&unfocused_content[0], "+1");
+        let unfocused_add = label_style_at(&unfocused_buf, add_x, 0);
+
+        app.focus_outline();
+        let focused_buf = render_once(&mut app, OUTLINE_TEST_WIDTH, 20);
+        let focused_content = buf_lines(&focused_buf);
+        let add_x = find_label_x(&focused_content[0], "+1");
+        let focused_add = label_style_at(&focused_buf, add_x, 0);
+
+        assert_eq!(
+            unfocused_add, focused_add,
+            "the outline header's diffstat span must not change with focus"
+        );
+        assert_eq!(
+            unfocused_add,
+            (Some(theme.add_fg), true),
+            "the diffstat span keeps its own semantic color and bold regardless of focus"
+        );
+    }
+
+    #[test]
+    fn changeset_prefix_text_follows_focus_while_the_warn_glyph_stays_semantic() {
+        // `changeset_prefix_spans` (the diff header's changeset-position prefix, shown only with
+        // the outline closed) splits into a `[i/n] {title}` text span that now follows the same
+        // `focused` flag `diff_header_line` passes to `file_segment_spans`, and a glyph-only warn
+        // span that keeps `theme.warn_fg` regardless (locked decision #2) — exercised directly
+        // rather than through a rendered frame to probe both flag values in isolation. (A real
+        // frame CAN show the prefix dim: outline closed + Split zoom, where a caption is the lit
+        // label and `diff_header_line` receives `focused == false`.)
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let app = two_committed_changesets_app(&fixture); // cs-b: current + needs_restack
+        let theme = Palette::dark();
+        let icons = crate::icons::IconMode::None;
+
+        let lit = changeset_prefix_spans(&app, &theme, icons, true);
+        let dim = changeset_prefix_spans(&app, &theme, icons, false);
+
+        let text_style = |spans: &[TSpan<'static>]| {
+            spans
+                .iter()
+                .find(|s| s.content.contains("[2/2]"))
+                .expect("counter+title span present")
+                .style
+        };
+        assert_eq!(
+            text_style(&lit),
+            pane_header_label_style(&theme, true),
+            "the changeset-prefix text lights with focus"
+        );
+        assert_eq!(
+            text_style(&dim),
+            pane_header_label_style(&theme, false),
+            "the changeset-prefix text dims without focus"
+        );
+
+        let warn_style = |spans: &[TSpan<'static>]| {
+            spans
+                .iter()
+                .find(|s| s.content.contains('⚠'))
+                .expect("warn glyph span present")
+                .style
+        };
+        assert_eq!(
+            warn_style(&lit).fg,
+            Some(theme.warn_fg),
+            "the warn glyph keeps its semantic color while the prefix text is focused"
+        );
+        assert_eq!(
+            warn_style(&lit),
+            warn_style(&dim),
+            "the warn glyph's style is unaffected by the prefix text's focus"
         );
     }
 }

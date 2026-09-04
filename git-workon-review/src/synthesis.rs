@@ -145,19 +145,30 @@ pub struct PatchText {
 }
 
 impl PatchText {
-    /// Render the full patch: a `diff --git`/`index`/`---`/`+++` file header, then each
-    /// hunk's bytes. Always ends in `\n` (each hunk's last line is either a real line with its
-    /// own trailing `\n`, or a `missing_newline` line whose marker supplies one).
+    /// Render the full patch: a `diff --git`/(`new file mode`|`deleted file mode`)?/`index`/
+    /// `---`/`+++` file header, then each hunk's bytes. Always ends in `\n` (each hunk's last
+    /// line is either a real line with its own trailing `\n`, or a `missing_newline` line whose
+    /// marker supplies one).
     ///
-    /// The `index 0000000..0000000 <mode>` line's OIDs are a placeholder — this crate never
+    /// A one-sided patch (`old_path` or `new_path` is `None` — a whole-file creation or
+    /// deletion) additionally needs a `new file mode {mode:06o}` / `deleted file mode
+    /// {mode:06o}` line: without it, git parses the patch as a MODIFICATION of an existing
+    /// path and rejects it against an untracked/absent preimage ("does not exist in index") —
+    /// this is the exact shape `git diff --no-index /dev/null <file>` emits, and the one both
+    /// `git2::Diff::from_buffer` + `Repository::apply(ApplyLocation::Index)` and `git apply
+    /// --cached` accept (see the go/no-go test in `tests/suite/file_ops.rs`). The `index` line
+    /// that follows omits its mode suffix for a one-sided patch — canonical git output has no
+    /// mode there, since the mode line above already carries it.
+    ///
+    /// The `index 0000000..0000000[ <mode>]` line's OIDs are a placeholder — this crate never
     /// reads blob OIDs off the model (untracked deltas don't have them either), and `git
     /// apply` ignores them. The line exists because `git2::Diff::from_buffer` parses stricter
-    /// than `git apply` and rejects a bare 3-line header (plan risk #4). The MODE, however, is
-    /// load-bearing: `Repository::apply(ApplyLocation::Index, ..)` takes the new index entry's
-    /// mode straight from this line, so it must be the file's real mode
-    /// ([`Self::new_mode`]) — a hardcoded `100644` here used to silently clobber the exec bit
-    /// of any staged `100755` file (the `git apply` CLI path never had this bug: it reads the
-    /// mode from the working tree instead).
+    /// than `git apply` and rejects a bare 3-line header (plan risk #4). For a two-sided
+    /// (Modified/Renamed/Copied) patch, the MODE is load-bearing: `Repository::apply
+    /// (ApplyLocation::Index, ..)` takes the new index entry's mode straight from this line, so
+    /// it must be the file's real mode ([`Self::new_mode`]) — a hardcoded `100644` here used to
+    /// silently clobber the exec bit of any staged `100755` file (the `git apply` CLI path
+    /// never had this bug: it reads the mode from the working tree instead).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let diff_git_old = self
@@ -171,7 +182,23 @@ impl PatchText {
             .or(self.old_path.as_deref())
             .unwrap_or("");
         out.extend_from_slice(format!("diff --git a/{diff_git_old} b/{diff_git_new}\n").as_bytes());
-        out.extend_from_slice(format!("index 0000000..0000000 {:06o}\n", self.new_mode).as_bytes());
+        match (&self.old_path, &self.new_path) {
+            (None, Some(_)) => {
+                out.extend_from_slice(format!("new file mode {:06o}\n", self.new_mode).as_bytes());
+                out.extend_from_slice(b"index 0000000..0000000\n");
+            }
+            (Some(_), None) => {
+                out.extend_from_slice(
+                    format!("deleted file mode {:06o}\n", self.old_mode).as_bytes(),
+                );
+                out.extend_from_slice(b"index 0000000..0000000\n");
+            }
+            _ => {
+                out.extend_from_slice(
+                    format!("index 0000000..0000000 {:06o}\n", self.new_mode).as_bytes(),
+                );
+            }
+        }
         let old_label = match &self.old_path {
             Some(p) => format!("a/{p}"),
             None => "/dev/null".to_string(),
@@ -209,15 +236,23 @@ impl PatchText {
 ///
 /// Refuses:
 /// - binary files ([`SynthesisError::BinaryFile`]) — no hunks exist to synthesize from.
-/// - statuses a hunk patch can't express ([`SynthesisError::LineSelectionUnsupported`]):
-///   `Added`/`Deleted`/`Untracked`/`Unmerged` are whole-file operations by nature — a hunk
-///   patch of a deletion would stage an empty blob instead of removing the file, and a hunk
-///   patch of an untracked file has no index/HEAD preimage to apply against (trap 3). CS4's
-///   `ops.rs` routes these statuses to `file_ops.rs` before synthesis is ever reached, so
+/// - statuses NEITHER a two-sided NOR a one-sided (creation) hunk patch can express
+///   ([`SynthesisError::LineSelectionUnsupported`]): `Deleted` (a hunk patch of a deletion would
+///   stage an empty blob instead of removing the file — trap 3) and `Unmerged`. CS4's `ops.rs`
+///   routes these statuses to `file_ops.rs` before synthesis is ever reached, so
 ///   `LineSelectionUnsupported` is the variant callers see here — it's the closest existing
 ///   error to "use the whole-file op instead," which is exactly its `help` text.
 ///   `Copied` is treated like `Renamed` (both carry an `old_path`).
 /// - `hunk_idx` out of range ([`SynthesisError::HunkOutOfRange`]).
+///
+/// Admits (does NOT refuse): `Modified`/`Renamed`/`Copied` (the original two-sided callers), and
+/// — per the line-ops-on-one-sided-files handoff — non-binary `Untracked`/`Added`: these have no
+/// `HEAD`/index preimage, but [`partial_hunk_patch`] synthesizes a one-sided (creation) patch for
+/// them instead of a two-sided one (see that function's doc). [`whole_hunk_patch`] is technically
+/// reachable on these statuses too (it shares this guard), but nothing calls it that way —
+/// `ops::apply_hunk`'s routing (`is_hunk_patchable`) is deliberately UNCHANGED and still falls
+/// back to the whole-file op for `Untracked`/`Added`, so `whole_hunk_patch` never actually
+/// synthesizes a one-sided patch in practice.
 fn selectable_hunk(
     file: &FileChange,
     hunk_idx: usize,
@@ -228,7 +263,11 @@ fn selectable_hunk(
         });
     }
     match file.status {
-        FileStatus::Modified | FileStatus::Renamed | FileStatus::Copied => {}
+        FileStatus::Modified
+        | FileStatus::Renamed
+        | FileStatus::Copied
+        | FileStatus::Untracked
+        | FileStatus::Added => {}
         other => {
             return Err(SynthesisError::LineSelectionUnsupported {
                 path: file.path.clone(),
@@ -456,11 +495,39 @@ pub struct LineSelection {
 /// Counts are recomputed per emitted line (context, converted-to-context, kept-add, kept-del
 /// all bump the relevant side(s)); the header is rebuilt as
 /// `@@ -old_start,old_count +new_start,new_count @@` plus the source hunk's header suffix
-/// (reused via [`header_suffix`]) — the starts are unchanged, only the counts move.
+/// (reused via [`header_suffix`]) — `new_start` is unchanged, only the counts move (and, for a
+/// one-sided source, `old_start` — see below).
 ///
 /// Same refusals as [`whole_hunk_patch`]: binary files ([`SynthesisError::BinaryFile`]),
 /// unsupported statuses ([`SynthesisError::LineSelectionUnsupported`]), and an out-of-range
 /// `hunk_idx` ([`SynthesisError::HunkOutOfRange`]).
+///
+/// ## One-sided sources (`Untracked`/`Added`, no `HEAD`/index preimage)
+///
+/// `hunk.lines` is ALL [`LineKind::Addition`] for these statuses (nothing pre-existed, so
+/// there's nothing to have context or a deletion among) — the direction rules above still apply
+/// mechanically (a dropped addition is omitted under `base == Old`, converted to context under
+/// `base == New`), but the RENDERED patch's shape depends on whether any Context line ended up
+/// emitted:
+///
+/// - `base == Old` (staging a subset of an untracked file's lines): dropped additions are always
+///   OMITTED, never converted to context (there's no deletion rule to mirror them into) — so no
+///   Context line is ever emitted here, and the rendered patch is always a pure creation:
+///   `old_path: None`.
+/// - `base == New` (unstaging an Added file's lines, or discarding an Untracked file's lines):
+///   dropped additions convert to Context — the lines NOT selected for the reverse-apply must
+///   stay in the target. If any survive as Context, the patch has a real (non-empty) old side —
+///   `old_path: Some(path)`, so `invert()` renders it as a two-sided modification, not a
+///   deletion. If EVERY addition was kept (no Context survives — a full-file selection),
+///   `old_path` stays `None`: `invert()` then renders a deletion, matching "removing the whole
+///   file" — though [`crate::app`]'s discard flow routes a full untracked selection to the
+///   whole-file confirm (fork 2 of the handoff) rather than relying on this implicitly.
+///
+/// Either way, `old_start` in the rendered header is `0` when the final `old_count` is `0` (pure
+/// creation/no old side), else `1` (a real, if partial, old-side region starting at the file's
+/// first line) — `hunk.old_start` itself is `0` for these statuses (git2 has no old-side line
+/// numbers to report), so it can't be reused verbatim once the old side gains content the way a
+/// two-sided source's `old_start` can.
 ///
 /// A deletion line carrying [`crate::model::HunkLine::missing_newline`] — whether a dropped
 /// deletion converted to context (see above) or a KEPT deletion emitted verbatim — followed by
@@ -570,20 +637,43 @@ pub fn partial_hunk_patch(
         .filter(|l| matches!(l.kind, LineKind::Context | LineKind::Addition))
         .count() as u32;
 
+    // One-sided sources (no HEAD/index preimage) get a possibly-`None` old_path and a
+    // recomputed old_start, per this function's doc comment; two-sided sources keep their
+    // existing (always non-`None`, always-`hunk.old_start`) behavior unchanged.
+    let one_sided_source = matches!(file.status, FileStatus::Untracked | FileStatus::Added);
+    let old_path = if one_sided_source {
+        if old_count == 0 {
+            None
+        } else {
+            Some(old_path)
+        }
+    } else {
+        Some(old_path)
+    };
+    let old_start = if one_sided_source {
+        if old_count == 0 {
+            0
+        } else {
+            1
+        }
+    } else {
+        hunk.old_start
+    };
+
     let mut header = format!(
-        "@@ -{},{old_count} +{},{new_count} @@",
-        hunk.old_start, hunk.new_start
+        "@@ -{old_start},{old_count} +{},{new_count} @@",
+        hunk.new_start
     )
     .into_bytes();
     header.extend_from_slice(&header_suffix(&hunk.header));
 
     Ok(PatchText {
-        old_path: Some(old_path),
+        old_path,
         new_path: Some(new_path),
         old_mode: file.old_mode,
         new_mode: file.new_mode,
         hunks: vec![PatchHunk {
-            old_start: hunk.old_start,
+            old_start,
             old_count,
             new_start: hunk.new_start,
             new_count,
@@ -760,6 +850,130 @@ mod tests {
         assert_eq!(inverted.hunks[0].lines[1].content, b"line2");
     }
 
+    /// A hand-built one-sided (creation) [`PatchText`] — `whole_hunk_patch`/`partial_hunk_patch`
+    /// don't synthesize these yet (that's step 3, gated on `selectable_hunk`'s status refusal);
+    /// this constructs `PatchText` directly to pin `to_bytes`'s header-rendering contract on its
+    /// own, matching the canonical `git diff --no-index /dev/null file` shape from the handoff.
+    fn creation_patch() -> PatchText {
+        PatchText {
+            old_path: None,
+            new_path: Some("new.txt".to_string()),
+            old_mode: 0,
+            new_mode: 0o100644,
+            hunks: vec![PatchHunk {
+                old_start: 0,
+                old_count: 0,
+                new_start: 1,
+                new_count: 2,
+                header: b"@@ -0,0 +1,2 @@\n".to_vec(),
+                lines: vec![
+                    PatchLine {
+                        kind: LineKind::Addition,
+                        content: b"hello\n".to_vec(),
+                        missing_newline: false,
+                    },
+                    PatchLine {
+                        kind: LineKind::Addition,
+                        content: b"world\n".to_vec(),
+                        missing_newline: false,
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn creation_patch_renders_new_file_mode_and_bare_index_line() {
+        let patch = creation_patch();
+
+        let expected = [
+            "diff --git a/new.txt b/new.txt\n",
+            "new file mode 100644\n",
+            "index 0000000..0000000\n",
+            "--- /dev/null\n",
+            "+++ b/new.txt\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+hello\n",
+            "+world\n",
+        ]
+        .concat()
+        .into_bytes();
+
+        assert_eq!(patch.to_bytes(), expected);
+    }
+
+    #[test]
+    fn deletion_patch_renders_deleted_file_mode_and_bare_index_line() {
+        let patch = PatchText {
+            old_path: Some("gone.txt".to_string()),
+            new_path: None,
+            old_mode: 0o100644,
+            new_mode: 0,
+            hunks: vec![PatchHunk {
+                old_start: 1,
+                old_count: 2,
+                new_start: 0,
+                new_count: 0,
+                header: b"@@ -1,2 +0,0 @@\n".to_vec(),
+                lines: vec![
+                    PatchLine {
+                        kind: LineKind::Deletion,
+                        content: b"hello\n".to_vec(),
+                        missing_newline: false,
+                    },
+                    PatchLine {
+                        kind: LineKind::Deletion,
+                        content: b"world\n".to_vec(),
+                        missing_newline: false,
+                    },
+                ],
+            }],
+        };
+
+        let expected = [
+            "diff --git a/gone.txt b/gone.txt\n",
+            "deleted file mode 100644\n",
+            "index 0000000..0000000\n",
+            "--- a/gone.txt\n",
+            "+++ /dev/null\n",
+            "@@ -1,2 +0,0 @@\n",
+            "-hello\n",
+            "-world\n",
+        ]
+        .concat()
+        .into_bytes();
+
+        assert_eq!(patch.to_bytes(), expected);
+    }
+
+    /// Fork 1's `invert` requirement: a reversed creation patch must render as a DELETION
+    /// (`deleted file mode`), not silently keep the `new file mode` line — `invert` already
+    /// swaps `old_path`/`new_path`/`old_mode`/`new_mode`, so this is a round-trip contract test
+    /// on `to_bytes`'s header rendering, not new inversion logic.
+    #[test]
+    fn invert_of_creation_renders_as_deletion_header() {
+        let patch = creation_patch();
+        let inverted = patch.invert();
+
+        assert_eq!(inverted.old_path.as_deref(), Some("new.txt"));
+        assert!(inverted.new_path.is_none());
+
+        let rendered = String::from_utf8(inverted.to_bytes()).unwrap();
+        assert!(
+            rendered.contains("deleted file mode 100644\n"),
+            "expected a deleted file mode line, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("index 0000000..0000000\n"),
+            "expected the bare (mode-suffix-free) index line, got: {rendered}"
+        );
+        assert!(!rendered.contains("new file mode"));
+
+        // invert(invert(creation)) == creation (same contract as the existing modification
+        // round-trip test above).
+        assert_eq!(inverted.invert(), patch);
+    }
+
     #[test]
     fn refuses_binary_file() {
         let file = FileChange {
@@ -788,12 +1002,11 @@ mod tests {
 
     #[test]
     fn refuses_statuses_a_hunk_patch_cannot_express() {
-        for status in [
-            FileStatus::Added,
-            FileStatus::Deleted,
-            FileStatus::Untracked,
-            FileStatus::Unmerged,
-        ] {
+        // Deleted/Unmerged stay refused (fork 4): neither a two-sided nor a one-sided hunk
+        // patch can express them. Added/Untracked are no longer in this list — `selectable_hunk`
+        // now admits them (see its doc comment) for `partial_hunk_patch`'s one-sided path; see
+        // the synthesis unit tests around `creation_patch` for their positive coverage.
+        for status in [FileStatus::Deleted, FileStatus::Unmerged] {
             let file = FileChange {
                 path: "f.txt".to_string(),
                 old_path: None,
@@ -1000,12 +1213,9 @@ mod tests {
 
     #[test]
     fn partial_refuses_statuses_a_hunk_patch_cannot_express() {
-        for status in [
-            FileStatus::Added,
-            FileStatus::Deleted,
-            FileStatus::Untracked,
-            FileStatus::Unmerged,
-        ] {
+        // Deleted/Unmerged stay refused (fork 4); Added/Untracked are covered separately below
+        // (they now synthesize a one-sided patch instead of refusing).
+        for status in [FileStatus::Deleted, FileStatus::Unmerged] {
             let file = FileChange {
                 path: "f.txt".to_string(),
                 old_path: None,
@@ -1023,5 +1233,124 @@ mod tests {
                 "expected refusal for status {status:?}"
             );
         }
+    }
+
+    /// A pure-addition hunk shaped like an `Untracked` file's — `old_start`/`old_count` are `0`,
+    /// every line is an `Addition`, `old_path` is `None` — the fixture for the one-sided
+    /// `partial_hunk_patch` unit tests below.
+    fn untracked_hunk() -> Hunk {
+        let line = |content: &str, new_lnum| HunkLine {
+            kind: LineKind::Addition,
+            content: content.as_bytes().to_vec(),
+            old_lnum: None,
+            new_lnum: Some(new_lnum),
+            missing_newline: false,
+        };
+        Hunk {
+            old_start: 0,
+            old_count: 0,
+            new_start: 1,
+            new_count: 3,
+            header: b"@@ -0,0 +1,3 @@\n".to_vec(),
+            lines: vec![line("one\n", 1), line("two\n", 2), line("three\n", 3)],
+        }
+    }
+
+    fn untracked_file(hunk: Hunk) -> FileChange {
+        FileChange {
+            path: "new.txt".to_string(),
+            old_path: None,
+            status: FileStatus::Untracked,
+            is_binary: false,
+            old_mode: 0,
+            new_mode: 0o100644,
+            hunks: vec![hunk],
+        }
+    }
+
+    /// `base == Old` (staging a subset of an untracked file's lines): dropped additions are
+    /// always OMITTED, never converted to context — the rendered patch is always a pure
+    /// creation, `old_path: None`, regardless of which lines are kept.
+    #[test]
+    fn partial_base_old_on_untracked_renders_a_pure_creation() {
+        let file = untracked_file(untracked_hunk());
+        let sel = LineSelection {
+            keep_adds: BTreeSet::from([0, 2]), // "one" and "three"; "two" dropped
+            keep_dels: BTreeSet::new(),
+        };
+        let patch = partial_hunk_patch(&file, 0, &sel, PatchBase::Old).unwrap();
+
+        assert_eq!(patch.old_path, None);
+        assert_eq!(patch.new_path.as_deref(), Some("new.txt"));
+        assert_eq!(patch.hunks[0].old_start, 0);
+        assert_eq!(patch.hunks[0].old_count, 0);
+
+        let expected = [
+            "diff --git a/new.txt b/new.txt\n",
+            "new file mode 100644\n",
+            "index 0000000..0000000\n",
+            "--- /dev/null\n",
+            "+++ b/new.txt\n",
+            "@@ -0,0 +1,2 @@\n",
+            "+one\n",
+            "+three\n",
+        ]
+        .concat()
+        .into_bytes();
+        assert_eq!(patch.to_bytes(), expected);
+    }
+
+    /// `base == New` (unstaging/discarding a subset of lines) with a PARTIAL selection: the
+    /// dropped additions survive as Context, so the patch gains a real old side —
+    /// `old_path: Some(path)`, `old_start: 1` — and `invert()` (the actual apply direction for
+    /// Unstage/Discard) renders a two-sided MODIFICATION, not a deletion.
+    #[test]
+    fn partial_base_new_on_untracked_with_partial_selection_keeps_old_path() {
+        let file = untracked_file(untracked_hunk());
+        let sel = LineSelection {
+            keep_adds: BTreeSet::from([0]), // only "one" selected for reverse-apply
+            keep_dels: BTreeSet::new(),
+        };
+        let patch = partial_hunk_patch(&file, 0, &sel, PatchBase::New).unwrap();
+
+        assert_eq!(patch.old_path.as_deref(), Some("new.txt"));
+        assert_eq!(patch.new_path.as_deref(), Some("new.txt"));
+        assert_eq!(patch.hunks[0].old_start, 1);
+        assert_eq!(patch.hunks[0].old_count, 2); // "two" and "three" survive as context
+
+        let inverted = patch.invert();
+        assert_eq!(inverted.old_path.as_deref(), Some("new.txt"));
+        assert_eq!(inverted.new_path.as_deref(), Some("new.txt"));
+        let rendered = String::from_utf8(inverted.to_bytes()).unwrap();
+        assert!(
+            !rendered.contains("deleted file mode") && !rendered.contains("new file mode"),
+            "expected a two-sided modification header, got: {rendered}"
+        );
+    }
+
+    /// `base == New` with a FULL selection (every addition kept): no Context survives, so
+    /// `old_path` stays `None` and `invert()` renders a deletion — the shape a full-file discard
+    /// would produce if it went through this path (which `app.rs`'s routing avoids per fork 2,
+    /// but the synthesis-level contract still holds on its own).
+    #[test]
+    fn partial_base_new_on_untracked_with_full_selection_renders_as_deletion_when_inverted() {
+        let file = untracked_file(untracked_hunk());
+        let sel = LineSelection {
+            keep_adds: BTreeSet::from([0, 1, 2]),
+            keep_dels: BTreeSet::new(),
+        };
+        let patch = partial_hunk_patch(&file, 0, &sel, PatchBase::New).unwrap();
+
+        assert_eq!(patch.old_path, None);
+        assert_eq!(patch.hunks[0].old_start, 0);
+        assert_eq!(patch.hunks[0].old_count, 0);
+
+        let inverted = patch.invert();
+        assert!(inverted.new_path.is_none());
+        let rendered = String::from_utf8(inverted.to_bytes()).unwrap();
+        assert!(
+            rendered.contains("deleted file mode 100644\n"),
+            "expected a deletion header, got: {rendered}"
+        );
     }
 }

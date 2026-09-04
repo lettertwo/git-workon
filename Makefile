@@ -25,11 +25,12 @@ build:
 test:
 	cargo test --workspace
 
-# PTY smoke tests (ignored by default: wall-clock-bound and load-sensitive).
-# Spawns the review binary under a pseudo-terminal and plays the terminal's
-# side of the theme=auto probe conversation; see tests/pty_smoke.rs.
+# PTY tests (ignored by default: wall-clock-bound and load-sensitive). Spawns the review
+# binary under a pseudo-terminal; covers the theme=auto probe conversation (see
+# tests/pty/pty_smoke.rs) and launch/nav/streamed-startup responsiveness bounds (see
+# tests/pty/pty_responsiveness.rs) — merged into one `pty` test binary, see tests/pty/main.rs.
 smoke:
-	cargo test -p git-workon-review --test pty_smoke -- --ignored
+	cargo test -p git-workon-review --test pty -- --ignored
 
 fmt:
 	cargo fmt

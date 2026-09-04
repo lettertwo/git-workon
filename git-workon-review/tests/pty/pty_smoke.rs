@@ -14,16 +14,13 @@
 //! test: re-run solo before treating a failure as a regression). Run them explicitly:
 //!
 //! ```text
-//! cargo test -p git-workon-review --test pty_smoke -- --ignored
+//! cargo test -p git-workon-review --test pty -- --ignored
 //! ```
 //!
 //! Color/SGR assertions are deliberately absent — capturing ratatui frames through a PTY is
 //! unreliable; reply *parsing* is unit-tested in `terminal_query.rs`.
 
-#![cfg(unix)]
-
-mod pty_support;
-use pty_support::spawn_review;
+use crate::pty_support::{probe_cache_path, spawn_review};
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -97,7 +94,7 @@ fn assert_q_quits_promptly(mut session: Session<OsProcess, OsStream>) {
 }
 
 #[test]
-#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_smoke -- --ignored"]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
 fn theme_auto_stays_responsive_when_the_terminal_answers() {
     let fixture = auto_theme_fixture();
     let mut session = spawn_review(&fixture);
@@ -113,7 +110,7 @@ fn theme_auto_stays_responsive_when_the_terminal_answers() {
 }
 
 #[test]
-#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty_smoke -- --ignored"]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
 fn theme_auto_stays_responsive_when_the_terminal_is_silent() {
     // The no-hang guarantee: a terminal that never answers (tmux without passthrough, CI) must
     // cost at most the probe deadline, then fall back to a curated theme and run normally. This
@@ -125,6 +122,10 @@ fn theme_auto_stays_responsive_when_the_terminal_is_silent() {
 
     assert_q_quits_promptly(session);
 
+    // NOT asserted here: what tty name the recorded verdict is keyed by — that is
+    // `silent_probe_verdict_is_keyed_to_the_concrete_tty_device`'s job, in its own PTY so the
+    // two tests never share a cache file's write timing.
+    //
     // NOT asserted here: that a SECOND launch on this same (now cache-hit) terminal is fast.
     // That behavior is real (manually verified end-to-end with the actual binary under `expect`
     // — a first silent launch pays the ~800ms deadline and records a verdict; a second launch on
@@ -138,4 +139,33 @@ fn theme_auto_stays_responsive_when_the_terminal_is_silent() {
     // Chasing that harness quirk was out of scope here; two-process verification stays a manual
     // workflow for this one behavior, same posture pty_responsiveness.rs takes for precise
     // per-phase timings.
+}
+
+#[test]
+#[ignore = "PTY smoke — run explicitly: cargo test -p git-workon-review --test pty -- --ignored"]
+fn silent_probe_verdict_is_keyed_to_the_concrete_tty_device() {
+    // The 2026-07 auto-theme-goes-dark bug: `terminal_key()` resolved the tty name from an fd
+    // opened on `/dev/tty`, which macOS's `ttyname_r` reports as the literal "/dev/tty" — one
+    // constant key shared by EVERY terminal window. A single silent verdict (recorded by a
+    // dogfood run under `expect`, whose pty answers no OSC queries) then matched every real
+    // terminal with the same TERM/TERM_PROGRAM, so `theme = auto` silently fell back to curated
+    // dark for the cache's whole 30-day TTL. The verdict must instead be keyed to this PTY's
+    // concrete device (`/dev/ttysNNN` on macOS, `/dev/pts/N` on Linux) so it scopes to the one
+    // terminal that actually went silent.
+    let fixture = auto_theme_fixture();
+    let session = spawn_review(&fixture);
+    assert_q_quits_promptly(session); // silent PTY: the probe times out and records its verdict
+
+    let cache = std::fs::read_to_string(probe_cache_path(&fixture))
+        .expect("silent launch must have recorded a probe-cache verdict");
+    let entries: serde_json::Value = serde_json::from_str(&cache).expect("cache is JSON");
+    let tty = entries[0]["tty"].as_str().expect("verdict has a tty key");
+    assert_ne!(
+        tty, "/dev/tty",
+        "verdict keyed to the non-scoping /dev/tty poisons every terminal window"
+    );
+    assert!(
+        tty.starts_with("/dev/"),
+        "verdict tty {tty:?} is not a device path"
+    );
 }

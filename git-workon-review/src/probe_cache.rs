@@ -15,10 +15,14 @@
 //! working every launch.
 //!
 //! ## Key
-//! The controlling tty's device path (`/dev/ttysNNN` via `ttyname_r`) plus `$TERM` and
-//! `$TERM_PROGRAM`. The tty path scopes a verdict to one terminal window; TERM/TERM_PROGRAM guard
-//! against a later, DIFFERENT emulator reusing a recycled tty number and inheriting a stale
-//! "silent" verdict it never earned.
+//! The controlling tty's CONCRETE device path (`/dev/ttysNNN` on macOS, `/dev/pts/N` on Linux,
+//! via `ttyname_r` on the first standard fd that is a tty) plus `$TERM` and `$TERM_PROGRAM`. The
+//! tty path scopes a verdict to one terminal window; TERM/TERM_PROGRAM guard against a later,
+//! DIFFERENT emulator reusing a recycled tty number and inheriting a stale "silent" verdict it
+//! never earned. The name must NOT come from an fd opened on `/dev/tty`: macOS's `ttyname_r`
+//! reports that fd as the literal "/dev/tty", one constant key shared by every terminal window —
+//! which let a single silent verdict (a dogfood run under `expect`) put every real kitty window
+//! on the curated-dark fallback for the whole TTL (the 2026-07 auto-theme-goes-dark bug).
 //!
 //! ## Store
 //! A small human-readable JSON array of `{tty, term, term_program, timestamp}` objects under
@@ -57,16 +61,22 @@ pub(crate) struct TerminalKey {
     term_program: String,
 }
 
-/// Build this launch's [`TerminalKey`] from the controlling tty and environment. `None` when
-/// there's no controlling tty to key against (no `/dev/tty`, not unix) — callers treat that the
-/// same as a cache miss.
+/// Build this launch's [`TerminalKey`] from the controlling tty and environment. `None` when no
+/// standard fd is a tty to key against (stdio fully redirected, not unix) — callers treat that
+/// the same as a cache miss, so an un-keyable launch just probes.
+///
+/// The device name is resolved from the first of stdin/stdout/stderr that `isatty` reports —
+/// deliberately NOT from an fd opened on `/dev/tty`, even though the probe itself converses over
+/// `/dev/tty`: on macOS, `ttyname_r` on such an fd returns the literal "/dev/tty", collapsing
+/// every terminal window onto one shared cache key (see the module doc's "Key" section for the
+/// poisoning this caused).
 #[cfg(unix)]
 pub(crate) fn terminal_key() -> Option<TerminalKey> {
     use std::ffi::CStr;
-    use std::os::unix::io::AsRawFd;
 
-    let tty = std::fs::File::options().read(true).open("/dev/tty").ok()?;
-    let fd = tty.as_raw_fd();
+    let fd = [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO]
+        .into_iter()
+        .find(|&fd| unsafe { libc::isatty(fd) } == 1)?;
     let mut buf = [0 as std::os::raw::c_char; 256];
     if unsafe { libc::ttyname_r(fd, buf.as_mut_ptr(), buf.len()) } != 0 {
         return None;

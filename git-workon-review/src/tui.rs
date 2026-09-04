@@ -45,11 +45,12 @@ use ratatui::widgets::Paragraph;
 use ratatui::{Frame, Terminal};
 use workon::Changeset;
 use workon_review::acquire::{diff_changeset, ChangesetDiff};
-use workon_review::app::{self, App, FileLoadSpec, LoadedViews};
+use workon_review::app::{self, App, FileLoadSpec, LoadedViews, Severity};
+use workon_review::config;
 use workon_review::highlight::TsHighlighter;
 use workon_review::keymap::{Command, Dispatch, KeyPress, Keymap};
 use workon_review::render;
-use workon_review::theme::Palette;
+use workon_review::theme::{Palette, PaletteContext};
 
 /// One event the review loop reacts to. `Tick` is synthesized by the main loop on an inbox
 /// `recv_timeout` timeout — it is never sent through the channel itself (see [`recv_event`]).
@@ -427,6 +428,7 @@ fn drain_pending(
 enum Action {
     Quit,
     ToggleHelp,
+    ReloadConfig,
     MoveCursorBy(i64),
     ScrollTop,
     ScrollBottom,
@@ -447,6 +449,8 @@ enum Action {
     StartSelection,
     ExpandGap,
     ExpandGapAll,
+    ResetGaps,
+    ExpandAllGaps,
     HscrollLeft,
     HscrollRight,
     ToggleOutline,
@@ -478,6 +482,7 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::Quit => Action::Quit,
         Command::ToggleOutline => Action::ToggleOutline,
         Command::ToggleHelp => Action::ToggleHelp,
+        Command::ReloadConfig => Action::ReloadConfig,
         Command::CursorDown => Action::MoveCursorBy(1),
         Command::CursorUp => Action::MoveCursorBy(-1),
         Command::HalfPageDown => Action::MoveCursorBy(half_page),
@@ -495,6 +500,8 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::StartSelection => Action::StartSelection,
         Command::ExpandGap => Action::ExpandGap,
         Command::ExpandGapAll => Action::ExpandGapAll,
+        Command::ResetGaps => Action::ResetGaps,
+        Command::ExpandAllGaps => Action::ExpandAllGaps,
         Command::HscrollLeft => Action::HscrollLeft,
         Command::HscrollRight => Action::HscrollRight,
         Command::NextFile => Action::NextFile,
@@ -593,6 +600,8 @@ fn action_needs_loaded_view(action: Action) -> bool {
             | Action::ToggleSplitFocus
             | Action::ExpandGap
             | Action::ExpandGapAll
+            | Action::ResetGaps
+            | Action::ExpandAllGaps
     )
 }
 
@@ -610,6 +619,7 @@ fn apply_action(app: &mut App, action: Action) -> bool {
     match action {
         Action::Quit => return true,
         Action::ToggleHelp => app.toggle_help(),
+        Action::ReloadConfig => app.request_config_reload(),
         Action::MoveCursorBy(delta) => app.move_cursor_by(delta),
         Action::ScrollTop => app.scroll_top(),
         Action::ScrollBottom => app.scroll_bottom(),
@@ -630,6 +640,8 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::StartSelection => app.start_selection(),
         Action::ExpandGap => app.expand_gap_at_cursor(false),
         Action::ExpandGapAll => app.expand_gap_at_cursor(true),
+        Action::ResetGaps => app.reset_gaps(),
+        Action::ExpandAllGaps => app.expand_all_gaps(),
         Action::HscrollLeft => app.hscroll_left(),
         Action::HscrollRight => app.hscroll_right(),
         Action::ToggleOutline => app.toggle_outline(),
@@ -1032,12 +1044,18 @@ impl Tui {
     /// the tty before crossterm's event stream has a reader racing them. Neither thread is joined:
     /// when `run` returns, `main` returns, and the process takes both down (ADR-037's kill-on-exit
     /// lifecycle — neither thread ever writes, so an abandoned one can't corrupt anything).
+    ///
+    /// `keymap`/`theme` are taken BY VALUE (not `&Keymap`/`&Palette`) — a `reload-config` request
+    /// (`R`) needs to swap both mid-session, which needs owned locals `event_loop` can hold a
+    /// `&mut` into; `palette_ctx` is what a reload re-resolves `theme = auto` against (see
+    /// [`PaletteContext`]'s doc comment) rather than re-probing the terminal.
     pub fn run(
         &mut self,
         app: &mut App,
-        keymap: &Keymap,
-        theme: &Palette,
+        mut keymap: Keymap,
+        mut theme: Palette,
         repo_path: PathBuf,
+        palette_ctx: &PaletteContext,
     ) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<InboxMessage>();
         spawn_input_thread(tx.clone());
@@ -1048,7 +1066,14 @@ impl Tui {
             wave_tx: &tx,
             repo_path: &repo_path,
         };
-        let result = event_loop(&mut self.terminal, app, keymap, theme, &pipeline);
+        let result = event_loop(
+            &mut self.terminal,
+            app,
+            &mut keymap,
+            &mut theme,
+            palette_ctx,
+            &pipeline,
+        );
         let restored = self.restore();
         result.and(restored)
     }
@@ -1066,10 +1091,11 @@ impl Tui {
     pub fn run_streamed(
         &mut self,
         app: &mut App,
-        keymap: &Keymap,
-        theme: &Palette,
+        mut keymap: Keymap,
+        mut theme: Palette,
         repo_path: PathBuf,
         changesets: Vec<Changeset>,
+        palette_ctx: &PaletteContext,
     ) -> io::Result<()> {
         let (tx, rx) = mpsc::channel::<InboxMessage>();
         spawn_input_thread(tx.clone());
@@ -1091,7 +1117,14 @@ impl Tui {
             wave_tx: &tx,
             repo_path: &repo_path,
         };
-        let result = event_loop(&mut self.terminal, app, keymap, theme, &pipeline);
+        let result = event_loop(
+            &mut self.terminal,
+            app,
+            &mut keymap,
+            &mut theme,
+            palette_ctx,
+            &pipeline,
+        );
         let restored = self.restore();
         result.and(restored)
     }
@@ -1144,8 +1177,9 @@ const OPEN_DEBOUNCE: Duration = Duration::from_millis(80);
 fn event_loop<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     app: &mut App,
-    keymap: &Keymap,
-    theme: &Palette,
+    keymap: &mut Keymap,
+    theme: &mut Palette,
+    palette_ctx: &PaletteContext,
     pipeline: &Pipeline<'_>,
 ) -> io::Result<()> {
     let Pipeline {
@@ -1211,6 +1245,31 @@ fn event_loop<W: Write>(
                 gen,
                 Some(app.current_cs()),
             );
+        }
+
+        // `reload-config` (`R`): re-read the whole `workon.review.*` tree through `App`'s own
+        // repo handle and swap it into the keymap/palette the render/dispatch calls above already
+        // hold `&mut` into — `App` itself flagged this via `request_config_reload` (it can't do
+        // the swap itself, see that method's doc comment). The immutable `app.repo()` borrow ends
+        // with `resolve_runtime`'s return, before `app` is touched mutably below.
+        if app.take_config_reload_request() {
+            let runtime = config::resolve_runtime(app.repo(), palette_ctx);
+            *keymap = runtime.keymap;
+            *theme = runtime.palette;
+            // A half-entered chord against the OLD keymap is meaningless once the bindings under
+            // it have changed.
+            pending.clear();
+            let view_warnings = app.reload_view_config(&runtime.view_config);
+            let mut extra_warnings = runtime.warnings;
+            extra_warnings.extend(view_warnings);
+            // `crate::plumb_zoom_hint_and_warnings` re-plumbs the "cycle zoom" refusal hint the
+            // same way `main.rs`'s `seat_app` does at startup — a reload that rebinds
+            // `cycle-zoom` would otherwise leave the hint naming the old key (no binding at all
+            // leaves the previous label in place, same as startup) — and surfaces any warnings.
+            // A reload with nothing to warn about still owes the user a signal that it worked.
+            if !crate::plumb_zoom_hint_and_warnings(app, keymap, extra_warnings) {
+                app.notify("config reloaded", Severity::Info);
+            }
         }
     }
 }
@@ -1553,16 +1612,43 @@ mod tests {
     }
 
     #[test]
-    fn z_and_w_map_to_zoom_and_split_focus() {
+    fn shift_z_and_w_map_to_zoom_and_split_focus() {
+        // diff-fold-keys: `cycle-zoom` moved off bare `z` to `Z` — `z` now anchors the `zM`/`zR`
+        // gap fold-all chords in this view (see `z_m_and_z_r_map_to_reset_and_expand_all_gaps`
+        // below), and a bare-key binding can't coexist with a longer chord sharing its prefix.
         let km = Keymap::defaults();
         let mut pending: Vec<KeyPress> = Vec::new();
         assert_eq!(
-            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false, false),
+            map_key(&km, &mut pending, key(KeyCode::Char('Z')), 20, false, false),
             Action::CycleZoom
         );
         assert_eq!(
             map_key(&km, &mut pending, key(KeyCode::Char('w')), 20, false, false),
             Action::ToggleSplitFocus
+        );
+    }
+
+    #[test]
+    fn z_m_and_z_r_map_to_reset_and_expand_all_gaps() {
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false, false),
+            Action::None,
+            "the first key of a chord reports no action yet (Pending)"
+        );
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('M')), 20, false, false),
+            Action::ResetGaps
+        );
+
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('z')), 20, false, false),
+            Action::None
+        );
+        assert_eq!(
+            map_key(&km, &mut pending, key(KeyCode::Char('R')), 20, false, false),
+            Action::ExpandAllGaps
         );
     }
 
@@ -3357,6 +3443,28 @@ mod tests {
             app.current_view_ref().is_some(),
             "the active file's view must be cached after its FileReady lands"
         );
+    }
+
+    // ── `reload-config` (`R`) ───────────────────────────────────────────────────
+
+    #[test]
+    fn reload_config_command_maps_to_the_reload_action_and_sets_the_app_flag() {
+        assert_eq!(
+            command_to_action(Command::ReloadConfig, 20),
+            Action::ReloadConfig
+        );
+
+        use git_workon_fixture::prelude::*;
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let mut app = app_from_fixture(&fixture);
+        assert!(!app.take_config_reload_request());
+
+        apply_action(&mut app, Action::ReloadConfig);
+        assert!(
+            app.take_config_reload_request(),
+            "Action::ReloadConfig must raise App's request flag"
+        );
+        assert!(!app.take_config_reload_request(), "the flag is one-shot");
     }
 
     // ── diff-hscroll: `Action::FocusOutline` pans home before focusing ─────────────

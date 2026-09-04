@@ -18,8 +18,8 @@ use workon::{Changeset, ChangesetSpan};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{
-    align_file, collapse_gaps_with_expansions, gap_hidden_range, inline_rows, AlignedRow, CellKind,
-    DisplayRow, GapExpansion, InlineRow, Row,
+    align_file, collapse_gaps, collapse_gaps_with_expansions, gap_hidden_range, inline_rows,
+    AlignedRow, CellKind, DisplayRow, GapExpansion, InlineRow, Row,
 };
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
@@ -250,6 +250,48 @@ impl FileView {
         entry.after += more_after;
         entry.full |= full;
         self.rebuild_rows();
+    }
+
+    /// Collapse every gap back to the original, freshly-loaded window, discarding every
+    /// [`Self::expand_gap`]/[`Self::scope_expand_gap`] accumulated since. An empty
+    /// [`Self::expansions`] map already IS that original state (what [`Self::load`] starts with),
+    /// so nothing-to-discard returns `false` without rebuilding — the caller uses that to leave
+    /// selection/scroll state alone when the row space did not reshape (the same rule
+    /// [`App::expand_gap_at_cursor`] documents). Driven by `zM` — see [`App::reset_gaps`].
+    pub fn reset_expansions(&mut self) -> bool {
+        if self.expansions.is_empty() {
+            return false;
+        }
+        self.expansions.clear();
+        self.rebuild_rows();
+        true
+    }
+
+    /// Reveal every collapsed gap in the file at once. Collects the gap keys from the BASE
+    /// collapse ([`collapse_gaps`], not [`Self::display`]) so a gap that's already partially
+    /// expanded is still caught — the base collapse always has every gap the file can have, while
+    /// the current display only shows the ones still collapsed under the CURRENT expansions.
+    /// Returns whether anything actually changed (some gap was not already fully revealed);
+    /// a gapless or already-fully-expanded file skips the rebuild and returns `false`, same
+    /// contract as [`Self::reset_expansions`].
+    pub fn expand_all_gaps(&mut self) -> bool {
+        let mut changed = false;
+        for row in collapse_gaps(&self.aligned) {
+            if let DisplayRow::Gap { key, .. } = row {
+                changed |= !self.expansions.get(&key).is_some_and(|e| e.full);
+                self.expansions.insert(
+                    key,
+                    GapExpansion {
+                        full: true,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        if changed {
+            self.rebuild_rows();
+        }
+        changed
     }
 
     /// CS9's scope-reveal: widen the gap keyed `key` to uncover a tree-sitter scope range
@@ -582,7 +624,27 @@ pub enum Role {
     Staged,
 }
 
-/// The zoom the user *requested* via `z` — persists across file navigation (like [`Layout`]). The
+/// `workon.review.diff.text` (see ADR-035's "Revised (CS11, diff foreground/background split)"
+/// section): which foreground source changed lines render with. A **behavior selector, not a
+/// color** — it lives on `App` rather than [`crate::theme::Palette`] because it decides which
+/// already-resolved palette color a segment picks, not what a color IS. Context lines always keep
+/// syntax highlighting regardless of this setting; only changed (`Del`/`Add`) lines are affected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffTextMode {
+    /// Tree-sitter foreground everywhere, changed lines included — today's behavior, and the
+    /// pixel-identity default.
+    #[default]
+    Syntax,
+    /// Changed lines take the tint foreground (`add_fg`/`del_fg`, or the staged pair per the
+    /// line's attribution) across their full width.
+    Tint,
+    /// Syntax stays on the line; only the edit spans take the tint foreground. On an unpaired
+    /// line (no word-diff counterpart), the tint foreground spans the full width — wherever the
+    /// edit background wash is painted, the tint foreground is painted too.
+    Edit,
+}
+
+/// The zoom the user *requested* via `Z` — persists across file navigation (like [`Layout`]). The
 /// actual state rendered per file is [`EffectiveZoom`], resolved by [`effective_zoom`] from this
 /// plus the file's available sub-diffs; a file lacking the requested role collapses to
 /// [`Role::Combined`] rather than showing an empty pane.
@@ -657,65 +719,113 @@ pub fn effective_zoom(
     }
 }
 
-/// Parse `workon.review.outline.mode` (CS7) into an [`OutlineMode`]. Canonical strings mirror
-/// the variant names, kebab-cased: `flat`, `stack`, `tree`, `stack-tree`. `None` on anything
-/// else — [`App::apply_view_config`] falls back to [`OutlineMode::default`] and warns.
-fn parse_outline_mode(raw: &str) -> Option<OutlineMode> {
-    match raw {
-        "flat" => Some(OutlineMode::Flat),
-        "stack" => Some(OutlineMode::Stack),
-        "tree" => Some(OutlineMode::Tree),
-        "stack-tree" => Some(OutlineMode::StackTree),
-        _ => None,
-    }
+/// The valid config strings for one of the CS7 view-config enums, in declaration order — the
+/// single source both the `parse_*` functions below and their warning messages
+/// (`App::apply_view_config`, config-validation-completeness Decision 5) read from, so the
+/// "valid: …" list in a warning can never list a name the parser doesn't actually accept (or
+/// omit one it does).
+fn valid_options_list<T: Copy>(options: &[(&str, T)]) -> String {
+    options
+        .iter()
+        .map(|(name, _)| *name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
-/// Parse `workon.review.outline.order` (CS3) into an [`OutlineOrder`]. Canonical strings mirror
-/// the variant names, kebab-cased: `head-first`, `base-first`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`OutlineOrder::default`] and warns.
-fn parse_outline_order(raw: &str) -> Option<OutlineOrder> {
-    match raw {
-        "head-first" => Some(OutlineOrder::HeadFirst),
-        "base-first" => Some(OutlineOrder::BaseFirst),
-        _ => None,
-    }
+/// The canonical config string for `options`' `T::default()` variant — reads the enum's real
+/// `Default` impl rather than hardcoding a name, so a warning's "using default '…'" can never
+/// drift from what `Default::default()` actually produces.
+fn default_option_name<T: Copy + PartialEq + Default>(
+    options: &'static [(&'static str, T)],
+) -> &'static str {
+    options
+        .iter()
+        .find(|(_, value)| *value == T::default())
+        .map(|(name, _)| *name)
+        .expect("T::default() has a canonical name listed in `options`")
 }
 
-/// Parse `workon.review.icons` (CS5) into an [`IconMode`]. Canonical strings mirror
-/// the variant names, kebab-cased: `nerd`, `none`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`IconMode::default`] (also `none` — CS5's
-/// no-auto-detection default) and warns.
-fn parse_icon_mode(raw: &str) -> Option<IconMode> {
-    match raw {
-        "nerd" => Some(IconMode::Nerd),
-        "none" => Some(IconMode::None),
-        _ => None,
-    }
+/// Look up `raw` in one of the CS7 `*_OPTIONS` tables below — `None` on anything not in
+/// `options`, the "unrecognized" signal [`resolve_option`] falls back to a default and warns on.
+fn parse_option<T: Copy>(options: &[(&str, T)], raw: &str) -> Option<T> {
+    options
+        .iter()
+        .find(|(name, _)| *name == raw)
+        .map(|(_, value)| *value)
 }
 
-/// Parse `workon.review.diff.layout` (CS7) into a [`Layout`]. Canonical strings mirror the
-/// variant names: `sbs`, `inline`. `None` on anything else — [`App::apply_view_config`] falls
-/// back to [`Layout::default`] and warns.
-fn parse_diff_layout(raw: &str) -> Option<Layout> {
-    match raw {
-        "sbs" => Some(Layout::Sbs),
-        "inline" => Some(Layout::Inline),
-        _ => None,
-    }
+/// Resolve one `workon.review.*` view-config string against `options`: [`parse_option`] on a
+/// hit, or `T::default()` plus a pushed "unrecognized (valid: …); using default '…'" warning on
+/// a miss — the shared warn-and-default shape every site in [`App::apply_view_config`] needs.
+/// `key` is the fully-qualified config key (e.g. `"workon.review.outline.mode"`) as it should
+/// read in the warning.
+fn resolve_option<T: Copy + PartialEq + Default>(
+    key: &str,
+    raw: &str,
+    options: &'static [(&'static str, T)],
+    warnings: &mut Vec<String>,
+) -> T {
+    parse_option(options, raw).unwrap_or_else(|| {
+        let valid = valid_options_list(options);
+        let default = default_option_name(options);
+        warnings.push(format!(
+            "{key} = '{raw}' unrecognized (valid: {valid}); using default '{default}'"
+        ));
+        T::default()
+    })
 }
 
-/// Parse `workon.review.diff.zoom` (CS7) into a [`Zoom`]. Canonical strings mirror the variant
-/// names: `split`, `combined`, `unstaged`, `staged`. `None` on anything else —
-/// [`App::apply_view_config`] falls back to [`Zoom::default`] and warns.
-fn parse_diff_zoom(raw: &str) -> Option<Zoom> {
-    match raw {
-        "split" => Some(Zoom::Split),
-        "combined" => Some(Zoom::Combined),
-        "unstaged" => Some(Zoom::Unstaged),
-        "staged" => Some(Zoom::Staged),
-        _ => None,
-    }
-}
+/// `workon.review.outline.mode` (CS7)'s valid config strings, kebab-cased mirrors of the
+/// [`OutlineMode`] variant names, in [`App::apply_view_config`]'s warning order. Resolved via
+/// [`resolve_option`] — [`App::apply_view_config`] falls back to [`OutlineMode::default`] and
+/// warns on anything not listed here.
+const OUTLINE_MODE_OPTIONS: &[(&str, OutlineMode)] = &[
+    ("flat", OutlineMode::Flat),
+    ("stack", OutlineMode::Stack),
+    ("tree", OutlineMode::Tree),
+    ("stack-tree", OutlineMode::StackTree),
+];
+
+/// `workon.review.outline.order` (CS3)'s valid config strings, kebab-cased mirrors of the
+/// [`OutlineOrder`] variant names. Resolved via [`resolve_option`] — [`App::apply_view_config`]
+/// falls back to [`OutlineOrder::default`] and warns on anything not listed here.
+const OUTLINE_ORDER_OPTIONS: &[(&str, OutlineOrder)] = &[
+    ("head-first", OutlineOrder::HeadFirst),
+    ("base-first", OutlineOrder::BaseFirst),
+];
+
+/// `workon.review.icons` (CS5)'s valid config strings, kebab-cased mirrors of the [`IconMode`]
+/// variant names. Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to
+/// [`IconMode::default`] (also `none` — CS5's no-auto-detection default) and warns on anything
+/// not listed here.
+const ICON_MODE_OPTIONS: &[(&str, IconMode)] =
+    &[("none", IconMode::None), ("nerd", IconMode::Nerd)];
+
+/// `workon.review.diff.layout` (CS7)'s valid config strings, mirroring the [`Layout`] variant
+/// names. Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to
+/// [`Layout::default`] and warns on anything not listed here.
+const DIFF_LAYOUT_OPTIONS: &[(&str, Layout)] = &[("sbs", Layout::Sbs), ("inline", Layout::Inline)];
+
+/// `workon.review.diff.zoom` (CS7)'s valid config strings, mirroring the [`Zoom`] variant names.
+/// Resolved via [`resolve_option`] — [`App::apply_view_config`] falls back to [`Zoom::default`]
+/// and warns on anything not listed here.
+const DIFF_ZOOM_OPTIONS: &[(&str, Zoom)] = &[
+    ("split", Zoom::Split),
+    ("combined", Zoom::Combined),
+    ("unstaged", Zoom::Unstaged),
+    ("staged", Zoom::Staged),
+];
+
+/// `workon.review.diff.text` (CS11)'s valid config strings, mirroring the [`DiffTextMode`]
+/// variant names — see [ADR-035](../../../docs/adr/035-review-theming-base16-hybrid.md)'s
+/// "Revised (CS11, diff foreground/background split)" section. Resolved via [`resolve_option`]
+/// — [`App::apply_view_config`] falls back to [`DiffTextMode::default`] and warns on anything
+/// not listed here.
+const DIFF_TEXT_OPTIONS: &[(&str, DiffTextMode)] = &[
+    ("syntax", DiffTextMode::Syntax),
+    ("tint", DiffTextMode::Tint),
+    ("edit", DiffTextMode::Edit),
+];
 
 /// CS4: which outline row a Header/Dir cursor selection resolves to — [`App::summary_target`]'s
 /// return type, and the input [`App::summary_for`] consumes to build the renderable summary.
@@ -1204,9 +1314,13 @@ pub struct App {
     highlighter: TsHighlighter,
     /// Current render layout; see [`Layout`]'s doc comment for the persistence contract.
     pub layout: Layout,
-    /// The requested zoom (cycled by `z`); the effective per-file zoom is resolved each frame via
+    /// The requested zoom (cycled by `Z`); the effective per-file zoom is resolved each frame via
     /// [`effective_zoom`]. Persists across file navigation, like [`Self::layout`].
     pub zoom: Zoom,
+    /// `workon.review.diff.text` (CS11) — which foreground source changed lines render with.
+    /// Read directly by `render.rs`, same as [`Self::layout`]/[`Self::zoom`]; see
+    /// [`DiffTextMode`]'s doc comment.
+    pub diff_text: DiffTextMode,
     /// Which split pane has focus. Only meaningful under [`EffectiveZoom::Split`]; reset to
     /// `Unstaged` (the top pane) whenever a file opens or the zoom changes.
     split_focus: SplitPane,
@@ -1304,6 +1418,19 @@ pub struct App {
     /// touches a thread or a `Repository`-carrying `Sender` itself, so it stays constructible (and
     /// `refresh` stays synchronously testable) with nothing wired up to actually dispatch this.
     pending_wave: Option<(u64, Vec<(usize, Changeset)>)>,
+    /// Display label for the resolved [`crate::keymap::Command::CycleZoom`] binding, shown in
+    /// [`Self::notify_combined_refusal`]'s "cycle zoom" hint. `App` deliberately has no keymap
+    /// field (the keymap is threaded through `tui.rs`/`main.rs` separately), so `main.rs::seat_app`
+    /// sets this once at seat time from the resolved binding; defaults to `"Z"` — the command's
+    /// default binding — for every `App::new`/`from_changesets` path that never seats a keymap
+    /// (keeps existing unit tests passing without churn).
+    zoom_key_label: String,
+    /// A `reload-config` (`R`) request, picked up (and cleared) by [`Self::take_config_reload_request`].
+    /// Mirrors [`Self::pending_wave`]'s request-flag shape: `App` can't own the `Keymap`/`Palette`
+    /// the reload swaps in (they're threaded through `tui.rs`/`main.rs`, same reason
+    /// [`Self::zoom_key_label`] is a label rather than a keymap reference), so it only raises the
+    /// flag here and the event loop — which DOES hold those — does the actual reload.
+    config_reload_requested: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1467,6 +1594,7 @@ impl App {
             highlighter: TsHighlighter::new(),
             layout: Layout::default(),
             zoom: Zoom::default(),
+            diff_text: DiffTextMode::default(),
             split_focus: SplitPane::Unstaged,
             notice: None,
             queue: StagingQueue::new(),
@@ -1484,6 +1612,8 @@ impl App {
             generation: 1,
             wave_failure_notified: false,
             pending_wave: None,
+            zoom_key_label: "Z".to_string(),
+            config_reload_requested: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1500,6 +1630,14 @@ impl App {
     /// never calls it, leaving [`Self::review_source`] at its `None` default.
     pub fn set_review_source(&mut self, source: Source) {
         self.review_source = Some(source);
+    }
+
+    /// Set the display label shown in [`Self::notify_combined_refusal`]'s "cycle zoom" hint —
+    /// see the `zoom_key_label` field's doc comment. `main.rs::plumb_zoom_hint_and_warnings` calls
+    /// this with the resolved [`crate::keymap::Command::CycleZoom`] binding, both right after
+    /// `seat_app` constructs the `App` and on every `reload-config`.
+    pub fn set_zoom_key_label(&mut self, label: String) {
+        self.zoom_key_label = label;
     }
 
     /// The current `.git/index`'s cheap fingerprint (mtime + size), or `None` if the read fails —
@@ -2210,6 +2348,27 @@ impl App {
         self.pending_wave.take()
     }
 
+    /// `App`'s own repo handle — read-only access for a caller (the reload command) that needs to
+    /// re-read `workon.review.*` config through the SAME handle `App` already opened, rather than
+    /// opening a second one onto the same on-disk repo.
+    pub fn repo(&self) -> &Repository {
+        &self.repo
+    }
+
+    /// Raise a `reload-config` (`R`) request — picked up (and cleared) by the event loop via
+    /// [`Self::take_config_reload_request`]. `App` can't do the reload itself: it doesn't own the
+    /// `Keymap`/`Palette` that get swapped (see [`Self::config_reload_requested`]'s doc comment).
+    pub fn request_config_reload(&mut self) {
+        self.config_reload_requested = true;
+    }
+
+    /// Take the pending `reload-config` request, if any — one-shot, mirroring
+    /// [`Self::take_pending_wave`]'s take-and-clear shape: a second call with nothing new
+    /// requested in between returns `false`.
+    pub fn take_config_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.config_reload_requested)
+    }
+
     /// Apply one loader result (ADR-037's chokepoint, the `FileReady` inbox arm routes here):
     /// dropped outright on a generation mismatch (`gen != self.generation` — the world it was
     /// computed against no longer exists, see [`Self::generation`]'s doc comment). Otherwise:
@@ -2225,7 +2384,7 @@ impl App {
     /// [`Self::complete_pending_open`]'s tail — with one refinement over a plain "always clear"
     /// rule: an `Ok` result only clears the pending open when its SHAPE satisfies the current
     /// effective zoom (see [`loaded_views_satisfy`]). Without this, a zoom cycled mid-load
-    /// (`z` is exempt from force-completion — [`Self::open_current`] re-defers with
+    /// (`Z` is exempt from force-completion — [`Self::open_current`] re-defers with
     /// `open_pending_dispatched = false`) lets the stale-shaped in-flight result seat only the
     /// old view, clear the pending flags, and strand the new zoom's view forever un-dispatched.
     /// When unsatisfied, `open_pending` stays set and `open_pending_dispatched` resets to
@@ -2357,7 +2516,7 @@ impl App {
         }
     }
 
-    /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`z`). The new zoom
+    /// Cycle the requested zoom `Split → Combined → Unstaged → Staged → Split` (`Z`). The new zoom
     /// persists across file navigation; both panes reset to their first hunks so `cursor`/`scroll`
     /// are always valid for the now-active view(s).
     pub fn cycle_zoom(&mut self) {
@@ -3636,8 +3795,13 @@ impl App {
     }
 
     /// The `(scroll, cursor)` a split pane renders with: the focused pane contributes its own
-    /// `scroll` and `Some(cursor)` (so the cursor highlight draws there); the unfocused pane
-    /// contributes its stashed scroll and `None` (no highlight). Combined resolves to the focused
+    /// `scroll`/`cursor`; the unfocused pane contributes its stashed `alt` scroll/cursor (CS1,
+    /// `unfocused-cursor-wash` — previously `None`, since only the focused pane ever drew a
+    /// cursor; now the unfocused half's remembered position is always returned too, so the
+    /// renderer can paint it with the dim [`crate::theme::Palette::cursor_unfocused_bg`] wash
+    /// when it's within the visible `scroll..end` range). The cursor alone no longer says
+    /// whether a pane holds focus — callers resolve that separately (`split_focus_role`,
+    /// `outline_focused`) and pick the wash accordingly. Combined resolves to the focused
     /// (single) state.
     pub(crate) fn pane_render_state(&self, role: Role) -> (usize, Option<usize>) {
         let pane = match role {
@@ -3648,7 +3812,7 @@ impl App {
         if self.split_focus == pane {
             (self.scroll, Some(self.cursor))
         } else {
-            (self.alt.scroll, None)
+            (self.alt.scroll, Some(self.alt.cursor))
         }
     }
 
@@ -3790,6 +3954,41 @@ impl App {
         self.clamp_cursor();
     }
 
+    /// Collapse every gap in the focused file's view back to the original, freshly-loaded state,
+    /// discarding any accumulated [`Self::expand_gap_at_cursor`] reveals (`zM`, mirroring the
+    /// outline's `OutlineCollapseAll`). Scope: the focused view only ([`FileView::expansions`] is
+    /// per-file, same as a refresh already clears it). A no-op when there's no loaded view
+    /// (mirrors [`Self::expand_gap_at_cursor`]'s guard).
+    ///
+    /// `zM`/`zR` share the `z` prefix in `View::Diff`, which is why `cycle-zoom` moved off bare
+    /// `z` to `Z` (see `keymap::tests::shift_z_dispatches_cycle_zoom_with_no_collisions`'s doc
+    /// comment for the mechanics that forced the rebind).
+    pub fn reset_gaps(&mut self) {
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        // Tail only when the row space actually reshaped — a no-op zM must leave an in-progress
+        // selection alone, the same rule expand_gap_at_cursor documents above.
+        if view.reset_expansions() {
+            self.cancel_selection();
+            self.derive_scroll();
+            self.clamp_cursor();
+        }
+    }
+
+    /// Reveal every collapsed gap in the focused file's view at once (`zR`, mirroring the
+    /// outline's `OutlineExpandAll`). Scope and tail mirror [`Self::reset_gaps`].
+    pub fn expand_all_gaps(&mut self) {
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        if view.expand_all_gaps() {
+            self.cancel_selection();
+            self.derive_scroll();
+            self.clamp_cursor();
+        }
+    }
+
     /// Toggle between side-by-side and inline layouts (`L`). Deliberately does not try to
     /// re-derive an exactly equivalent `cursor` position for the new layout — the two layouts'
     /// row vectors track the same underlying content in a different shape, and translating
@@ -3833,8 +4032,17 @@ impl App {
         self.layout = layout;
     }
 
-    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom` (CS7) as
-    /// the App's initial view-config state, via the same setters the interactive keys drive
+    /// Set `workon.review.diff.text`'s resolved mode directly — the config-startup (CS11)
+    /// counterpart, mirroring [`Self::set_layout`]/[`Self::set_zoom`]. Purely a render-time
+    /// foreground selector: no cursor/scroll state depends on it, so unlike `set_layout` there is
+    /// nothing else to clamp or re-derive, at startup OR on reload.
+    pub fn set_diff_text(&mut self, mode: DiffTextMode) {
+        self.diff_text = mode;
+    }
+
+    /// Apply `workon.review.outline.width|mode` and `workon.review.diff.layout|zoom|text` (CS7,
+    /// CS11) as the App's initial view-config state, via the same setters the interactive keys
+    /// drive
     /// (see each setter's doc comment for why that's enough to stay on the gated path). Call
     /// once, right after construction and before [`Self::open_current`] (see `main.rs`) — the
     /// setters here don't themselves re-derive `cursor`/`scroll`, and the caller's
@@ -3855,7 +4063,8 @@ impl App {
                 _ => {
                     warnings.push(format!(
                         "workon.review.outline.width = {w} out of range \
-                         ({MIN_OUTLINE_WIDTH}-{MAX_OUTLINE_WIDTH}); using default"
+                         ({MIN_OUTLINE_WIDTH}-{MAX_OUTLINE_WIDTH}); using default \
+                         {DEFAULT_OUTLINE_WIDTH}"
                     ));
                     DEFAULT_OUTLINE_WIDTH
                 }
@@ -3865,59 +4074,117 @@ impl App {
         self.set_outline_width(width);
 
         let mode = match &raw.outline_mode {
-            Some(m) => parse_outline_mode(m).unwrap_or_else(|| {
-                warnings.push(format!(
-                    "workon.review.outline.mode = '{m}' unrecognized; using default"
-                ));
-                OutlineMode::default()
-            }),
+            Some(m) => resolve_option(
+                "workon.review.outline.mode",
+                m,
+                OUTLINE_MODE_OPTIONS,
+                &mut warnings,
+            ),
             None => OutlineMode::default(),
         };
         self.set_outline_mode(mode);
 
         let order = match &raw.outline_order {
-            Some(o) => parse_outline_order(o).unwrap_or_else(|| {
-                warnings.push(format!(
-                    "workon.review.outline.order = '{o}' unrecognized; using default"
-                ));
-                OutlineOrder::default()
-            }),
+            Some(o) => resolve_option(
+                "workon.review.outline.order",
+                o,
+                OUTLINE_ORDER_OPTIONS,
+                &mut warnings,
+            ),
             None => OutlineOrder::default(),
         };
         self.set_outline_order(order);
 
         let icons = match &raw.icons {
-            Some(i) => parse_icon_mode(i).unwrap_or_else(|| {
-                warnings.push(format!(
-                    "workon.review.icons = '{i}' unrecognized; using default"
-                ));
-                IconMode::default()
-            }),
+            Some(i) => resolve_option("workon.review.icons", i, ICON_MODE_OPTIONS, &mut warnings),
             None => IconMode::default(),
         };
         self.set_icon_mode(icons);
 
         let layout = match &raw.diff_layout {
-            Some(l) => parse_diff_layout(l).unwrap_or_else(|| {
-                warnings.push(format!(
-                    "workon.review.diff.layout = '{l}' unrecognized; using default"
-                ));
-                Layout::default()
-            }),
+            Some(l) => resolve_option(
+                "workon.review.diff.layout",
+                l,
+                DIFF_LAYOUT_OPTIONS,
+                &mut warnings,
+            ),
             None => Layout::default(),
         };
         self.set_layout(layout);
 
         let zoom = match &raw.diff_zoom {
-            Some(z) => parse_diff_zoom(z).unwrap_or_else(|| {
-                warnings.push(format!(
-                    "workon.review.diff.zoom = '{z}' unrecognized; using default"
-                ));
-                Zoom::default()
-            }),
+            Some(z) => resolve_option(
+                "workon.review.diff.zoom",
+                z,
+                DIFF_ZOOM_OPTIONS,
+                &mut warnings,
+            ),
             None => Zoom::default(),
         };
         self.set_zoom(zoom);
+
+        let diff_text = match &raw.diff_text {
+            Some(t) => resolve_option(
+                "workon.review.diff.text",
+                t,
+                DIFF_TEXT_OPTIONS,
+                &mut warnings,
+            ),
+            None => DiffTextMode::default(),
+        };
+        self.set_diff_text(diff_text);
+
+        warnings
+    }
+
+    /// Apply a mid-session `workon.review.outline.*`/`workon.review.diff.*` change (the
+    /// `reload-config` command, `R`) — the reload counterpart to [`Self::apply_view_config`].
+    ///
+    /// [`Self::apply_view_config`]'s setters deliberately skip re-deriving `cursor`/`scroll`/
+    /// outline state, because [`Self::open_current`] (called once right after it, at startup)
+    /// derives all of that fresh. Reload can't call `open_current` — that would reset the
+    /// cursor/scroll position and re-arm a deferred load, throwing away the user's place for what
+    /// should be a cheap recolor/rebind (the exact regression this design exists to prevent).
+    /// Instead: run `apply_view_config`, then replay only the TAIL of whichever interactive
+    /// counterpart(s) actually changed something — [`Self::toggle_layout`]'s tail if `layout`
+    /// flipped, [`Self::outline_cycle_mode`]'s tail if `outline.mode`/`outline.order` changed.
+    /// `zoom`'s interactive counterpart, [`Self::cycle_zoom`], has no further tail beyond the bare
+    /// assignment once its committed-changeset notice is dropped — that notice was purely
+    /// interactive feedback for what would otherwise be a silent cycle no-op, not an invariant:
+    /// [`Self::effective_zoom_for`] already collapses a non-stageable changeset to `Combined`
+    /// regardless of the requested zoom, so a config-driven `zoom` change can't bypass the gate
+    /// either. Reload never emits that notice and never re-derives the pane position for a zoom
+    /// change — same "don't call `open_current`" reasoning as everything else here.
+    pub fn reload_view_config(&mut self, raw: &RawViewConfig) -> Vec<String> {
+        let layout_before = self.layout;
+        let outline_mode_before = self.outline.mode;
+        let outline_order_before = self.outline.order;
+
+        let warnings = self.apply_view_config(raw);
+
+        if self.layout != layout_before {
+            // Mirrors `toggle_layout`'s tail: the two layouts' row vectors are different
+            // coordinate spaces, so a selection anchor doesn't translate across them.
+            self.selection_anchor = None;
+            self.clamp_cursor();
+            if let EffectiveZoom::Split = self.effective_zoom_for(self.current) {
+                let role = self.unfocused_split_role();
+                let rows = self.role_row_count(self.current, role);
+                self.alt.cursor = if rows == 0 {
+                    0
+                } else {
+                    self.alt.cursor.min(rows - 1)
+                };
+            }
+            self.derive_scroll();
+        }
+
+        if self.outline.mode != outline_mode_before || self.outline.order != outline_order_before {
+            // Mirrors `outline_cycle_mode`'s tail: the row list's shape just changed, so a stale
+            // pan offset or cursor index could easily land past the new mode's content.
+            self.outline.hscroll = 0;
+            self.sync_outline_to_current();
+        }
 
         warnings
     }
@@ -3984,8 +4251,9 @@ impl App {
                 Severity::Error,
             );
         } else {
+            let key = &self.zoom_key_label;
             self.notify(
-                format!("{verb} in the unstaged/staged pane — cycle zoom (z)"),
+                format!("{verb} in the unstaged/staged pane — cycle zoom ({key})"),
                 Severity::Error,
             );
         }
@@ -4433,11 +4701,11 @@ impl App {
     }
 
     /// Stage (unstaged pane) / unstage (staged pane) the active line selection (`s` with a
-    /// selection up). Refuses on the combined view (cycle-zoom notice), on a file no hunk patch
-    /// can express (the modified-file notice — line ops need a two-sided hunk, per
-    /// [`ops::is_hunk_patchable`]), and on a selection that covers no changed lines. Otherwise
-    /// applies every overlapped hunk's kept lines as ONE merged patch via [`LineSelectionOp`]
-    /// (never one op per hunk — see that type's docs), drains once, and clears the selection.
+    /// selection up). Refuses on the combined view (cycle-zoom notice), on a file no line op can
+    /// express ([`ops::supports_line_ops`] — Deleted/Unmerged/binary, per-status notice), and on
+    /// a selection that covers no changed lines. Otherwise applies every overlapped hunk's kept
+    /// lines as ONE merged patch via [`LineSelectionOp`] (never one op per hunk — see that
+    /// type's docs), drains once, and clears the selection.
     fn stage_selection(&mut self) {
         if self.cur().diff.files.is_empty() {
             self.cancel_selection();
@@ -4450,9 +4718,9 @@ impl App {
         let Some(verb) = Self::verb_for_role(role) else {
             return;
         };
-        if !ops::is_hunk_patchable(&self.cur().diff.files[self.current]) {
+        if !ops::supports_line_ops(&self.cur().diff.files[self.current]) {
             self.notify(
-                "line staging needs a modified file — use s/S for the whole file",
+                line_ops_refusal_message(&self.cur().diff.files[self.current]),
                 Severity::Error,
             );
             return;
@@ -4470,9 +4738,13 @@ impl App {
     }
 
     /// Request confirmation to discard the active line selection from the worktree (`d` with a
-    /// selection up). Discard acts only in the unstaged pane; refuses otherwise, on a
-    /// non-hunk-patchable file, or on a selection with no changed lines. The confirm prompt states
-    /// the TRUE scope (total lines across N hunks); the discard runs on `y`.
+    /// selection up). Discard acts only in the unstaged pane; refuses otherwise, on a file no
+    /// line op can express ([`ops::supports_line_ops`], per-status notice), or on a selection
+    /// with no changed lines. A selection covering ALL of an `Untracked` file's lines is routed
+    /// to the whole-file discard confirm instead (fork 2 of the line-ops-on-one-sided-files
+    /// handoff): the file gets removed, not left behind empty, and the prompt says so. Otherwise
+    /// the confirm prompt states the TRUE scope (total lines across N hunks); the discard runs
+    /// on `y`.
     fn discard_selection(&mut self) {
         if self.cur().diff.files.is_empty() {
             self.cancel_selection();
@@ -4486,16 +4758,24 @@ impl App {
             self.notify("discard acts in the unstaged pane", Severity::Error);
             return;
         }
-        if !ops::is_hunk_patchable(&self.cur().diff.files[self.current]) {
-            self.notify(
-                "line staging needs a modified file — use s/S for the whole file",
-                Severity::Error,
-            );
+        let file = &self.cur().diff.files[self.current];
+        if !ops::supports_line_ops(file) {
+            self.notify(line_ops_refusal_message(file), Severity::Error);
             return;
         }
         let selections = self.selection_line_ops();
         if selections.is_empty() {
             self.notify("no changed lines in selection", Severity::Error);
+            return;
+        }
+        if file.status == FileStatus::Untracked && selection_covers_every_line(file, &selections) {
+            let path = file.path.clone();
+            self.request_confirm(
+                format!("Discard `{path}`? This removes the untracked file. (y/n)"),
+                PendingOp::DiscardFile {
+                    file_idx: self.current,
+                },
+            );
             return;
         }
         let total: usize = selections
@@ -4516,6 +4796,51 @@ impl App {
             },
         );
     }
+}
+
+/// Per-status footer refusal for a line-op gate failure (fork 4 of the line-ops-on-one-sided-files
+/// handoff): name the blocked status specifically rather than the old one-size-fits-all
+/// "needs a modified file" wording, which stopped being accurate once
+/// [`ops::supports_line_ops`] started admitting `Untracked`/`Added` too. The statuses that still
+/// reach this message are exactly [`ops::supports_line_ops`]'s refusals: `Deleted`, `Unmerged`,
+/// and any binary file regardless of status.
+fn line_ops_refusal_message(file: &FileChange) -> String {
+    if file.is_binary {
+        return "line staging isn't available for a binary file — use s/S for the whole file"
+            .to_string();
+    }
+    let noun = match file.status {
+        FileStatus::Deleted => "deleted file",
+        FileStatus::Unmerged => "unmerged file",
+        // Every other status passes `ops::supports_line_ops`, so this arm is unreachable in
+        // practice — kept as a safe fallback rather than a `panic!`/`unreachable!` (a routing
+        // bug elsewhere should surface as a slightly generic notice, not a crash).
+        _ => "file",
+    };
+    format!("line staging isn't available for a {noun} — use s/S for the whole file")
+}
+
+/// Fork 2's full-selection detector: whether `selections` keeps every [`LineKind::Addition`]
+/// line across ALL of `file`'s hunks — the shape [`App::discard_selection`] must route to the
+/// whole-file discard confirm instead of a partial line discard (an `Untracked` file has no
+/// deletions to speak of, so "every addition kept" is "the whole file selected"). `false` when
+/// `file` has no addition lines at all (nothing to have "covered everything").
+fn selection_covers_every_line(file: &FileChange, selections: &[(usize, LineSelection)]) -> bool {
+    let total_adds: usize = file
+        .hunks
+        .iter()
+        .map(|h| {
+            h.lines
+                .iter()
+                .filter(|l| l.kind == LineKind::Addition)
+                .count()
+        })
+        .sum();
+    if total_adds == 0 {
+        return false;
+    }
+    let selected_adds: usize = selections.iter().map(|(_, sel)| sel.keep_adds.len()).sum();
+    selected_adds == total_adds
 }
 
 /// Resolve a selection's kept old-del / new-add LINE NUMBERS to a [`LineSelection`] — whose keys
@@ -4675,7 +5000,7 @@ pub enum LoadedViews {
 /// Whether a loaded result's SHAPE — what zoom it was built against, per [`FileLoadSpec::zoom`]
 /// — still matches `current_zoom`, the current file's effective zoom at result-apply time. Used
 /// by [`App::apply_file_ready`] to tell a still-useful deferred-open result apart from one a
-/// mid-load `z` cycle outran: `Single` satisfies only the SAME role's `Single`, `Split`
+/// mid-load `Z` cycle outran: `Single` satisfies only the SAME role's `Single`, `Split`
 /// satisfies only `Split` (never the reverse — a `Split` result doesn't seat a `Single` open,
 /// and vice versa, even though `set_if_absent` already caches whichever roles it carries).
 fn loaded_views_satisfy(views: &LoadedViews, current_zoom: EffectiveZoom) -> bool {
@@ -4946,11 +5271,12 @@ mod tests {
     use super::test_support::app_from_fixture;
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity, Summary,
-        SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, SCROLLOFF,
+        DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity,
+        Summary, SummaryTarget, Zoom, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, MAX_OUTLINE_WIDTH,
+        MIN_OUTLINE_WIDTH, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
-    use crate::config::ReviewConfig;
+    use crate::config::{RawViewConfig, ReviewConfig};
     use crate::icons::IconMode;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
@@ -5329,7 +5655,7 @@ mod tests {
             .expect("first take dispatches against the Split zoom");
         assert_eq!(spec.zoom, EffectiveZoom::Split);
 
-        // Mid-load `z`: CycleZoom is exempt from force-completion, so this re-defers the open
+        // Mid-load `Z`: CycleZoom is exempt from force-completion, so this re-defers the open
         // against the NEW zoom instead of blocking for it.
         app.cycle_zoom();
         assert!(
@@ -7565,6 +7891,42 @@ mod tests {
     }
 
     #[test]
+    fn combined_refusal_defaults_to_the_shift_z_label() {
+        use super::{Severity, Zoom};
+
+        // `App::from_changesets`/`App::new` paths that never seat a keymap (this test included)
+        // must keep showing the command's default binding, byte-identical to before this field
+        // existed.
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.zoom = Zoom::Combined;
+        app.open_current();
+        app.stage_hunk();
+
+        let notice = app.notice.as_ref().expect("combined stage must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("(Z)"), "got: {:?}", notice.text);
+    }
+
+    #[test]
+    fn combined_refusal_shows_the_seated_zoom_key_label() {
+        use super::{Severity, Zoom};
+
+        // `main.rs::seat_app` calls `set_zoom_key_label` with the resolved CycleZoom binding —
+        // simulate a rebind by setting a non-default label directly.
+        let fixture = partial_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.set_zoom_key_label("F5".to_string());
+        app.zoom = Zoom::Combined;
+        app.open_current();
+        app.stage_hunk();
+
+        let notice = app.notice.as_ref().expect("combined stage must refuse");
+        assert_eq!(notice.severity, Severity::Error);
+        assert!(notice.text.contains("(F5)"), "got: {:?}", notice.text);
+    }
+
+    #[test]
     fn discard_hunk_in_staged_pane_refuses() {
         use super::{Severity, Zoom};
 
@@ -7930,8 +8292,8 @@ mod tests {
     }
 
     #[test]
-    fn line_stage_on_untracked_file_refuses_with_modified_file_message() {
-        use super::Severity;
+    fn line_stage_on_untracked_file_stages_only_the_selected_lines() {
+        use crate::outline::StagedStatus;
 
         let fixture = FixtureBuilder::new()
             .config("core.autocrlf", "false")
@@ -7940,20 +8302,106 @@ mod tests {
             .unwrap();
         let mut app = app_from_fixture(&fixture);
         app.open_current();
-        app.start_selection(); // untracked file has an unstaged change, so selection is allowed
+        app.start_selection(); // single row: just the first addition line ("x\n")
+        app.stage_hunk();
+
+        assert!(
+            app.notice.is_none(),
+            "line staging on an untracked file must succeed now; got notice: {:?}",
+            app.notice
+        );
+        assert!(
+            app.selection_anchor.is_none(),
+            "selection clears after apply"
+        );
+
+        let repo = fixture.repo().unwrap();
+        repo.assert(predicate::repo::index_blob_equals(
+            "new.txt",
+            b"x\n".to_vec(),
+        ));
+        repo.assert(predicate::repo::workdir_file_equals(
+            "new.txt",
+            b"x\ny\nz\n".to_vec(),
+        ));
+
+        assert_eq!(
+            app.cur().staged_status(0),
+            StagedStatus::Partial,
+            "a partially staged untracked file shows Partial in the outline"
+        );
+    }
+
+    /// Regression guard (fork 4): a `Deleted` file still refuses line staging — unlike
+    /// `Untracked`/`Added`, a deletion has no meaningful "one-sided" creation shape — but the
+    /// notice now names the status instead of the old one-size-fits-all "modified file" wording.
+    #[test]
+    fn line_stage_on_deleted_file_still_refuses_with_per_status_message() {
+        use super::Severity;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .deleted_file("gone.txt", "bye\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection();
         app.stage_hunk();
 
         let notice = app.notice.as_ref().expect("line staging must refuse here");
         assert_eq!(notice.severity, Severity::Error);
         assert!(
-            notice.text.contains("line staging needs a modified file"),
+            notice
+                .text
+                .contains("line staging isn't available for a deleted file"),
             "got: {:?}",
             notice.text
         );
         let repo = fixture.repo().unwrap();
         assert!(
-            !predicate::repo::has_staged_file("new.txt").eval(repo),
+            !predicate::repo::has_staged_deletion("gone.txt").eval(repo),
             "a refused line stage must not touch the index"
+        );
+    }
+
+    /// Fork 2: discarding a selection that covers EVERY line of an untracked file routes to the
+    /// whole-file discard confirm (file removal), not a partial line-discard confirm — and does
+    /// NOT leave an empty file behind.
+    #[test]
+    fn discard_selection_covering_the_whole_untracked_file_confirms_file_removal() {
+        use super::PendingOp;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .untracked_file("new.txt", "only\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.start_selection(); // single-line file: this one row IS the whole file
+        app.discard_hunk(); // active selection -> discard_selection
+
+        let confirm = app
+            .pending_confirm
+            .as_ref()
+            .expect("full-file untracked discard requests a confirm");
+        assert!(
+            confirm.prompt.contains("removes the untracked file"),
+            "expected file-removal wording, got: {:?}",
+            confirm.prompt
+        );
+        assert_eq!(
+            confirm.op,
+            PendingOp::DiscardFile { file_idx: 0 },
+            "must route to the whole-file discard op, not a partial line discard"
+        );
+
+        app.resolve_confirm(true);
+        let repo = fixture.repo().unwrap();
+        assert!(
+            !repo.workdir().unwrap().join("new.txt").exists(),
+            "the untracked file must be removed outright, not left empty"
         );
     }
 
@@ -9817,6 +10265,7 @@ mod tests {
         assert_eq!(app.icon_mode(), IconMode::default());
         assert_eq!(app.layout, Layout::default());
         assert_eq!(app.zoom, Zoom::default());
+        assert_eq!(app.diff_text, DiffTextMode::default());
     }
 
     #[test]
@@ -9847,7 +10296,16 @@ mod tests {
 
         assert_eq!(app.outline_width(), DEFAULT_OUTLINE_WIDTH);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("outline.width"));
+        // Full-message pin (config-validation-completeness Decision 5): the range and fallback
+        // must come from the real `MIN_OUTLINE_WIDTH`/`MAX_OUTLINE_WIDTH`/`DEFAULT_OUTLINE_WIDTH`
+        // constants, never hardcoded numbers.
+        assert_eq!(
+            warnings[0],
+            format!(
+                "workon.review.outline.width = 9999 out of range \
+                 ({MIN_OUTLINE_WIDTH}-{MAX_OUTLINE_WIDTH}); using default {DEFAULT_OUTLINE_WIDTH}"
+            )
+        );
     }
 
     #[test]
@@ -9878,7 +10336,13 @@ mod tests {
 
         assert_eq!(app.outline_mode(), OutlineMode::default());
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("outline.mode"));
+        // Full-message pin: the valid set and fallback name come from `OUTLINE_MODE_OPTIONS`/
+        // `OutlineMode::default`, not a hardcoded string.
+        assert_eq!(
+            warnings[0],
+            "workon.review.outline.mode = 'bogus' unrecognized \
+             (valid: flat, stack, tree, stack-tree); using default 'stack'"
+        );
     }
 
     #[test]
@@ -10003,6 +10467,123 @@ mod tests {
         assert_eq!(app.zoom, Zoom::default());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("diff.zoom"));
+    }
+
+    #[test]
+    fn diff_text_overrides_default_when_set() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.text", "tint")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.diff_text, DiffTextMode::Tint);
+    }
+
+    #[test]
+    fn diff_text_invalid_falls_back_to_default_with_warning() {
+        let fixture = FixtureBuilder::new()
+            .config("workon.review.diff.text", "bogus")
+            .build()
+            .unwrap();
+        let config = ReviewConfig::new(fixture.repo().unwrap()).view_config();
+        let mut app = app_from_fixture(&fixture);
+
+        let warnings = app.apply_view_config(&config);
+
+        assert_eq!(app.diff_text, DiffTextMode::default());
+        assert_eq!(warnings.len(), 1);
+        // Full-message pin: matches the handoff's target shape verbatim.
+        assert_eq!(
+            warnings[0],
+            "workon.review.diff.text = 'bogus' unrecognized (valid: syntax, tint, edit); \
+             using default 'syntax'"
+        );
+    }
+
+    // ── `reload-config` (`R`): request flag + mid-session view-config apply ────
+
+    #[test]
+    fn config_reload_request_is_one_shot() {
+        let fixture = FixtureBuilder::new().build().unwrap();
+        let mut app = app_from_fixture(&fixture);
+
+        assert!(!app.take_config_reload_request(), "nothing requested yet");
+
+        app.request_config_reload();
+        assert!(
+            app.take_config_reload_request(),
+            "the request just raised must be observed"
+        );
+        assert!(
+            !app.take_config_reload_request(),
+            "a second take with nothing new requested must find nothing left"
+        );
+    }
+
+    #[test]
+    fn reload_view_config_does_not_reset_the_diff_cursor_to_row_0() {
+        // The key regression this design exists to prevent: `apply_view_config` alone (as
+        // `open_current` would run after it at startup) resets cursor/scroll via `reset_panes`;
+        // `reload_view_config` must NOT do that, since a config reload should read as a cheap
+        // recolor/rebind, not a jump back to the top of the file.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "a.txt",
+                "one\ntwo\nthree\nfour\nfive\n",
+                "ONE\ntwo\nTHREE\nfour\nFIVE\n",
+            )
+            .build()
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.move_cursor_by(2);
+        let cursor_before = app.cursor;
+        assert!(
+            cursor_before > 0,
+            "test setup: cursor must have moved off row 0"
+        );
+
+        // A layout flip exercises `reload_view_config`'s `toggle_layout`-mirroring tail (the
+        // clamp, not a reset) — the most invasive of the three tails it can run.
+        let raw = RawViewConfig {
+            diff_layout: Some("inline".to_string()),
+            ..Default::default()
+        };
+        let warnings = app.reload_view_config(&raw);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.layout, Layout::Inline);
+        assert_ne!(
+            app.cursor, 0,
+            "reload must not reset the diff cursor to row 0 like open_current/reset_panes would"
+        );
+    }
+
+    #[test]
+    fn reload_view_config_leaves_the_outline_cursor_valid_after_a_mode_change() {
+        let mut app = two_committed_changesets_two_and_one_files();
+        app.outline.open = true;
+
+        let raw = RawViewConfig {
+            outline_mode: Some("tree".to_string()),
+            ..Default::default()
+        };
+        let warnings = app.reload_view_config(&raw);
+
+        assert!(warnings.is_empty());
+        assert_eq!(app.outline_mode(), OutlineMode::Tree);
+        let items = app.outline_items();
+        assert!(
+            app.outline.cursor < items.len(),
+            "outline cursor must stay a valid index into the new mode's row list"
+        );
     }
 
     // ── CS4: summary panel ───────────────────────────────────────────────────────
@@ -11215,6 +11796,151 @@ mod tests {
                 .iter()
                 .any(|r| matches!(r, DisplayRow::Gap { .. })),
             "the gap must be back in its base (still-collapsed) form"
+        );
+    }
+
+    // ── diff-fold-keys CS3: reset (`zM`) / expand-all (`zR`) gaps ───────────
+
+    #[test]
+    fn reset_gaps_collapses_an_expanded_gap_back_to_the_freshly_loaded_shape() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let freshly_loaded_len = app.current_view_ref().unwrap().display.len();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+        assert!(
+            app.current_view_ref().unwrap().display.len() > freshly_loaded_len,
+            "precondition: the gap must actually have expanded"
+        );
+
+        app.reset_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert_eq!(
+            view.display.len(),
+            freshly_loaded_len,
+            "reset must return the display to its freshly-loaded (fully collapsed) shape"
+        );
+        assert!(
+            view.display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "a `Gap` row must be back after resetting"
+        );
+    }
+
+    #[test]
+    fn reset_gaps_with_nothing_expanded_is_a_no_op() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let before_len = app.current_view_ref().unwrap().display.len();
+        let before_cursor = app.cursor;
+        // An in-progress selection must survive a no-op zM — the row space didn't reshape, so
+        // there's no reason to destroy it (same rule as expand_gap_at_cursor's non-gap no-op).
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+
+        app.reset_gaps();
+
+        assert_eq!(
+            app.current_view_ref().unwrap().display.len(),
+            before_len,
+            "no-op must not change the row count"
+        );
+        assert_eq!(app.cursor, before_cursor, "no-op must not move the cursor");
+        assert!(
+            app.selection_anchor.is_some(),
+            "a no-op reset must leave an in-progress selection alone"
+        );
+    }
+
+    #[test]
+    fn expand_all_gaps_on_a_fully_expanded_file_is_a_no_op_that_keeps_the_selection() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.expand_all_gaps();
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+
+        app.expand_all_gaps();
+
+        assert!(
+            app.selection_anchor.is_some(),
+            "re-running zR with every gap already revealed must leave the selection alone"
+        );
+    }
+
+    #[test]
+    fn reset_gaps_keeps_the_cursor_in_bounds_after_collapsing_an_expanded_region() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        let gap_row = only_gap_row(&app);
+        app.cursor = gap_row;
+        app.expand_gap_at_cursor(false);
+        // Put the cursor deep inside the just-revealed region, past where the reset shape ends.
+        app.cursor = app.current_view_ref().unwrap().display.len() - 1;
+
+        app.reset_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            app.cursor < view.display.len(),
+            "cursor must be clamped back into the reset (shorter) display: {} vs len {}",
+            app.cursor,
+            view.display.len()
+        );
+    }
+
+    #[test]
+    fn expand_all_gaps_leaves_no_gap_row_behind() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+
+        app.expand_all_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert!(
+            !view
+                .display
+                .iter()
+                .any(|r| matches!(r, DisplayRow::Gap { .. })),
+            "expand-all must reveal every gap: {:?}",
+            view.display
+        );
+        assert!(
+            app.cursor < view.display.len(),
+            "cursor must stay in bounds"
+        );
+    }
+
+    #[test]
+    fn expand_all_gaps_then_reset_gaps_round_trips_to_the_freshly_loaded_shape() {
+        let fixture = two_hunks_with_a_wide_gap_fixture();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        let freshly_loaded_len = app.current_view_ref().unwrap().display.len();
+
+        app.expand_all_gaps();
+        assert!(
+            app.current_view_ref().unwrap().display.len() > freshly_loaded_len,
+            "precondition: expand-all must have revealed more rows"
+        );
+
+        app.reset_gaps();
+
+        let view = app.current_view_ref().unwrap();
+        assert_eq!(
+            view.display.len(),
+            freshly_loaded_len,
+            "reset must undo an expand-all just as it undoes a partial expansion"
         );
     }
 

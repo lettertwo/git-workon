@@ -1,5 +1,7 @@
 mod tui;
 
+use std::ffi::OsStr;
+
 use clap::{CommandFactory, Parser};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
@@ -8,10 +10,20 @@ use miette::{IntoDiagnostic, Result};
 use workon_review::acquire::{diff_changesets, resolve_changesets};
 use workon_review::app::{App, ChangesetView, Severity};
 use workon_review::config::{self, ReviewConfig};
-use workon_review::keymap::Keymap;
+use workon_review::keymap::{self, Command, Keymap};
 use workon_review::source::{complete_source, resolve_source, Source};
 use workon_review::terminal_query;
-use workon_review::theme::Palette;
+use workon_review::theme::{self, Palette};
+
+/// Whether `NO_COLOR` (per `no-color.org`) requests colorless output — any non-empty value
+/// means yes, unset or empty means no. `FORCE_COLOR` is deliberately not consulted: `NO_COLOR`
+/// is the user's explicit request for THIS tool's colors, whereas `FORCE_COLOR` (already read
+/// elsewhere for test/output-capture posture) answers a different question. Takes `Option<&OsStr>`
+/// rather than reading `std::env::var_os` itself so tests can drive it without touching process
+/// env (the `FORCE_COLOR=3` dev-env trap this repo's tests already work around).
+fn no_color(var: Option<&OsStr>) -> bool {
+    var.is_some_and(|v| !v.is_empty())
+}
 
 /// A TUI for reviewing changesets
 #[derive(Debug, Parser)]
@@ -81,36 +93,57 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // Resolve the keymap from git config once at startup, BEFORE `repo` moves into `App`
-    // (ADR-034). A failed config read degrades to the registry defaults rather than aborting the
-    // review. Collision/unknown-action warnings surface through the footer notice below.
-    let keymap = match ReviewConfig::new(&repo).bindings() {
-        Ok(bindings) => Keymap::from_bindings(&bindings),
-        Err(_) => Keymap::defaults(),
-    };
-
-    // Resolve the palette selection the same way, before `repo` moves — a config-read error
-    // degrades to dark rather than aborting the review (CS5). `Auto` runs the terminal-derivation
-    // probe (CS6), which needs the controlling tty and so lives outside the pure `theme.rs`; it is
-    // bounded by a hard timeout and always yields a curated fallback on a silent/hostile terminal,
-    // never a hang. `Dark`/`Light` stay CS5's I/O-free `for_theme` path.
-    // `probed` is whether a real probe conversation happened on the tty this launch — NOT just
-    // "theme was auto". `detect_auto_palette` reports `false` on a cached "silent terminal"
-    // verdict (see `probe_cache`), since a cache hit writes nothing to the tty and so owes no
-    // flush; every other path (an answered probe, a timed-out-uncached probe, a non-auto theme)
-    // is `false`/`true` exactly as before.
+    // Resolve the palette selection first, before `repo` moves — a config-read error degrades to
+    // dark rather than aborting the review (CS5). `Auto` runs the terminal-derivation probe (CS6),
+    // which needs the controlling tty and so lives outside the pure `theme.rs`; it is bounded by a
+    // hard timeout and always yields a curated fallback on a silent/hostile terminal, never a
+    // hang. `Dark`/`Light`/a read error stay `resolve_runtime`'s own I/O-free ladder below — this
+    // only feeds `auto_base` (what to cache for `PaletteContext`), so a non-`Auto` selection gets
+    // a cheap unread placeholder here rather than running `for_theme` a second time only to have
+    // `resolve_runtime` immediately re-derive and use its own. `probed` is whether a real probe
+    // conversation happened on the tty this launch — NOT just "theme was auto". `detect_auto_
+    // palette` reports `false` on a cached "silent terminal" verdict (see `probe_cache`), since a
+    // cache hit writes nothing to the tty and so owes no flush; every other path (an answered
+    // probe, a timed-out-uncached probe, a non-auto theme) is `false`/`true` exactly as before.
     let selection = ReviewConfig::new(&repo).theme();
-    let (theme, probed) = match selection {
+    let (auto_base, probed) = match selection {
         Ok(config::Theme::Auto) => terminal_query::detect_auto_palette(),
-        Ok(selection) => (Palette::for_theme(selection), false),
-        Err(_) => (Palette::dark(), false),
+        _ => (Palette::dark(), false),
     };
 
-    // Resolve the view-config settings (outline width/mode, diff layout/zoom) the same way,
-    // before `repo` moves — CS7. `view_config` reads into an owned `RawViewConfig`, so no
-    // borrow of `repo` survives past this statement (unlike a bare `ReviewConfig<'repo>`, which
-    // would still be borrowing `repo` when `App::from_changesets` tries to move it below).
-    let view_config = ReviewConfig::new(&repo).view_config();
+    // CS2 (`no-color-mono`): read the env kill-switch once here — `resolve_runtime` applies it
+    // last in its ladder (after resolution AND overrides), so it always wins over an override.
+    // `FORCE_COLOR` is deliberately not consulted (see `no_color`'s doc comment).
+    let no_color_env = no_color(std::env::var_os("NO_COLOR").as_deref());
+    if no_color_env {
+        // Crossterm ALSO honors NO_COLOR, by stripping every color SGR at the output layer —
+        // which would erase `mono()`'s achromatic washes and leave cursor/selection/staged
+        // attribution invisible (the exact unusability the grayscale ladders exist to prevent).
+        // This app owns NO_COLOR semantics at the palette level instead, so disable crossterm's
+        // blanket suppression and let the grayscale washes through. One-time: `resolve_runtime`
+        // itself has no terminal to reconfigure, so this stays here rather than moving with it.
+        crossterm::style::force_color_output(true);
+    }
+
+    // `PaletteContext` bundles what `resolve_runtime` can't derive itself (it's pure/I/O-free): the
+    // probe result (or the non-auto/error base) to use whenever `theme = auto`, never re-probed,
+    // and the NO_COLOR kill-switch. Reused verbatim by a later `reload-config` (ADR-034) so `auto`
+    // stays cached across the session — see `PaletteContext`'s doc comment.
+    let palette_ctx = theme::PaletteContext {
+        auto_base,
+        no_color: no_color_env,
+    };
+
+    // Resolve the keymap, palette, and view-config settings in one call, BEFORE `repo` moves into
+    // `App` — the same structural core a config reload uses (see `config::resolve_runtime`'s doc
+    // comment), so startup and reload can never drift apart. Every getter degrades to a default on
+    // a config-read error rather than aborting the review (ADR-034); collision/unknown-action/
+    // malformed-override warnings surface through the footer notice below.
+    let runtime = config::resolve_runtime(&repo, &palette_ctx);
+    let keymap = runtime.keymap;
+    let theme = runtime.palette;
+    let theme_override_warnings = runtime.warnings;
+    let view_config = runtime.view_config;
 
     // After a probe, OSC replies from a slow terminal (e.g. one ssh round-trip away) may have
     // straggled in while the theme was being derived above. Discard them now, BEFORE crossterm
@@ -177,12 +210,19 @@ fn main() -> Result<()> {
         // `App` owns its own `Repository` handle (see `app.rs`'s doc comment) — moved in here
         // after acquisition is done borrowing it. `App::from_changesets` opens on whichever
         // changeset the lib marked `current` (locked decision #6).
-        let mut app = seat_app(repo, views, source, &view_config, &keymap);
+        let mut app = seat_app(
+            repo,
+            views,
+            source,
+            &view_config,
+            &keymap,
+            &theme_override_warnings,
+        );
 
         // A carried acquire failure surfaces HERE — the same logical point (running the TUI) it
         // surfaced at before CS5 moved the terminal takeover ahead of the diff phase.
         tui.into_diagnostic()?
-            .run(&mut app, &keymap, &theme, repo_path)
+            .run(&mut app, keymap, theme, repo_path, &palette_ctx)
             .into_diagnostic()?;
     } else {
         // Every changeset starts `Pending` (ADR-037's "Slots") — `App` is constructible from
@@ -195,10 +235,17 @@ fn main() -> Result<()> {
             .map(ChangesetView::pending)
             .collect();
 
-        let mut app = seat_app(repo, views, source, &view_config, &keymap);
+        let mut app = seat_app(
+            repo,
+            views,
+            source,
+            &view_config,
+            &keymap,
+            &theme_override_warnings,
+        );
 
         tui.into_diagnostic()?
-            .run_streamed(&mut app, &keymap, &theme, repo_path, changesets)
+            .run_streamed(&mut app, keymap, theme, repo_path, changesets, &palette_ctx)
             .into_diagnostic()?;
     }
 
@@ -207,16 +254,17 @@ fn main() -> Result<()> {
 
 /// The app-seating tail both `changesets.len()` arms of `main` share byte-identically (F5):
 /// build `App` from `views`, wire the review source, defer file loads (CS4), apply CS7's
-/// view-config settings, open the current file, and surface any keymap/view-config warnings as
-/// a startup notice. `open_current` is a no-op on an empty file list — safe for the streamed
-/// arm's `Pending` slots (no files yet), which `Tui::run_streamed`'s `ChangesetReady` handling
-/// re-runs it for once the active changeset's diff actually lands.
+/// view-config settings, open the current file, and surface any keymap/view-config/theme-override
+/// warnings as a startup notice. `open_current` is a no-op on an empty file list — safe for the
+/// streamed arm's `Pending` slots (no files yet), which `Tui::run_streamed`'s `ChangesetReady`
+/// handling re-runs it for once the active changeset's diff actually lands.
 fn seat_app(
     repo: Repository,
     views: Vec<ChangesetView>,
     source: Option<Source>,
     view_config: &config::RawViewConfig,
     keymap: &Keymap,
+    theme_override_warnings: &[String],
 ) -> App {
     let mut app = App::from_changesets(repo, views);
     if let Some(source) = source {
@@ -235,14 +283,61 @@ fn seat_app(
     let view_config_warnings = app.apply_view_config(view_config);
     app.open_current();
 
-    // A misconfigured keybinding or view-config setting is non-fatal: show the collected
-    // warnings as a startup notice (cleared on the first keypress, like any notice) and run with
-    // the defaults for those keys/settings.
-    let mut warnings = keymap.warnings().to_vec();
-    warnings.extend(view_config_warnings);
-    if !warnings.is_empty() {
-        app.notify(warnings.join("; "), Severity::Error);
-    }
+    // A misconfigured keybinding, view-config setting, or theme override is non-fatal: show the
+    // collected warnings as a startup notice (cleared on the first keypress, like any notice) and
+    // run with the defaults for those keys/settings/colors — `plumb_zoom_hint_and_warnings` also
+    // re-plumbs the resolved CycleZoom binding into the "cycle zoom" refusal hint, see its doc
+    // comment.
+    let mut extra_warnings = view_config_warnings;
+    extra_warnings.extend(theme_override_warnings.iter().cloned());
+    plumb_zoom_hint_and_warnings(&mut app, keymap, extra_warnings);
 
     app
+}
+
+/// The zoom-hint plumbing + warning-aggregation tail `seat_app` (above) and `tui::event_loop`'s
+/// `reload-config` handling both need — the same structural core as `config::resolve_runtime`,
+/// so a change to how warnings surface or how the zoom hint is plumbed needs only one edit. Sets
+/// the "cycle zoom" refusal hint from `keymap`'s resolved `CycleZoom` binding (App has no keymap
+/// field of its own — see `App::zoom_key_label`'s doc comment; leaves the previous label in
+/// place if the command has no bound key), then merges `keymap.warnings()` with `extra_warnings`
+/// (view-config/theme-override warnings, already collected by the caller) and shows them as a
+/// notice, cleared on the first keypress like any notice. Returns whether any warnings were
+/// shown, so a reload can layer its own "config reloaded" success notice only when nothing
+/// needed reporting.
+fn plumb_zoom_hint_and_warnings(
+    app: &mut App,
+    keymap: &Keymap,
+    extra_warnings: Vec<String>,
+) -> bool {
+    if let Some(label) = keymap::primary_key(keymap, Command::CycleZoom) {
+        app.set_zoom_key_label(label);
+    }
+    let mut warnings = keymap.warnings().to_vec();
+    warnings.extend(extra_warnings);
+    let had_warnings = !warnings.is_empty();
+    if had_warnings {
+        app.notify(warnings.join("; "), Severity::Error);
+    }
+    had_warnings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_color_truth_table() {
+        assert!(!no_color(None), "unset must not trigger mono");
+        assert!(
+            !no_color(Some(OsStr::new(""))),
+            "empty must not trigger mono"
+        );
+        assert!(no_color(Some(OsStr::new("1"))));
+        assert!(
+            no_color(Some(OsStr::new("0"))),
+            "any non-empty value counts, per no-color.org"
+        );
+        assert!(no_color(Some(OsStr::new("true"))));
+    }
 }

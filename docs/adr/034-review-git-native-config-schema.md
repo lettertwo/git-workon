@@ -32,6 +32,8 @@ is stored **action-as-key** in **per-view subsections**:
 
 ```
 workon.review.theme                    = dark            ; global, non-view
+workon.review.theme.<slot>             = #rrggbb          ; base00-base0f override (CS1)
+workon.review.theme.<tint>             = #rrggbb          ; diff/cursor tint override (CS1)
 workon.review.<view>.bind.<action>     = "<key tokens>"  ; a keymap entry
 workon.review.<view>.<setting>         = <value>         ; view config
 ```
@@ -58,6 +60,12 @@ workon.review.<view>.<setting>         = <value>         ; view config
 - **View config** (non-binding) shares the view namespace: `workon.review.outline.width`,
   `workon.review.outline.mode`, `workon.review.diff.layout`, `workon.review.diff.zoom`.
   The `.bind.` marker is what distinguishes a keymap entry from a view setting.
+- **Theme overrides** (CS1, user-configurable colors tier — see
+  [ADR-035](035-review-theming-base16-hybrid.md)'s CS1 revision) live in the `review.theme`
+  subsection, distinct from the top-level `workon.review.theme` selection itself: `workon.review
+  .theme.base00`–`workon.review.theme.base0f` (base16 slot overrides) and eleven kebab-case tint
+  keys (`workon.review.theme.cursor-bg`, …). Same validation posture as an unknown bind
+  action — an unrecognized key or malformed `#rrggbb` value is a startup warning, not an error.
 - **Load-time inversion:** on startup, walk every `workon.review.*.bind.*` variable, split
   values into key tokens, and build the per-view key→action dispatch maps. This pass
   validates (unknown `bind.<action>` → warning; the action set is enumerable) and detects
@@ -67,6 +75,16 @@ workon.review.<view>.<setting>         = <value>         ; view config
   cascade (confirm > outline-unfocus > selection-cancel > quit) stay hardcoded — they are
   conventional, safety-sensitive, and the Esc cascade's documented precedence would break
   if rebound.
+- **`reload-config` (`R`, global view, rebindable like any other action):** re-reads the
+  whole `workon.review.*` tree and swaps it in without restarting — this ADR's schema was
+  originally "read once at startup"; live reload makes it "read once, re-readable on
+  demand" instead, with no schema change (the same getters just run again). One exception:
+  `theme = auto`'s terminal-derivation probe (ADR-035) never re-runs mid-session — it needs
+  the tty, which the TUI owns once the alternate screen is live, and a second probe
+  conversation there would corrupt input. Reload caches the startup probe result and reuses
+  it whenever the resolved theme is `auto`, so switching `theme` to `dark`/`light` takes
+  effect on reload, but switching back to `auto` reuses the cached base rather than
+  re-probing.
 
 ## Consequences
 
@@ -87,6 +105,45 @@ workon.review.<view>.<setting>         = <value>         ; view config
   home without a second design pass.
 - Adding a rebindable action = adding it to the enumerable action set (code default +
   dispatch + help entry); it is automatically configurable, validated, and documented.
+
+## Revised (config validation completeness)
+
+The validation posture above ("an unrecognized key … is a startup warning, not an error") turned
+out to hold in only two of the four places it reads as a promise. `workon.review.theme.*` warns on
+an unrecognized key, and the bind pass warns on an unknown action — but every *other* key under
+`workon.review.*` is read by an explicit getter, so a name no getter asks for is never seen by
+anything. A typo'd `workon.review.diff.laoyut` or `workon.review.outline.wdith` is silently
+dropped: no warning, no effect, and nothing to distinguish it from a setting that simply had no
+visible result. This bit in practice, twice in one session, on two different subsections.
+
+**Unknown-key detection now covers the whole `workon.review.*` tree**, via a single validation pass
+over `entries("workon.review.*")` driven by a central known-key registry: exact scalar names, plus
+pattern arms for the two open-ended subspaces (`theme.<slot|tint>`, `<view>.bind.<action>`). Any
+name no arm claims warns and is ignored, same non-fatal posture as everything else here.
+
+Scope stops at `workon.review.*` deliberately. That subsection is this crate's exclusively;
+`workon.*` at large belongs to `git-workon-lib`, and scanning wider would warn about
+`workon.autocopy` and every other key this crate has no business knowing.
+
+**The registry is a second source of truth, and that is the real cost.** A getter added without a
+matching registry entry would make its key warn as unknown *while working correctly* — worse than
+the silent-drop it replaces. The mitigation is a drift test that enumerates the getters' keys and
+asserts each is claimed by the registry, so the failure lands in CI rather than in a user's footer.
+The alternative — threading consumed-key tracking through every getter so the getters *are* the
+registry — removes the drift class outright but reworks every reader's signature or call site; the
+registry-plus-test was judged the better trade at this schema's size, and the choice is revisitable
+if the schema grows a third open-ended subspace.
+
+**Invalid-value warnings now carry the allowed set and the fallback being applied.** The existing
+messages named the offending value but neither what was legal nor what the reader did instead —
+`"workon.review.diff.text = 'edt' unrecognized; using default"` leaves a user to go read source or
+docs for both halves. They now read `(valid: syntax, tint, edit); using default 'syntax'`, and the
+range-checked and color-format cases get the same treatment. Theme keys keep saying `ignoring`
+rather than naming a default, because an ignored override genuinely has no default to apply — the
+underlying scheme's value stands.
+
+**Unknown keys suggest a nearest match** by edit distance against the registry when one is close
+enough, since the overwhelmingly common cause of an unknown key is a typo of a real one.
 
 ## References
 
