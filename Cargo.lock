@@ -988,6 +988,7 @@ dependencies = [
  "dirs",
  "expectrl",
  "fuzzy-matcher",
+ "git-workon-annotations",
  "git-workon-fixture",
  "git-workon-lib",
  "git2",

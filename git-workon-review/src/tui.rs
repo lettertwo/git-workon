@@ -480,6 +480,9 @@ enum Action {
     SearchPrev,
     CopyLines,
     CopyLocation,
+    AnnotationView,
+    TourNext,
+    TourPrev,
     None,
 }
 
@@ -520,6 +523,9 @@ fn command_to_action(command: Command, pane_height: usize) -> Action {
         Command::SearchPrev => Action::SearchPrev,
         Command::CopyLines => Action::CopyLines,
         Command::CopyLocation => Action::CopyLocation,
+        Command::AnnotationView => Action::AnnotationView,
+        Command::TourNext => Action::TourNext,
+        Command::TourPrev => Action::TourPrev,
         Command::NextFile => Action::NextFile,
         Command::PrevFile => Action::PrevFile,
         Command::NextHunk => Action::NextHunk,
@@ -597,10 +603,11 @@ fn map_key(
 /// have produced — e.g. `j` then immediately `s` must stage the same hunk eager code would have.
 ///
 /// Exempt (returns `false`): every action that ends in its own fresh `open_current` (`NextFile`,
-/// `PrevFile`, `NextChangeset`, `PrevChangeset`, `ToggleMaximize`, and the outline nav/confirm actions),
-/// since those simply set a NEW pending open rather than needing the current one force-completed;
-/// plus pure UI toggles/no-ops (`Refresh` rebuilds all views itself; `ToggleHelp`/`Quit`/`None`
-/// touch no view state at all).
+/// `PrevFile`, `NextChangeset`, `PrevChangeset`, `ToggleMaximize`, and the outline nav/confirm actions,
+/// plus `TourNext`/`TourPrev` — `App::goto_tour_stop` calls `switch_changeset` itself when the
+/// stop lands elsewhere in the stack), since those simply set a NEW pending open rather than
+/// needing the current one force-completed; plus pure UI toggles/no-ops (`Refresh` rebuilds all
+/// views itself; `ToggleHelp`/`AnnotationView`/`Quit`/`None` touch no view state at all).
 fn action_needs_loaded_view(action: Action) -> bool {
     matches!(
         action,
@@ -699,6 +706,9 @@ fn apply_action(app: &mut App, action: Action) -> bool {
         Action::SearchPrev => app.search_prev(),
         Action::CopyLines => app.copy_lines(),
         Action::CopyLocation => app.copy_location(),
+        Action::AnnotationView => app.toggle_annotation_overlay(),
+        Action::TourNext => app.tour_next(),
+        Action::TourPrev => app.tour_prev(),
         Action::None => {}
     }
     false
@@ -715,10 +725,10 @@ enum KeyOutcome {
 
 /// Resolve one `Key` event to a [`KeyOutcome`], given the caller has already ruled out the
 /// modal cases (a pending discard confirm, the help overlay, the outline-filter input, the
-/// search prompt) — this is cases 5-9 of `update`'s documented Esc-precedence cascade, extracted
+/// search prompt) — this is cases 6-10 of `update`'s documented Esc-precedence cascade, extracted
 /// so [`update`] and [`update_batch`] share the exact same resolution instead of duplicating it.
 ///
-/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 5-9 do (the
+/// Clears any showing footer notice as a side effect, exactly like `update`'s cases 6-10 do (the
 /// confirm, help, and prompt modals deliberately do not — that stays in their own arms, not
 /// here).
 fn resolve_key(
@@ -746,7 +756,7 @@ fn resolve_key(
     }
     // The outline fuzzy filter (`outline-filter`): with the outline focused (the input row does NOT
     // have capture —
-    // that's `update`'s case-3 modal arm) and a query actively narrowing the list, Esc unwinds
+    // that's `update`'s case-4 modal arm) and a query actively narrowing the list, Esc unwinds
     // the filter instead of quitting — mirroring how the selection-Esc arm above unwinds the
     // diff's innermost mode before Esc's outer meanings apply. Only the NEXT Esc reaches the
     // outline's terminal quit leaf.
@@ -766,7 +776,7 @@ fn resolve_key(
     ))
 }
 
-/// `update`'s case-3 modal arm: apply one key press while the outline fuzzy filter INPUT has
+/// `update`'s case-4 modal arm: apply one key press while the outline fuzzy filter INPUT has
 /// keyboard capture (see [`App::outline_filter_focused`]). Every branch calls straight into an
 /// `App::outline_filter_*` method — no [`Action`]/[`map_key`] indirection, mirroring the
 /// confirm/help modals' own direct `key.code` matches just above this arm's call site, rather
@@ -818,7 +828,7 @@ fn prompt_edit_for_key(key: KeyEvent) -> Option<PromptEdit> {
     }
 }
 
-/// `update`'s case-3 modal arm: apply one key press while the outline fuzzy filter INPUT has
+/// `update`'s case-4 modal arm: apply one key press while the outline fuzzy filter INPUT has
 /// keyboard capture (see [`App::outline_filter_focused`]). Handles its own Enter/Esc and the
 /// outline-list-navigation extras (`Ctrl-c`/`Ctrl-n`/`Ctrl-p`/`Down`/`Up`) directly, then
 /// delegates every other key to [`prompt_edit_for_key`] — every branch calls straight into an
@@ -886,13 +896,13 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 /// message and performs its normal action. `Resize`/`Tick` do NOT clear it: a redraw or timer
 /// tick isn't the user acting on the message.
 ///
-/// Esc precedence (highest first): a pending discard confirm > the help overlay being open > the
-/// outline fuzzy filter input having capture > the in-diff search prompt having capture > an active
-/// line selection OR an active search (diff-focused) > an active outline-filter query
-/// (outline-focused) > the outline having focus > the diff having focus with the outline open >
-/// the normal key map (where Esc quits). Concretely — the home-base model: the outline is where
-/// Esc always eventually lands you before it quits, unwinding any inner mode (selection, search,
-/// filter) along the way.
+/// Esc precedence (highest first): a pending discard confirm > the help overlay being open >
+/// the annotation overlay being open > the outline fuzzy filter input having capture > the
+/// in-diff search prompt having capture > an active line selection OR an active search
+/// (diff-focused) > an active outline-filter query (outline-focused) > the outline having focus >
+/// the diff having focus with the outline open > the normal key map (where Esc quits).
+/// Concretely — the home-base model: the outline is where Esc always eventually lands you before
+/// it quits, unwinding any inner mode (selection, search, filter) along the way.
 ///
 /// 1. A pending discard confirm captures the keyboard FIRST (before the notice clear and the
 ///    normal key map): `y` accepts, `n`/`Esc` cancels, and every other key is swallowed — a modal
@@ -902,39 +912,44 @@ fn apply_search_input_key(app: &mut App, key: KeyEvent) {
 ///    reacts). Ranked just below the confirm modal — in practice the two are never up
 ///    together, since opening help doesn't run through a confirm, but the confirm winning keeps
 ///    a destructive prompt from ever being silently dismissed by a stray overlay key.
-/// 3. Otherwise, the outline fuzzy filter INPUT (`/`, while it has capture — see
+/// 3. Otherwise, the annotation overlay (`c`, [`App::annotation_overlay_visible`]) captures the
+///    keyboard next, mirroring help's own swallow: `c`/`q`/`Esc` close it, every other key is a
+///    no-op. Ranked just below help — the two can't be up together (opening one never routes
+///    through the other) — and above every case below, for the same reason help is.
+/// 4. Otherwise, the outline fuzzy filter INPUT (`/`, while it has capture — see
 ///    [`App::outline_filter_focused`]) captures next, mirroring the same swallow: typing/editing
 ///    keys reach [`crate::prompt::PromptState`], `Enter`/`Esc` return capture to the outline row
 ///    list KEEPING the query, `Ctrl-c` clears it and returns capture too, and `Down`/`Up`/
 ///    `Ctrl-n`/`Ctrl-p` move the outline selection without leaving the input. Ranked below help
-///    (opening help while filtering isn't reachable today — `?` isn't part of the input's own key
-///    set — but the ordering still says which would win if that ever changed) and above every
-///    other case, since none of them should observe a key the filter input itself consumes.
-/// 4. Otherwise, the in-diff search prompt (`/` in the diff view, while it has capture — see
+///    and the annotation overlay (opening either while filtering isn't reachable today — neither
+///    `?` nor `c` is part of the input's own key set — but the ordering still says which would
+///    win if that ever changed) and above every other case, since none of them should observe a
+///    key the filter input itself consumes.
+/// 5. Otherwise, the in-diff search prompt (`/` in the diff view, while it has capture — see
 ///    [`App::search_focused`]) captures next, mirroring the outline-filter input's swallow:
 ///    typing/editing keys reach [`crate::prompt::PromptState`] (live-previewing highlights, never
 ///    moving the cursor), `Enter` accepts and jumps, `Esc` aborts back to whatever search (or
 ///    none) was active before `/` was pressed. Ranked below the outline-filter input for the same
 ///    "can't actually collide today, but the ordering says who'd win" reason — the two prompts
 ///    can never both have capture (one requires outline focus, the other diff focus).
-/// 5. Otherwise, with the diff focused, Esc CANCELS an active line selection OR clears an active
+/// 6. Otherwise, with the diff focused, Esc CANCELS an active line selection OR clears an active
 ///    search (selection wins if, somehow, both are active) instead of moving focus or quitting
-///    (`q` still quits). This arm is guarded to defer to case 7 when the outline has focus. Other
+///    (`q` still quits). This arm is guarded to defer to case 8 when the outline has focus. Other
 ///    keys fall through to the normal map — `j`/`k` extend a selection, `n`/`N` step a search.
-/// 6. Otherwise, with the outline focused and a NON-EMPTY filter query (capture on the row list,
-///    not the input — that's case 3), Esc CLEARS the filter ([`App::outline_filter_clear`])
-///    instead of quitting — the outline-side mirror of case 5's unwind-the-innermost-mode rule;
-///    only the next Esc reaches case 7's quit leaf.
-/// 7. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
+/// 7. Otherwise, with the outline focused and a NON-EMPTY filter query (capture on the row list,
+///    not the input — that's case 4), Esc CLEARS the filter ([`App::outline_filter_clear`])
+///    instead of quitting — the outline-side mirror of case 6's unwind-the-innermost-mode rule;
+///    only the next Esc reaches case 8's quit leaf.
+/// 8. Otherwise, while the outline pane has focus, Esc QUITS — same terminal leaf as `q`. The
 ///    outline is home base; there's nowhere further out to walk to.
-/// 8. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
+/// 9. Otherwise, with the diff focused and the outline OPEN, Esc walks outward one step: it
 ///    focuses the outline (same effect as `h`/[`App::focus_outline`]) rather than quitting.
-/// 9. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`) quits
-///    — there's no outline to walk out to.
+/// 10. Otherwise (diff focused, outline closed) the normal map applies, where Esc (like `q`)
+///     quits — there's no outline to walk out to.
 ///
-/// A `Key` event clears any showing footer notice before applying its own action (cases 5-9); the
-/// confirm, help, and the two prompt modals (cases 1-4) deliberately do not. Cases 5-9 are
-/// delegated to [`resolve_key`], shared with [`update_batch`].
+/// A `Key` event clears any showing footer notice before applying its own action (cases 6-10);
+/// the confirm, help, annotation overlay, and the two prompt modals (cases 1-5) deliberately do
+/// not. Cases 6-10 are delegated to [`resolve_key`], shared with [`update_batch`].
 fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: AppEvent) -> bool {
     match event {
         AppEvent::Key(key) if app.pending_confirm.is_some() => {
@@ -954,6 +969,19 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             }
             false
         }
+        // The annotation overlay (`c`, `App::toggle_annotation_overlay`) captures the keyboard
+        // exactly like the help overlay above — `c`/`q`/`Esc` close it, every other key is
+        // swallowed. Ranked just below help (the two can't be up together; opening one never
+        // routes through the other), same as help is ranked just below the confirm modal.
+        AppEvent::Key(key) if app.annotation_overlay_visible => {
+            match key.code {
+                KeyCode::Char('c') | KeyCode::Char('q') | KeyCode::Esc => {
+                    app.toggle_annotation_overlay()
+                }
+                _ => {}
+            }
+            false
+        }
         AppEvent::Key(key) if app.outline_filter_focused() => {
             apply_filter_input_key(app, key);
             false
@@ -966,12 +994,14 @@ fn update(app: &mut App, keymap: &Keymap, pending: &mut Vec<KeyPress>, event: Ap
             KeyOutcome::Handled => false,
             KeyOutcome::Action(action) => apply_action(app, action),
         },
-        // Mouse support: all four modals swallow mouse input exactly like they swallow keys (cases
-        // 1-4 above) — a click/wheel while a discard confirm, the help overlay, the outline fuzzy
-        // filter input, or the in-diff search prompt is up does nothing.
+        // Mouse support: all five modals swallow mouse input exactly like they swallow keys
+        // (cases 1-5 above) — a click/wheel while a discard confirm, the help overlay, the
+        // annotation overlay, the outline fuzzy filter input, or the in-diff search prompt is up
+        // does nothing.
         AppEvent::Mouse(_)
             if app.pending_confirm.is_some()
                 || app.help_visible
+                || app.annotation_overlay_visible
                 || app.outline_filter_focused()
                 || app.search_focused() =>
         {
@@ -1099,6 +1129,7 @@ fn update_batch(
             AppEvent::Key(key)
                 if app.pending_confirm.is_none()
                     && !app.help_visible
+                    && !app.annotation_overlay_visible
                     && !app.outline_filter_focused()
                     && !app.search_focused()
                     && !(key.code == KeyCode::Esc

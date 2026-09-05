@@ -77,6 +77,9 @@ pub enum Command {
     SearchPrev,
     CopyLines,
     CopyLocation,
+    AnnotationView,
+    TourNext,
+    TourPrev,
     // Diff view.
     FocusOutline,
     // Outline view.
@@ -390,6 +393,27 @@ pub static REGISTRY: &[Registered] = &[
         name: "copy-location",
         default_keys: "Y",
         description: "Copy path:line (or path:lo-hi) for the selected rows to the clipboard",
+    },
+    Registered {
+        command: Command::AnnotationView,
+        view: View::Diff,
+        name: "annotation-view",
+        default_keys: "c",
+        description: "View the comment thread/tour stop anchored to the row under the cursor",
+    },
+    Registered {
+        command: Command::TourNext,
+        view: View::Diff,
+        name: "tour-next",
+        default_keys: "]t",
+        description: "Step to the next stop of the active walkthrough tour",
+    },
+    Registered {
+        command: Command::TourPrev,
+        view: View::Diff,
+        name: "tour-prev",
+        default_keys: "[t",
+        description: "Step to the previous stop of the active walkthrough tour",
     },
     // ── Outline view ─────────────────────────────────────────────────────────
     Registered {

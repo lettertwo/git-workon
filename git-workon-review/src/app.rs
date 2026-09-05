@@ -16,6 +16,10 @@ use std::path::Path;
 use git2::Repository;
 use unicode_width::UnicodeWidthStr;
 use workon::{Changeset, ChangesetSpan};
+use workon_annotations::store::AnnotationStore;
+use workon_annotations::{
+    anchor as annot_anchor, Annotation, AnnotationKind, ChangesetKey, Fingerprint,
+};
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
 use crate::align::{
@@ -690,6 +694,31 @@ pub enum DiffTextMode {
 pub enum EffectiveZoom {
     Single(Role),
     Split,
+}
+
+/// What kind of annotation marker a gutter cell paints, resolved per rendered row by
+/// [`App::annotation_markers`] from whatever [`Annotation`]s the row's anchor(s) resolve to
+/// (ADR-039). `Both` wins when a comment thread and a tour stop land on the same row — the
+/// granularity this slice picked over one marker per annotation (which the gutter's single
+/// trailing cell has no room for) or a single undifferentiated marker (which would hide
+/// whether there's anything to reply to versus just walk through).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind {
+    Comment,
+    Tour,
+    Both,
+}
+
+impl MarkerKind {
+    /// Fold another row occupant into this one — same kind stays put, a different kind
+    /// collapses to [`MarkerKind::Both`].
+    fn combine(self, other: MarkerKind) -> MarkerKind {
+        if self == other {
+            self
+        } else {
+            MarkerKind::Both
+        }
+    }
 }
 
 /// Resolve the diff pane's requested state — the focused split pane's role and whether it's
@@ -1522,6 +1551,31 @@ pub struct App {
     /// instead of triggering ANOTHER refresh. Always `false` outside that call; never persists
     /// across separate load attempts, so the next one gets its own single retry.
     refreshing_for_geometry_mismatch: bool,
+    /// The ADR-039 annotation store, opened off `repo.commondir()` (shared by every worktree of
+    /// this repo, matching the graphite-metadata reader's discipline) in [`Self::from_changesets`].
+    /// `None` when the open failed (no `.git` dir yet, permissions, a corrupt db) — degrades to
+    /// "no markers, no overlay, no tour" rather than aborting the whole session; the caller raises
+    /// a one-time footer notice for that case (see [`Self::from_changesets`]'s tail).
+    annotations: Option<AnnotationStore>,
+    /// The store's write-visibility fingerprint as of the last successful poll — see
+    /// [`Self::poll_annotations`]. `None` until the first poll (or forever, alongside
+    /// [`Self::annotations`], when the store failed to open).
+    annotations_fingerprint: Option<Fingerprint>,
+    /// The active walkthrough's name, set by [`Self::set_tour`] — `None` until a caller (a
+    /// future `--tour` flag, or a test) picks one; nothing in this crate infers a tour on its
+    /// own (the store has no "list tours" query — see [`Self::set_tour`]'s doc comment).
+    tour_name: Option<String>,
+    /// The active tour's stops, ordered by `seq` (mirrors [`workon_annotations::store::AnnotationStore::tour`]'s
+    /// own ordering) — reloaded by [`Self::reload_tour_stops`] whenever [`Self::tour_name`]
+    /// changes or [`Self::poll_annotations`] observes a store write.
+    tour_stops: Vec<Annotation>,
+    /// Index into [`Self::tour_stops`] the reviewer is currently parked on, or `None` before the
+    /// first [`Self::tour_next`]/[`Self::tour_prev`] step.
+    tour_idx: Option<usize>,
+    /// Whether the annotation view/reply overlay (`c`, [`Self::toggle_annotation_overlay`]) is
+    /// showing — the same modal-capture shape as [`Self::help_visible`] (see that field's doc
+    /// comment); `tui::update` intercepts every key while this is `true`.
+    pub annotation_overlay_visible: bool,
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1674,6 +1728,15 @@ impl App {
             let ticket = refresh_coordinator.begin();
             refresh_coordinator.complete(ticket, sig);
         }
+        // ADR-039: the annotation store lives at `<commondir>/workon-review/annotations.db`,
+        // shared by every worktree of this repo (the same discipline the graphite-metadata
+        // reader uses) — read BEFORE `repo` moves into `app` below. An open failure (no
+        // `.git` dir yet, permissions, a corrupt db) degrades to no markers/overlay/tour
+        // rather than aborting the session; the footer notice is raised after construction,
+        // once `app.notify` exists to raise it through.
+        let commondir = repo.commondir().to_path_buf();
+        let annotations = AnnotationStore::open(&commondir).ok();
+        let annotations_open_failed = annotations.is_none();
         let mut app = Self {
             repo,
             changesets,
@@ -1716,12 +1779,24 @@ impl App {
             search_matches: Vec::new(),
             search_current: None,
             refreshing_for_geometry_mismatch: false,
+            annotations,
+            annotations_fingerprint: None,
+            tour_name: None,
+            tour_stops: Vec::new(),
+            tour_idx: None,
+            annotation_overlay_visible: false,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
         // than leaving it at its default `0` — in Stack mode row `0` is a HEADER, not the current
         // file, whenever the current changeset isn't the first in the stack.
         app.sync_outline_to_current();
+        if annotations_open_failed {
+            app.notify(
+                "annotations unavailable — comments and tours are disabled this session",
+                Severity::Info,
+            );
+        }
         app
     }
 
@@ -1779,6 +1854,261 @@ impl App {
             .note_index_event(sig, self.queue.len())
         {
             self.coordinated_refresh();
+        }
+        self.poll_annotations();
+    }
+
+    /// A SIBLING poll to the index-signature check above, over the annotations store's own
+    /// write-visibility fingerprint (`PRAGMA data_version` + this crate's revision counter —
+    /// see [`workon_annotations::Fingerprint`]'s doc comment). Reloads the active tour's stops
+    /// when another connection (a future MCP server, or this TUI's own future authoring path)
+    /// committed since the last poll.
+    ///
+    /// Deliberately does NOT call [`Self::coordinated_refresh`] and does NOT bump
+    /// [`Self::generation`] (ADR-039's gotcha): an annotation write changes what a gutter
+    /// marker overlays, not the diff content itself, so nothing view-cache-invalidating runs
+    /// for it — see `annotation_poll_never_bumps_generation` for the pinned assertion.
+    fn poll_annotations(&mut self) {
+        let Some(store) = self.annotations.as_ref() else {
+            return;
+        };
+        let Ok(fingerprint) = store.fingerprint() else {
+            return;
+        };
+        if Some(fingerprint) == self.annotations_fingerprint {
+            return;
+        }
+        self.annotations_fingerprint = Some(fingerprint);
+        self.reload_tour_stops();
+    }
+
+    /// This session's [`ChangesetKey`] for the ACTIVE changeset — the annotations crate's
+    /// mirror of [`ChangesetIdentity`] (see that type's doc comment for why name alone is
+    /// ambiguous), rebuilt fresh from [`Changeset`] rather than routed through
+    /// `ChangesetIdentity` itself, since that type's fields are private to this module's own
+    /// nav-identity use and carry no annotations-crate conversion.
+    fn current_changeset_key(&self) -> ChangesetKey {
+        let cs = &self.cur().cs;
+        ChangesetKey::new(cs.name.clone(), cs.span == ChangesetSpan::Uncommitted)
+    }
+
+    /// The active file `idx`'s `role` view's annotation markers, one [`MarkerKind`] per
+    /// occupied ROW (not per annotation — several annotations resolving to the same row
+    /// collapse to one cell via [`MarkerKind::combine`]), keyed by row index in [`Self::layout`]'s
+    /// active coordinate space (`display` for [`Layout::Sbs`], `inline` for [`Layout::Inline`]).
+    /// Computed fresh per call (this slice's render call sites call it once per rendered pane per
+    /// frame, not once per annotation) rather than cached on `App` — annotation counts per file
+    /// are small, and caching would need its own invalidation story alongside the poll above.
+    ///
+    /// An annotation whose anchor resolves to a currently-collapsed gap surfaces on the GAP row
+    /// itself (the `fold_marker` " ▸ N" precedent — see [`resolve_marker_row`]) rather than being
+    /// silently dropped.
+    pub(crate) fn annotation_markers(&self, idx: usize, role: Role) -> HashMap<usize, MarkerKind> {
+        let mut out = HashMap::new();
+        let Some(store) = self.annotations.as_ref() else {
+            return out;
+        };
+        let Some(view) = self.role_view_ref(idx, role) else {
+            return out;
+        };
+        let Some(file) = self.files().get(idx) else {
+            return out;
+        };
+        let key = self.current_changeset_key();
+        let Ok(candidates) = store.by_path(&key, &file.path) else {
+            return out;
+        };
+        for annotation in &candidates {
+            let Some((row_idx, marker_kind)) =
+                resolve_annotation_row(view, self.layout, annotation)
+            else {
+                continue;
+            };
+            out.entry(row_idx)
+                .and_modify(|k: &mut MarkerKind| *k = k.combine(marker_kind))
+                .or_insert(marker_kind);
+        }
+        out
+    }
+
+    /// The annotations anchored to the row under [`Self::cursor`] in the focused pane's current
+    /// file/role — root comment/tour-stop annotations first, each immediately followed by its
+    /// own replies (in insertion order; replies carry no anchor of their own, see
+    /// [`workon_annotations::Annotation::anchor`]'s doc comment, so they can't be resolved to a row
+    /// independently — they're gathered by `parent_uid` once a root resolves to the cursor's row).
+    /// Feeds [`crate::render::render_annotation_overlay`]. Empty when the store is unavailable,
+    /// nothing resolves to this row, or the reads themselves fail.
+    pub(crate) fn annotations_at_cursor(&self) -> Vec<Annotation> {
+        let Some(store) = self.annotations.as_ref() else {
+            return Vec::new();
+        };
+        let Some(view) = self.current_view_ref() else {
+            return Vec::new();
+        };
+        let Some(file) = self.files().get(self.current) else {
+            return Vec::new();
+        };
+        let key = self.current_changeset_key();
+        let Ok(candidates) = store.by_path(&key, &file.path) else {
+            return Vec::new();
+        };
+        let roots: Vec<Annotation> = candidates
+            .into_iter()
+            .filter(|a| {
+                resolve_annotation_row(view, self.layout, a)
+                    .is_some_and(|(row_idx, _)| row_idx == self.cursor)
+            })
+            .collect();
+        if roots.is_empty() {
+            return Vec::new();
+        }
+        let all = store.by_changeset(&key).unwrap_or_default();
+        let mut out = Vec::new();
+        for root in roots {
+            let uid = root.uid.clone();
+            out.push(root);
+            out.extend(
+                all.iter()
+                    .filter(|a| a.parent_uid.as_deref() == Some(uid.as_str()))
+                    .cloned(),
+            );
+        }
+        out
+    }
+
+    /// Toggle the annotation view/reply overlay (`c`) — see [`Self::annotation_overlay_visible`]'s
+    /// doc comment.
+    pub fn toggle_annotation_overlay(&mut self) {
+        self.annotation_overlay_visible = !self.annotation_overlay_visible;
+    }
+
+    /// Set the active walkthrough by name and reload its stops (`main.rs`'s future `--tour`
+    /// flag, and tests). Nothing infers a tour automatically today — the store has no "list
+    /// tours" query (a tour's identity is just whatever name its stops share), so a tour must
+    /// be named explicitly by the caller, matching how [`Self::set_review_source`] is a setter
+    /// rather than a constructor parameter.
+    pub fn set_tour(&mut self, tour: impl Into<String>) {
+        self.tour_name = Some(tour.into());
+        self.tour_idx = None;
+        self.reload_tour_stops();
+    }
+
+    fn reload_tour_stops(&mut self) {
+        self.tour_stops = match (self.annotations.as_ref(), self.tour_name.as_deref()) {
+            (Some(store), Some(name)) => store.tour(name).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+    }
+
+    /// `]t`: step to the next stop of the active tour (see [`Self::set_tour`]). Clamps at the
+    /// last stop — does not wrap. A no-op with a footer notice when no tour is active or it has
+    /// no stops.
+    pub fn tour_next(&mut self) {
+        self.tour_step(1);
+    }
+
+    /// `[t`: step to the previous stop of the active tour. See [`Self::tour_next`].
+    pub fn tour_prev(&mut self) {
+        self.tour_step(-1);
+    }
+
+    fn tour_step(&mut self, delta: i64) {
+        if self.tour_stops.is_empty() {
+            self.notify("no active tour", Severity::Info);
+            return;
+        }
+        let len = self.tour_stops.len() as i64;
+        let next = match self.tour_idx {
+            Some(i) => (i as i64 + delta).clamp(0, len - 1),
+            None => 0,
+        };
+        self.tour_idx = Some(next as usize);
+        self.goto_tour_stop(next as usize);
+    }
+
+    /// Land the diff view on tour stop `stop_idx`: switch changeset/file if the stop anchors
+    /// elsewhere in the stack (`switch_changeset` → `complete_pending_open`, per the plan), then
+    /// reveal and park the cursor on the stop's anchored row via the same bounded-reveal step
+    /// [`Self::jump_to_search_match`] uses (see [`Self::reveal_aligned_idx`]).
+    ///
+    /// `ensure_loaded` runs UNCONDITIONALLY, even when the stop's file is already
+    /// current — `switch_changeset`'s own `open_current` is what loads a view on a real switch,
+    /// but a stop landing on the ALREADY-current file/changeset skips that branch entirely, and
+    /// nothing else in this session eagerly loads a view on construction (see
+    /// `test_support::app_from_fixture`'s callers, which load explicitly). Without this, the
+    /// first step of a tour that opens on the file the reviewer is already looking at would
+    /// silently no-op on the `role_view_ref` lookup below instead of resolving the anchor.
+    fn goto_tour_stop(&mut self, stop_idx: usize) {
+        let Some(stop) = self.tour_stops.get(stop_idx).cloned() else {
+            return;
+        };
+        let Some(anchor) = stop.anchor.clone() else {
+            return;
+        };
+        if let Some(cs_idx) = self.changesets.iter().position(|v| {
+            v.cs.name == stop.changeset.name()
+                && (v.cs.span == ChangesetSpan::Uncommitted) == stop.changeset.uncommitted()
+        }) {
+            let file_idx = self.changesets[cs_idx]
+                .files()
+                .iter()
+                .position(|f| f.path == anchor.path)
+                .unwrap_or(0);
+            if cs_idx != self.current_cs || file_idx != self.current {
+                self.switch_changeset(cs_idx, file_idx);
+            }
+        }
+        self.complete_pending_open();
+        self.ensure_loaded(self.current);
+
+        let role = self.focused_role_for(self.current);
+        let Some(aligned_idx) = self.role_view_ref(self.current, role).and_then(|view| {
+            aligned_idx_for_lineno(&view.aligned, anchor.new_side, anchor.lineno as usize)
+        }) else {
+            return;
+        };
+        self.reveal_aligned_idx(aligned_idx);
+
+        let layout = self.layout;
+        if let Some(view) = self.current_view_ref() {
+            if let Some((row_idx, is_gap)) =
+                resolve_marker_row(view, layout, anchor.new_side, anchor.lineno as usize)
+            {
+                if !is_gap {
+                    self.cursor = row_idx;
+                }
+            }
+        }
+        self.cancel_selection();
+        self.derive_scroll();
+        self.clamp_cursor();
+    }
+
+    /// The bounded-reveal step shared by [`Self::jump_to_search_match`] and
+    /// [`Self::goto_tour_stop`] (locked decision: the same widen-just-enough reveal, never
+    /// `full: true` — commit `bcb673c`'s fix, see [`crate::align::CONTEXT_LINES`]): if
+    /// `aligned_idx` in the current view sits inside a collapsed gap, widen whichever edge is
+    /// nearer it by just enough rows to surface it plus a small context margin. A no-op when
+    /// `aligned_idx` isn't inside a gap at all (already visible, or out of range).
+    fn reveal_aligned_idx(&mut self, aligned_idx: usize) {
+        let Some(view) = self.current_view() else {
+            return;
+        };
+        let Some(key) = crate::align::gap_key_for_aligned_idx(&view.aligned, aligned_idx) else {
+            return;
+        };
+        let Some((start, end)) = gap_hidden_range(&view.aligned, key, &view.expansions) else {
+            return;
+        };
+        if aligned_idx < start || aligned_idx >= end {
+            return;
+        }
+        let dist_to_start = aligned_idx - start;
+        let dist_to_end = end - 1 - aligned_idx;
+        if dist_to_start <= dist_to_end {
+            view.expand_gap(key, dist_to_start + 1 + CONTEXT_LINES, 0, false);
+        } else {
+            view.expand_gap(key, 0, dist_to_end + 1 + CONTEXT_LINES, false);
         }
     }
 
@@ -4167,27 +4497,9 @@ impl App {
         };
         self.search_current = Some(idx);
 
-        if let Some(view) = self.current_view() {
-            if let Some(key) = crate::align::gap_key_for_aligned_idx(&view.aligned, m.aligned_idx) {
-                if let Some((start, end)) = gap_hidden_range(&view.aligned, key, &view.expansions) {
-                    if m.aligned_idx >= start && m.aligned_idx < end {
-                        // Reveal from whichever edge is nearer the match: `dist_to_start` rows lie
-                        // between the hidden range's leading edge and the match (inclusive of the
-                        // match's own row), `dist_to_end` the same from the trailing edge. Widen
-                        // that edge by `dist + 1` (through the match's row) plus a small context
-                        // margin, so the reveal reads like the rest of the file rather than
-                        // stopping dead on the match itself.
-                        let dist_to_start = m.aligned_idx - start;
-                        let dist_to_end = end - 1 - m.aligned_idx;
-                        if dist_to_start <= dist_to_end {
-                            view.expand_gap(key, dist_to_start + 1 + CONTEXT_LINES, 0, false);
-                        } else {
-                            view.expand_gap(key, 0, dist_to_end + 1 + CONTEXT_LINES, false);
-                        }
-                    }
-                }
-            }
-        }
+        // The bounded reveal (widen just enough of the nearer edge, never `full: true` — see
+        // `reveal_aligned_idx`'s doc comment) is shared with tour stepping (`goto_tour_stop`).
+        self.reveal_aligned_idx(m.aligned_idx);
 
         let layout = self.layout;
         if let Some(view) = self.current_view_ref() {
@@ -6123,6 +6435,107 @@ pub(crate) fn inline_row_linenos(row: &InlineRow) -> (Option<usize>, Option<usiz
     }
 }
 
+/// The index into `aligned` whose `new_side`/old-side row is `Row::Line(lineno)` — ADR-039's
+/// pre-collapse-space lookup for an annotation anchor, mirroring how
+/// [`crate::align::gap_key_for_aligned_idx`] already expects to be called (aligned-space, not
+/// display/inline-space). `None` when the line was removed on this side (no such row) or the
+/// view's aligned list doesn't cover it.
+fn aligned_idx_for_lineno(aligned: &[AlignedRow], new_side: bool, lineno: usize) -> Option<usize> {
+    aligned.iter().position(|r| {
+        let side = if new_side { r.new } else { r.old };
+        matches!(side, Row::Line(n) if n == lineno)
+    })
+}
+
+/// Resolve `(new_side, lineno)` to its row in `layout`'s CURRENT row list: the row itself if
+/// still visible (`is_gap: false`), else the [`DisplayRow::Gap`]/[`InlineRow::Gap`] currently
+/// hiding it (`is_gap: true` — the `fold_marker` " ▸ N" precedent: a gap-hidden target still
+/// gets a marker, on the gap's own row, rather than being silently dropped). `None` when the
+/// target isn't in this view at all (e.g. a mismatched (file, role) pairing, or content
+/// deleted on this side).
+fn resolve_marker_row(
+    view: &FileView,
+    layout: Layout,
+    new_side: bool,
+    lineno: usize,
+) -> Option<(usize, bool)> {
+    match layout {
+        Layout::Sbs => {
+            if let Some(idx) = view.display.iter().position(|r| {
+                let (old, new) = display_row_linenos(r);
+                if new_side {
+                    new == Some(lineno)
+                } else {
+                    old == Some(lineno)
+                }
+            }) {
+                return Some((idx, false));
+            }
+        }
+        Layout::Inline => {
+            if let Some(idx) = view.inline.iter().position(|r| match r {
+                InlineRow::Context { old, new } => {
+                    if new_side {
+                        *new == lineno
+                    } else {
+                        *old == lineno
+                    }
+                }
+                InlineRow::Del { old, .. } => !new_side && *old == lineno,
+                InlineRow::Add { new, .. } => new_side && *new == lineno,
+                InlineRow::Gap { .. } => false,
+            }) {
+                return Some((idx, false));
+            }
+        }
+    }
+    let aligned_idx = aligned_idx_for_lineno(&view.aligned, new_side, lineno)?;
+    let key = crate::align::gap_key_for_aligned_idx(&view.aligned, aligned_idx)?;
+    match layout {
+        Layout::Sbs => view
+            .display
+            .iter()
+            .position(|r| matches!(r, DisplayRow::Gap { key: k, .. } if *k == key))
+            .map(|i| (i, true)),
+        Layout::Inline => view
+            .inline
+            .iter()
+            .position(|r| matches!(r, InlineRow::Gap { key: k, .. } if *k == key))
+            .map(|i| (i, true)),
+    }
+}
+
+/// Resolve one stored [`Annotation`]'s anchor against `view` (ADR-039's content-hash context
+/// anchoring — [`workon_annotations::anchor::resolve`]) and, if it still resolves, the row it
+/// lands on in `layout`'s current row list (see [`resolve_marker_row`]). Shared by
+/// [`App::annotation_markers`] and [`App::annotations_at_cursor`] so the two can't drift on
+/// what counts as "this annotation is on this row". `None` for a replies/chapter annotation
+/// (no anchor of its own — see [`Annotation::anchor`]'s doc comment) or an orphaned anchor
+/// (renders as unanchored, never wrong, per ADR-039's anchoring decision).
+fn resolve_annotation_row(
+    view: &FileView,
+    layout: Layout,
+    annotation: &Annotation,
+) -> Option<(usize, MarkerKind)> {
+    let anchor = annotation.anchor.as_ref()?;
+    let marker_kind = match annotation.kind {
+        AnnotationKind::Comment => MarkerKind::Comment,
+        AnnotationKind::TourStop => MarkerKind::Tour,
+        // Chapters are per-changeset prose, never anchored — unreachable via the `?` above,
+        // kept explicit so this match stays exhaustive if that invariant ever loosens.
+        AnnotationKind::Chapter => return None,
+    };
+    let lines: Vec<&str> = if anchor.new_side {
+        view.new_lines.iter().map(String::as_str).collect()
+    } else {
+        view.old_lines.iter().map(String::as_str).collect()
+    };
+    let resolution = annot_anchor::resolve(anchor, &lines);
+    let lineno = resolution.lineno?;
+    let (row_idx, _is_gap) = resolve_marker_row(view, layout, anchor.new_side, lineno as usize)?;
+    Some((row_idx, marker_kind))
+}
+
 /// Which hunk (index into `hunks`) a row occupying old line `old` / new line `new` falls in, by
 /// matching its line number against each hunk's `old_start`/`old_count` (or
 /// `new_start`/`new_count`) span — the same counters [`align_file`] reads. A row inside a hunk's
@@ -6195,8 +6608,8 @@ mod tests {
     use super::test_support::app_from_fixture;
     use super::{
         build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews, Region, Role, Severity,
-        Summary, SummaryTarget, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, MAX_OUTLINE_WIDTH,
+        DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews, MarkerKind, Region, Role,
+        Severity, Summary, SummaryTarget, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, MAX_OUTLINE_WIDTH,
         MIN_OUTLINE_WIDTH, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
@@ -6204,6 +6617,30 @@ mod tests {
     use crate::icons::IconMode;
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
+    use workon_annotations::store::{AnnotationStore, TourStop, Walkthrough};
+    use workon_annotations::{Anchor, AnnotationKind, ChangesetKey, NewAnnotation};
+
+    /// Open the annotations store at `fixture`'s commondir — [`AnnotationStore::open`] the same
+    /// way [`App::from_changesets`] does, so a test can seed rows [`app_from_fixture`]'s own
+    /// [`App`] then observes through its `annotations` field. Seeded THROUGH the store, never a
+    /// new `FixtureBuilder` method (see ADR-039's implementer gotcha: the fixture's graphite
+    /// writer uses `repo.path()`, but annotation readers/writers use `repo.commondir()`).
+    fn seed_store(fixture: &Fixture) -> AnnotationStore {
+        let repo = fixture.repo().unwrap();
+        AnnotationStore::open(repo.commondir()).unwrap()
+    }
+
+    fn single_line_anchor(path: &str, new_side: bool, lineno: u32, target: &str) -> Anchor {
+        Anchor {
+            path: path.to_string(),
+            new_side,
+            lineno,
+            end_lineno: lineno,
+            target: target.to_string(),
+            before: Vec::new(),
+            after: Vec::new(),
+        }
+    }
 
     #[test]
     fn whole_files_arrive_path_sorted() {
@@ -14360,5 +14797,167 @@ mod tests {
         app.cursor = 3;
 
         assert_eq!(app.resolve_copy_lines(), Ok("B\nc\nD".to_string()));
+    }
+
+    // ── ADR-039: annotation markers, tour stepping, the no-generation-bump poll ─────
+
+    #[test]
+    fn annotation_markers_resolves_a_comment_row_in_sbs_layout() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let store = seed_store(&fixture);
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Comment,
+                changeset: ChangesetKey::new("main", true),
+                anchor: Some(single_line_anchor("tracked.txt", true, 2, "CHANGED")),
+                body: "why?".into(),
+                author: "reviewer".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let markers = app.annotation_markers(0, role);
+        assert_eq!(markers.len(), 1, "exactly one row carries a marker");
+        assert_eq!(*markers.values().next().unwrap(), MarkerKind::Comment);
+    }
+
+    #[test]
+    fn annotations_at_cursor_gathers_the_root_and_its_replies() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let store = seed_store(&fixture);
+        let root = store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Comment,
+                changeset: ChangesetKey::new("main", true),
+                anchor: Some(single_line_anchor("tracked.txt", true, 2, "CHANGED")),
+                body: "why?".into(),
+                author: "reviewer".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+        store.reply(&root.uid, "because", "author").unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let (&row_idx, _) = app.annotation_markers(0, role).iter().next().unwrap();
+        app.cursor = row_idx;
+
+        let thread = app.annotations_at_cursor();
+        assert_eq!(thread.len(), 2, "the root plus its one reply");
+        assert_eq!(thread[0].body, "why?");
+        assert_eq!(thread[1].body, "because");
+    }
+
+    #[test]
+    fn annotation_poll_never_bumps_generation() {
+        // Mirrors the shape of the index-signature poll's own echo-suppression test: a write
+        // through a SECOND connection must be observed (the store's write-visibility
+        // fingerprint moves), but `on_tick`'s annotation poll must never bump `App::generation`
+        // — ADR-039's gotcha: an annotation write invalidates no view cache.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("tracked.txt", "line1\nline2\n", "line1\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        let generation_before = app.generation();
+
+        let store = seed_store(&fixture);
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Comment,
+                changeset: ChangesetKey::new("main", true),
+                anchor: Some(single_line_anchor("tracked.txt", true, 2, "CHANGED")),
+                body: "why?".into(),
+                author: "reviewer".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        app.on_tick();
+
+        assert_eq!(
+            app.generation(),
+            generation_before,
+            "an annotation write must never bump the ADR-037 generation counter"
+        );
+    }
+
+    #[test]
+    fn tour_next_and_prev_step_through_stops_and_switch_files() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "a1\na2\n", "a1\nCHANGED_A\n")
+            .unstaged_file("b.txt", "b1\nb2\n", "b1\nCHANGED_B\n")
+            .build()
+            .unwrap();
+        let store = seed_store(&fixture);
+        store
+            .put_walkthrough(Walkthrough {
+                changeset: ChangesetKey::new("main", true),
+                tour: "onboarding".into(),
+                chapter: None,
+                chapter_author: None,
+                stops: vec![
+                    TourStop {
+                        anchor: single_line_anchor("a.txt", true, 2, "CHANGED_A"),
+                        body: "first stop".into(),
+                        author: "agent".into(),
+                        seq: 1,
+                    },
+                    TourStop {
+                        anchor: single_line_anchor("b.txt", true, 2, "CHANGED_B"),
+                        body: "second stop".into(),
+                        author: "agent".into(),
+                        seq: 2,
+                    },
+                ],
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_tour("onboarding");
+
+        app.tour_next();
+        assert_eq!(app.files()[app.current].path, "a.txt");
+        assert_eq!(
+            app.role_view_ref(app.current, app.focused_role_for(app.current))
+                .unwrap()
+                .new_line(2),
+            "CHANGED_A"
+        );
+
+        app.tour_next();
+        assert_eq!(app.files()[app.current].path, "b.txt");
+
+        app.tour_prev();
+        assert_eq!(
+            app.files()[app.current].path,
+            "a.txt",
+            "tour_prev steps back to the first stop's file"
+        );
     }
 }
