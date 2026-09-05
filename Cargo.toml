@@ -1,7 +1,13 @@
 [workspace]
 resolver = "2"
 default-members = ["git-workon"]
-members = ["git-workon", "git-workon-lib", "git-workon-fixture", "git-workon-review"]
+members = [
+  "git-workon",
+  "git-workon-lib",
+  "git-workon-fixture",
+  "git-workon-review",
+  "git-workon-annotations",
+]
 
 [workspace.package]
 authors = ["Eric Eldredge <lettertwo@gmail.com>"]
