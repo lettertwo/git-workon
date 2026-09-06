@@ -2135,6 +2135,17 @@ impl App {
         self.editor.as_ref().map(|s| s.state.text())
     }
 
+    /// The open editor's [`EditorTarget::Create`] anchor, or `None` when the editor isn't open
+    /// or is targeting a reply instead — a test-only window into what
+    /// [`Self::capture_annotation_anchor`] resolved at open time.
+    #[cfg(test)]
+    pub fn editor_create_anchor(&self) -> Option<&Anchor> {
+        match self.editor.as_ref()?.target {
+            EditorTarget::Create { ref anchor } => Some(anchor),
+            EditorTarget::Reply { .. } => None,
+        }
+    }
+
     /// The open editor's buffer wrapped to `width` display columns — see
     /// [`crate::editor::EditorState::wrapped_lines`]. Empty when the editor isn't open.
     pub fn editor_wrapped_lines(&self, width: usize) -> Vec<String> {
@@ -5744,8 +5755,8 @@ impl App {
     }
 
     /// Whether a staging verb would act on the current file rather than refuse — the same
-    /// [`Self::staging_role`] gate `stage_file`/`stage_hunk`/`start_selection` check before they
-    /// call [`Self::notify_unstageable_refusal`], read here by the renderer so the footer stops
+    /// [`Self::staging_role`] gate `stage_file`/`stage_hunk` check before they call
+    /// [`Self::notify_unstageable_refusal`], read here by the renderer so the footer stops
     /// advertising `stage`/`discard` where they can only refuse (`render::render_footer`).
     ///
     /// Deliberately the SAME predicate rather than a second one that reconstructs the conditions
@@ -5778,16 +5789,15 @@ impl App {
         }
     }
 
-    /// Mode-aware refusal notice for a staging verb / line-selection start that only makes sense
-    /// outside the whole role — i.e. every call site below whose `staging_role()`/
-    /// `staging_role().is_none()` guard failed (the locked decision that committed mode is
-    /// derived, not stored, with targeted guards). A
-    /// committed changeset is ALWAYS whole-only (no staged/unstaged split exists — see
-    /// [`Self::is_committed`]), so it gets its own wording. The non-committed branch's only
+    /// Mode-aware refusal notice for a staging verb that only makes sense outside the whole
+    /// role — i.e. every call site below whose `staging_role()`/`staging_role().is_none()` guard
+    /// failed (the locked decision that committed mode is derived, not stored, with targeted
+    /// guards). A committed changeset is ALWAYS whole-only (no staged/unstaged split exists —
+    /// see [`Self::is_committed`]), so it gets its own wording. The non-committed branch's only
     /// remaining caller is a binary file (ADR-038 decision 10): `effective_zoom` short-circuits
     /// on `!can_stage` before it looks at anything else, so no key press moves it out of
     /// `Role::Whole` — advising a key would be wrong, so this states non-stageability instead.
-    /// `verb` ("stage"/"select") keeps each call site's original non-committed wording.
+    /// `verb` ("stage") keeps each call site's original non-committed wording.
     fn notify_unstageable_refusal(&mut self, verb: &str) {
         if self.is_committed() {
             self.notify(
@@ -6133,15 +6143,15 @@ impl App {
         self.derive_scroll();
     }
 
-    /// Start a line selection anchored at the current cursor (`v`). Refuses (a notice, no anchor
-    /// set) on the whole role or any non-staging role — you can only select lines where you can
-    /// stage them (same gate as the verbs). A no-op on an empty file list.
+    /// Start a line selection anchored at the current cursor (`v`). A selection isn't
+    /// staging-shaped — `copy_lines`, `copy_location`, and `capture_annotation_anchor` all read
+    /// it in the whole role too — so the only real gate is having a loaded view to select in
+    /// (`stage_selection`/`discard_selection` already re-check `staging_role` themselves before
+    /// acting on it). Refuses (a notice, no anchor set) when nothing is loaded — a binary file,
+    /// or an empty file list.
     pub fn start_selection(&mut self) {
-        if self.cur().diff.files.is_empty() {
-            return;
-        }
-        if self.staging_role().is_none() {
-            self.notify_unstageable_refusal("select");
+        if self.current_view_ref().is_none() {
+            self.notify("nothing here to select", Severity::Error);
             return;
         }
         self.selection_anchor = Some(self.cursor);
@@ -10208,8 +10218,8 @@ mod tests {
 
     #[test]
     fn start_selection_on_a_binary_file_refuses() {
-        // Same re-point as `stage_hunk_on_a_binary_file_refuses_without_touching_the_index`: a
-        // binary file is the only non-committed case left that lands in `Role::Whole`.
+        // A binary file has no loaded view — `current_view_ref` is `start_selection`'s only
+        // gate now, so this is the one non-committed case left that still refuses.
         use super::Severity;
 
         let fixture = FixtureBuilder::new()
@@ -10226,15 +10236,15 @@ mod tests {
 
         assert!(
             app.selection_anchor.is_none(),
-            "the whole role has no staging direction, so selection is refused"
+            "a binary file has nothing loaded to select in"
         );
         let notice = app
             .notice
             .as_ref()
-            .expect("whole-role selection must refuse");
+            .expect("a binary file's selection must refuse");
         assert_eq!(notice.severity, Severity::Error);
         assert!(
-            notice.text.contains("not stageable"),
+            notice.text.contains("nothing here to select"),
             "got: {:?}",
             notice.text
         );
@@ -10788,15 +10798,72 @@ mod tests {
 
         app.clear_notice();
         app.start_selection();
-        assert!(app.selection_anchor.is_none());
+        assert!(
+            app.selection_anchor.is_some(),
+            "start_selection no longer gates on staging_role — a committed changeset has a \
+             loaded view, so selection starts"
+        );
+
+        app.stage_hunk();
         let notice = app
             .notice
             .as_ref()
-            .expect("start_selection must refuse on a committed changeset");
+            .expect("stage_hunk must still refuse on a committed changeset, selection or not");
         assert!(
             notice.text.contains("already committed"),
             "got: {:?}",
             notice.text
+        );
+    }
+
+    /// A committed changeset's whole role now supports `v` end to end: `start_selection` sets an
+    /// anchor, extending the cursor extends the range, and `capture_annotation_anchor` (driven
+    /// through `open_annotation_editor_for_create`) resolves the FULL selected range into the
+    /// anchor rather than just the cursor row — the regression this bug fix targets.
+    #[test]
+    fn selection_on_a_committed_changeset_feeds_the_annotation_anchor() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("f.txt", "a\nb\nc\nd\ne\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("f.txt", "a\nB\nc\nD\ne\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "main".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        let lineno = app.cursor as u32 + 1;
+
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+        app.move_cursor_by(1);
+        app.open_annotation_editor_for_create();
+
+        assert!(app.editor_is_open());
+        let anchor = app
+            .editor_create_anchor()
+            .expect("open_annotation_editor_for_create must target a Create anchor");
+        assert_eq!(
+            anchor.end_lineno,
+            lineno + 1,
+            "the anchor must span the whole selection, not just the cursor row"
         );
     }
 
@@ -15098,11 +15165,11 @@ mod tests {
     /// Content yank in `Role::Whole` succeeds — the locked decision that there is no
     /// whole-role exemption for yank pins this against a future "helpful" refusal: the
     /// side-selection rule (which side a row contributes) is total (it always yields a side), so
-    /// unlike the staging verbs there is nothing to refuse. `start_selection` itself still gates
-    /// whole role (it's a staging-shaped verb), so the selection is set directly here rather than
-    /// through `v`. ADR-038: `Role::Whole` for a file with real content is now only reachable
-    /// on a committed changeset (a binary file has no loaded view to copy from), so this exercises
-    /// it there instead of via a forced `Zoom::Combined`.
+    /// unlike the staging verbs there is nothing to refuse. `start_selection` no longer gates on
+    /// `staging_role` (it only needs a loaded view), so the selection is driven through it
+    /// directly here rather than being set by hand. ADR-038: `Role::Whole` for a file with real
+    /// content is now only reachable on a committed changeset (a binary file has no loaded view
+    /// to copy from), so this exercises it there instead of via a forced `Zoom::Combined`.
     #[test]
     fn content_yank_succeeds_in_whole_role() {
         let fixture = FixtureBuilder::new()
@@ -15138,7 +15205,8 @@ mod tests {
             "a committed changeset always resolves to Role::Whole (effective_zoom)"
         );
         app.cursor = 1;
-        app.selection_anchor = Some(1);
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
         app.cursor = 3;
 
         assert_eq!(app.resolve_copy_lines(), Ok("B\nc\nD".to_string()));
