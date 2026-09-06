@@ -81,6 +81,10 @@ pub struct ChangesetSummary {
     pub failed: bool,
     /// The acquisition failure message (ADR-037), `Some` only when `failed`.
     pub failure_message: Option<String>,
+    /// ADR-039's per-changeset walkthrough prose (`AnnotationKind::Chapter`), `None` when no
+    /// tour has authored one for this changeset — never populated for a [`DirSummary`], which
+    /// has no single changeset to anchor a chapter to.
+    pub chapter: Option<String>,
     pub files: Vec<SummaryFileRow>,
     pub total_adds: usize,
     pub total_dels: usize,
@@ -95,6 +99,7 @@ pub fn changeset_summary(
     loading: bool,
     failed: bool,
     failure_message: Option<String>,
+    chapter: Option<String>,
     files: &[FileChange],
 ) -> ChangesetSummary {
     let (files, total_adds, total_dels) = file_rows(files);
@@ -105,6 +110,7 @@ pub fn changeset_summary(
         loading,
         failed,
         failure_message,
+        chapter,
         files,
         total_adds,
         total_dels,
@@ -228,14 +234,31 @@ mod tests {
             false,
             false,
             None,
+            None,
             &files,
         );
         assert_eq!(summary.label, "My Title");
         assert!(summary.current);
         assert!(!summary.needs_restack);
         assert_eq!(summary.files.len(), 2);
+        assert_eq!(summary.chapter, None, "no chapter arg was passed");
         assert_eq!(summary.total_adds, 2);
         assert_eq!(summary.total_dels, 4);
+    }
+
+    #[test]
+    fn changeset_summary_carries_the_chapter_through_unchanged() {
+        let summary = changeset_summary(
+            "My Title".to_string(),
+            true,
+            false,
+            false,
+            false,
+            None,
+            Some("A walkthrough chapter.".to_string()),
+            &[],
+        );
+        assert_eq!(summary.chapter.as_deref(), Some("A walkthrough chapter."));
     }
 
     #[test]
@@ -246,6 +269,7 @@ mod tests {
             false,
             true,
             false,
+            None,
             None,
             &[],
         );
@@ -263,6 +287,7 @@ mod tests {
             false,
             true,
             Some("boom".to_string()),
+            None,
             &[],
         );
         assert!(summary.failed);

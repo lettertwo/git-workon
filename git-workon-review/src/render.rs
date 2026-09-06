@@ -28,6 +28,7 @@ use crate::search::SearchSide;
 use crate::summary::{ChangesetSummary, DirSummary, SummaryFileRow};
 use crate::theme::Palette;
 use crate::wordiff::Span as WordSpan;
+use crate::wrap::wrap_text;
 use workon_annotations::AnnotationKind;
 
 // The on-tint colors (diff add/del gradient + staged variants, cursor/selection washes, and syntax
@@ -1868,6 +1869,18 @@ fn diff_header_line(
         ));
     }
     spans.extend(file_segment_spans(app, theme, icons, focused, role_badge));
+    if let Some((i, n)) = app.tour_progress() {
+        // ADR-039 walkthrough polish: the active tour's step position, appended to the diff
+        // header rather than the footer (the footer is a single overloaded row — confirm
+        // prompt, search prompt, or notice — that a persistent indicator would keep losing
+        // fights with). Only reachable once `]t`/`[t` has actually parked on a stop, so this
+        // never appears on the pending/failed/empty-files early return above (no file view to
+        // land a stop on there anyway).
+        spans.push(TSpan::styled(
+            format!("  stop {i}/{n}"),
+            Style::default().fg(theme.dim),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -2109,6 +2122,7 @@ fn push_summary_body(
 /// ([`render_body`]), and the body no longer duplicates it as its own first line.
 fn changeset_summary_lines(
     summary: &ChangesetSummary,
+    width: usize,
     height: usize,
     theme: &Palette,
     icons: IconMode,
@@ -2141,6 +2155,19 @@ fn changeset_summary_lines(
             Style::default().fg(theme.dim),
         )));
         return (title, lines);
+    }
+
+    // ADR-039's walkthrough chapter: wrapped prose plus a blank separator, prepended ahead of
+    // the file list — counted into `lines` BEFORE `push_summary_body` derives its own height
+    // budget below, so a long chapter elides file rows first rather than overflowing the pane.
+    if let Some(chapter) = &summary.chapter {
+        for wrapped in wrap_text(chapter, width) {
+            lines.push(Line::from(TSpan::styled(
+                wrapped,
+                Style::default().fg(theme.foreground),
+            )));
+        }
+        lines.push(Line::from(""));
     }
 
     push_summary_body(
@@ -2204,9 +2231,10 @@ fn render_summary(
     theme: &Palette,
     icons: IconMode,
 ) -> Line<'static> {
+    let width = area.width as usize;
     let height = area.height as usize;
     let (title, lines) = match summary {
-        Summary::Changeset(cs) => changeset_summary_lines(cs, height, theme, icons),
+        Summary::Changeset(cs) => changeset_summary_lines(cs, width, height, theme, icons),
         Summary::Dir(dir) => dir_summary_lines(dir, height, theme, icons),
     };
     frame.render_widget(Paragraph::new(lines), area);
@@ -2983,18 +3011,19 @@ mod tests {
     use unicode_width::UnicodeWidthChar;
 
     use super::{
-        changeset_prefix_spans, compose_segments, content_spans, hscroll_cut, pan_spans,
-        pane_header_label_style, render, LineEmphasis, STATUS_PLACEHOLDER,
+        changeset_prefix_spans, changeset_summary_lines, compose_segments, content_spans,
+        hscroll_cut, pan_spans, pane_header_label_style, render, LineEmphasis, STATUS_PLACEHOLDER,
     };
     use crate::align::{DisplayRow, Row};
     use crate::app::test_support::app_from_fixture;
     use crate::app::{App, DiffTextMode, EffectiveZoom, Role};
     use crate::highlight::FgSpan;
+    use crate::icons::IconMode;
     use crate::keymap::Keymap;
     use crate::outline::OutlineItem;
     use crate::theme::Palette;
     use crate::wordiff::Span as WordSpan;
-    use workon_annotations::store::AnnotationStore;
+    use workon_annotations::store::{AnnotationStore, TourStop, Walkthrough};
     use workon_annotations::{Anchor, AnnotationKind, ChangesetKey, NewAnnotation};
 
     /// Render one frame against the default (unrebound) keymap and the dark theme — the vast
@@ -7586,6 +7615,164 @@ mod tests {
         assert!(
             content.contains("reviewer"),
             "the overlay shows the comment's author"
+        );
+    }
+
+    // ── ADR-039 slice 5: walkthrough chapters in the summary panel, tour progress ──────
+
+    /// Move `app`'s outline cursor onto `cs_idx`'s Header row and focus the outline — the
+    /// shared setup `summary_panel_title_has_no_counter_and_keeps_the_plain_foreground_look`
+    /// (above) already established for landing the diff pane on the summary panel.
+    fn focus_summary_for(app: &mut App, cs_idx: usize) {
+        let header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { cs_idx: c, .. } if *c == cs_idx))
+            .expect("the changeset's header row is present") as i64;
+        let delta = header_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+        app.focus_outline();
+    }
+
+    #[test]
+    fn chapter_renders_in_the_summary_panel() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let mut app = two_committed_changesets_app(&fixture);
+        let store = AnnotationStore::open(fixture.repo().unwrap().commondir()).unwrap();
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Chapter,
+                changeset: ChangesetKey::new("cs-b", false),
+                anchor: None,
+                body: "This stop walks through the restack fix.".into(),
+                author: "guide".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        focus_summary_for(&mut app, 1);
+
+        let buf = render_once(&mut app, 80, 20);
+        let content = buf_lines(&buf).join("\n");
+        assert!(
+            content.contains("This stop walks through the restack fix."),
+            "the chapter prose renders in the summary panel body: {content:?}"
+        );
+    }
+
+    #[test]
+    fn absent_chapter_renders_the_summary_body_as_before() {
+        // No `Chapter` annotation authored — [`ChangesetSummary::chapter`] is `None`, and the
+        // pure builder must fall straight back to `push_summary_body`'s own leading spacer
+        // blank rather than reserving a row for prose that isn't there.
+        let summary = crate::summary::changeset_summary(
+            "My Title".to_string(),
+            false,
+            false,
+            false,
+            false,
+            None,
+            None,
+            &[],
+        );
+        let (_, lines) =
+            changeset_summary_lines(&summary, 40, 10, &Palette::dark(), IconMode::None);
+        let first: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            first.trim(),
+            "",
+            "no chapter: first body row is still the pre-existing blank spacer, got {first:?}"
+        );
+    }
+
+    #[test]
+    fn wrapped_chapter_respects_the_height_budget_and_elides_file_rows() {
+        let mut builder = FixtureBuilder::new().config("core.autocrlf", "false");
+        for i in 0..8 {
+            builder =
+                builder.unstaged_file(&format!("file{i}.txt"), "a\n", &format!("a\nchanged{i}\n"));
+        }
+        let fixture = builder.build().unwrap();
+        let store = AnnotationStore::open(fixture.repo().unwrap().commondir()).unwrap();
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Chapter,
+                changeset: ChangesetKey::new("main", true),
+                anchor: None,
+                body: "This walkthrough chapter is long enough to wrap across several \
+                       display lines once it lands in the summary panel's narrow width."
+                    .into(),
+                author: "guide".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.focus_outline();
+        let header_idx = app
+            .outline_items()
+            .iter()
+            .position(|it| matches!(it, OutlineItem::Header { .. }))
+            .expect("the single changeset's header row is present") as i64;
+        let delta = header_idx - app.outline_cursor() as i64;
+        app.outline_move_by(delta);
+
+        // Wide enough that the summary pane (frame minus the 35-col outline) wraps the
+        // chapter at a readable width; 12 rows keeps the height budget tight.
+        let buf = render_once(&mut app, 100, 12);
+        let content = buf_lines(&buf).join("\n");
+        assert!(
+            content.contains("This walkthrough chapter"),
+            "the wrapped chapter still renders within the budget: {content:?}"
+        );
+        assert!(
+            content.contains("more"),
+            "8 files plus a wrapped chapter must overflow a 12-row pane and elide, got: \
+             {content:?}"
+        );
+    }
+
+    #[test]
+    fn tour_progress_renders_in_the_diff_header() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let store = AnnotationStore::open(fixture.repo().unwrap().commondir()).unwrap();
+        store
+            .put_walkthrough(Walkthrough {
+                changeset: ChangesetKey::new("main", true),
+                tour: "demo".into(),
+                chapter: None,
+                chapter_author: None,
+                stops: vec![TourStop {
+                    anchor: single_line_anchor("tracked.txt", true, 2, "CHANGED"),
+                    body: "look here".into(),
+                    author: "guide".into(),
+                    seq: 0,
+                }],
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.set_tour("demo");
+        app.tour_next();
+
+        let buf = render_once(&mut app, 60, 20);
+        let content = buf_lines(&buf).join("\n");
+        assert!(
+            content.contains("stop 1/1"),
+            "the diff header shows the tour's step position: {content:?}"
         );
     }
 }
