@@ -78,6 +78,8 @@ pub enum Command {
     CopyLines,
     CopyLocation,
     AnnotationView,
+    AnnotationCreate,
+    AnnotationResolve,
     TourNext,
     TourPrev,
     // Diff view.
@@ -400,6 +402,23 @@ pub static REGISTRY: &[Registered] = &[
         name: "annotation-view",
         default_keys: "c",
         description: "View the comment thread/tour stop anchored to the row under the cursor",
+    },
+    Registered {
+        command: Command::AnnotationCreate,
+        view: View::Diff,
+        name: "annotation-create",
+        // `A` and `C` were both free at last audit (checked against the whole registry, not
+        // just `View::Diff` — `a`/`A`/`c`(taken by `annotation-view`)/`C` weren't bound
+        // anywhere).
+        default_keys: "A",
+        description: "Add a comment anchored to the cursor (or selection)",
+    },
+    Registered {
+        command: Command::AnnotationResolve,
+        view: View::Diff,
+        name: "annotation-resolve",
+        default_keys: "C",
+        description: "Toggle open/resolved for the annotation thread under the cursor",
     },
     Registered {
         command: Command::TourNext,

@@ -18,7 +18,8 @@ use unicode_width::UnicodeWidthStr;
 use workon::{Changeset, ChangesetSpan};
 use workon_annotations::store::AnnotationStore;
 use workon_annotations::{
-    anchor as annot_anchor, Annotation, AnnotationKind, ChangesetKey, Fingerprint,
+    anchor as annot_anchor, Anchor, Annotation, AnnotationKind, ChangesetKey, Fingerprint,
+    NewAnnotation, Status,
 };
 
 use crate::acquire::{ChangesetDiff, WorktreeDiffs};
@@ -28,6 +29,7 @@ use crate::align::{
 };
 use crate::apply::{Git2Applier, StageVerb};
 use crate::config::RawViewConfig;
+use crate::editor::EditorState;
 use crate::highlight::{lang_key_for_ext, FgSpan, TsHighlighter};
 use crate::icons::IconMode;
 use crate::model::{DiffModel, FileChange, FileStatus, Hunk, LineKind};
@@ -1576,6 +1578,32 @@ pub struct App {
     /// showing — the same modal-capture shape as [`Self::help_visible`] (see that field's doc
     /// comment); `tui::update` intercepts every key while this is `true`.
     pub annotation_overlay_visible: bool,
+    /// The open annotation-authoring modal (`A` to create, or a reply key inside the annotation
+    /// overlay), or `None` when it's closed — combining presence, keyboard capture, AND the
+    /// pending write target in one field is the same doubled-up shape [`Self::pending_confirm`]
+    /// already uses (an `Option` that's both "is a modal showing" and "what does answering it
+    /// do"). `tui::update`'s Esc-ladder ranks this modal between the pending-confirm case and
+    /// the help overlay — see that function's doc comment.
+    editor: Option<EditorSession>,
+}
+
+/// The open annotation editor's buffer plus what accepting it (`Ctrl-s`,
+/// [`App::submit_editor`]) writes through the store.
+struct EditorSession {
+    state: EditorState,
+    target: EditorTarget,
+}
+
+/// What [`App::submit_editor`] does with the editor's text once accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EditorTarget {
+    /// A brand-new top-level annotation, anchored to `anchor` at OPEN time (see
+    /// [`App::capture_annotation_anchor`]) — the anchor never moves while the editor is open,
+    /// even if the reviewer scrolls or re-selects before submitting.
+    Create { anchor: Anchor },
+    /// A reply to the root annotation `parent_uid` — a reply carries no anchor of its own (see
+    /// [`workon_annotations::Annotation::anchor`]'s doc comment).
+    Reply { parent_uid: String },
 }
 
 /// A destructive staging op deferred behind a [`Confirm`], identified by index into [`App::files`]
@@ -1616,6 +1644,10 @@ pub enum PendingOp {
         files: Vec<(ChangesetIdentity, String)>,
         identity: OutlineRowIdentity,
     },
+    /// Discard the open annotation editor's in-progress draft (`Esc` on a dirty buffer, see
+    /// [`App::editor_is_dirty`]) — the annotation-authoring analog of the worktree discards
+    /// above: this variant still discards SOMETHING, just a draft rather than a change.
+    DiscardEditorDraft,
 }
 
 /// A pending destructive op plus the scope-stating prompt shown on the footer until answered.
@@ -1785,6 +1817,7 @@ impl App {
             tour_stops: Vec::new(),
             tour_idx: None,
             annotation_overlay_visible: false,
+            editor: None,
         };
         // Position the outline cursor on the changeset/file the lib marked `current` (the same
         // row `sync_outline_to_current` would reposition to after any diff-initiated nav) rather
@@ -1980,6 +2013,329 @@ impl App {
     /// doc comment.
     pub fn toggle_annotation_overlay(&mut self) {
         self.annotation_overlay_visible = !self.annotation_overlay_visible;
+    }
+
+    /// Capture an [`Anchor`] for the row under the cursor (or the active selection's range) in
+    /// the focused pane's current file/role — the annotation-authoring analog of
+    /// [`Self::resolve_yank_rows`], sharing [`resolve_row_side`]'s per-row side rule so anchor
+    /// capture and yank/copy can never pick a different side for the same row. The FIRST
+    /// resolved row picks the anchor's own side/target/context; a multi-line selection's LAST
+    /// resolved row only contributes `end_lineno` (mirroring [`Self::resolve_copy_location`]'s
+    /// lo/hi handling, which likewise doesn't require every row in a range to agree on a side).
+    /// `None` when there's no file/view loaded or the whole range is gap rows — same failure
+    /// shape as [`Self::resolve_yank_rows`].
+    fn capture_annotation_anchor(&self) -> Option<Anchor> {
+        let view = self.current_view_ref()?;
+        let file = self.files().get(self.current)?;
+        let (lo, hi) = self.selection_range().unwrap_or((self.cursor, self.cursor));
+        let rows: Vec<(bool, usize)> = (lo..=hi)
+            .filter_map(|r| resolve_row_side(view, self.layout, r))
+            .collect();
+        let (new_side, lineno) = *rows.first()?;
+        let (_, end_lineno) = *rows.last()?;
+        let lines: &[String] = if new_side {
+            &view.new_lines
+        } else {
+            &view.old_lines
+        };
+        let idx = lineno.checked_sub(1)?;
+        let target = lines.get(idx)?.clone();
+        let before = lines[idx.saturating_sub(3)..idx].to_vec();
+        let after_end = (idx + 1 + 3).min(lines.len());
+        let after = lines[idx + 1..after_end].to_vec();
+        Some(Anchor {
+            path: file.path.clone(),
+            new_side,
+            lineno: lineno as u32,
+            end_lineno: end_lineno as u32,
+            target,
+            before,
+            after,
+        })
+    }
+
+    /// `user.name` from this repo's git config (the same identity `git commit` would use), or
+    /// `"reviewer"` when it's unset or the read fails — a repo with no configured identity, or a
+    /// permissions error, shouldn't block authoring on a config problem this crate has no UI to
+    /// fix.
+    fn annotation_author(&self) -> String {
+        self.repo
+            .config()
+            .and_then(|c| c.get_string("user.name"))
+            .unwrap_or_else(|_| "reviewer".to_string())
+    }
+
+    /// `AnnotationCreate` (`A`): open the editor to compose a brand-new top-level comment,
+    /// anchored via [`Self::capture_annotation_anchor`] at OPEN time. A footer notice (never a
+    /// panic) when the store is unavailable or there's no line to anchor to.
+    pub fn open_annotation_editor_for_create(&mut self) {
+        if self.annotations.is_none() {
+            self.notify(
+                "annotations unavailable — comments and tours are disabled this session",
+                Severity::Info,
+            );
+            return;
+        }
+        let Some(anchor) = self.capture_annotation_anchor() else {
+            self.notify("no line here to annotate", Severity::Info);
+            return;
+        };
+        self.editor = Some(EditorSession {
+            state: EditorState::new(),
+            target: EditorTarget::Create { anchor },
+        });
+    }
+
+    /// Reply from inside the annotation overlay: open the editor targeting the FIRST root
+    /// annotation [`Self::annotations_at_cursor`] returns (a reply carries no anchor of its
+    /// own — it inherits the root's implicitly, see [`workon_annotations::Annotation::anchor`]'s
+    /// doc comment). A footer notice when there's nothing anchored to this row to reply to.
+    pub fn open_annotation_editor_for_reply(&mut self) {
+        if self.annotations.is_none() {
+            return;
+        }
+        let Some(root) = self
+            .annotations_at_cursor()
+            .into_iter()
+            .find(|a| a.parent_uid.is_none())
+        else {
+            self.notify("nothing here to reply to", Severity::Info);
+            return;
+        };
+        self.editor = Some(EditorSession {
+            state: EditorState::new(),
+            target: EditorTarget::Reply {
+                parent_uid: root.uid,
+            },
+        });
+    }
+
+    /// Whether the annotation editor modal is showing — `tui::update`'s Esc-ladder case-2 modal
+    /// arm test, ranked between the pending-confirm case and the help overlay (see that
+    /// function's doc comment).
+    pub fn editor_is_open(&self) -> bool {
+        self.editor.is_some()
+    }
+
+    /// Whether the open editor's buffer has anything typed — see
+    /// [`crate::editor::EditorState::is_dirty`]. `false` (never a panic) when the editor isn't
+    /// open at all.
+    pub fn editor_is_dirty(&self) -> bool {
+        self.editor.as_ref().is_some_and(|s| s.state.is_dirty())
+    }
+
+    /// The open editor's lines, for the render side — an empty slice when it isn't open.
+    pub fn editor_lines(&self) -> &[String] {
+        self.editor.as_ref().map(|s| s.state.lines()).unwrap_or(&[])
+    }
+
+    /// The open editor's buffer, newline-joined — `None` when the editor isn't open, as opposed
+    /// to [`Self::editor_lines`]'s empty slice, since an open-but-empty buffer is one line.
+    pub fn editor_text(&self) -> Option<String> {
+        self.editor.as_ref().map(|s| s.state.text())
+    }
+
+    /// The open editor's [`EditorTarget::Create`] anchor, or `None` when the editor isn't open
+    /// or is targeting a reply instead — a test-only window into what
+    /// [`Self::capture_annotation_anchor`] resolved at open time.
+    #[cfg(test)]
+    pub fn editor_create_anchor(&self) -> Option<&Anchor> {
+        match self.editor.as_ref()?.target {
+            EditorTarget::Create { ref anchor } => Some(anchor),
+            EditorTarget::Reply { .. } => None,
+        }
+    }
+
+    /// The open editor's buffer wrapped to `width` display columns — see
+    /// [`crate::editor::EditorState::wrapped_lines`]. Empty when the editor isn't open.
+    pub fn editor_wrapped_lines(&self, width: usize) -> Vec<String> {
+        self.editor
+            .as_ref()
+            .map(|s| s.state.wrapped_lines(width))
+            .unwrap_or_default()
+    }
+
+    /// Where the open editor's cursor lands in its own wrapped output space — see
+    /// [`crate::editor::EditorState::cursor_screen_pos`]. `(0, 0)` when the editor isn't open
+    /// (the caller only reads this while it is).
+    pub fn editor_cursor_screen_pos(&self, width: usize) -> (usize, usize) {
+        self.editor
+            .as_ref()
+            .map(|s| s.state.cursor_screen_pos(width))
+            .unwrap_or((0, 0))
+    }
+
+    /// `Esc` on a CLEAN editor buffer: close it outright, nothing to lose.
+    pub fn cancel_editor(&mut self) {
+        self.editor = None;
+    }
+
+    /// `Esc` on a DIRTY editor buffer ([`Self::editor_is_dirty`]): raise a `pending_confirm`
+    /// instead of discarding outright — the same "a destructive op gets a confirm" rule the
+    /// staging discards follow, applied to a draft instead of a worktree change.
+    pub fn request_editor_discard_confirm(&mut self) {
+        self.pending_confirm = Some(Confirm {
+            prompt: "Discard this draft? (y/n)".to_string(),
+            op: PendingOp::DiscardEditorDraft,
+        });
+    }
+
+    /// `Ctrl-s`: accept the open editor. Writes the buffer's text through the store —
+    /// [`AnnotationStore::insert`] for a [`EditorTarget::Create`],
+    /// [`AnnotationStore::reply`] for a [`EditorTarget::Reply`] — then closes the modal. A blank
+    /// buffer (nothing typed) is silently dropped rather than writing an empty annotation.
+    ///
+    /// Deliberately does NOT bump [`Self::generation`] or call [`Self::coordinated_refresh`]
+    /// (ADR-039's gotcha, same as [`Self::poll_annotations`]): an annotation write changes what a
+    /// gutter marker overlays, not the diff content itself, and [`Self::annotation_markers`]/
+    /// [`Self::annotations_at_cursor`] are computed fresh from the store on every call rather
+    /// than cached on `App` (see that method's doc comment) — the very next render already sees
+    /// this write with nothing further to rebuild.
+    pub fn submit_editor(&mut self) {
+        let Some(session) = self.editor.take() else {
+            return;
+        };
+        let Some(store) = self.annotations.as_ref() else {
+            return;
+        };
+        let text = session.state.text();
+        if text.trim().is_empty() {
+            return;
+        }
+        let author = self.annotation_author();
+        let result = match session.target {
+            EditorTarget::Create { anchor } => {
+                let changeset = self.current_changeset_key();
+                store
+                    .insert(NewAnnotation {
+                        kind: AnnotationKind::Comment,
+                        changeset,
+                        anchor: Some(anchor),
+                        body: text,
+                        author,
+                        tour: None,
+                        seq: None,
+                    })
+                    .map(|_| ())
+            }
+            EditorTarget::Reply { parent_uid } => {
+                store.reply(&parent_uid, &text, &author).map(|_| ())
+            }
+        };
+        if result.is_err() {
+            self.notify("failed to save the annotation", Severity::Error);
+        }
+    }
+
+    /// `AnnotationResolve`: toggle the FIRST root annotation [`Self::annotations_at_cursor`]
+    /// returns between [`Status::Open`]/[`Status::Resolved`] — bound both directly (from the
+    /// diff, without opening the overlay first) and, per ADR-039's slice-3 plan, as the key the
+    /// annotation overlay itself checks while it's showing. A footer notice when there's
+    /// nothing anchored to this row. Same generation/refresh gotcha as [`Self::submit_editor`].
+    pub fn resolve_annotation_at_cursor(&mut self) {
+        let Some(store) = self.annotations.as_ref() else {
+            return;
+        };
+        let Some(root) = self
+            .annotations_at_cursor()
+            .into_iter()
+            .find(|a| a.parent_uid.is_none())
+        else {
+            self.notify("nothing here to resolve", Severity::Info);
+            return;
+        };
+        let next = match root.status {
+            Status::Open => Status::Resolved,
+            Status::Resolved => Status::Open,
+        };
+        if store.set_status(&root.uid, next).is_err() {
+            self.notify("failed to update the annotation status", Severity::Error);
+        }
+    }
+
+    /// One typed char while the editor is focused — every non-control key `apply_editor_input_key`
+    /// decodes through `prompt_edit_for_key` routes here.
+    pub fn editor_insert_char(&mut self, c: char) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.insert_char(c);
+        }
+    }
+
+    /// `Enter` while the editor is focused: split the line at the cursor.
+    pub fn editor_newline(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.newline();
+        }
+    }
+
+    /// `Backspace` while the editor is focused.
+    pub fn editor_backspace(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.backspace();
+        }
+    }
+
+    /// `Delete` while the editor is focused.
+    pub fn editor_delete(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.delete();
+        }
+    }
+
+    /// `Left` while the editor is focused.
+    pub fn editor_move_left(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.move_left();
+        }
+    }
+
+    /// `Right` while the editor is focused.
+    pub fn editor_move_right(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.move_right();
+        }
+    }
+
+    /// `Up` while the editor is focused.
+    pub fn editor_move_up(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.move_up();
+        }
+    }
+
+    /// `Down` while the editor is focused.
+    pub fn editor_move_down(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.move_down();
+        }
+    }
+
+    /// `Ctrl-a`/`Home` while the editor is focused.
+    pub fn editor_move_home(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.move_home();
+        }
+    }
+
+    /// `Ctrl-e`/`End` while the editor is focused.
+    pub fn editor_move_end(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.move_end();
+        }
+    }
+
+    /// `Ctrl-u` while the editor is focused.
+    pub fn editor_clear_to_start(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.clear_to_start();
+        }
+    }
+
+    /// `Ctrl-w` while the editor is focused.
+    pub fn editor_delete_word_back(&mut self) {
+        if let Some(s) = self.editor.as_mut() {
+            s.state.delete_word_back();
+        }
     }
 
     /// Set the active walkthrough by name and reload its stops (`main.rs`'s future `--tour`
@@ -4309,13 +4665,10 @@ impl App {
     /// active) in the FOCUSED pane's ACTIVE layout coordinate space — the same space
     /// [`Self::selection_range`] itself is already in, so no translation happens here.
     ///
-    /// - **SBS**: the NEW side's lineno, falling back to the OLD side on a pure-deletion row that
-    ///   carries no new side (the same rule the old single-row `copy-path-line` resolver used).
-    ///   `DisplayRow::Gap` rows are skipped, never emitted.
-    /// - **Inline**: `Del` -> old lineno, `Add` -> new lineno, `Context` -> new lineno — mirroring
-    ///   [`Self::selection_line_ops`]'s per-side-precise handling (locked decision: which side
-    ///   a row contributes — new side, old on pure deletions).
-    ///   `InlineRow::Gap` rows are skipped.
+    /// The per-row side rule itself lives in [`resolve_row_side`] (its own doc comment has the
+    /// SBS/inline table) — factored out so ADR-039's annotation anchor capture
+    /// ([`Self::capture_annotation_anchor`]) shares it too, per that rule's own demand that
+    /// nothing else re-derive "which side does this row contribute."
     ///
     /// Each entry is `(is_new_side, lineno)`, one per non-gap row in range order — the order the
     /// caller needs both to pick text (per side) and to collapse a range to its first/last
@@ -4326,32 +4679,9 @@ impl App {
     fn resolve_yank_rows(&self) -> Result<Vec<(bool, usize)>, &'static str> {
         let view = self.current_view_ref().ok_or("no line to copy")?;
         let (lo, hi) = self.selection_range().unwrap_or((self.cursor, self.cursor));
-        let mut rows = Vec::new();
-        match self.layout {
-            Layout::Sbs => {
-                for r in lo..=hi {
-                    let Some(row) = view.display.get(r) else {
-                        continue;
-                    };
-                    let (old, new) = display_row_linenos(row);
-                    if let Some(n) = new {
-                        rows.push((true, n));
-                    } else if let Some(n) = old {
-                        rows.push((false, n));
-                    }
-                }
-            }
-            Layout::Inline => {
-                for r in lo..=hi {
-                    match view.inline.get(r) {
-                        Some(InlineRow::Del { old, .. }) => rows.push((false, *old)),
-                        Some(InlineRow::Add { new, .. }) => rows.push((true, *new)),
-                        Some(InlineRow::Context { new, .. }) => rows.push((true, *new)),
-                        Some(InlineRow::Gap { .. }) | None => {}
-                    }
-                }
-            }
-        }
+        let rows: Vec<(bool, usize)> = (lo..=hi)
+            .filter_map(|r| resolve_row_side(view, self.layout, r))
+            .collect();
         if rows.is_empty() {
             Err("no line to copy")
         } else {
@@ -5425,8 +5755,8 @@ impl App {
     }
 
     /// Whether a staging verb would act on the current file rather than refuse — the same
-    /// [`Self::staging_role`] gate `stage_file`/`stage_hunk`/`start_selection` check before they
-    /// call [`Self::notify_unstageable_refusal`], read here by the renderer so the footer stops
+    /// [`Self::staging_role`] gate `stage_file`/`stage_hunk` check before they call
+    /// [`Self::notify_unstageable_refusal`], read here by the renderer so the footer stops
     /// advertising `stage`/`discard` where they can only refuse (`render::render_footer`).
     ///
     /// Deliberately the SAME predicate rather than a second one that reconstructs the conditions
@@ -5459,16 +5789,15 @@ impl App {
         }
     }
 
-    /// Mode-aware refusal notice for a staging verb / line-selection start that only makes sense
-    /// outside the whole role — i.e. every call site below whose `staging_role()`/
-    /// `staging_role().is_none()` guard failed (the locked decision that committed mode is
-    /// derived, not stored, with targeted guards). A
-    /// committed changeset is ALWAYS whole-only (no staged/unstaged split exists — see
-    /// [`Self::is_committed`]), so it gets its own wording. The non-committed branch's only
+    /// Mode-aware refusal notice for a staging verb that only makes sense outside the whole
+    /// role — i.e. every call site below whose `staging_role()`/`staging_role().is_none()` guard
+    /// failed (the locked decision that committed mode is derived, not stored, with targeted
+    /// guards). A committed changeset is ALWAYS whole-only (no staged/unstaged split exists —
+    /// see [`Self::is_committed`]), so it gets its own wording. The non-committed branch's only
     /// remaining caller is a binary file (ADR-038 decision 10): `effective_zoom` short-circuits
     /// on `!can_stage` before it looks at anything else, so no key press moves it out of
     /// `Role::Whole` — advising a key would be wrong, so this states non-stageability instead.
-    /// `verb` ("stage"/"select") keeps each call site's original non-committed wording.
+    /// `verb` ("stage") keeps each call site's original non-committed wording.
     fn notify_unstageable_refusal(&mut self, verb: &str) {
         if self.is_committed() {
             self.notify(
@@ -5657,6 +5986,7 @@ impl App {
                     .collect();
                 self.outline_run_ops(ops, identity);
             }
+            PendingOp::DiscardEditorDraft => self.editor = None,
         }
     }
 
@@ -5813,15 +6143,15 @@ impl App {
         self.derive_scroll();
     }
 
-    /// Start a line selection anchored at the current cursor (`v`). Refuses (a notice, no anchor
-    /// set) on the whole role or any non-staging role — you can only select lines where you can
-    /// stage them (same gate as the verbs). A no-op on an empty file list.
+    /// Start a line selection anchored at the current cursor (`v`). A selection isn't
+    /// staging-shaped — `copy_lines`, `copy_location`, and `capture_annotation_anchor` all read
+    /// it in the whole role too — so the only real gate is having a loaded view to select in
+    /// (`stage_selection`/`discard_selection` already re-check `staging_role` themselves before
+    /// acting on it). Refuses (a notice, no anchor set) when nothing is loaded — a binary file,
+    /// or an empty file list.
     pub fn start_selection(&mut self) {
-        if self.cur().diff.files.is_empty() {
-            return;
-        }
-        if self.staging_role().is_none() {
-            self.notify_unstageable_refusal("select");
+        if self.current_view_ref().is_none() {
+            self.notify("nothing here to select", Severity::Error);
             return;
         }
         self.selection_anchor = Some(self.cursor);
@@ -6387,6 +6717,31 @@ pub(crate) fn display_row_linenos(row: &DisplayRow) -> (Option<usize>, Option<us
     }
 }
 
+/// Which side (old or new) row `row_idx` of `view`'s `layout`-space row list resolves to, plus
+/// its lineno — one row's worth of [`App::resolve_yank_rows`]' side-selection rule (see that
+/// method's doc comment for the SBS/inline table), factored out here so ADR-039's
+/// [`App::capture_annotation_anchor`] shares it too: both need "which side does THIS row
+/// contribute" without re-deriving the SBS-vs-inline branching. `None` for a gap row (SBS) or a
+/// `Filler`/`Gap` inline row — same "gap rows are skipped" rule both callers already expect.
+fn resolve_row_side(view: &FileView, layout: Layout, row_idx: usize) -> Option<(bool, usize)> {
+    match layout {
+        Layout::Sbs => {
+            let row = view.display.get(row_idx)?;
+            let (old, new) = display_row_linenos(row);
+            match new {
+                Some(n) => Some((true, n)),
+                None => old.map(|n| (false, n)),
+            }
+        }
+        Layout::Inline => match view.inline.get(row_idx)? {
+            InlineRow::Del { old, .. } => Some((false, *old)),
+            InlineRow::Add { new, .. } => Some((true, *new)),
+            InlineRow::Context { new, .. } => Some((true, *new)),
+            InlineRow::Gap { .. } => None,
+        },
+    }
+}
+
 /// The tree-sitter scope reveal's inputs for the gap at `gap_cursor`: the anchor line and which
 /// side it's in (`true` = new, `false` = old), resolved from the row immediately FOLLOWING the
 /// gap in `layout`'s row vector — the plan's rationale: the next hunk is what you're reading
@@ -6607,10 +6962,10 @@ mod tests {
 
     use super::test_support::app_from_fixture;
     use super::{
-        build_file_views, find_next_hunk_row, find_prev_hunk_row, App, ChangesetView, DiffState,
-        DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews, MarkerKind, Region, Role,
-        Severity, Summary, SummaryTarget, DEFAULT_OUTLINE_WIDTH, HSCROLL_STEP, MAX_OUTLINE_WIDTH,
-        MIN_OUTLINE_WIDTH, SCROLLOFF,
+        build_file_views, find_next_hunk_row, find_prev_hunk_row, resolve_row_side, App,
+        ChangesetView, DiffState, DiffTextMode, EffectiveZoom, HitRegions, Layout, LoadedViews,
+        MarkerKind, Region, Role, Severity, Summary, SummaryTarget, DEFAULT_OUTLINE_WIDTH,
+        HSCROLL_STEP, MAX_OUTLINE_WIDTH, MIN_OUTLINE_WIDTH, SCROLLOFF,
     };
     use crate::align::{AlignedRow, CellKind, DisplayRow, InlineRow, Row};
     use crate::config::{RawViewConfig, ReviewConfig};
@@ -6618,7 +6973,7 @@ mod tests {
     use crate::model::FileStatus;
     use crate::outline::{OutlineItem, OutlineMode, OutlineOrder, StagedStatus};
     use workon_annotations::store::{AnnotationStore, TourStop, Walkthrough};
-    use workon_annotations::{Anchor, AnnotationKind, ChangesetKey, NewAnnotation};
+    use workon_annotations::{Anchor, AnnotationKind, ChangesetKey, NewAnnotation, Status};
 
     /// Open the annotations store at `fixture`'s commondir — [`AnnotationStore::open`] the same
     /// way [`App::from_changesets`] does, so a test can seed rows [`app_from_fixture`]'s own
@@ -9863,8 +10218,8 @@ mod tests {
 
     #[test]
     fn start_selection_on_a_binary_file_refuses() {
-        // Same re-point as `stage_hunk_on_a_binary_file_refuses_without_touching_the_index`: a
-        // binary file is the only non-committed case left that lands in `Role::Whole`.
+        // A binary file has no loaded view — `current_view_ref` is `start_selection`'s only
+        // gate now, so this is the one non-committed case left that still refuses.
         use super::Severity;
 
         let fixture = FixtureBuilder::new()
@@ -9881,15 +10236,15 @@ mod tests {
 
         assert!(
             app.selection_anchor.is_none(),
-            "the whole role has no staging direction, so selection is refused"
+            "a binary file has nothing loaded to select in"
         );
         let notice = app
             .notice
             .as_ref()
-            .expect("whole-role selection must refuse");
+            .expect("a binary file's selection must refuse");
         assert_eq!(notice.severity, Severity::Error);
         assert!(
-            notice.text.contains("not stageable"),
+            notice.text.contains("nothing here to select"),
             "got: {:?}",
             notice.text
         );
@@ -10443,15 +10798,72 @@ mod tests {
 
         app.clear_notice();
         app.start_selection();
-        assert!(app.selection_anchor.is_none());
+        assert!(
+            app.selection_anchor.is_some(),
+            "start_selection no longer gates on staging_role — a committed changeset has a \
+             loaded view, so selection starts"
+        );
+
+        app.stage_hunk();
         let notice = app
             .notice
             .as_ref()
-            .expect("start_selection must refuse on a committed changeset");
+            .expect("stage_hunk must still refuse on a committed changeset, selection or not");
         assert!(
             notice.text.contains("already committed"),
             "got: {:?}",
             notice.text
+        );
+    }
+
+    /// A committed changeset's whole role now supports `v` end to end: `start_selection` sets an
+    /// anchor, extending the cursor extends the range, and `capture_annotation_anchor` (driven
+    /// through `open_annotation_editor_for_create`) resolves the FULL selected range into the
+    /// anchor rather than just the cursor row — the regression this bug fix targets.
+    #[test]
+    fn selection_on_a_committed_changeset_feeds_the_annotation_anchor() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .build()
+            .unwrap();
+        let base = fixture
+            .commit("main")
+            .file("f.txt", "a\nb\nc\nd\ne\n")
+            .create("base")
+            .unwrap();
+        let head = fixture
+            .commit("main")
+            .file("f.txt", "a\nB\nc\nD\ne\n")
+            .create("head")
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+        let cs = Changeset {
+            name: "main".to_string(),
+            span: ChangesetSpan::Committed { base, head },
+            title: None,
+            current: true,
+            needs_restack: false,
+        };
+        let diff = crate::acquire::diff_changeset(repo, &cs).unwrap();
+        let view = ChangesetView::from_changeset_diff(cs, diff);
+        let owned = Repository::open(repo.workdir().unwrap()).unwrap();
+        let mut app = App::from_changesets(owned, vec![view]);
+        app.open_current();
+        let lineno = app.cursor as u32 + 1;
+
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
+        app.move_cursor_by(1);
+        app.open_annotation_editor_for_create();
+
+        assert!(app.editor_is_open());
+        let anchor = app
+            .editor_create_anchor()
+            .expect("open_annotation_editor_for_create must target a Create anchor");
+        assert_eq!(
+            anchor.end_lineno,
+            lineno + 1,
+            "the anchor must span the whole selection, not just the cursor row"
         );
     }
 
@@ -14753,11 +15165,11 @@ mod tests {
     /// Content yank in `Role::Whole` succeeds — the locked decision that there is no
     /// whole-role exemption for yank pins this against a future "helpful" refusal: the
     /// side-selection rule (which side a row contributes) is total (it always yields a side), so
-    /// unlike the staging verbs there is nothing to refuse. `start_selection` itself still gates
-    /// whole role (it's a staging-shaped verb), so the selection is set directly here rather than
-    /// through `v`. ADR-038: `Role::Whole` for a file with real content is now only reachable
-    /// on a committed changeset (a binary file has no loaded view to copy from), so this exercises
-    /// it there instead of via a forced `Zoom::Combined`.
+    /// unlike the staging verbs there is nothing to refuse. `start_selection` no longer gates on
+    /// `staging_role` (it only needs a loaded view), so the selection is driven through it
+    /// directly here rather than being set by hand. ADR-038: `Role::Whole` for a file with real
+    /// content is now only reachable on a committed changeset (a binary file has no loaded view
+    /// to copy from), so this exercises it there instead of via a forced `Zoom::Combined`.
     #[test]
     fn content_yank_succeeds_in_whole_role() {
         let fixture = FixtureBuilder::new()
@@ -14793,7 +15205,8 @@ mod tests {
             "a committed changeset always resolves to Role::Whole (effective_zoom)"
         );
         app.cursor = 1;
-        app.selection_anchor = Some(1);
+        app.start_selection();
+        assert!(app.selection_anchor.is_some());
         app.cursor = 3;
 
         assert_eq!(app.resolve_copy_lines(), Ok("B\nc\nD".to_string()));
@@ -14903,6 +15316,208 @@ mod tests {
             app.generation(),
             generation_before,
             "an annotation write must never bump the ADR-037 generation counter"
+        );
+    }
+
+    /// `view.display`'s row index whose NEW side resolves to `lineno` — a test-only helper over
+    /// [`resolve_row_side`] (the same per-row side rule [`App::capture_annotation_anchor`]
+    /// shares with [`App::resolve_yank_rows`]), since these tests need to park the cursor on a
+    /// specific content row before opening the editor rather than discovering the row from an
+    /// already-stored annotation the way the slice-2 tests above do.
+    fn row_for_new_lineno(view: &super::FileView, layout: Layout, lineno: usize) -> usize {
+        (0..view.display.len())
+            .find(|&r| resolve_row_side(view, layout, r) == Some((true, lineno)))
+            .expect("no row resolves to that new-side lineno")
+    }
+
+    #[test]
+    fn annotation_create_persists_and_a_marker_appears() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let row_idx = {
+            let view = app.role_view_ref(0, role).unwrap();
+            row_for_new_lineno(view, app.layout, 2)
+        };
+        app.cursor = row_idx;
+
+        app.open_annotation_editor_for_create();
+        assert!(
+            app.editor_is_open(),
+            "a valid cursor row must capture an anchor and open the editor"
+        );
+        for c in "why?".chars() {
+            app.editor_insert_char(c);
+        }
+        app.submit_editor();
+        assert!(!app.editor_is_open(), "submit closes the modal");
+
+        let markers = app.annotation_markers(0, role);
+        assert_eq!(markers.len(), 1, "the new annotation resolves to one row");
+        assert_eq!(*markers.values().next().unwrap(), MarkerKind::Comment);
+    }
+
+    #[test]
+    fn annotation_create_with_a_blank_buffer_writes_nothing() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let row_idx = {
+            let view = app.role_view_ref(0, role).unwrap();
+            row_for_new_lineno(view, app.layout, 2)
+        };
+        app.cursor = row_idx;
+
+        app.open_annotation_editor_for_create();
+        app.submit_editor();
+
+        assert!(!app.editor_is_open(), "submit always closes the modal");
+        assert!(
+            app.annotation_markers(0, role).is_empty(),
+            "an empty buffer must not write an annotation"
+        );
+    }
+
+    #[test]
+    fn annotation_reply_from_overlay_writes_through_the_store() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let store = seed_store(&fixture);
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Comment,
+                changeset: ChangesetKey::new("main", true),
+                anchor: Some(single_line_anchor("tracked.txt", true, 2, "CHANGED")),
+                body: "why?".into(),
+                author: "reviewer".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let (&row_idx, _) = app.annotation_markers(0, role).iter().next().unwrap();
+        app.cursor = row_idx;
+
+        app.open_annotation_editor_for_reply();
+        assert!(
+            app.editor_is_open(),
+            "a root at this row must open the editor"
+        );
+        for c in "because".chars() {
+            app.editor_insert_char(c);
+        }
+        app.submit_editor();
+
+        let thread = app.annotations_at_cursor();
+        assert_eq!(thread.len(), 2, "the root plus its new reply");
+        assert_eq!(thread[1].body, "because");
+        assert!(
+            thread[1].anchor.is_none(),
+            "a reply carries no anchor of its own"
+        );
+    }
+
+    #[test]
+    fn annotation_resolve_toggles_the_root_status() {
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let store = seed_store(&fixture);
+        store
+            .insert(NewAnnotation {
+                kind: AnnotationKind::Comment,
+                changeset: ChangesetKey::new("main", true),
+                anchor: Some(single_line_anchor("tracked.txt", true, 2, "CHANGED")),
+                body: "why?".into(),
+                author: "reviewer".into(),
+                tour: None,
+                seq: None,
+            })
+            .unwrap();
+
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let (&row_idx, _) = app.annotation_markers(0, role).iter().next().unwrap();
+        app.cursor = row_idx;
+
+        app.resolve_annotation_at_cursor();
+        assert_eq!(app.annotations_at_cursor()[0].status, Status::Resolved);
+
+        app.resolve_annotation_at_cursor();
+        assert_eq!(
+            app.annotations_at_cursor()[0].status,
+            Status::Open,
+            "resolve toggles, it doesn't just set"
+        );
+    }
+
+    #[test]
+    fn annotation_submit_never_bumps_generation() {
+        // Mirrors `annotation_poll_never_bumps_generation`'s pin, over the write side: a local
+        // `submit_editor` write must never bump `App::generation` either — ADR-039's gotcha
+        // applies to every annotation write, not just the poll.
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file(
+                "tracked.txt",
+                "line1\nline2\nline3\n",
+                "line1\nCHANGED\nline3\n",
+            )
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.ensure_loaded(0);
+        let role = app.focused_role_for(0);
+        let row_idx = {
+            let view = app.role_view_ref(0, role).unwrap();
+            row_for_new_lineno(view, app.layout, 2)
+        };
+        app.cursor = row_idx;
+        let generation_before = app.generation();
+
+        app.open_annotation_editor_for_create();
+        app.editor_insert_char('x');
+        app.submit_editor();
+
+        assert_eq!(
+            app.generation(),
+            generation_before,
+            "submitting an annotation must never bump the ADR-037 generation counter"
         );
     }
 
