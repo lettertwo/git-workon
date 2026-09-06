@@ -462,7 +462,7 @@ For high-concurrency scenarios (many parallel agents all calling `git workon new
 
 ### Phase 3: MCP Server (New Crate)
 
-6. **`git-workon-mcp` crate** — Standalone binary implementing the MCP stdio protocol with five tools: `worktree_list`, `worktree_create`, `worktree_find`, `worktree_remove`, `worktree_create_from_pr`. Depends on `workon` (git-workon-lib). Tool responses use the WorktreeDescriptor JSON schema. Errors use the structured error protocol from Phase 2.
+6. **`git-workon-mcp` crate** — Standalone binary implementing the MCP stdio protocol with five tools: `worktree_list`, `worktree_create`, `worktree_find`, `worktree_remove`, `worktree_create_from_pr`. Depends on `workon` (git-workon-lib). Tool responses use the WorktreeDescriptor JSON schema. Errors use the structured error protocol from Phase 2. Status (2026-09-03, ADR-040): the crate exists, reached via `git workon mcp`, and today serves `git-workon-annotations`'s eight comment/walkthrough tools (ADR-039); this worktree tool set is still the plan, not yet built.
 
 ---
 
