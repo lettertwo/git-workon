@@ -1193,16 +1193,17 @@ fn update_batch(
 
     for event in events {
         match event {
-            // The coalescable path: no modal is up (the outline fuzzy filter input and the
-            // in-diff search
-            // search prompt both included — a key while either has capture must reach
-            // `apply_filter_input_key`/`apply_search_input_key` via the catch-all arm's `update`
-            // delegation below, never `resolve_key`/the coalescing path), and this isn't the
-            // selection-cancel/search-clear Esc guard (a context change — an "Esc cascade" — so it
-            // falls to the catch-all arm below, which flushes first and delegates the whole event
-            // to `update`). Notice-clearing still happens per key via `resolve_key`.
+            // The coalescable path: no modal is up (the outline fuzzy filter input, the in-diff
+            // search prompt, and the annotation editor all included — a key while any of them
+            // has capture must reach `apply_filter_input_key`/`apply_search_input_key`/
+            // `apply_editor_input_key` via the catch-all arm's `update` delegation below, never
+            // `resolve_key`/the coalescing path), and this isn't the selection-cancel/search-clear
+            // Esc guard (a context change — an "Esc cascade" — so it falls to the catch-all arm
+            // below, which flushes first and delegates the whole event to `update`). Notice-clearing
+            // still happens per key via `resolve_key`.
             AppEvent::Key(key)
                 if app.pending_confirm.is_none()
+                    && !app.editor_is_open()
                     && !app.help_visible
                     && !app.annotation_overlay_visible
                     && !app.outline_filter_focused()
@@ -2396,6 +2397,46 @@ mod tests {
         // actually discards the draft.
         app.resolve_confirm(true);
         assert!(!app.editor_is_open());
+    }
+
+    /// `update_batch`'s coalescing guard must bypass `resolve_key` for the annotation editor the
+    /// same as it does for every other modal — otherwise a real keystroke like `j`/`x` resolves
+    /// through the keymap (moving the cursor) instead of reaching `apply_editor_input_key`.
+    #[test]
+    fn editor_keys_reach_the_editor_through_update_batch() {
+        use git_workon_fixture::prelude::*;
+
+        let fixture = FixtureBuilder::new()
+            .config("core.autocrlf", "false")
+            .unstaged_file("a.txt", "one\ntwo\n", "one\nCHANGED\n")
+            .build()
+            .unwrap();
+        let mut app = app_from_fixture(&fixture);
+        app.open_current();
+        app.open_annotation_editor_for_create();
+        assert!(app.editor_is_open());
+        let cursor_before = app.cursor;
+
+        let km = Keymap::defaults();
+        let mut pending: Vec<KeyPress> = Vec::new();
+        let events = vec![
+            AppEvent::Key(key(KeyCode::Char('x'))),
+            AppEvent::Key(key(KeyCode::Char('j'))),
+            AppEvent::Key(key(KeyCode::Enter)),
+            AppEvent::Key(key(KeyCode::Char('y'))),
+        ];
+        let quit = update_batch(&mut app, &km, &mut pending, events);
+
+        assert!(!quit);
+        assert_eq!(
+            app.cursor, cursor_before,
+            "with the editor open, `j` must not move the diff cursor"
+        );
+        assert!(
+            app.editor_is_open(),
+            "typing into the editor must not close it"
+        );
+        assert_eq!(app.editor_text().as_deref(), Some("xj\ny"));
     }
 
     /// The mirror of the test above: a CLEAN buffer's Esc closes the editor immediately, no

@@ -2129,6 +2129,12 @@ impl App {
         self.editor.as_ref().map(|s| s.state.lines()).unwrap_or(&[])
     }
 
+    /// The open editor's buffer, newline-joined — `None` when the editor isn't open, as opposed
+    /// to [`Self::editor_lines`]'s empty slice, since an open-but-empty buffer is one line.
+    pub fn editor_text(&self) -> Option<String> {
+        self.editor.as_ref().map(|s| s.state.text())
+    }
+
     /// The open editor's buffer wrapped to `width` display columns — see
     /// [`crate::editor::EditorState::wrapped_lines`]. Empty when the editor isn't open.
     pub fn editor_wrapped_lines(&self, width: usize) -> Vec<String> {
