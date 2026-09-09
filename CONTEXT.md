@@ -20,4 +20,11 @@ Terms used throughout the `git-workon` codebase. Implementation details do not b
 
 **Merged(target)** — the worktree's branch has been merged into `target`. Only a candidate when `--merged` is passed.
 
+**PrMerged(number)** — `gh` reports a merged pull request whose head covers the branch's current tip. Always a candidate, gated only on a GitHub remote and `gh` being usable.
+
 **Explicit** — the worktree was named directly as a positional argument to `prune`.
+
+**Branch-only row** — a local branch with no worktree, evaluated by `prune` for the same
+candidate reasons as a worktree row (default on; `--no-branches` / `workon.pruneBranches =
+false` opts out). It never has a working tree, so status filters on `list`/`find` are
+unaffected.
