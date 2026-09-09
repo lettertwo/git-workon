@@ -2864,3 +2864,445 @@ fn prune_dry_run_ignores_merged_pr_without_head_oid() -> Result<(), Box<dyn std:
 
     Ok(())
 }
+
+// ── Branch-only rows ──────────────────────────────────────────────────────────
+
+/// Advance a local branch with no worktree by one commit on top of its current tip,
+/// without needing a worktree to write into (there's nowhere to check the branch
+/// out and commit through the normal fixture builder).
+fn advance_branch_without_worktree(
+    fixture: &Fixture,
+    branch: &str,
+    message: &str,
+) -> Result<git2::Oid, Box<dyn std::error::Error>> {
+    let repo = fixture.repo()?;
+    let head_commit = repo
+        .find_branch(branch, git2::BranchType::Local)?
+        .get()
+        .peel_to_commit()?;
+    let sig = git2::Signature::now("Test User", "test@example.com")?;
+    let new_oid = repo.commit(
+        None,
+        &sig,
+        &sig,
+        message,
+        &head_commit.tree()?,
+        &[&head_commit],
+    )?;
+    repo.find_branch(branch, git2::BranchType::Local)?
+        .get_mut()
+        .set_target(new_oid, message)?;
+    Ok(new_oid)
+}
+
+#[test]
+fn prune_stack_deletes_worktree_and_sibling_branch_via_pr_merged(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "https://github.com/test/test.git")
+        .branch("feat-1")
+        .worktree("feat-2")
+        .build()?;
+
+    let feat_1_tip = advance_branch_without_worktree(&fixture, "feat-1", "feat-1 commit")?;
+    let feat_2_tip = fixture
+        .commit("feat-2")
+        .file("feat-2.txt", "feat-2")
+        .create("feat-2 commit")?;
+
+    let stub = PathStub::new()?.binary(
+        "gh",
+        &gh_stub_pr_outcomes(&[
+            ("feat-1", GhOutcome::Merged(1, feat_1_tip.to_string())),
+            ("feat-2", GhOutcome::Merged(2, feat_2_tip.to_string())),
+        ]),
+    )?;
+
+    let feat_2_dir = fixture.cwd()?;
+    feat_2_dir.assert(predicate::path::is_dir());
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Pruned 1 worktree(s) and deleted 2 branch(es)",
+        ));
+
+    feat_2_dir.assert(predicate::path::missing());
+    fixture.assert(predicate::repo::has_branch("feat-1").not());
+    fixture.assert(predicate::repo::has_branch("feat-2").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_branch_only_remote_gone_requires_gone_flag() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "/dev/null")
+        .branch("feat")
+        .upstream("feat", "origin/feat")
+        .build()?;
+
+    fixture
+        .repo()?
+        .find_reference("refs/remotes/origin/feat")?
+        .delete()?;
+
+    // Without --gone, the row is visible (RemoteGone is a real signal) but not
+    // active, so it's merely selectable in the dry-run analysis.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[selectable]"))
+        .stderr(predicate::str::contains("(no worktree)"))
+        .stderr(predicate::str::contains("remote gone"));
+
+    fixture.assert(predicate::repo::has_branch("feat"));
+
+    // With --gone, it's active and gets deleted.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--gone")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deleted 1 branch(es)"));
+
+    fixture.assert(predicate::repo::has_branch("feat").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_branch_only_merged_removes_fast_forwarded_branch() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("feat")
+        .build()?;
+
+    // Diverge feat from main, then fast-forward main onto it — the same
+    // fast-forward-merge shape the existing worktree-level Merged tests use.
+    let feat_tip = advance_branch_without_worktree(&fixture, "feat", "feat commit")?;
+    fixture.update_branch("main", feat_tip)?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--merged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deleted 1 branch(es)"))
+        .stderr(predicate::str::contains("merged into main"));
+
+    fixture.assert(predicate::repo::has_branch("feat").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_branch_only_row_excludes_default_branch() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("feature")
+        .build()?;
+
+    // "main" has no worktree of its own here, so it can only ever be reached as a
+    // branch-only row — and it's excluded from the branch-only candidate pool
+    // entirely, so naming it is a hard miss rather than a healthy/locked row.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("main")
+        .arg("--dry-run")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("worktree(s) not found: main"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_branch_only_row_protected_glob_locked_out_and_survives_yes(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("release/v1")
+        .config("workon.pruneProtectedBranches", "release/*")
+        .build()?;
+
+    // release/v1 sits at the same commit as main, so it carries a Merged signal
+    // unconditionally — bare mode only hides signal-less rows — making it visible
+    // in dry-run without needing --merged at all.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[locked out]"))
+        .stderr(predicate::str::contains("(no worktree)"));
+
+    // Even an active --merged --yes run leaves a protected branch alone.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--merged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "protected by workon.pruneProtectedBranches",
+        ));
+
+    fixture.assert(predicate::repo::has_branch("release/v1"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_no_branches_flag_ignores_branch_only_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("merged-branch")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--no-branches")
+        .arg("--merged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No worktrees to prune"));
+
+    fixture.assert(predicate::repo::has_branch("merged-branch"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_branches_config_false_ignores_branch_only_rows() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("merged-branch")
+        .config("workon.pruneBranches", "false")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--merged")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No worktrees to prune"));
+
+    fixture.assert(predicate::repo::has_branch("merged-branch"));
+
+    Ok(())
+}
+
+#[test]
+fn prune_keep_branch_drops_branch_only_rows_from_dry_run() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("merged-branch")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--keep-branch")
+        .arg("--dry-run")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("No worktrees to prune"))
+        .stderr(predicate::str::contains("merged-branch").not());
+
+    Ok(())
+}
+
+#[test]
+fn prune_named_healthy_branch_only_row_skipped_without_force(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("healthy")
+        .build()?;
+
+    // `--merged=<nonexistent>` keeps the Merged signal from firing against main
+    // (the branch sits at main's tip, which would otherwise always count as merged),
+    // while the unmerged check still compares against the real default branch and
+    // finds nothing wrong — the same trick the worktree-level healthy-row test uses.
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("healthy")
+        .arg("--merged=develop-does-not-exist")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("not prunable"))
+        .stderr(predicate::str::contains("No worktrees to prune"));
+
+    fixture.assert(predicate::repo::has_branch("healthy"));
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("healthy")
+        .arg("--merged=develop-does-not-exist")
+        .arg("--force")
+        .arg("--yes")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("deleted 1 branch(es)"));
+
+    fixture.assert(predicate::repo::has_branch("healthy").not());
+
+    Ok(())
+}
+
+/// The consecutive-gh-failure bound (see the PR-merged signal tests above) has to
+/// trip before the worktree rows are exhausted, so branch rows appended after them
+/// never get looked up at all in this shape.
+#[test]
+fn prune_gh_bound_holds_with_branch_rows_appended() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .remote("origin", "https://github.com/test/test.git")
+        .worktree("feature-one")
+        .worktree("feature-two")
+        .worktree("feature-three")
+        .worktree("feature-four")
+        .worktree("feature-five")
+        .branch("branch-one")
+        .branch("branch-two")
+        .build()?;
+
+    for branch in [
+        "feature-one",
+        "feature-two",
+        "feature-three",
+        "feature-four",
+        "feature-five",
+    ] {
+        fixture
+            .commit(branch)
+            .file(&format!("{branch}.txt"), branch)
+            .create("Feature commit")?;
+    }
+    advance_branch_without_worktree(&fixture, "branch-one", "branch-one commit")?;
+    advance_branch_without_worktree(&fixture, "branch-two", "branch-two commit")?;
+
+    let stub = PathStub::new()?.binary("gh", &gh_stub_pr_list_fails())?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    prune_cmd
+        .current_dir(&fixture)
+        .env("PATH", stub.path())
+        .env("NO_COLOR", "1")
+        .arg("prune")
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let invocations = stub.invocations("gh");
+    let pr_list_calls = invocations
+        .iter()
+        .filter(|line| line.starts_with("pr list"))
+        .count();
+    assert_eq!(
+        pr_list_calls, 3,
+        "worktree rows should exhaust the bound before any branch row is looked up, got {pr_list_calls}"
+    );
+    assert!(
+        !invocations
+            .iter()
+            .any(|line| line.contains("branch-one") || line.contains("branch-two")),
+        "no gh call should reference a branch-only row once the bound has tripped: {invocations:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn prune_branch_row_json_reports_kind_and_null_path() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .branch("merged-branch")
+        .build()?;
+
+    let mut prune_cmd = cargo_bin_cmd!("git-workon");
+    let output = prune_cmd
+        .current_dir(&fixture)
+        .arg("prune")
+        .arg("--merged")
+        .arg("--yes")
+        .arg("--json")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let json: serde_json::Value = serde_json::from_str(&stdout)?;
+    let pruned = json["pruned"].as_array().expect("pruned should be array");
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0]["kind"], serde_json::json!("branch"));
+    assert_eq!(pruned[0]["path"], serde_json::json!(null));
+    assert_eq!(pruned[0]["branch_deleted"], serde_json::json!(true));
+
+    fixture.assert(predicate::repo::has_branch("merged-branch").not());
+
+    Ok(())
+}

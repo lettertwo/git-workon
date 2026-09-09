@@ -292,6 +292,18 @@ pub struct Prune {
     pub no_fetch: bool,
     #[arg(
         long,
+        conflicts_with = "no_branches",
+        help = "Also consider local branches with no worktree (default; see workon.pruneBranches)"
+    )]
+    pub branches: bool,
+    #[arg(
+        long,
+        conflicts_with = "branches",
+        help = "Do not consider local branches with no worktree, even if workon.pruneBranches is true"
+    )]
+    pub no_branches: bool,
+    #[arg(
+        long,
         value_name = "BRANCH",
         num_args = 0..=1,
         default_missing_value = "",
@@ -346,6 +358,20 @@ impl Prune {
         if self.fetch {
             Some(true)
         } else if self.no_fetch {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Returns the CLI override for including branch-only rows.
+    ///
+    /// `Some(true)` if `--branches` was passed, `Some(false)` if `--no-branches` was
+    /// passed, `None` to fall back to the `workon.pruneBranches` config (default true).
+    pub fn branches_override(&self) -> Option<bool> {
+        if self.branches {
+            Some(true)
+        } else if self.no_branches {
             Some(false)
         } else {
             None
