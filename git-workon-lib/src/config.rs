@@ -254,6 +254,26 @@ impl<'repo> WorkonConfig<'repo> {
         }
     }
 
+    /// Get whether to also consider local branches with no worktree as prune candidates.
+    ///
+    /// Precedence: CLI override > workon.pruneBranches config > true
+    ///
+    /// When true (the default), `prune` also scans local branches that have no
+    /// worktree checked out, applying the same signals as worktree rows. This is how
+    /// a merged PR stack's sibling branches (left behind once their worktree's branch
+    /// is pruned) get cleaned up. Set `workon.pruneBranches = false` or pass
+    /// `--no-branches` to scope `prune` back to worktrees only.
+    pub fn prune_branches(&self, cli_override: Option<bool>) -> Result<bool> {
+        if let Some(override_val) = cli_override {
+            return Ok(override_val);
+        }
+        let config = self.repo.config()?;
+        match config.get_bool("workon.pruneBranches") {
+            Ok(val) => Ok(val),
+            Err(_) => Ok(true),
+        }
+    }
+
     /// Check if a given branch name is protected from pruning.
     ///
     /// Returns true if the branch name matches any of the protected patterns.

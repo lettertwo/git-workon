@@ -5,10 +5,11 @@
 //! after a *prune-fetch* — a fetch that also removes stale `refs/remotes/<remote>/*`
 //! entries. Nothing in the codebase performed such a fetch before this module.
 //!
-//! Two public functions are provided:
+//! Public functions:
 //!
 //! - [`remotes_tracked_by_worktrees`] — discover which remotes are relevant (deduplicated
 //!   list of `branch.<name>.remote` values across all worktrees).
+//! - [`remotes_tracked_by_branches`] — the same discovery for branches with no worktree.
 //! - [`prune_fetch`] — run the equivalent of `git fetch --prune <remote>` for a single
 //!   remote, deleting stale remote-tracking refs and then fetching.
 
@@ -41,6 +42,31 @@ pub fn remotes_tracked_by_worktrees<'a>(
         };
 
         let remote_key = format!("branch.{}.remote", branch_name);
+        if let Ok(remote) = config.get_string(&remote_key) {
+            if !remotes.contains(&remote) {
+                remotes.push(remote);
+            }
+        }
+    }
+
+    Ok(remotes)
+}
+
+/// Returns the deduplicated list of remote names tracked by the given branch names.
+///
+/// Sibling of [`remotes_tracked_by_worktrees`] for branches with no worktree: reads
+/// `branch.<name>.remote` from git config for each name. Results are deduplicated and
+/// returned in stable (first-seen) order. Branches with no upstream configured are
+/// silently skipped.
+pub fn remotes_tracked_by_branches<'a>(
+    repo: &git2::Repository,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<Vec<String>> {
+    let config = repo.config()?;
+    let mut remotes: Vec<String> = Vec::new();
+
+    for name in names {
+        let remote_key = format!("branch.{}.remote", name);
         if let Ok(remote) = config.get_string(&remote_key) {
             if !remotes.contains(&remote) {
                 remotes.push(remote);
