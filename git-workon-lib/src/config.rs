@@ -29,7 +29,8 @@
 //! - **workon.pruneProtectedBranches** - Branches protected from pruning (multi-value, default: [])
 //! - **workon.pruneGone** - Treat gone-upstream worktrees as prune candidates by default (bool, default: false)
 //! - **workon.pruneFetch** - Fetch from tracked remotes before evaluating gone status (bool, default: false)
-//! - **workon.stackModel** - Active stack model: "auto", "graphite", "git", or "none" (string, default: "auto")
+//! - **workon.stackModel** - Active stack model: "auto", "graphite", "gh-stack", "git", "none",
+//!   "mixed:graphite", or "mixed:gh-stack" (string, default: "auto")
 //! - **workon.stackWorktreeGranularity** - Worktree granularity for stacked diffs: "stack" (string, default: "stack")
 //! - **workon.stackAutoTrack** - Auto-register new branches with the active stack tool after
 //!   `workon new` (bool, default: true)
@@ -62,7 +63,7 @@ use std::time::Duration;
 use git2::Repository;
 
 use crate::error::{ConfigError, Result, StackError};
-use crate::stack::{Granularity, StackModel};
+use crate::stack::{Granularity, StackModel, StackProvider};
 
 /// Configuration reader for workon settings stored in git config.
 ///
@@ -318,15 +319,19 @@ impl<'repo> WorkonConfig<'repo> {
     ///
     /// Auto-detection: returns `Graphite` when the repo has been `gt init`-ed
     /// (`.graphite_repo_config` or `.graphite_metadata.db` exists), else `GhStack` when a
-    /// gh-stack file is present, else `None`. Graphite wins when both are present — see
-    /// [`StackModel::detect`].
+    /// gh-stack file is present, else `None`. When both tools' artifacts are present, ties
+    /// break on which has ref-backed tracked branches: both live → `Mixed` (gh-stack primary,
+    /// Graphite fallback); only one live → that provider, strict; neither live → `GhStack` —
+    /// see [`StackModel::detect`] for the full table.
     ///
     /// Accepted config values: `"graphite"`, `"gh-stack"`, `"git"`, `"none"`, `"auto"`
-    /// (re-runs detection). `"git"` opts into metadata-less git-inference
-    /// ([`StackModel::Git`]) explicitly — it is never the result of `"auto"`. `"ghstack"`
-    /// (no hyphen) is a *different* tool (Meta's Phabricator-style stacker) and is rejected
-    /// as unsupported rather than treated as a typo for `"gh-stack"`. Anything else returns
-    /// an error.
+    /// (re-runs detection), `"mixed:graphite"`, `"mixed:gh-stack"` (explicit `Mixed` pin,
+    /// naming the primary directly, skipping the liveness read). `"git"` opts into
+    /// metadata-less git-inference ([`StackModel::Git`]) explicitly — it is never the result
+    /// of `"auto"`. `"ghstack"` (no hyphen) is a *different* tool (Meta's Phabricator-style
+    /// stacker) and is rejected as unsupported rather than treated as a typo for `"gh-stack"`.
+    /// Bare `"mixed"` and any other `"mixed:<x>"` fall through to `UnknownModel`, same as any
+    /// other unrecognized value.
     pub fn stack_model(&self, cli_override: Option<&str>) -> Result<StackModel> {
         let raw = if let Some(val) = cli_override {
             Some(val.to_string())
@@ -341,6 +346,12 @@ impl<'repo> WorkonConfig<'repo> {
             Some("graphite") => Ok(StackModel::Graphite),
             Some("gh-stack") => Ok(StackModel::GhStack),
             Some("git") => Ok(StackModel::Git),
+            Some("mixed:graphite") => Ok(StackModel::Mixed {
+                primary: StackProvider::Graphite,
+            }),
+            Some("mixed:gh-stack") => Ok(StackModel::Mixed {
+                primary: StackProvider::GhStack,
+            }),
             Some(other) if matches!(other, "branchless" | "sapling" | "spr" | "ghstack") => {
                 Err(StackError::UnsupportedModel {
                     model: other.to_string(),

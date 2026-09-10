@@ -1,6 +1,6 @@
 use git_workon_fixture::prelude::*;
 use std::error::Error;
-use workon::{Granularity, StackModel, WorkonConfig};
+use workon::{Granularity, StackModel, StackProvider, WorkonConfig};
 
 #[test]
 fn read_default_branch_config() -> Result<(), Box<dyn Error>> {
@@ -242,6 +242,89 @@ fn stack_model_gh_stack_returns_gh_stack_variant() -> Result<(), Box<dyn Error>>
     let repo = fixture.repo()?;
     let cfg = WorkonConfig::new(repo)?;
     assert_eq!(cfg.stack_model(None)?, StackModel::GhStack);
+    Ok(())
+}
+
+#[test]
+fn stack_model_mixed_graphite_returns_mixed_variant_with_graphite_primary(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "mixed:graphite")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(
+        cfg.stack_model(None)?,
+        StackModel::Mixed {
+            primary: StackProvider::Graphite
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn stack_model_mixed_gh_stack_returns_mixed_variant_with_gh_stack_primary(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "mixed:gh-stack")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(
+        cfg.stack_model(None)?,
+        StackModel::Mixed {
+            primary: StackProvider::GhStack
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn stack_model_mixed_cli_override_wins_over_config() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "graphite")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    assert_eq!(
+        cfg.stack_model(Some("mixed:gh-stack"))?,
+        StackModel::Mixed {
+            primary: StackProvider::GhStack
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn stack_model_bare_mixed_is_rejected() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .config("workon.stackModel", "mixed")
+        .build()?;
+    let repo = fixture.repo()?;
+    let cfg = WorkonConfig::new(repo)?;
+    let err = cfg.stack_model(None).unwrap_err();
+    assert!(
+        err.to_string().contains("Unknown stack model"),
+        "expected 'Unknown stack model' for bare 'mixed', got: {err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn stack_model_mixed_unknown_provider_is_rejected() -> Result<(), Box<dyn Error>> {
+    // "mixed:ghstack" (no hyphen) must not slip through as a typo fix for "mixed:gh-stack".
+    for bad in &["mixed:foo", "mixed:ghstack"] {
+        let fixture = FixtureBuilder::new()
+            .config("workon.stackModel", bad)
+            .build()?;
+        let repo = fixture.repo()?;
+        let cfg = WorkonConfig::new(repo)?;
+        let err = cfg.stack_model(None).unwrap_err();
+        assert!(
+            err.to_string().contains("Unknown stack model"),
+            "expected 'Unknown stack model' for '{bad}', got: {err}"
+        );
+    }
     Ok(())
 }
 

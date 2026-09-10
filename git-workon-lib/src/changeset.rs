@@ -17,6 +17,10 @@
 //!   still walked through, so live descendants of a ghost still appear. Falls back to the
 //!   `Git` arm when `head_branch` is a trunk branch or has no metadata row at all (mirrors
 //!   the nvim prototype's factory behavior).
+//! - [`StackModel::Mixed`] → reads both providers' metadata and assembles from whichever one's
+//!   `parents` contains `head_branch`, checked in [`StackModel::providers`] order (primary
+//!   first); falls to the primary's metadata when neither tracks it, which then falls to `Git`
+//!   through the same trunk/untracked check as the single-provider arms.
 //! - [`StackModel::Git`] → no metadata; walks `upstream..head_branch` commit-by-commit
 //!   (oldest first), one [`Changeset`] per commit.
 //!
@@ -30,7 +34,7 @@ use git2::{BranchType, Oid, Repository, StatusOptions};
 
 use crate::error::{ChangesetError, Result};
 use crate::stack::metadata::{self, StackMetadata};
-use crate::stack::{gh_stack, graphite, StackModel};
+use crate::stack::{gh_stack, graphite, StackModel, StackProvider};
 
 /// What a [`Changeset`] spans: a resolved commit range, or the working tree + index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +85,25 @@ pub fn assemble_changesets(
         }
         StackModel::GhStack => {
             assemble_from_metadata(repo, head_branch, &gh_stack::read_metadata(repo)?)
+        }
+        StackModel::Mixed { primary } => {
+            // Read both providers' metadata and assemble from whichever one actually tracks
+            // `head_branch` — checked in provider order, primary first. Neither tracking it
+            // falls to the primary's metadata, which `assemble_from_metadata` itself routes to
+            // `assemble_git` (head_branch is a trunk or has no metadata row either way).
+            let (graphite_meta, gh_stack_meta) = (
+                graphite::read_metadata(repo)?,
+                gh_stack::read_metadata(repo)?,
+            );
+            let meta_for = |provider: StackProvider| match provider {
+                StackProvider::Graphite => &graphite_meta,
+                StackProvider::GhStack => &gh_stack_meta,
+            };
+            let owner = model
+                .providers()
+                .find(|&p| meta_for(p).parents.contains_key(head_branch))
+                .unwrap_or(primary);
+            assemble_from_metadata(repo, head_branch, meta_for(owner))
         }
     }
 }

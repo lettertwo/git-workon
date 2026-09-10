@@ -683,3 +683,28 @@ fn gh_stack_needs_restack_true_when_base_differs_from_parent_live_tip() -> Resul
     );
     Ok(())
 }
+
+// ── StackModel::Mixed ────────────────────────────────────────────────────────────
+
+#[test]
+fn mixed_head_tracked_only_by_gh_stack_assembles_from_gh_stack_metadata(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["a", "b", "c"])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let model = StackModel::Mixed {
+        primary: workon::StackProvider::Graphite,
+    };
+
+    // "b" has no Graphite row at all — assembly must fall to gh-stack's metadata rather than
+    // reporting it untracked.
+    let changesets = assemble_changesets(repo, "b", model)?;
+    let names: Vec<&str> = changesets.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, vec!["a", "b", "c"]);
+
+    Ok(())
+}
