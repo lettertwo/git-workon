@@ -900,6 +900,13 @@ fn read_config_entries(
             "git".to_string(),
             scalar_source(repo, &git_config, "workon.stackModel"),
         ),
+        Ok(StackModel::Mixed { primary }) => (
+            match primary {
+                workon::StackProvider::Graphite => "mixed (graphite primary)".to_string(),
+                workon::StackProvider::GhStack => "mixed (gh-stack primary)".to_string(),
+            },
+            scalar_source(repo, &git_config, "workon.stackModel"),
+        ),
         Err(_) => (
             "(invalid)".to_string(),
             scalar_source(repo, &git_config, "workon.stackModel"),

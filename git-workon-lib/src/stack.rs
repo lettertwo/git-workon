@@ -7,8 +7,9 @@
 //!
 //! Stack awareness is two-dimensional:
 //!
-//! - [`StackModel`] — which tool manages stacks (v1: Graphite and `gh stack`, plus
-//!   metadata-less git-inference via [`StackModel::Git`]; future: branchless, sapling)
+//! - [`StackModel`] — which tool manages stacks (v1: Graphite and `gh stack`, [`StackModel::Mixed`]
+//!   when both have live branches, plus metadata-less git-inference via [`StackModel::Git`];
+//!   future: branchless, sapling)
 //! - [`Granularity`] — how worktrees map to stacks (v1: [`Granularity::Stack`], one per stack)
 //!
 //! ## Default-on behavior
@@ -58,6 +59,16 @@ use git2::Repository;
 
 use crate::error::Result;
 
+/// A concrete stacked-diff tool. [`StackModel::Mixed`] names one as primary, the other as
+/// fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StackProvider {
+    /// Graphite (`gt`), read via `stack/graphite.rs`.
+    Graphite,
+    /// `gh stack`, read via `stack/gh_stack.rs`.
+    GhStack,
+}
+
 /// Which stacked-diff tool is managing stacks in this repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StackModel {
@@ -68,6 +79,13 @@ pub enum StackModel {
     /// `gh stack` (the `github/gh-stack` extension) manages stacks via a JSON file. See
     /// `stack/gh_stack.rs`'s module docs for the canonical-file-plus-symlinks model.
     GhStack,
+    /// Both Graphite and gh-stack have ref-backed tracked branches in this repository.
+    /// `primary` is consulted first by [`current_stack`], [`enumerate_stacks`], and
+    /// [`crate::assemble_changesets`]; the other provider answers only when `primary` has no
+    /// row for the branch in question. Only reachable via `"auto"` (or unset) config — an
+    /// explicit `workon.stackModel = graphite`/`gh-stack` stays strict, never falling back to
+    /// the other provider even when it also has live branches. See [`StackModel::detect`].
+    Mixed { primary: StackProvider },
     /// No stack-metadata tool; changesets are inferred purely from git, one per commit in
     /// `upstream..HEAD`. Unlike [`StackModel::Graphite`]/[`StackModel::GhStack`], this carries
     /// no branch-level stack topology: [`enumerate_stacks`] and [`current_stack`] treat it as
@@ -101,20 +119,64 @@ impl StackModel {
     /// explicit `workon.stackModel = git` config, or a caller mapping `None` to `Git` before
     /// calling [`crate::assemble_changesets`] (the review crate does this from M3 onward).
     ///
-    /// **Graphite wins** when both tools' artifacts are present: `.graphite_repo_config`
-    /// comes from an explicit, repo-wide `gt init`, while a `gh-stack` file can appear as a
-    /// side effect of one `gh stack add` run in one worktree. The more deliberate,
-    /// repo-scoped signal wins, so no repo that resolves to `Graphite` today can silently flip
-    /// to `GhStack` just because someone tried the other tool once. The escape hatch is an
-    /// explicit `workon.stackModel = gh-stack`.
+    /// **When both tools' artifacts are present**, detection tie-breaks on *live* metadata —
+    /// whether each provider has at least one ref-backed tracked branch (see
+    /// [`graphite::has_live_branches`]/[`gh_stack::has_live_branches`]) — rather than always
+    /// preferring one provider:
+    ///
+    /// - Both live → [`StackModel::Mixed`] with gh-stack as primary: GitHub's native stack
+    ///   support is the more deliberate signal now that it exists, so it answers first, but
+    ///   neither provider's tracked branches are hidden.
+    /// - Only one live → that provider, strict (not `Mixed`): the other's artifacts are stale
+    ///   (e.g. a lingering `.graphite_repo_config` from a repo that migrated to gh-stack), so
+    ///   there is nothing to fall back to.
+    /// - Neither live → `GhStack`: an ambiguous, doubly-stale state that `doctor`'s
+    ///   `BothStackToolsDetected` check explains rather than detection resolving further.
+    ///
+    /// A single artifact present (no ambiguity) skips the liveness read entirely and returns
+    /// that provider, matching today's behavior. The escape hatch out of `Mixed` — or out of a
+    /// tie-break you disagree with — is an explicit `workon.stackModel = graphite`/`gh-stack`,
+    /// which is strict and never reachable via `"auto"`.
     pub fn detect(repo: &Repository) -> Self {
-        if graphite::is_graphite_repo(repo) {
-            Self::Graphite
-        } else if gh_stack::is_gh_stack_repo(repo) {
-            Self::GhStack
-        } else {
-            Self::None
+        let graphite_artifacts = graphite::is_graphite_repo(repo);
+        let gh_artifacts = gh_stack::is_gh_stack_repo(repo);
+
+        match (graphite_artifacts, gh_artifacts) {
+            (false, false) => Self::None,
+            (true, false) => Self::Graphite,
+            (false, true) => Self::GhStack,
+            (true, true) => {
+                let graphite_live = graphite::has_live_branches(repo);
+                let gh_stack_live = gh_stack::has_live_branches(repo);
+                match (graphite_live, gh_stack_live) {
+                    (true, true) => Self::Mixed {
+                        primary: StackProvider::GhStack,
+                    },
+                    (true, false) => Self::Graphite,
+                    (false, true) => Self::GhStack,
+                    (false, false) => Self::GhStack,
+                }
+            }
         }
+    }
+
+    /// Providers to consult, in fallback order. `Graphite`/`GhStack` consult only themselves
+    /// (strict, no fallback); `Mixed` consults `primary` first, then the other; `None`/`Git`
+    /// have no provider to consult.
+    pub fn providers(self) -> impl Iterator<Item = StackProvider> {
+        let (first, second) = match self {
+            Self::Graphite => (Some(StackProvider::Graphite), None),
+            Self::GhStack => (Some(StackProvider::GhStack), None),
+            Self::Mixed { primary } => {
+                let other = match primary {
+                    StackProvider::Graphite => StackProvider::GhStack,
+                    StackProvider::GhStack => StackProvider::Graphite,
+                };
+                (Some(primary), Some(other))
+            }
+            Self::None | Self::Git => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 }
 
@@ -153,18 +215,58 @@ pub struct Stack {
     pub merged: HashSet<String>,
 }
 
+/// Dispatch [`enumerate_stacks`] to one concrete provider's implementation.
+fn provider_enumerate_stacks(repo: &Repository, provider: StackProvider) -> Result<Vec<Stack>> {
+    match provider {
+        StackProvider::Graphite => graphite::enumerate_stacks(repo).map_err(Into::into),
+        StackProvider::GhStack => gh_stack::enumerate_stacks(repo).map_err(Into::into),
+    }
+}
+
+/// Dispatch [`current_stack`] to one concrete provider's implementation.
+fn provider_current_stack(
+    repo: &Repository,
+    head_branch: &str,
+    provider: StackProvider,
+) -> Result<Option<Stack>> {
+    match provider {
+        StackProvider::Graphite => graphite::current_stack(repo, head_branch).map_err(Into::into),
+        StackProvider::GhStack => gh_stack::current_stack(repo, head_branch).map_err(Into::into),
+    }
+}
+
 /// Return all stacks present in metadata, one per connected component.
 ///
 /// Each returned [`Stack`] corresponds to one potential [`StackGroup`] — the same `(trunk,
 /// sorted diffs)` key used by [`group_by_stack`]. Used by the `list` command to surface
 /// stacks that have no checked-out worktrees.
+///
+/// Under [`StackModel::Mixed`], returns the primary provider's stacks followed by the
+/// secondary's, excluding any secondary stack that shares a branch with a primary stack — a
+/// branch belongs to one place in the tree, and the primary's placement always wins (the CLI's
+/// `display::build_tree` merges stacks per trunk with a `visited`-based dedupe that would
+/// otherwise drop the shared branch non-deterministically).
 pub fn enumerate_stacks(repo: &Repository, model: StackModel) -> Result<Vec<Stack>> {
     match model {
         StackModel::None => Ok(vec![]),
-        StackModel::Graphite => graphite::enumerate_stacks(repo).map_err(Into::into),
-        StackModel::GhStack => gh_stack::enumerate_stacks(repo).map_err(Into::into),
         // Git-inference has no branch-level stack topology to enumerate — flat, like None.
         StackModel::Git => Ok(vec![]),
+        StackModel::Graphite => provider_enumerate_stacks(repo, StackProvider::Graphite),
+        StackModel::GhStack => provider_enumerate_stacks(repo, StackProvider::GhStack),
+        StackModel::Mixed { .. } => {
+            let mut providers = model.providers();
+            let primary = providers.next().expect("Mixed always has a primary");
+            let secondary = providers.next().expect("Mixed always has a secondary");
+            let primary_stacks = provider_enumerate_stacks(repo, primary)?;
+            let claimed: std::collections::HashSet<String> = primary_stacks
+                .iter()
+                .flat_map(|s| s.diffs.iter().cloned())
+                .collect();
+            let secondary_stacks = provider_enumerate_stacks(repo, secondary)?
+                .into_iter()
+                .filter(|s| !s.diffs.iter().any(|b| claimed.contains(b)));
+            Ok(primary_stacks.into_iter().chain(secondary_stacks).collect())
+        }
     }
 }
 
@@ -173,6 +275,11 @@ pub fn enumerate_stacks(repo: &Repository, model: StackModel) -> Result<Vec<Stac
 ///
 /// The returned [`Stack`] includes all branches reachable from the same stack root, not just
 /// the ancestors of `head_branch`, so branching stacks are fully represented.
+///
+/// Under [`StackModel::Mixed`], consults [`StackModel::providers`] in order and returns the
+/// first `Some`: the primary provider's row for `head_branch` if it has one, else the
+/// secondary's. An error from either provider propagates immediately rather than being
+/// swallowed to reach the fallback — a corrupt store is a real failure, not "no row here."
 pub fn current_stack(
     repo: &Repository,
     head_branch: &str,
@@ -180,10 +287,16 @@ pub fn current_stack(
 ) -> Result<Option<Stack>> {
     match model {
         StackModel::None => Ok(None),
-        StackModel::Graphite => graphite::current_stack(repo, head_branch).map_err(Into::into),
-        StackModel::GhStack => gh_stack::current_stack(repo, head_branch).map_err(Into::into),
         // Git-inference has no branch-level stack topology — flat, like None.
         StackModel::Git => Ok(None),
+        _ => {
+            for provider in model.providers() {
+                if let Some(stack) = provider_current_stack(repo, head_branch, provider)? {
+                    return Ok(Some(stack));
+                }
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -239,6 +352,18 @@ pub fn is_graphite_repo(repo: &Repository) -> bool {
 /// `BothStackToolsDetected` checks.
 pub fn is_gh_stack_repo(repo: &Repository) -> bool {
     gh_stack::is_gh_stack_repo(repo)
+}
+
+/// `true` if `provider` has at least one ref-backed tracked branch in this repository — see
+/// [`graphite::has_live_branches`]/[`gh_stack::has_live_branches`] for the definition. Used by
+/// [`StackModel::detect`]'s tie-break, and by `list`'s pin hint and `doctor`'s
+/// `StackModelPinHidesLiveBranches` check to tell whether an explicit `workon.stackModel` pin
+/// is hiding the other provider's tracked branches.
+pub fn provider_has_live_branches(repo: &Repository, provider: StackProvider) -> bool {
+    match provider {
+        StackProvider::Graphite => graphite::has_live_branches(repo),
+        StackProvider::GhStack => gh_stack::has_live_branches(repo),
+    }
 }
 
 /// Per-worktree gh-stack link status, for `doctor`'s `GhStackWorktreeNotLinked` check.
@@ -384,7 +509,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_prefers_graphite_when_both_tools_artifacts_are_present() {
+    fn detect_resolves_mixed_when_both_tools_have_live_branches() {
         let fixture = FixtureBuilder::new()
             .graphite_config(&["main"])
             .branch_metadata("a", "main")
@@ -395,8 +520,65 @@ mod tests {
 
         assert_eq!(
             StackModel::detect(repo),
+            StackModel::Mixed {
+                primary: StackProvider::GhStack
+            },
+            "both tools have a ref-backed tracked branch, so neither is hidden"
+        );
+    }
+
+    #[test]
+    fn detect_resolves_gh_stack_when_only_gh_stack_has_live_branches() {
+        // Graphite's only metadata row is a ghost (branch ref deleted) — Graphite's artifacts
+        // are stale, gh-stack's are not.
+        let fixture = FixtureBuilder::new()
+            .graphite_config(&["main"])
+            .ghost_branch_metadata("a", "main")
+            .gh_stack(None, 1, "main", &["feat-a"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(
+            StackModel::detect(repo),
+            StackModel::GhStack,
+            "Graphite's only row is a ghost; gh-stack's tracked branch is live"
+        );
+    }
+
+    #[test]
+    fn detect_resolves_graphite_when_gh_stack_has_only_ghost_branches() {
+        let fixture = FixtureBuilder::new()
+            .graphite_config(&["main"])
+            .branch_metadata("a", "main")
+            .gh_stack(None, 1, "main", &[])
+            .gh_stack_ghost_branch(None, 1, "feat-a")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(
+            StackModel::detect(repo),
             StackModel::Graphite,
-            "Graphite's repo-wide gt init must win over a gh-stack file appearing alongside it"
+            "gh-stack's only row is a ghost; Graphite's tracked branch is live"
+        );
+    }
+
+    #[test]
+    fn detect_resolves_graphite_when_both_tools_have_only_ghost_branches() {
+        let fixture = FixtureBuilder::new()
+            .graphite_config(&["main"])
+            .ghost_branch_metadata("a", "main")
+            .gh_stack(None, 1, "main", &[])
+            .gh_stack_ghost_branch(None, 1, "feat-a")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        assert_eq!(
+            StackModel::detect(repo),
+            StackModel::GhStack,
+            "neither tool has a live branch; gh-stack is the default, doctor explains the ambiguity"
         );
     }
 
