@@ -1492,3 +1492,112 @@ fn list_tree_marks_merged_worktree_branch_and_hides_merged_metadata_only_branch(
 
     Ok(())
 }
+
+// ── Mixed stack model pin hint ────────────────────────────────────────────────
+// Both providers have live tracked branches. Under `auto` this resolves to `Mixed` and stays
+// quiet; an explicit pin hides the other provider and gets a dimmed stderr hint (NO_COLOR=1
+// per the FORCE_COLOR trap — see git-workon-fixture/src/lib.rs's module docs).
+
+#[test]
+fn list_auto_with_both_providers_live_shows_both_stacks_and_no_hint(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["gh-stack-only"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("list")
+        .output()?;
+
+    assert!(output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(stderr.is_empty(), "Mixed must stay quiet: {stderr}");
+
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    assert!(
+        stdout.contains("graphite-only") && stdout.contains("gh-stack-only"),
+        "both providers' tracked branches must appear: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_explicit_graphite_pin_hints_hidden_gh_stack_branches(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["gh-stack-only"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("list")
+        .output()?;
+
+    assert!(output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        stderr.contains("gh-stack has tracked branches")
+            && stderr.contains("workon.stackModel=graphite"),
+        "expected pin hint in stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_json_and_no_stack_suppress_pin_hint() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["gh-stack-only"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+
+    let json_output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("list")
+        .arg("--json")
+        .output()?;
+    assert!(json_output.status.success());
+    assert!(
+        std::str::from_utf8(&json_output.stderr)?.is_empty(),
+        "--json must never print the hint"
+    );
+
+    let no_stack_output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("list")
+        .arg("--no-stack")
+        .output()?;
+    assert!(no_stack_output.status.success());
+    assert!(
+        std::str::from_utf8(&no_stack_output.stderr)?.is_empty(),
+        "--no-stack must never print the hint"
+    );
+
+    Ok(())
+}
