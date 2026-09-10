@@ -5,8 +5,9 @@ git-workon integrates with [Graphite](https://graphite.dev) and with
 workflows. When either tool is active, `list`, `find`, and `new` all become stack-aware by
 default. Use `--no-stack` on any invocation to fall back to branch-flat behavior.
 
-If both tools' artifacts are present in the same repository, Graphite wins: see
-"Auto-detection and both tools present" below.
+If both tools' artifacts are present in the same repository, `auto` ties on which one has
+tracked branches — using both at once is supported: see "Auto-detection and both tools present"
+below.
 
 ## Setup
 
@@ -46,17 +47,43 @@ git config workon.stackModel none
 
 ### Auto-detection and both tools present
 
-`workon.stackModel = auto` (the default) checks Graphite's artifacts first, then gh-stack's:
-`.graphite_repo_config` comes from an explicit, repo-wide `gt init`, while a `gh-stack` file can
-appear from a single `gh stack add` run in one worktree, so the more deliberate signal wins. If
-you've tried both tools in the same repository and want gh-stack instead, pin it explicitly:
+`workon.stackModel = auto` (the default) checks artifacts first — `.graphite_repo_config`/
+`.graphite_metadata.db` for Graphite, a `gh-stack` file anywhere for gh-stack. With only one
+present, that tool is used, same as ever. With **both** present, `auto` checks which one has
+live, ref-backed tracked branches:
+
+- **Both have tracked branches** — you're using both tools in the same repository (e.g. one
+  stack under Graphite, another under `gh stack`). `auto` resolves to a mixed mode, gh-stack
+  first: gh-stack answers for any branch, Graphite answers for branches gh-stack doesn't know
+  about. `list` shows both stacks; nothing is hidden.
+- **Only one has tracked branches** — the other tool's artifacts are stale (e.g. you ran
+  `gt init` once and never tracked a branch, or migrated off it). `auto` uses the one with
+  tracked branches.
+- **Neither has tracked branches** — an ambiguous, doubly-stale state; `auto` falls back to
+  gh-stack and `git workon doctor` explains why.
+
+If you'd rather pin one tool explicitly and stop `auto` from ever falling back to the other,
+set it directly:
 
 ```bash
 git config workon.stackModel gh-stack
 ```
 
-`git workon doctor` reports `BothStackToolsDetected` when it sees artifacts for both, so you
-know when `auto` made a call you might want to override.
+An explicit pin is strict: it never falls back to the other provider, even if that provider also
+has tracked branches. If it does, `list` prints a dimmed stderr hint and `git workon doctor`
+reports `StackModelPinHidesLiveBranches`, so you know branches are being hidden on purpose (or
+by accident). `git workon doctor` also reports `BothStackToolsDetected` whenever both artifacts
+are present under `auto`, showing what it resolved to and each provider's liveness.
+
+You can also pin the mixed mode itself, naming its primary directly and skipping the liveness
+read entirely:
+
+```bash
+git config workon.stackModel mixed:graphite   # or mixed:gh-stack
+```
+
+This is useful when you know you want the fallback behavior but disagree with which provider
+`auto` would pick as primary.
 
 ## Worktree per stack
 
