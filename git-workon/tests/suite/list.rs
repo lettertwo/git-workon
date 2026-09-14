@@ -1403,3 +1403,92 @@ fn list_json_gh_stack_two_stacks_on_shared_trunk_include_respective_numbers(
 
     Ok(())
 }
+
+#[test]
+fn list_json_reports_merged_branches_in_the_stack_merged_array(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.stackModel", "gh-stack")
+        .worktree("main")
+        .worktree("feat-a")
+        .worktree("feat-b")
+        .gh_stack(None, 1, "main", &["feat-a", "feat-b"])
+        .gh_stack_merged_branch(None, 1, "feat-a")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("list")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+
+    let stacks = parsed["stacks"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected stacks array in: {stdout}"));
+    let group = stacks
+        .iter()
+        .find(|g| {
+            g["diffs"]
+                .as_array()
+                .is_some_and(|d| d.iter().any(|v| v == "feat-a"))
+        })
+        .unwrap_or_else(|| panic!("no stack group containing feat-a in: {stdout}"));
+    assert_eq!(
+        group["merged"],
+        serde_json::json!(["feat-a"]),
+        "feat-a must appear in the stack's merged array: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn list_tree_marks_merged_worktree_branch_and_hides_merged_metadata_only_branch(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // feat-a is merged and has a worktree: it must still render, with a " merged" marker.
+    // feat-b is merged and has NO worktree: it must not appear at all.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.stackModel", "gh-stack")
+        .worktree("main")
+        .worktree("feat-a")
+        .gh_stack(None, 1, "main", &["feat-a"])
+        .gh_stack_merged_branch(None, 1, "feat-a")
+        .gh_stack_ghost_branch(None, 1, "feat-b")
+        .gh_stack_merged_branch(None, 1, "feat-b")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("list")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+
+    let feat_a_line = stdout
+        .lines()
+        .find(|l| l.contains("feat-a"))
+        .unwrap_or_else(|| panic!("no feat-a row in: {stdout}"));
+    assert!(
+        feat_a_line.contains("merged"),
+        "feat-a has a worktree, so it must render with a merged marker: {feat_a_line}"
+    );
+    assert!(
+        !stdout.contains("feat-b"),
+        "feat-b is merged with no worktree, so it must not render at all: {stdout}"
+    );
+
+    Ok(())
+}
