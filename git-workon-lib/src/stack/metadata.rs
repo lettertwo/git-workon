@@ -1,16 +1,9 @@
 //! Provider-free stack graph algorithms over [`StackMetadata`].
 //!
-//! Each stack provider (Graphite today; gh-stack later) reduces its own on-disk format to a
-//! [`StackMetadata`] — a trunk set plus `branch → (parent, parent_revision)` — and every other
-//! algorithm here is shared: connected-component enumeration, the current-stack walk, and the
-//! changeset ancestor/descendant walk. Providers own parsing; this module owns the graph.
-//!
-//! **The ghost-pruning difference is enforced by signature, not by comment.** Only [`enumerate`]
-//! takes a `&Repository`, so only [`enumerate`] can call [`crate::resolve::branch_exists`] to
-//! prune ghost branches (metadata rows with no live ref) before building stacks. [`current`] and
-//! [`changeset_walk`] take no `Repository` precisely because they must not prune: routing needs
-//! deleted stack nodes to stay visible so it can distinguish a deleted stack node from a plain
-//! typo, and changeset assembly needs to walk *through* a ghost to reach its live descendants.
+//! Each stack provider reduces its own on-disk format to a [`StackMetadata`] — a trunk set plus
+//! `branch → (parent, parent_revision)` — and every other algorithm here is shared:
+//! connected-component enumeration, the current-stack walk, and the changeset
+//! ancestor/descendant walk.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -18,12 +11,13 @@ use git2::Repository;
 
 use super::Stack;
 
-/// One branch's stack metadata: its recorded parent branch and (if known) the parent revision
-/// snapshotted at track/restack time.
+/// One branch's stack metadata: its recorded parent branch, (if known) the parent revision
+/// snapshotted at track/restack time, and whether its PR has merged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BranchMetadata {
     pub parent: String,
     pub parent_revision: Option<String>,
+    pub merged: bool,
 }
 
 /// Provider-agnostic stack metadata: a trunk set plus `branch → (parent, parent_revision)`,
@@ -42,7 +36,8 @@ pub(crate) struct StackMetadata {
     pub stack_numbers: HashMap<String, u64>,
 }
 
-/// Return all stacks present in `meta`, one per connected component, ghost branches PRUNED.
+/// Return all stacks present in `meta`, one per connected component, ghost AND merged
+/// branches PRUNED.
 ///
 /// A "connected component" is the set of all non-trunk branches reachable from a single direct
 /// child of a trunk branch. This is the same grouping key used by `group_by_stack`, so each
@@ -50,8 +45,10 @@ pub(crate) struct StackMetadata {
 ///
 /// Ghost branches — those present in metadata but whose branch ref no longer exists
 /// (merged/deleted while the provider's records linger) — are dropped before the BFS so they
-/// do not surface as metadata nodes in `list`/`find`. (`current` deliberately does NOT prune —
-/// routing needs deleted nodes to stay visible.)
+/// do not surface as metadata nodes in `list`/`find`. Merged branches (per
+/// `BranchMetadata::merged`) are dropped the same way: `gh stack sync` leaves a merged
+/// branch's row behind rather than deleting it, and a merged branch with no worktree has
+/// nothing left worth surfacing as a metadata-only node.
 pub(crate) fn enumerate(repo: &Repository, meta: &StackMetadata) -> Vec<Stack> {
     let mut parent_map: HashMap<String, String> = meta
         .parents
@@ -66,6 +63,24 @@ pub(crate) fn enumerate(repo: &Repository, meta: &StackMetadata) -> Vec<Stack> {
     // deleted. Filter before the BFS so orphaned subtrees are pruned consistently. Trunks are
     // not in the parent map (they are values, not keys), so they are always preserved.
     parent_map.retain(|branch, _| crate::resolve::branch_exists(repo, branch));
+
+    // Drop merged branches: `list.rs` still renders a merged branch that a worktree covers
+    // (its row comes from `current`, not this pruned map), but a metadata-only merged node has
+    // nothing left to show. Unlike the ghost prune above, a merged branch's live descendants
+    // must survive: `gh stack sync` merges a stack bottom-up and leaves the rest of the stack
+    // recorded as children of the merged row, so the BFS below (seeded only from direct trunk
+    // children) would otherwise lose the whole remaining stack. Reparent each branch past every
+    // merged ancestor first, then drop the merged rows.
+    let is_merged = |b: &str| meta.parents.get(b).map(|m| m.merged).unwrap_or(false);
+    for parent in parent_map.values_mut() {
+        while is_merged(parent) {
+            match meta.parents.get(parent.as_str()) {
+                Some(m) => *parent = m.parent.clone(),
+                None => break,
+            }
+        }
+    }
+    parent_map.retain(|branch, _| !is_merged(branch));
 
     if parent_map.is_empty() {
         return vec![];
@@ -133,6 +148,7 @@ pub(crate) fn enumerate(repo: &Repository, meta: &StackMetadata) -> Vec<Stack> {
                 current,
                 parents,
                 number,
+                merged: HashSet::new(), // every merged row was dropped from `parent_map` above
             });
         }
     }
@@ -223,12 +239,18 @@ pub(crate) fn current(meta: &StackMetadata, head_branch: &str) -> Option<Stack> 
     let number = stack_branches
         .iter()
         .find_map(|b| meta.stack_numbers.get(b).copied());
+    let merged: HashSet<String> = stack_branches
+        .iter()
+        .filter(|b| meta.parents.get(*b).map(|m| m.merged).unwrap_or(false))
+        .cloned()
+        .collect();
     Some(Stack {
         trunk,
         diffs: stack_branches,
         current: head_branch.to_string(),
         parents,
         number,
+        merged,
     })
 }
 
@@ -316,7 +338,12 @@ mod tests {
     use super::*;
     use git_workon_fixture::prelude::*;
 
-    fn meta(trunk: &str, parents: &[(&str, &str)], numbers: &[(&str, u64)]) -> StackMetadata {
+    fn meta(
+        trunk: &str,
+        parents: &[(&str, &str)],
+        numbers: &[(&str, u64)],
+        merged: &[&str],
+    ) -> StackMetadata {
         StackMetadata {
             trunks: vec![trunk.to_string()],
             parents: parents
@@ -327,6 +354,7 @@ mod tests {
                         BranchMetadata {
                             parent: parent.to_string(),
                             parent_revision: None,
+                            merged: merged.contains(branch),
                         },
                     )
                 })
@@ -354,6 +382,7 @@ mod tests {
             "main",
             &[("feat-a", "main"), ("feat-b", "feat-a")],
             &[("feat-b", 12)],
+            &[],
         );
 
         let stacks = enumerate(repo, &meta);
@@ -366,11 +395,78 @@ mod tests {
         let fixture = FixtureBuilder::new().branch("feat-a").build().unwrap();
         let repo = fixture.repo().unwrap();
 
-        let meta = meta("main", &[("feat-a", "main")], &[]);
+        let meta = meta("main", &[("feat-a", "main")], &[], &[]);
 
         let stacks = enumerate(repo, &meta);
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].number, None);
+    }
+
+    #[test]
+    fn enumerate_drops_merged_branch_but_keeps_live_sibling() {
+        let fixture = FixtureBuilder::new()
+            .branch("feat-a")
+            .branch("feat-b")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = meta(
+            "main",
+            &[("feat-a", "main"), ("feat-b", "main")],
+            &[],
+            &["feat-a"],
+        );
+
+        let stacks = enumerate(repo, &meta);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].diffs, vec!["feat-b".to_string()]);
+        assert!(stacks[0].merged.is_empty());
+    }
+
+    #[test]
+    fn enumerate_reparents_live_descendants_of_merged_branch() {
+        let fixture = FixtureBuilder::new()
+            .branch("feat-a")
+            .branch("feat-b")
+            .branch("feat-c")
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = meta(
+            "main",
+            &[
+                ("feat-a", "main"),
+                ("feat-b", "feat-a"),
+                ("feat-c", "feat-b"),
+            ],
+            &[],
+            &["feat-a"],
+        );
+
+        let stacks = enumerate(repo, &meta);
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(
+            stacks[0].diffs,
+            vec!["feat-b".to_string(), "feat-c".to_string()]
+        );
+        assert_eq!(stacks[0].parents["feat-b"], "main");
+        assert_eq!(stacks[0].parents["feat-c"], "feat-b");
+    }
+
+    #[test]
+    fn current_retains_merged_branch_and_records_it() {
+        let meta = meta(
+            "main",
+            &[("feat-a", "main"), ("feat-b", "feat-a")],
+            &[],
+            &["feat-a"],
+        );
+
+        let stack = current(&meta, "feat-b").expect("feat-b is tracked");
+        assert!(stack.diffs.contains(&"feat-a".to_string()));
+        assert_eq!(stack.merged, HashSet::from(["feat-a".to_string()]));
     }
 
     #[test]
@@ -379,6 +475,7 @@ mod tests {
             "main",
             &[("feat-a", "main"), ("feat-b", "feat-a")],
             &[("feat-a", 7)],
+            &[],
         );
 
         let stack = current(&meta, "feat-b").expect("feat-b is tracked");

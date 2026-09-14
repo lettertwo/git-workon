@@ -60,17 +60,11 @@ use super::metadata::{self, BranchMetadata, StackMetadata};
 use super::Stack;
 use crate::error::StackError;
 
-/// One `branchRef` entry (`{ branch, head, base, pullRequest }`), pulled from a raw
-/// `serde_json::Value` rather than a derived struct (this crate has no `serde` derive
-/// dependency, only `serde_json`; see `graphite.rs` for the same raw-`Value` convention).
-/// `head` and `pullRequest` are read from the file but not carried into [`StackMetadata`]:
-/// assembly uses the live tip for `head`, and `pullRequest` has no `StackMetadata` field.
-/// Both matter to the write path (added in a later changeset), which round-trips the raw
-/// `Value` to preserve them.
 #[derive(Debug)]
 struct GhStackBranchRef {
     branch: String,
     base: String,
+    merged: bool,
 }
 
 impl GhStackBranchRef {
@@ -82,6 +76,11 @@ impl GhStackBranchRef {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
+            merged: value
+                .get("pullRequest")
+                .and_then(|pr| pr.get("merged"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         })
     }
 }
@@ -329,6 +328,7 @@ pub(crate) fn read_metadata(repo: &Repository) -> Result<StackMetadata, StackErr
                 .or_insert(BranchMetadata {
                     parent: parent.clone(),
                     parent_revision,
+                    merged: branch_ref.merged,
                 });
             if entry.number != 0 {
                 stack_numbers
@@ -1043,6 +1043,65 @@ mod tests {
         assert_eq!(stacks.len(), 1);
         assert_eq!(stacks[0].number, Some(12));
         assert_eq!(stacks[0].diffs, vec!["feat-a", "feat-b"]);
+    }
+
+    #[test]
+    fn merged_true_is_read_from_pull_request() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .branch("feat-b")
+            .raw_gh_stack(
+                None,
+                br#"{"schemaVersion": 1, "stacks": [{"number": 1, "trunk": {"branch": "main", "head": "", "base": ""}, "branches": [{"branch": "feat-a", "head": "", "base": "", "pullRequest": {"number": 1, "merged": true}}, {"branch": "feat-b", "head": "", "base": "", "pullRequest": null}]}]}"#.to_vec(),
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = read_metadata(repo).unwrap();
+        assert!(meta.parents["feat-a"].merged);
+        assert!(!meta.parents["feat-b"].merged, "sibling must stay unmerged");
+    }
+
+    #[test]
+    fn missing_pull_request_reads_merged_false() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .raw_gh_stack(
+                None,
+                br#"{"schemaVersion": 1, "stacks": [{"number": 1, "trunk": {"branch": "main", "head": "", "base": ""}, "branches": [{"branch": "feat-a", "head": "", "base": ""}]}]}"#.to_vec(),
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = read_metadata(repo).unwrap();
+        assert!(!meta.parents["feat-a"].merged);
+    }
+
+    #[test]
+    fn null_pull_request_reads_merged_false() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .raw_gh_stack(
+                None,
+                br#"{"schemaVersion": 1, "stacks": [{"number": 1, "trunk": {"branch": "main", "head": "", "base": ""}, "branches": [{"branch": "feat-a", "head": "", "base": "", "pullRequest": null}]}]}"#.to_vec(),
+            )
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = read_metadata(repo).unwrap();
+        assert!(!meta.parents["feat-a"].merged);
     }
 
     #[test]

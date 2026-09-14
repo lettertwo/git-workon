@@ -1741,6 +1741,7 @@ mod tests {
                     .map(|(c, p)| (c.to_string(), p.to_string()))
                     .collect(),
                 number: None,
+                merged: HashSet::new(),
             },
             members: vec![],
         }
