@@ -25,7 +25,9 @@
 //! - Worktrees whose gh-stack admin-dir file isn't linked to the canonical store — fixable
 //!   with --fix (plants the link, or merges a pre-existing real file first)
 //! - gh-stack files that fail to parse, or whose stacks disagree across worktrees
-//! - Both Graphite and gh-stack artifacts present with the model left on `auto`
+//! - Both Graphite and gh-stack artifacts present with the model left on `auto`: reports the
+//!   dual state, what `auto` resolved to, and each provider's liveness
+//! - An explicit `workon.stackModel` pin hiding the other provider's live tracked branches
 //!
 //! ## Flags:
 //! - `--fix` - Automatically repair fixable issues (missing directory entries, renamed keys)
@@ -40,8 +42,8 @@ use workon::{
     encode_worktree_name, get_repo, get_worktrees, gh_stack_divergent_stack_numbers,
     gh_stack_readability_errors, gh_stack_worktree_link_status, is_gh_stack_repo,
     is_graphite_active, is_graphite_repo, link_worktree, migrate_worktree, preferred_remote_order,
-    relative_worktree_path, rename_worktree_metadata, GhStackLinkStatus, Granularity, StackModel,
-    WorkonConfig, WorktreeDescriptor,
+    provider_has_live_branches, relative_worktree_path, rename_worktree_metadata,
+    GhStackLinkStatus, Granularity, StackModel, StackProvider, WorkonConfig, WorktreeDescriptor,
 };
 
 use crate::cli::Doctor;
@@ -104,7 +106,18 @@ enum IssueKind {
     GhStackDivergentStacks {
         number: u64,
     },
-    BothStackToolsDetected,
+    BothStackToolsDetected {
+        resolved: String,
+        graphite_live: bool,
+        gh_stack_live: bool,
+    },
+    StackModelPinHidesLiveBranches {
+        pinned: String,
+        hidden: String,
+    },
+    MixedPinPrimaryNotInitialized {
+        primary: StackProvider,
+    },
 }
 
 struct Issue {
@@ -226,9 +239,39 @@ impl Issue {
                     "stack #{number} is defined differently in more than one worktree's gh-stack file"
                 )
             }
-            IssueKind::BothStackToolsDetected => {
-                "both Graphite and gh-stack artifacts are present; set workon.stackModel explicitly to avoid ambiguity".to_string()
+            IssueKind::BothStackToolsDetected {
+                resolved,
+                graphite_live,
+                gh_stack_live,
+            } => match (graphite_live, gh_stack_live) {
+                (true, true) => format!(
+                    "both Graphite and gh-stack have tracked branches; auto resolves to {resolved}; pin one with workon.stackModel to make it strict"
+                ),
+                (true, false) => format!(
+                    "both Graphite and gh-stack artifacts are present; only Graphite has tracked branches, auto resolves to {resolved}"
+                ),
+                (false, true) => format!(
+                    "both Graphite and gh-stack artifacts are present; only gh-stack has tracked branches, auto resolves to {resolved}"
+                ),
+                (false, false) => {
+                    "both Graphite and gh-stack artifacts are present; set workon.stackModel explicitly to avoid ambiguity".to_string()
+                }
+            },
+            IssueKind::StackModelPinHidesLiveBranches { pinned, hidden } => {
+                format!(
+                    "{hidden} has tracked branches that workon.stackModel={pinned} hides; unset it (auto) to show both"
+                )
             }
+            IssueKind::MixedPinPrimaryNotInitialized { primary } => match primary {
+                StackProvider::Graphite => {
+                    "stackModel=mixed:graphite but repo not gt-initialized — run: gt init"
+                        .to_string()
+                }
+                StackProvider::GhStack => {
+                    "stackModel=mixed:gh-stack but no gh-stack file found — run: gh stack init"
+                        .to_string()
+                }
+            },
         }
     }
 
@@ -253,7 +296,11 @@ impl Issue {
             IssueKind::GhStackNotInitialized => "gh_stack_not_initialized",
             IssueKind::GhStackFileUnreadable { .. } => "gh_stack_file_unreadable",
             IssueKind::GhStackDivergentStacks { .. } => "gh_stack_divergent_stacks",
-            IssueKind::BothStackToolsDetected => "both_stack_tools_detected",
+            IssueKind::BothStackToolsDetected { .. } => "both_stack_tools_detected",
+            IssueKind::StackModelPinHidesLiveBranches { .. } => {
+                "stack_model_pin_hides_live_branches"
+            }
+            IssueKind::MixedPinPrimaryNotInitialized { .. } => "mixed_pin_primary_not_initialized",
         }
     }
 }
@@ -265,8 +312,12 @@ impl Run for Doctor {
         let config = WorkonConfig::new(&repo)?;
         // Computed once up front: gates the per-worktree link check below and the
         // dependency-section gh-stack checks further down, mirroring the GraphiteNotInitialized
-        // gate later in this function.
-        let gh_stack_active = matches!(config.stack_model(None), Ok(StackModel::GhStack));
+        // gate later in this function. True whenever gh-stack is one of the model's providers,
+        // so a `Mixed` repo still gets its unlinked worktree files flagged (and `--fix`ed).
+        let gh_stack_active = config
+            .stack_model(None)
+            .map(|m| m.providers().any(|p| p == StackProvider::GhStack))
+            .unwrap_or(false);
 
         debug!("found {} worktree(s)", worktrees.len());
         output::status(&format!("Checking {} worktree(s)...", worktrees.len()));
@@ -580,10 +631,27 @@ impl Run for Doctor {
             }
         }
 
-        // Both tools' artifacts present, model left on auto/unset: `StackModel::detect` picks
-        // Graphite deterministically (see its docs), but the user tried both tools and might
-        // not know which one workon is actually reading. An explicit `workon.stackModel =
-        // graphite` silences this — it's read as "I know, and I mean it."
+        // Explicit `mixed:<provider>` pin naming a primary with no artifacts at all: mirrors
+        // GraphiteNotInitialized/GhStackNotInitialized above, but for the pinned Mixed primary
+        // rather than a strict Graphite/GhStack pin.
+        if let Ok(StackModel::Mixed { primary }) = config.stack_model(None) {
+            let primary_has_artifacts = match primary {
+                StackProvider::Graphite => is_graphite_repo(&repo),
+                StackProvider::GhStack => is_gh_stack_repo(&repo),
+            };
+            if !primary_has_artifacts {
+                debug!("workon.stackModel=mixed:<primary> but primary has no artifacts");
+                let issue = Issue::config(IssueKind::MixedPinPrimaryNotInitialized { primary });
+                output::check_warn("stack", &issue.message());
+                issues.push(issue);
+            }
+        }
+
+        // Both tools' artifacts present, model left on auto/unset: report the dual state and
+        // what `auto` actually resolved to (see `StackModel::detect`'s live-metadata
+        // tie-break), plus each provider's liveness. An explicit `workon.stackModel =
+        // graphite`/`gh-stack` silences this — it's read as "I know, and I mean it" — but gets
+        // its own `StackModelPinHidesLiveBranches` warning below if it hides live branches.
         let stack_model_is_explicit = !matches!(
             repo.config()
                 .ok()
@@ -592,10 +660,56 @@ impl Run for Doctor {
             None | Some("auto")
         );
         if !stack_model_is_explicit && is_graphite_repo(&repo) && is_gh_stack_repo(&repo) {
-            debug!("both graphite and gh-stack artifacts present, model left on auto");
-            let issue = Issue::config(IssueKind::BothStackToolsDetected);
+            let graphite_live = provider_has_live_branches(&repo, StackProvider::Graphite);
+            let gh_stack_live = provider_has_live_branches(&repo, StackProvider::GhStack);
+            let resolved = match config.stack_model(None) {
+                Ok(StackModel::Mixed {
+                    primary: StackProvider::Graphite,
+                }) => "mixed (graphite primary)".to_string(),
+                Ok(StackModel::Mixed {
+                    primary: StackProvider::GhStack,
+                }) => "mixed (gh-stack primary)".to_string(),
+                Ok(StackModel::Graphite) => "graphite".to_string(),
+                Ok(StackModel::GhStack) => "gh-stack".to_string(),
+                _ => "gh-stack".to_string(),
+            };
+            debug!(
+                "both graphite and gh-stack artifacts present, model left on auto (resolved={resolved})"
+            );
+            let issue = Issue::config(IssueKind::BothStackToolsDetected {
+                resolved,
+                graphite_live,
+                gh_stack_live,
+            });
             output::check_warn("stack", &issue.message());
             issues.push(issue);
+        }
+
+        // An explicit pin hides the other provider's live branches — same predicate as the
+        // `list` hint (see `crate::cmd::list`). Under `auto` this state can't occur (`detect`
+        // would have produced `Mixed`), so seeing a plain `Graphite`/`GhStack` model already
+        // means the pin is explicit.
+        if stack_model_is_explicit {
+            let hidden = match config.stack_model(None) {
+                Ok(StackModel::Graphite) => {
+                    provider_has_live_branches(&repo, StackProvider::GhStack)
+                        .then(|| ("gh-stack".to_string(), "graphite".to_string()))
+                }
+                Ok(StackModel::GhStack) => {
+                    provider_has_live_branches(&repo, StackProvider::Graphite)
+                        .then(|| ("Graphite".to_string(), "gh-stack".to_string()))
+                }
+                _ => None,
+            };
+            if let Some((hidden_provider, pinned)) = hidden {
+                debug!("workon.stackModel pin hides the other provider's live branches");
+                let issue = Issue::config(IssueKind::StackModelPinHidesLiveBranches {
+                    pinned,
+                    hidden: hidden_provider,
+                });
+                output::check_warn("stack", &issue.message());
+                issues.push(issue);
+            }
         }
 
         debug!("found {} issue(s) total", issues.len());
@@ -647,6 +761,22 @@ impl Run for Doctor {
                     }
                     if let IssueKind::GhStackDivergentStacks { number } = &issue.kind {
                         obj["number"] = json!(number);
+                    }
+                    if let IssueKind::BothStackToolsDetected {
+                        resolved,
+                        graphite_live,
+                        gh_stack_live,
+                    } = &issue.kind
+                    {
+                        obj["resolved"] = json!(resolved);
+                        obj["graphite_live"] = json!(graphite_live);
+                        obj["gh_stack_live"] = json!(gh_stack_live);
+                    }
+                    if let IssueKind::StackModelPinHidesLiveBranches { pinned, hidden } =
+                        &issue.kind
+                    {
+                        obj["pinned"] = json!(pinned);
+                        obj["hidden"] = json!(hidden);
                     }
                     if let IssueKind::RenamedConfigKey {
                         old_key,
@@ -898,6 +1028,13 @@ fn read_config_entries(
         ),
         Ok(StackModel::Git) => (
             "git".to_string(),
+            scalar_source(repo, &git_config, "workon.stackModel"),
+        ),
+        Ok(StackModel::Mixed { primary }) => (
+            match primary {
+                workon::StackProvider::Graphite => "mixed (graphite primary)".to_string(),
+                workon::StackProvider::GhStack => "mixed (gh-stack primary)".to_string(),
+            },
             scalar_source(repo, &git_config, "workon.stackModel"),
         ),
         Err(_) => (

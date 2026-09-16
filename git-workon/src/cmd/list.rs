@@ -67,14 +67,15 @@ use log::debug;
 use miette::{IntoDiagnostic, Result};
 use serde_json::json;
 use workon::{
-    current_stack, enumerate_stacks, get_repo, get_worktrees, group_by_stack, WorkonConfig,
-    WorktreeDescriptor,
+    current_stack, enumerate_stacks, get_repo, get_worktrees, group_by_stack,
+    provider_has_live_branches, StackProvider, WorkonConfig, WorktreeDescriptor,
 };
 
 use crate::cli::List;
 use crate::cmd::filter::StatusFilter;
 use crate::display::{build_tree, format_aligned_rows, format_tree_lines, worktree_display_row};
 use crate::json::worktree_to_json;
+use crate::output;
 
 use super::Run;
 
@@ -93,6 +94,30 @@ impl Run for List {
         } else {
             WorkonConfig::new(&repo)?.stack_model(None)?
         };
+
+        // An explicit `workon.stackModel` pin can hide the other provider's live branches —
+        // under `auto` this state can't occur (detect would have produced `Mixed` instead), so
+        // seeing a plain `Graphite`/`GhStack` model here already means the pin is explicit; no
+        // need to re-read config to confirm it. Mixed itself stays quiet — both providers are
+        // already visible.
+        if !self.no_stack {
+            let hidden = match effective_model {
+                workon::StackModel::Graphite => {
+                    provider_has_live_branches(&repo, StackProvider::GhStack)
+                        .then_some(("gh-stack", "graphite"))
+                }
+                workon::StackModel::GhStack => {
+                    provider_has_live_branches(&repo, StackProvider::Graphite)
+                        .then_some(("Graphite", "gh-stack"))
+                }
+                _ => None,
+            };
+            if let Some((hidden_provider, pinned_model)) = hidden {
+                output::detail(&format!(
+                    "{hidden_provider} has tracked branches that workon.stackModel={pinned_model} hides; unset it (auto) to show both"
+                ));
+            }
+        }
 
         // Apply filters (AND logic)
         let filtered: Vec<_> = worktrees

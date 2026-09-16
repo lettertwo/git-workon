@@ -58,7 +58,8 @@ use crate::output;
 use workon::{
     add_worktree, copy_untracked, current_stack, current_worktree, get_repo, get_worktrees,
     graphite_trunk, link_worktree, register_branch, resolve_remote_tracking, workon_root,
-    BranchType, CopyOptions, RemoteResolution, StackModel, WorkonConfig, WorktreeDescriptor,
+    BranchType, CopyOptions, RemoteResolution, StackModel, StackProvider, WorkonConfig,
+    WorktreeDescriptor,
 };
 
 use super::Run;
@@ -323,69 +324,64 @@ impl Run for New {
         // Register the new branch with the active stack tool (non-fatal on failure — `new`
         // has already created the worktree).
         match effective_model {
-            StackModel::Graphite => {
-                // Deliberately NOT guarded on `detect_gt()`: `StackModel::detect` resolves
-                // `Graphite` from repo metadata alone, so this can run on a machine without
-                // `gt`. The resulting "gt track unavailable" warning is the point — the new
-                // branch really is untracked, and silence would hide that until the stack
-                // looked wrong later. See `new_gt_track_failure_is_non_fatal`.
-                if !self.no_stack && !branch_pre_existed && config.gt_auto_track(None)? {
-                    // Prefer the explicit base branch, then the repo's graphite trunk.
-                    // If neither is known, omit --parent so gt infers from its own config.
-                    let parent = base_branch
-                        .as_deref()
-                        .map(String::from)
-                        .or_else(|| graphite_trunk(&repo));
-                    debug!(
-                        "Running: gt track{} in {}",
-                        parent
-                            .as_deref()
-                            .map(|p| format!(" --parent {p}"))
-                            .unwrap_or_default(),
-                        worktree.path().display()
-                    );
-                    let mut cmd = std::process::Command::new("gt");
-                    cmd.arg("track");
-                    if let Some(p) = &parent {
-                        cmd.arg("--parent").arg(p);
-                    }
-                    match cmd.current_dir(worktree.path()).output() {
-                        Ok(out) if out.status.success() => {
-                            debug!("gt track succeeded");
-                        }
-                        Ok(out) => {
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            output::warn(&format!("gt track failed: {}", stderr.trim()));
-                        }
-                        Err(e) => {
-                            output::warn(&format!("gt track unavailable: {}", e));
-                        }
-                    }
+            StackModel::Graphite => register_graphite(
+                &repo,
+                &worktree,
+                &config,
+                base_branch.as_deref(),
+                branch_pre_existed,
+                self.no_stack,
+            )?,
+            StackModel::GhStack => register_gh_stack(
+                &repo,
+                &worktree,
+                &config,
+                &effective_branch,
+                base_branch.as_deref(),
+                branch_pre_existed,
+                self.no_stack,
+            )?,
+            StackModel::Mixed { primary } => {
+                // Follow the parent's provider: the fork belongs wherever `base_branch` is
+                // already tracked, checked in `providers()` order (primary first). No base, or
+                // neither provider knows it, falls to `primary` — matching a plain `Graphite`/
+                // `GhStack` model's own "untracked base" behavior (Graphite tracks with no
+                // `--parent`; gh-stack skips with a debug log, both unconditionally).
+                let owner = base_branch
+                    .as_deref()
+                    .and_then(|base| {
+                        effective_model
+                            .providers()
+                            .find(|&p| provider_tracks(&repo, base, p))
+                    })
+                    .unwrap_or(primary);
+                match owner {
+                    StackProvider::Graphite => register_graphite(
+                        &repo,
+                        &worktree,
+                        &config,
+                        base_branch.as_deref(),
+                        branch_pre_existed,
+                        self.no_stack,
+                    )?,
+                    StackProvider::GhStack => register_gh_stack(
+                        &repo,
+                        &worktree,
+                        &config,
+                        &effective_branch,
+                        base_branch.as_deref(),
+                        branch_pre_existed,
+                        self.no_stack,
+                    )?,
                 }
-            }
-            StackModel::GhStack => {
-                // Plant the gh-stack canonical-file symlinks for the new worktree first.
-                // Unlike `gt track`, there's nothing to run inside another process: this is
-                // pure filesystem plumbing that makes gh-stack's own writes visible from
-                // every worktree, so it isn't gated on `branch_pre_existed`.
-                if !self.no_stack {
+                // `link_worktree` is filesystem plumbing (making gh-stack's canonical file
+                // visible from this worktree), not registration — it runs whenever gh-stack is
+                // one of Mixed's providers, regardless of which one owns this fork.
+                if owner != StackProvider::GhStack && !self.no_stack {
                     if let Some(name) = worktree.name() {
                         if let Err(e) = link_worktree(&repo, name) {
                             output::warn(&format!("gh-stack link failed: {}", e));
                         }
-                    }
-                }
-
-                // Register the branch in the canonical file, after the symlinks above are
-                // in place. Skipped (not warned) when there's no known base branch — there
-                // is no stack to append onto without one.
-                if !self.no_stack && !branch_pre_existed && config.stack_auto_track(None)? {
-                    if let Some(base) = base_branch.as_deref() {
-                        if let Err(e) = register_branch(&repo, &effective_branch, base) {
-                            output::warn(&format!("gh-stack register failed: {}", e));
-                        }
-                    } else {
-                        debug!("gh-stack register skipped: no base branch known");
                     }
                 }
             }
@@ -429,6 +425,111 @@ impl Run for New {
         }
 
         Ok(Some(worktree))
+    }
+}
+
+/// Register `worktree`'s branch with Graphite via `gt track`, non-fatal on failure.
+///
+/// Deliberately NOT guarded on `detect_gt()`: `StackModel::detect` resolves `Graphite` from
+/// repo metadata alone, so this can run on a machine without `gt`. The resulting "gt track
+/// unavailable" warning is the point — the new branch really is untracked, and silence would
+/// hide that until the stack looked wrong later. See `new_gt_track_failure_is_non_fatal`.
+fn register_graphite(
+    repo: &git2::Repository,
+    worktree: &WorktreeDescriptor,
+    config: &WorkonConfig,
+    base_branch: Option<&str>,
+    branch_pre_existed: bool,
+    no_stack: bool,
+) -> Result<()> {
+    if !no_stack && !branch_pre_existed && config.gt_auto_track(None)? {
+        // Prefer the explicit base branch, then the repo's graphite trunk. If neither is
+        // known, omit --parent so gt infers from its own config.
+        let parent = base_branch
+            .map(String::from)
+            .or_else(|| graphite_trunk(repo));
+        debug!(
+            "Running: gt track{} in {}",
+            parent
+                .as_deref()
+                .map(|p| format!(" --parent {p}"))
+                .unwrap_or_default(),
+            worktree.path().display()
+        );
+        let mut cmd = std::process::Command::new("gt");
+        cmd.arg("track");
+        if let Some(p) = &parent {
+            cmd.arg("--parent").arg(p);
+        }
+        match cmd.current_dir(worktree.path()).output() {
+            Ok(out) if out.status.success() => {
+                debug!("gt track succeeded");
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                output::warn(&format!("gt track failed: {}", stderr.trim()));
+            }
+            Err(e) => {
+                output::warn(&format!("gt track unavailable: {}", e));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Register `effective_branch` with gh-stack: plant the canonical-file symlinks, then append
+/// the branch onto `base_branch`'s stack. Non-fatal on failure.
+fn register_gh_stack(
+    repo: &git2::Repository,
+    worktree: &WorktreeDescriptor,
+    config: &WorkonConfig,
+    effective_branch: &str,
+    base_branch: Option<&str>,
+    branch_pre_existed: bool,
+    no_stack: bool,
+) -> Result<()> {
+    // Plant the gh-stack canonical-file symlinks for the new worktree first. Unlike `gt
+    // track`, there's nothing to run inside another process: this is pure filesystem
+    // plumbing that makes gh-stack's own writes visible from every worktree, so it isn't
+    // gated on `branch_pre_existed`.
+    if !no_stack {
+        if let Some(name) = worktree.name() {
+            if let Err(e) = link_worktree(repo, name) {
+                output::warn(&format!("gh-stack link failed: {}", e));
+            }
+        }
+    }
+
+    // Register the branch in the canonical file, after the symlinks above are in place.
+    // Skipped (not warned) when there's no known base branch — there is no stack to append
+    // onto without one.
+    if !no_stack && !branch_pre_existed && config.stack_auto_track(None)? {
+        if let Some(base) = base_branch {
+            if let Err(e) = register_branch(repo, effective_branch, base) {
+                output::warn(&format!("gh-stack register failed: {}", e));
+            }
+        } else {
+            debug!("gh-stack register skipped: no base branch known");
+        }
+    }
+    Ok(())
+}
+
+/// `true` if `provider` has a tracked-stack row for `branch` — used under `StackModel::Mixed`
+/// to find which provider owns the fork's base branch. A read error (corrupt store) counts as
+/// "doesn't track it" with a debug log: registration is already non-fatal, and the provider
+/// that does own the base can still claim the fork.
+fn provider_tracks(repo: &git2::Repository, branch: &str, provider: StackProvider) -> bool {
+    let model = match provider {
+        StackProvider::Graphite => StackModel::Graphite,
+        StackProvider::GhStack => StackModel::GhStack,
+    };
+    match current_stack(repo, branch, model) {
+        Ok(stack) => stack.is_some(),
+        Err(e) => {
+            debug!("{provider:?} metadata unreadable while resolving fork owner: {e}");
+            false
+        }
     }
 }
 

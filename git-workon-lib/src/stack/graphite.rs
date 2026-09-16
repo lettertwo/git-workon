@@ -63,6 +63,31 @@ pub fn is_graphite_repo(repo: &Repository) -> bool {
     git_dir.join(".graphite_metadata.db").exists() || git_dir.join(".graphite_repo_config").exists()
 }
 
+/// `true` if Graphite metadata has at least one non-trunk branch whose ref still resolves.
+///
+/// Used by [`StackModel::detect`](super::StackModel::detect)'s live-metadata tie-break: a repo
+/// that migrated off Graphite keeps `.graphite_repo_config`/`.graphite_metadata.db` behind, and
+/// their metadata rows for deleted branches must NOT count as "live" — that ghost state is
+/// exactly the case that has to lose the tie-break. Checks `parents`' keys (non-trunk branches),
+/// never `trunks`' values, per [`StackMetadata`]'s own doc: trunks are not metadata rows.
+///
+/// A `read_metadata` error (corrupt store) yields `false` here, logged via `log::debug!` — never
+/// probes the `gt` binary, and never surfaces as an error itself. Detection stays infallible;
+/// the corrupt store is surfaced later by the provider call that actually needs the data, and by
+/// `doctor`.
+pub(crate) fn has_live_branches(repo: &Repository) -> bool {
+    match read_metadata(repo) {
+        Ok(meta) => meta
+            .parents
+            .keys()
+            .any(|b| crate::resolve::branch_exists(repo, b)),
+        Err(e) => {
+            log::debug!("graphite: has_live_branches: read_metadata failed: {e}");
+            false
+        }
+    }
+}
+
 /// Return the first trunk branch name from `.graphite_repo_config`, or `None` if the
 /// file is missing, unparseable, or contains no trunk entries.
 ///

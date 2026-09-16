@@ -1,6 +1,6 @@
 use git_workon_fixture::prelude::*;
 use std::error::Error;
-use workon::{current_stack, enumerate_stacks, graphite_trunk, StackModel};
+use workon::{current_stack, enumerate_stacks, graphite_trunk, StackModel, StackProvider};
 
 // ── both-format parameterization ──────────────────────────────────────────────
 //
@@ -587,6 +587,85 @@ fn current_stack_returns_only_the_member_stack_when_trunk_is_shared() -> Result<
     let numbered_stack = current_stack(repo, "review-tui", StackModel::GhStack)?.unwrap();
     assert_eq!(numbered_stack.diffs, vec!["review-tui"]);
     assert_eq!(numbered_stack.number, Some(7));
+
+    Ok(())
+}
+
+// ── StackModel::Mixed — per-branch fallback to the secondary provider ────────
+
+#[test]
+fn current_stack_under_mixed_falls_back_to_secondary_provider_per_branch(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["gh-stack-only"])
+        .branch("untracked")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let model = StackModel::Mixed {
+        primary: StackProvider::Graphite,
+    };
+
+    let graphite_stack = current_stack(repo, "graphite-only", model)?.unwrap();
+    assert_eq!(graphite_stack.diffs, vec!["graphite-only"]);
+
+    let gh_stack_stack = current_stack(repo, "gh-stack-only", model)?.unwrap();
+    assert_eq!(gh_stack_stack.diffs, vec!["gh-stack-only"]);
+
+    assert!(current_stack(repo, "untracked", model)?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn current_stack_under_explicit_gh_stack_config_ignores_a_graphite_tracked_branch(
+) -> Result<(), Box<dyn Error>> {
+    // Explicit config stays strict — even though Graphite has a live tracked branch, the
+    // explicit `GhStack` model must not fall back to it.
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .build()?;
+    let repo = fixture.repo()?;
+
+    assert!(current_stack(repo, "graphite-only", StackModel::GhStack)?.is_none());
+
+    Ok(())
+}
+
+#[test]
+fn enumerate_stacks_under_mixed_returns_both_providers_deduping_shared_branches(
+) -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .graphite_config(&["main"])
+        .branch_metadata("shared", "main")
+        .gh_stack(None, 1, "main", &["shared"])
+        .gh_stack(None, 2, "main", &["gh-stack-only"])
+        .build()?;
+    let repo = fixture.repo()?;
+
+    let model = StackModel::Mixed {
+        primary: StackProvider::Graphite,
+    };
+    let mut stacks = enumerate_stacks(repo, model)?;
+    stacks.sort_by(|a, b| a.diffs[0].cmp(&b.diffs[0]));
+
+    // "shared" is tracked by both providers; it must appear exactly once, under the primary
+    // (Graphite)'s placement, not duplicated by gh-stack's stack #1.
+    let shared_occurrences: usize = stacks
+        .iter()
+        .filter(|s| s.diffs.iter().any(|b| b == "shared"))
+        .count();
+    assert_eq!(shared_occurrences, 1, "shared branch must appear once");
+
+    let all_diffs: Vec<&str> = stacks
+        .iter()
+        .flat_map(|s| s.diffs.iter().map(String::as_str))
+        .collect();
+    assert!(all_diffs.contains(&"shared"));
+    assert!(all_diffs.contains(&"gh-stack-only"));
 
     Ok(())
 }

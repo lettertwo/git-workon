@@ -159,7 +159,7 @@ git workon doctor --dry-run      # preview fixes without applying
 Checks performed:
 - **Worktrees**: missing directories, broken git links, gone upstreams
 - **Dependencies**: `gh` CLI (PR features), `gh` auth status, git remote, `gt` CLI (stack features), hook commands in PATH
-- **Configuration**: renamed config keys (auto-fixable), invalid `stackModel`/`stackWorktreeGranularity`, invalid `prFormat`, `defaultBranch` not found in repo, `stackModel=graphite` without `gt init`
+- **Configuration**: renamed config keys (auto-fixable), invalid `stackModel`/`stackWorktreeGranularity`, invalid `prFormat`, `defaultBranch` not found in repo, `stackModel=graphite` without `gt init`, both Graphite and gh-stack artifacts present (reports what `auto` resolved to and each provider's liveness), an explicit `stackModel` pin hiding the other provider's tracked branches
 
 ### Copy untracked files between worktrees
 
@@ -256,7 +256,8 @@ man git-workon
     pruneBranches = true         # also consider local branches with no worktree
 
     # Stacked diffs (Graphite or gh-stack)
-    stackModel = auto            # "auto", "graphite", "gh-stack", "git", or "none"
+    stackModel = auto            # "auto", "graphite", "gh-stack", "git", "none",
+                                  # "mixed:graphite", or "mixed:gh-stack"
     stackWorktreeGranularity = stack  # "stack" (one worktree per stack)
     stackAutoTrack = true        # auto-register new branches with the active stack tool after 'workon new'
     gtAutoTrack = true           # deprecated alias for stackAutoTrack, read only as a fallback

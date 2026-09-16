@@ -1394,3 +1394,144 @@ fn new_gh_stack_register_lock_contention_warns_and_exits_zero(
 
     Ok(())
 }
+
+// ── StackModel::Mixed registration ────────────────────────────────────────────
+// Both tools have live branches (auto resolves to Mixed, gh-stack primary); a fork's base
+// branch decides which provider registers it (plan: "follow the parent's provider").
+
+#[test]
+fn new_under_mixed_forks_off_gh_stack_branch_registers_with_gh_stack(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["gh-stack-base"])
+        .build()?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .env("PATH", path_without_gt_new())
+        .arg("new")
+        .arg("feat-2")
+        .arg("--base")
+        .arg("gh-stack-base")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "new must succeed; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    let base_oid = bare_repo
+        .find_branch("gh-stack-base", git2::BranchType::Local)?
+        .get()
+        .target()
+        .unwrap();
+    bare_repo.assert(predicate::repo::gh_stack_branch_base(
+        None,
+        "feat-2",
+        base_oid.to_string(),
+    ));
+
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        !stderr.contains("gt track"),
+        "a fork owned by gh-stack must never attempt gt track: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_under_mixed_forks_off_trunk_uses_primary_gh_stack() -> Result<(), Box<dyn std::error::Error>>
+{
+    // "main" is the trunk, not a tracked diff in either provider, so neither `providers()`
+    // check in the Mixed arm claims it as an owner and the fork falls to `primary` (gh-stack).
+    // gh-stack has no stack ending at "main" (its one stack ends at "gh-stack-only"), so
+    // registration itself fails — but non-fatally, and via gh-stack, never `gt track`.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["gh-stack-only"])
+        .build()?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .env("PATH", path_without_gt_new())
+        .arg("new")
+        .arg("feat-2")
+        .arg("--base")
+        .arg("main")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "new must succeed even when gh-stack registration fails; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("gh-stack register failed"),
+        "an untracked base falls to the primary (gh-stack) provider: {stderr}"
+    );
+    assert!(
+        !stderr.contains("gt track"),
+        "gh-stack owns this fork under the new default; graphite must not run: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn new_under_auto_detected_mixed_base_less_fork_links_gh_stack_without_registering(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // No explicit workon.stackModel: both providers have live branches, so `auto` resolves to
+    // `Mixed` with gh-stack primary. No `--base` means neither provider's `providers()` check
+    // can claim ownership via a tracked base branch, so the fork falls to `primary` (gh-stack)
+    // — which links the new worktree's gh-stack admin-dir symlinks but skips the
+    // canonical-file append (nothing to append onto), and never touches Graphite.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("graphite-only", "main")
+        .gh_stack(None, 1, "main", &["gh-stack-only"])
+        .build()?;
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&fixture)
+        .env("PATH", path_without_gt_new())
+        .arg("new")
+        .arg("feat-3")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "new must succeed with no base branch; stderr: {}",
+        std::str::from_utf8(&output.stderr).unwrap_or("(invalid utf8)")
+    );
+
+    let bare_path = fixture.root()?.join(".bare");
+    let bare_repo = git2::Repository::open_bare(&bare_path)?;
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-3"));
+    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-3", 0).not());
+
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        !stderr.contains("gt track"),
+        "gh-stack owns base-less forks under the new default; graphite must not run: {stderr}"
+    );
+
+    Ok(())
+}

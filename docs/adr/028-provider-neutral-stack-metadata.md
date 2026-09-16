@@ -101,18 +101,42 @@ pre-existing per-worktree files via `migrate_worktree`; the union read in
 `gh_stack::read_metadata` survives as a degraded fallback for whatever isn't yet linked. See
 "The shared canonical file" below for why the symlink approach works at all.
 
-## Detection: Graphite wins
+## Detection: live-metadata tie-break
 
-`StackModel::detect` (`stack.rs`) checks Graphite first, then gh-stack: `.graphite_repo_config`
-or `.graphite_metadata.db` existing means `Graphite`; otherwise a `gh-stack` file anywhere
-`gh_stack::is_gh_stack_repo` looks means `GhStack`; otherwise `None`. `.graphite_repo_config`
-comes from an explicit, repo-wide `gt init`, while a `gh-stack` file can appear as a side effect
-of one `gh stack add` run in a single worktree, so the more deliberate, repo-scoped signal wins.
-No repository that resolves to `Graphite` today can silently flip to `GhStack` because someone
-tried the other tool once in one worktree. The escape hatch is an explicit
-`workon.stackModel = gh-stack`; `doctor`'s `BothStackToolsDetected` check surfaces the ambiguity
-when both artifacts are present so the user knows to pin the config if `auto` picked the wrong
-one.
+> **Amended 2026-09-10, 2026-09-16.** This section replaces the original "Graphite wins" rule
+> (both artifacts present always resolved to `Graphite`) with the live-metadata tie-break below.
+> The old rule is in this file's git history.
+
+`StackModel::detect` (`stack.rs`) checks artifacts first: `.graphite_repo_config` or
+`.graphite_metadata.db` existing means Graphite artifacts are present; a `gh-stack` file
+anywhere `gh_stack::is_gh_stack_repo` looks means gh-stack artifacts are present. With only one
+artifact present, detection returns that provider directly (`None` if neither) — unchanged from
+before, and no metadata read is needed since there is no ambiguity.
+
+With **both** artifacts present, detection reads each provider's liveness — whether it has at
+least one ref-backed tracked branch (`graphite::has_live_branches` /
+`gh_stack::has_live_branches`, checking `StackMetadata::parents`' keys against
+`resolve::branch_exists`, never probing the `gt` binary) — and ties break on the table:
+
+| Graphite live | gh-stack live | Resolves to |
+| --- | --- | --- |
+| yes | yes | `StackModel::Mixed { primary: GhStack }` |
+| yes | no | `StackModel::Graphite` (gh-stack's artifact is stale) |
+| no | yes | `StackModel::GhStack` (Graphite's artifact is stale) |
+| no | no | `StackModel::GhStack` (doubly stale; `doctor` explains) |
+
+`Mixed` makes gh-stack primary — GitHub's native stack support removed the reason to treat
+Graphite's repo-wide `gt init` as the more deliberate signal, so gh-stack answers first now — but
+unlike the old "Graphite wins" rule, Graphite's tracked branches are never hidden: `current_stack`
+and `enumerate_stacks` fall back to the secondary provider per branch (see
+`StackModel::providers`), and `assemble_changesets`'s `Mixed` arm reads whichever provider's
+metadata actually tracks the head branch. The escape hatch out of `Mixed`, or out of a tie-break
+you disagree with, is an explicit `workon.stackModel = graphite`/`gh-stack` (strict, no fallback)
+or `workon.stackModel = mixed:graphite`/`mixed:gh-stack` (pins `Mixed`'s primary directly,
+skipping the liveness read); none of these are ever reachable via `auto`. `doctor`'s
+`BothStackToolsDetected` check reports the dual state, what `auto` resolved to, and each
+provider's liveness; a `StackModelPinHidesLiveBranches` check (and a matching `list` stderr hint)
+fires when an explicit pin hides the other provider's live branches.
 
 ## The shared canonical file
 

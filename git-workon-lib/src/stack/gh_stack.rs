@@ -347,6 +347,24 @@ pub(crate) fn read_metadata(repo: &Repository) -> Result<StackMetadata, StackErr
     })
 }
 
+/// `true` if gh-stack metadata has at least one non-trunk branch whose ref still resolves.
+///
+/// Same contract as [`graphite::has_live_branches`](super::graphite::has_live_branches) — see
+/// its docs for why this checks `parents`' keys (never `trunks`), why an unreadable store
+/// yields `false` rather than erroring, and why this must never probe an external binary.
+pub(crate) fn has_live_branches(repo: &Repository) -> bool {
+    match read_metadata(repo) {
+        Ok(meta) => meta
+            .parents
+            .keys()
+            .any(|b| crate::resolve::branch_exists(repo, b)),
+        Err(e) => {
+            log::debug!("gh-stack: has_live_branches: read_metadata failed: {e}");
+            false
+        }
+    }
+}
+
 /// Return all gh-stack stacks, one per connected component, ghost branches PRUNED.
 pub(crate) fn enumerate_stacks(repo: &Repository) -> Result<Vec<Stack>, StackError> {
     Ok(metadata::enumerate(repo, &read_metadata(repo)?))

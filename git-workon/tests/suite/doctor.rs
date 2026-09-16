@@ -632,6 +632,51 @@ fn doctor_detects_unlinked_gh_stack_worktree_and_fixes_with_link(
 }
 
 #[test]
+fn doctor_links_unlinked_gh_stack_worktree_under_mixed_model(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Both providers live, so `auto` resolves to Mixed. The gh-stack link checks are gated on
+    // gh-stack being one of the model's providers, not on the model being exactly GhStack —
+    // otherwise a Mixed repo would never get its unlinked worktree file flagged or fixed.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .graphite_config(&["main"])
+        .branch_metadata("gt-a", "main")
+        .gh_stack(None, 1, "main", &["feat-a"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("mixed (gh-stack primary)"))
+        .stderr(predicate::str::contains(
+            "is not linked to the canonical gh-stack file",
+        ));
+
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .arg("--fix")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "Linked to canonical gh-stack file",
+        ));
+
+    let bare_repo = git2::Repository::open_bare(fixture.root()?.join(".bare"))?;
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
+
+    Ok(())
+}
+
+#[test]
 fn doctor_migrates_worktree_holding_a_real_gh_stack_file() -> Result<(), Box<dyn std::error::Error>>
 {
     let fixture = FixtureBuilder::new()
@@ -705,6 +750,85 @@ fn doctor_json_gh_stack_extension_not_found_emits_kind() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn doctor_warns_mixed_graphite_pin_when_graphite_has_no_artifacts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "mixed:graphite")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "stackModel=mixed:graphite but repo not gt-initialized — run: gt init",
+        ));
+
+    Ok(())
+}
+
+#[test]
+fn doctor_warns_mixed_gh_stack_pin_when_gh_stack_has_no_artifacts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "mixed:gh-stack")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "stackModel=mixed:gh-stack but no gh-stack file found — run: gh stack init",
+        ));
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_mixed_pin_primary_not_initialized_emits_kind(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "mixed:graphite")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let issues = parsed["issues"].as_array().expect("issues must be array");
+    assert!(
+        issues
+            .iter()
+            .any(|i| i["kind"] == "mixed_pin_primary_not_initialized"),
+        "expected mixed_pin_primary_not_initialized issue in: {stdout}"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn doctor_warns_both_stack_tools_detected_when_model_is_auto(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
@@ -724,8 +848,133 @@ fn doctor_warns_both_stack_tools_detected_when_model_is_auto(
         .assert()
         .success()
         .stderr(predicate::str::contains(
-            "both Graphite and gh-stack artifacts are present",
+            "both Graphite and gh-stack have tracked branches; auto resolves to mixed (gh-stack primary)",
         ));
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_both_stack_tools_detected_reports_resolved_and_liveness(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .gh_stack(None, 1, "main", &["feat-b"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let issues = parsed["issues"].as_array().expect("issues must be array");
+    let issue = issues
+        .iter()
+        .find(|i| i["kind"] == "both_stack_tools_detected")
+        .unwrap_or_else(|| panic!("no both_stack_tools_detected issue in: {stdout}"));
+
+    assert_eq!(issue["resolved"], "mixed (gh-stack primary)");
+    assert_eq!(issue["graphite_live"], true);
+    assert_eq!(issue["gh_stack_live"], true);
+
+    Ok(())
+}
+
+#[test]
+fn doctor_warns_both_stack_tools_detected_when_only_one_is_live(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Graphite's only row is a ghost (branch deleted); gh-stack's tracked branch is live.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .ghost_branch_metadata("feat-a", "main")
+        .gh_stack(None, 1, "main", &["feat-b"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "only gh-stack has tracked branches, auto resolves to gh-stack",
+        ));
+
+    Ok(())
+}
+
+#[test]
+fn doctor_warns_stack_model_pin_hides_live_branches() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .gh_stack(None, 1, "main", &["feat-b"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .arg("doctor")
+        .output()?;
+
+    assert!(output.status.success());
+    let stderr = std::str::from_utf8(&output.stderr)?;
+    assert!(
+        stderr.contains("gh-stack has tracked branches that workon.stackModel=graphite hides"),
+        "expected pin-hides-live-branches warning in stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_stack_model_pin_hides_live_branches() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .config("workon.stackModel", "graphite")
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .gh_stack(None, 1, "main", &["feat-b"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let issues = parsed["issues"].as_array().expect("issues must be array");
+    let issue = issues
+        .iter()
+        .find(|i| i["kind"] == "stack_model_pin_hides_live_branches")
+        .unwrap_or_else(|| panic!("no stack_model_pin_hides_live_branches issue in: {stdout}"));
+
+    assert_eq!(issue["pinned"], "graphite");
+    assert_eq!(issue["hidden"], "gh-stack");
 
     Ok(())
 }
@@ -805,6 +1054,38 @@ fn doctor_flags_unreadable_gh_stack_file_for_unsupported_schema(
     assert!(
         stderr.contains("is unreadable"),
         "expected gh-stack unreadable message in stderr: {stderr}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn doctor_json_config_summary_reports_mixed_with_primary() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .graphite_config(&["main"])
+        .branch_metadata("feat-a", "main")
+        .gh_stack(None, 1, "main", &["feat-b"])
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .arg("doctor")
+        .arg("--json")
+        .output()?;
+
+    assert!(output.status.success());
+    let stdout = std::str::from_utf8(&output.stdout)?;
+    let parsed: serde_json::Value = serde_json::from_str(stdout)?;
+    let config = &parsed["configuration"];
+
+    assert_eq!(
+        config["workon.stackModel"]["value"], "mixed (gh-stack primary)",
+        "configuration summary must report the resolved Mixed model: {stdout}"
     );
 
     Ok(())
