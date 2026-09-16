@@ -45,6 +45,7 @@
 //! # }
 //! ```
 
+mod branch;
 mod changeset;
 mod checkout;
 mod clone;
@@ -68,6 +69,7 @@ mod workon_root;
 mod worktree;
 mod worktree_name;
 
+pub use crate::branch::*;
 pub use crate::changeset::*;
 pub use crate::checkout::*;
 pub use crate::clone::*;

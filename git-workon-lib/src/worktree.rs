@@ -43,6 +43,7 @@ use git2::WorktreeAddOptions;
 use git2::{Repository, Worktree};
 use log::debug;
 
+use crate::branch::{branch_has_gone_upstream, branch_is_merged_into, tip_at_or_behind};
 use crate::error::{Result, WorktreeError};
 use crate::workon_root;
 use crate::worktree_name::{encode_worktree_name, relative_worktree_path};
@@ -307,30 +308,8 @@ impl WorktreeDescriptor {
             None => return Ok(false), // Detached HEAD, no branch to check
         };
 
-        // Open the repository
-        let repo = Repository::open(self.path())?;
-
-        // Find the local branch
-        let branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
-            Ok(b) => b,
-            Err(_) => return Ok(false), // Branch doesn't exist
-        };
-
-        // Check if upstream is configured via git config
-        let config = repo.config()?;
-        let remote_key = format!("branch.{}.remote", branch_name);
-
-        // If no upstream is configured, it's not "gone"
-        match config.get_string(&remote_key) {
-            Ok(_) => {
-                // Upstream is configured - check if the reference exists
-                match branch.upstream() {
-                    Ok(_) => Ok(false), // Upstream exists
-                    Err(_) => Ok(true), // Upstream configured but ref is gone
-                }
-            }
-            Err(_) => Ok(false), // No upstream configured
-        }
+        let repo = self.commondir_repo()?;
+        branch_has_gone_upstream(&repo, &branch_name)
     }
 
     /// Returns true if the worktree's branch has been merged into the target branch.
@@ -352,44 +331,8 @@ impl WorktreeDescriptor {
             None => return Ok(false), // Detached HEAD, no branch to check
         };
 
-        // Don't consider the target branch as merged into itself
-        if branch_name == target_branch {
-            return Ok(false);
-        }
-
-        // Open the bare repository (not the worktree) to check actual branch states
-        // The worktree's .git points to the commondir (bare repo)
-        let worktree_repo = Repository::open(self.path())?;
-        let commondir = worktree_repo.commondir();
-        let repo = Repository::open(commondir)?;
-
-        // Find the current branch
-        let current_branch = match repo.find_branch(&branch_name, git2::BranchType::Local) {
-            Ok(b) => b,
-            Err(_) => return Ok(false), // Branch doesn't exist
-        };
-
-        // Find the target branch
-        let target = match repo.find_branch(target_branch, git2::BranchType::Local) {
-            Ok(b) => b,
-            Err(_) => return Ok(false), // Target branch doesn't exist
-        };
-
-        // Get commit OIDs
-        let current_oid = current_branch
-            .get()
-            .target()
-            .ok_or(WorktreeError::NoCurrentBranchTarget)?;
-        let target_oid = target.get().target().ok_or(WorktreeError::NoBranchTarget)?;
-
-        // If they point to the same commit, the branch is merged
-        if current_oid == target_oid {
-            return Ok(true);
-        }
-
-        // Check if current branch's commit is reachable from target
-        // This means target is a descendant of (or equal to) current
-        Ok(repo.graph_descendant_of(target_oid, current_oid)?)
+        let repo = self.commondir_repo()?;
+        branch_is_merged_into(&repo, &branch_name, target_branch)
     }
 
     /// Returns true if the worktree's HEAD is at or behind `oid`.
@@ -411,31 +354,27 @@ impl WorktreeDescriptor {
             Some(h) => h,
             None => return Ok(false),
         };
-
-        if head_oid_str == oid {
-            return Ok(true);
-        }
-
-        let target_oid = match git2::Oid::from_str(oid) {
-            Ok(o) => o,
-            Err(_) => return Ok(false),
-        };
         let head_oid = match git2::Oid::from_str(&head_oid_str) {
             Ok(o) => o,
             Err(_) => return Ok(false),
         };
 
-        // Open the bare repository (not the worktree) to check the target OID; it may
-        // only exist under refs/remotes/ there, the same as is_merged_into does.
+        let repo = self.commondir_repo()?;
+        tip_at_or_behind(&repo, head_oid, oid)
+    }
+
+    /// Opens the commondir repository backing this worktree.
+    ///
+    /// `self.path()` is the worktree's own checkout, whose `.git` file points at the
+    /// commondir (the shared, non-worktree-specific repo). Signal checks open it
+    /// directly rather than the worktree repo because it holds refs the worktree may
+    /// not see under `refs/remotes/` (a target OID reported by `gh` or a merged PR
+    /// head, for example), and it reads the same `branch.*` config either way.
+    fn commondir_repo(&self) -> Result<Repository> {
         let worktree_repo = Repository::open(self.path())?;
         let commondir = worktree_repo.commondir();
         let repo = Repository::open(commondir)?;
-
-        if repo.find_commit(target_oid).is_err() {
-            return Ok(false);
-        }
-
-        Ok(repo.graph_descendant_of(target_oid, head_oid)?)
+        Ok(repo)
     }
 
     /// Returns the commit hash (SHA) of the worktree's current HEAD.

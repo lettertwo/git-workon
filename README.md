@@ -112,6 +112,8 @@ git workon list --dirty --ahead  # filters combine with AND logic
 
 `prune` always analyzes every worktree in scope for every signal (branch deleted, remote gone, merged into target, PR merged) — `--gone`/`--merged` don't hide anything, they just decide what counts as an *active* criterion for pre-checking and auto-pruning. A branch-deleted worktree and a worktree whose branch tip is the head of a merged PR are always active. By default, pruning deletes the local branch ref along with the worktree; use `--keep-branch` to preserve it.
 
+Local branches with no worktree checked out are candidates too (default on; `--no-branches` / `workon.pruneBranches = false` opts out), evaluated for the same signals. This is what cleans up a merged stack's sibling branches once the worktree on the stack's other branch is pruned.
+
 ```sh
 git workon prune                 # interactive: multi-select picker, pre-checked with the safe default
 git workon prune --yes           # skip the picker; prune exactly the pre-checked set (for scripting)
@@ -121,6 +123,7 @@ git workon prune --gone          # treat gone-upstream worktrees as active (pre-
 git workon prune --gone --fetch  # fetch --prune from remotes first so gone status is fresh
 git workon prune --merged        # treat merged-into-default worktrees as active
 git workon prune --merged=release/v2  # merge target other than the default branch
+git workon prune --no-branches   # only consider worktrees, skip branches with no worktree
 git workon prune --keep-branch   # prune worktrees but keep local branch refs
 git workon prune --allow-dirty   # prune even with uncommitted changes
 git workon prune --allow-unmerged # prune even with unmerged commits
@@ -128,11 +131,13 @@ git workon prune --include-locked # include locked worktrees
 git workon prune --force         # override all safety checks (protection, dirty, unmerged, locked)
 ```
 
-Naming a worktree strictly narrows the scope — it's never additive with `--gone`/`--merged`. An unmatched name is a hard error listing every miss, before anything is deleted. A named worktree with nothing wrong with it (no signal, not dirty, not unmerged) still shows up — annotated "not prunable" — but needs `--force` to actually be pruned; naming is how a healthy worktree gets pulled into view, not how it gets deleted. The default worktree never appears, even when named with `--force`.
+Naming a worktree or a local branch with no worktree strictly narrows the scope — it's never additive with `--gone`/`--merged`. An unmatched name is a hard error listing every miss, before anything is deleted. A named row with nothing wrong with it (no signal, not dirty, not unmerged) still shows up — annotated "not prunable" — but needs `--force` to actually be pruned; naming is how a healthy row gets pulled into view, not how it gets deleted. The default branch never appears, even when named with `--force`, whether or not it has a worktree.
 
 In an interactive terminal, `prune` opens a checkbox picker (pre-checked rows match the same "safe default" `--yes` would prune) followed by one summary confirm. Non-interactively (`--yes`, `--json`, or no TTY), it prunes the pre-checked set directly.
 
-Safety checks (skipped with `--force`): protected branches (`workon.pruneProtectedBranches`), locked worktrees (`--include-locked`), uncommitted changes (tracked files only when the only signal is a gone upstream; `--allow-dirty`), unmerged commits (skipped when any signal is present; `--allow-unmerged`).
+Safety checks (skipped with `--force`): protected branches (`workon.pruneProtectedBranches`), locked worktrees (`--include-locked`), uncommitted changes (tracked files only when the only signal is a gone upstream; `--allow-dirty`), unmerged commits (skipped when any signal is present; `--allow-unmerged`). A branch-only row has no working tree, so it's never dirty or locked.
+
+`--json` reports `"kind": "worktree"` or `"kind": "branch"` on every `pruned`/`skipped` entry, with `"path": null` for a branch-only row.
 
 ### Rename a worktree
 
@@ -248,6 +253,7 @@ man git-workon
     pruneProtectedBranches = release/*
     pruneGone = false            # prune gone-upstream worktrees by default
     pruneFetch = false           # fetch from remotes before evaluating gone status
+    pruneBranches = true         # also consider local branches with no worktree
 
     # Stacked diffs (Graphite or gh-stack)
     stackModel = auto            # "auto", "graphite", "gh-stack", "git", or "none"

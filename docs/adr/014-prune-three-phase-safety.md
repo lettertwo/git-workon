@@ -4,6 +4,9 @@
 > `--gone`/`--merged`, list+confirm, and a gone-upstream hint). The safety-check
 > ordering and override flags are unchanged; what changed is *visibility* and the
 > interaction model.
+>
+> Amended 2026-09-09: the candidate pool now also includes local branches with no
+> worktree, evaluated for the same signals. See "Branch-only rows" below.
 
 ## Context
 
@@ -25,7 +28,9 @@ v2 collapses this into one analysis pipeline that always runs in full, with `--g
 - **`--dry-run`**: prints the same annotated analysis — pre-checked / selectable / locked-out, each with its signals — and exits. No picker, no deletion.
 - **Non-interactive** (`--yes`, `--json`, or no TTY): bare mode prunes exactly the pre-checked set (unchanged from the old `--yes` behavior). Named mode prunes named worktrees when safe, per the rules above.
 
-`--json` extends the existing envelope (`pruned`/`skipped`/`dry_run`) with a `signals` array per entry; `--dry-run --json` populates `pruned` with the would-be-pruned set and leaves `dry_run: true` without deleting anything, same as before.
+`--json` extends the existing envelope (`pruned`/`skipped`/`dry_run`) with a `signals` array per entry; `--dry-run --json` populates `pruned` with the would-be-pruned set and leaves `dry_run: true` without deleting anything, same as before. Each entry also carries `"kind": "worktree"` or `"kind": "branch"`, with `"path": null` for a branch-only row.
+
+**Branch-only rows** (added 2026-09-09): the candidate pool also includes every local branch with no worktree (minus the default branch, protected globs, and any branch checked out in a worktree), on by default (`--no-branches` / `workon.pruneBranches = false` opts out). This exists because a merged stack's sibling branches are left behind once the worktree on the stack's other branch is pruned: gh-stack never sets `branch.<name>.remote`, so `RemoteGone` can't fire on those branches, and a squash merge defeats `Merged`. `PrMerged` is often the only signal that can reach them. Branch rows are evaluated for the same signals as worktree rows, checked against the repo directly (there's no worktree path to open) rather than through `WorktreeDescriptor`. `locked` and `dirty` are always false for a branch-only row (there's no working tree to lock or dirty), so only the protected and unmerged safety checks apply, and `--force` overrides protection the same as it would for a worktree row. `--keep-branch` drops branch-only rows entirely before they're shown: there's nothing to keep-branch about a row whose only action is deleting the branch.
 
 ## Consequences
 
@@ -35,11 +40,13 @@ v2 collapses this into one analysis pipeline that always runs in full, with `--g
 - Breaking UX change: `prune <name>` combined with `--gone`/`--merged` used to also sweep in filter-matched worktrees; naming now strictly narrows, never adds.
 - Fetch narrows to remotes tracked by named worktrees when names are given, reducing unnecessary network calls.
 - The interactive experience moves from "read a static list, type y/n" to "toggle checkboxes, confirm once" — more control, at the cost of one more keystroke for the default case (still just Enter, Enter).
+- Breaking UX change: `--json` entries now carry a `kind` field, and a branch-only entry's `path` is `null` instead of a string.
 
 ## References
 
 - `docs/diagrams/prune-flow.md` — full flow diagram
-- `git-workon/src/cmd/prune.rs` — `Signal`, `PruneRow`, `classify`, `run_interactive`
-- `git-workon-lib/src/fetch.rs` — `remotes_tracked_by_worktrees`, `prune_fetch`
-- `git-workon-lib/src/config.rs` — `WorkonConfig::prune_gone`, `WorkonConfig::prune_fetch`
+- `git-workon/src/cmd/prune.rs` — `Signal`, `PruneRow`, `classify`, `run_interactive`, `build_branch_row`
+- `git-workon-lib/src/branch.rs` — `branch_has_gone_upstream`, `branch_is_merged_into`, `branch_tip_at_or_behind` (branch-only-row signal checks)
+- `git-workon-lib/src/fetch.rs` — `remotes_tracked_by_worktrees`, `remotes_tracked_by_branches`, `prune_fetch`
+- `git-workon-lib/src/config.rs` — `WorkonConfig::prune_gone`, `WorkonConfig::prune_fetch`, `WorkonConfig::prune_branches`
 - `git-workon-lib/src/error.rs` — `PruneError::NamesNotFound`

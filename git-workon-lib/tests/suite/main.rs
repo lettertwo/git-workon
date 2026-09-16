@@ -3,6 +3,7 @@
 //! a `mod` here merges them into one binary (one link instead of one per file), cutting build
 //! time for the crate's suite.
 
+mod branch;
 mod changeset;
 mod clone;
 mod config;
