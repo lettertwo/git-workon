@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.3](https://github.com/lettertwo/git-workon/compare/git-workon-v0.13.2...git-workon-v0.13.3) - 2026-09-16
+
+### Added
+
+- *(cli)* prune local branches with no worktree ([#99](https://github.com/lettertwo/git-workon/pull/99))
+
 ## [0.13.2](https://github.com/lettertwo/git-workon/compare/git-workon-v0.13.1...git-workon-v0.13.2) - 2026-08-31
 
 ### Fixed
