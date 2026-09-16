@@ -175,12 +175,15 @@ impl Run for List {
                         .iter()
                         .map(|(child, parent)| (child.clone(), json!(parent)))
                         .collect();
+                    let mut merged: Vec<&String> = group.stack.merged.iter().collect();
+                    merged.sort();
                     json!({
                         "trunk": group.stack.trunk,
                         "diffs": group.stack.diffs,
                         "parents": parents,
                         "checkouts": checkouts,
                         "number": group.stack.number,
+                        "merged": merged,
                     })
                 })
                 .collect();

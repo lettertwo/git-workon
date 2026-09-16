@@ -126,6 +126,9 @@ struct GhStackBranchSpec {
     /// Ghost entries simulate a branch gh-stack still tracks but whose git ref was
     /// deleted/merged — no local branch ref is created for these.
     ghost: bool,
+    /// Writes `pullRequest: { number, merged: true }` instead of `pullRequest: null`,
+    /// simulating a branch `gh stack sync` has recorded as merged.
+    merged: bool,
 }
 
 /// One `stacks[]` entry queued by [`FixtureBuilder::gh_stack`]/[`FixtureBuilder::gh_stack_at`].
@@ -149,6 +152,13 @@ enum GhStackOp {
     /// Append a ghost branch onto the `target` file's stack numbered `number` (which must
     /// already have been queued via a prior [`GhStackOp::Stack`]).
     GhostBranch {
+        target: GhStackTarget,
+        number: u64,
+        branch: String,
+    },
+    /// Flip a branch already queued by a prior [`GhStackOp::Stack`] on the `target` file's stack
+    /// numbered `number` to `merged: true`.
+    MergedBranch {
         target: GhStackTarget,
         number: u64,
         branch: String,
@@ -435,6 +445,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
                     branch: branch.to_string(),
                     base: GhStackBase::ResolveParentTip,
                     ghost: false,
+                    merged: false,
                 })
                 .collect(),
         };
@@ -464,6 +475,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
                     branch: branch.to_string(),
                     base: GhStackBase::Verbatim(base.to_string()),
                     ghost: false,
+                    merged: false,
                 })
                 .collect(),
         };
@@ -486,6 +498,27 @@ impl<'fixture> FixtureBuilder<'fixture> {
         branch: &str,
     ) -> Self {
         self.gh_stack_ops.push(GhStackOp::GhostBranch {
+            target: worktree.map(str::to_string),
+            number,
+            branch: branch.to_string(),
+        });
+        self
+    }
+
+    /// Mark an already-queued branch on `worktree`'s stack numbered `number` as merged —
+    /// writes `pullRequest: { number, merged: true }` for it instead of `pullRequest: null`,
+    /// simulating `gh stack sync` recording a merged PR.
+    ///
+    /// A [`gh_stack`](Self::gh_stack)/[`gh_stack_at`](Self::gh_stack_at) call queueing `branch`
+    /// on this `(worktree, number)` must come first — `build()` panics otherwise, mirroring
+    /// [`gh_stack_ghost_branch`](Self::gh_stack_ghost_branch).
+    pub fn gh_stack_merged_branch(
+        mut self,
+        worktree: Option<&str>,
+        number: u64,
+        branch: &str,
+    ) -> Self {
+        self.gh_stack_ops.push(GhStackOp::MergedBranch {
             target: worktree.map(str::to_string),
             number,
             branch: branch.to_string(),
@@ -913,12 +946,22 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 }
             }
 
-            fn branch_ref_json(branch: &str, head: String, base: String) -> serde_json::Value {
+            fn branch_ref_json(
+                branch: &str,
+                head: String,
+                base: String,
+                merged: bool,
+            ) -> serde_json::Value {
+                let pull_request = if merged {
+                    serde_json::json!({ "number": 1, "merged": true })
+                } else {
+                    serde_json::Value::Null
+                };
                 serde_json::json!({
                     "branch": branch,
                     "head": head,
                     "base": base,
-                    "pullRequest": serde_json::Value::Null,
+                    "pullRequest": pull_request,
                 })
             }
 
@@ -980,7 +1023,43 @@ impl<'fixture> FixtureBuilder<'fixture> {
                             branch: branch.clone(),
                             base: GhStackBase::ResolveParentTip,
                             ghost: true,
+                            merged: false,
                         });
+                    }
+                    GhStackOp::MergedBranch {
+                        target,
+                        number,
+                        branch,
+                    } => {
+                        let i = target_index(&stacks_by_target, target).unwrap_or_else(|| {
+                            panic!(
+                                "gh_stack_merged_branch({target:?}, {number}, {branch:?}): \
+                                 no prior gh_stack/gh_stack_at queued a stack numbered {number} \
+                                 for this target"
+                            )
+                        });
+                        let entries = &mut stacks_by_target[i].1;
+                        let spec = entries
+                            .iter_mut()
+                            .find(|s| s.number == *number)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "gh_stack_merged_branch({target:?}, {number}, {branch:?}): \
+                                     no queued stack numbered {number} for this target"
+                                )
+                            });
+                        let branch_spec = spec
+                            .branches
+                            .iter_mut()
+                            .find(|b| &b.branch == branch)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "gh_stack_merged_branch({target:?}, {number}, {branch:?}): \
+                                     no queued branch {branch:?} on stack numbered {number} \
+                                     for this target"
+                                )
+                            });
+                        branch_spec.merged = true;
                     }
                     _ => {}
                 }
@@ -1008,13 +1087,13 @@ impl<'fixture> FixtureBuilder<'fixture> {
                                     }
                                 };
                                 let head = resolve_tip(&b.branch).unwrap_or_default();
-                                branch_ref_json(&b.branch, head, base)
+                                branch_ref_json(&b.branch, head, base, b.merged)
                             })
                             .collect();
                         serde_json::json!({
                             "id": format!("id-{}", spec.number),
                             "number": spec.number,
-                            "trunk": branch_ref_json(&spec.trunk, trunk_tip, String::new()),
+                            "trunk": branch_ref_json(&spec.trunk, trunk_tip, String::new(), false),
                             "branches": branches_json,
                         })
                     })

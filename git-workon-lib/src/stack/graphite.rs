@@ -173,6 +173,10 @@ fn read_branch_metadata_from_sqlite(
             BranchMetadata {
                 parent,
                 parent_revision,
+                // No observable merged-state field: the sqlite `state` column is empty in
+                // practice and `.graphite_pr_info` carries no merge marker. Known gap — see
+                // ADR-028.
+                merged: false,
             },
         );
     }
@@ -222,6 +226,9 @@ fn read_branch_metadata_from_refs(
                 BranchMetadata {
                     parent: parent.to_string(),
                     parent_revision,
+                    // Same known gap as the sqlite path above: no merged-state field exists
+                    // in `refs/branch-metadata/*` blobs either.
+                    merged: false,
                 },
             );
         }

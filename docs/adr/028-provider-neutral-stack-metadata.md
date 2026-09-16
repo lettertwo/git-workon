@@ -251,6 +251,20 @@ sees the same state regardless of which worktree wrote it.
   as a dependency but no `serde` derive crate, and the write path in particular needs the raw
   `Value` round-trip to preserve `id` and `pullRequest` on stack entries workon itself never
   touches.
+- **Merged-branch awareness.** `gh stack sync` leaves a merged branch's metadata row behind rather
+  than deleting it (its help text says the row is kept for rebase and display logic), and its
+  `--prune` cannot `git branch -D` a branch that a worktree has checked out, which is the normal
+  git-workon case. To reflect this, `gh_stack::read_metadata` reads `pullRequest.merged` into
+  `BranchMetadata.merged`, and `Stack` gains a `merged: HashSet<String>` field. `enumerate` drops
+  merged rows the way it drops ghosts, but first reparents each surviving branch past every merged
+  ancestor: sync merges a stack bottom-up, so without that step a merged bottom branch would take
+  the whole remaining stack down with it. `current` retains merged rows, same reasoning as ghost
+  retention. The CLI tree builder (`build_children` in `display.rs`) drops a merged branch that
+  has no worktree and splices its live children onto its parent, and renders a dim ` merged`
+  suffix on a merged branch that does have one. `list --json` gains an additive per-stack
+  `"merged"` array. **Graphite gap:** neither `.graphite_metadata.db` (its `state` column is
+  empty in practice) nor the `refs/branch-metadata/*` blobs carry PR merged state, so
+  `BranchMetadata.merged` is hardcoded `false` for Graphite.
 
 ## References
 

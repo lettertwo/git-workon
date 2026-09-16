@@ -52,7 +52,7 @@ pub(crate) mod gh_stack;
 pub(crate) mod graphite;
 pub(crate) mod metadata;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use git2::Repository;
 
@@ -147,6 +147,10 @@ pub struct Stack {
     /// `(trunk, sorted diff set)` and does not consult this field. Always `None` for
     /// [`StackModel::Graphite`] and [`StackModel::Git`], which have no numbering concept.
     pub number: Option<u64>,
+    /// Member branches (a subset of [`Stack::diffs`]) whose PR has merged, per
+    /// `BranchMetadata::merged`. Always empty for [`StackModel::Graphite`] — see
+    /// [`graphite::read_branch_metadata`]'s docs for why merged state isn't observable there.
+    pub merged: HashSet<String>,
 }
 
 /// Return all stacks present in metadata, one per connected component.
@@ -403,6 +407,7 @@ mod tests {
             current: current.to_string(),
             parents: HashMap::new(),
             number: None,
+            merged: HashSet::new(),
         }
     }
 
