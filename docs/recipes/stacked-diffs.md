@@ -23,11 +23,10 @@ git-workon auto-detects Graphite when `.git/.graphite_repo_config` or
 github/gh-stack`) and at least one `gh stack init`/`gh stack add` run somewhere in the
 repository.
 
-git-workon keeps one canonical `gh-stack` file at `<common-dir>/gh-stack` and symlinks each
-worktree's `gh-stack`/`gh-stack.lock` admin-dir paths to it, so the extension behaves the same
-whether you run it from the worktree that first created the stack or from any other worktree in
-it. `workon new` plants these symlinks itself in a `GhStack` repository; see "The symlink model"
-below for what happens to a worktree that predates git-workon's involvement.
+gh-stack 0.2 and later keeps one catalog at `<common-dir>/gh-stack` shared by every worktree, so
+the extension behaves the same from any worktree in a stack. git-workon reads that file and
+registers new branches in it; see "The shared catalog (gh-stack)" below for upgrading a repo
+that older git-workon versions set up.
 
 ### Verify, either way
 
@@ -190,38 +189,36 @@ returns the `auth` worktree even when its HEAD is on `auth-step-1`.
 git workon find auth-step-3 --no-stack   # reverts to name/HEAD-only match
 ```
 
-## The symlink model (gh-stack)
+## The shared catalog (gh-stack)
 
-`gh stack`'s own file format was designed for a single working tree: it writes one JSON file at
-`git rev-parse --git-dir` + `/gh-stack`, which for a linked worktree is
-`<common-dir>/worktrees/<name>/gh-stack`. Left alone, that means `gh stack view` (and `up`,
-`down`, `top`, `bottom`) only see the stacks registered from the one worktree that happened to
-write the file.
+gh-stack 0.2 and later stores every stack in `<common-dir>/gh-stack` and migrates any
+per-worktree `gh-stack` file it finds into it on the next `gh stack` command. Cross-worktree
+`gh stack rebase`, `sync`, and `modify` work natively (they need Git 2.36+), and gh-stack never
+creates or removes worktrees, so `git workon new` stays the way to make one. git-workon only
+reads the catalog and registers new branches in it, so there is no link or migrate step.
 
-git-workon works around this by keeping one canonical copy at `<common-dir>/gh-stack` and
-symlinking each worktree's admin-dir path to it. gh-stack's own writes (`os.WriteFile`) truncate
-and rewrite through the symlink rather than replacing it, so every worktree ends up reading and
-writing the same file transparently, with no `gh stack link` step required.
-
-A worktree can still end up **unlinked**: one created before this repository ever became a
-`GhStack` repo under git-workon, or one where `gh stack init` ran before `workon new` had a
-chance to plant the symlinks (see "Known limitations" below). `git workon doctor` reports these
-as `GhStackWorktreeNotLinked`, and:
+Older git-workon versions symlinked each worktree's `gh-stack`/`gh-stack.lock` admin-dir paths to
+the catalog. gh-stack 0.2 rejects a symlink there, so every `gh stack` command fails until the
+links are gone. To upgrade such a repo:
 
 ```bash
 git workon doctor --fix
 ```
 
-plants the missing symlinks for a worktree with no `gh-stack` file yet, or merges an existing
-real `gh-stack` file into canonical (leaving a `gh-stack.bak` backup behind) before replacing it
-with a symlink, for a worktree that already has stacks registered locally. Until `--fix` runs,
-git-workon still reads an unlinked worktree's file as a degraded fallback, so nothing in it goes
-invisible; it just isn't shared with other worktrees the way a linked file is.
+`doctor` reports each link as `gh_stack_worktree_symlinked` (an error) and `--fix` removes the
+symlinks only. A real per-worktree `gh-stack` file is reported as `gh_stack_legacy_worktree_file`
+(a warning) and left alone: run any `gh stack` command and upstream migrates it. A leftover
+rebase or modify record is reported as `gh_stack_recovery_pending`: finish it with
+`gh stack rebase --continue` or `--abort` (or the `modify` equivalent) before pruning that
+worktree.
+
+If you stay on gh-stack older than 0.2, it still writes per-worktree files. git-workon reads
+those as a fallback, so nothing in them goes invisible.
 
 ## Disabling auto-track
 
 `git workon new` registers the new branch with the active stack tool automatically (`gt track`
-under Graphite, a direct write to the canonical file under gh-stack). To disable:
+under Graphite, a direct write to the shared catalog under gh-stack). To disable:
 
 ```bash
 git config workon.stackAutoTrack false
@@ -249,8 +246,6 @@ you register it manually (`gt track`, or `gh stack add` from inside the worktree
   implemented; setting it currently returns an error.
 - Stack-aware `prune` and `move` (refuse to orphan stack children, rename whole stacks)
   are planned for a future release.
-- A repository where `gh stack init` runs for the first time inside a worktree (rather than via
-  `git workon new`) gets a real, unlinked `gh-stack` file in that worktree until `git workon
-  doctor --fix` migrates it to canonical. `doctor` reports this, and the degraded union read
-  means the stacks in that file are still visible to `list`/`find` in the meantime, just not
-  shared with other worktrees until the fix runs.
+- With gh-stack older than 0.2, `gh stack init` inside a worktree writes a per-worktree
+  `gh-stack` file that is not shared with other worktrees. git-workon still reads it for
+  `list`/`find`. Upgrade gh-stack and run any `gh stack` command to migrate it into the catalog.
