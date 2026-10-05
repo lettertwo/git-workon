@@ -22,8 +22,10 @@
 //! - workon.defaultBranch set to a branch that does not exist locally
 //! - stackModel=graphite but repo not initialized with `gt init`
 //! - stackModel=gh-stack but no gh-stack file anywhere, or the `gh-stack` extension missing
-//! - Worktrees whose gh-stack admin-dir file isn't linked to the canonical store — fixable
-//!   with --fix (plants the link, or merges a pre-existing real file first)
+//! - `gh-stack`/`gh-stack.lock` symlinks in a worktree admin dir (planted by older workon, they
+//!   break gh-stack >=0.2) — an error, fixable with --fix (removes symlinks only)
+//! - A real per-worktree `gh-stack` file (upstream migrates it on the next `gh stack` run) or a
+//!   pending `gh-stack-rebase-state`/`gh-stack-modify-state` record — warnings, not fixable
 //! - gh-stack files that fail to parse, or whose stacks disagree across worktrees
 //! - Both Graphite and gh-stack artifacts present with the model left on `auto`
 //!
@@ -38,10 +40,9 @@ use miette::{IntoDiagnostic, Result};
 use serde_json::json;
 use workon::{
     encode_worktree_name, get_repo, get_worktrees, gh_stack_divergent_stack_numbers,
-    gh_stack_readability_errors, gh_stack_worktree_link_status, is_gh_stack_repo,
-    is_graphite_active, is_graphite_repo, preferred_remote_order, relative_worktree_path,
-    rename_worktree_metadata, GhStackLinkStatus, Granularity, StackModel, WorkonConfig,
-    WorktreeDescriptor,
+    gh_stack_readability_errors, gh_stack_worktree_state, is_gh_stack_repo, is_graphite_active,
+    is_graphite_repo, preferred_remote_order, relative_worktree_path, rename_worktree_metadata,
+    unlink_gh_stack_worktree, Granularity, StackModel, WorkonConfig, WorktreeDescriptor,
 };
 
 use crate::cli::Doctor;
@@ -91,9 +92,15 @@ enum IssueKind {
     StaleWorktreeName {
         expected: String,
     },
-    GhStackWorktreeNotLinked {
+    GhStackWorktreeSymlinked {
         worktree: String,
-        holds_file: bool,
+    },
+    GhStackLegacyWorktreeFile {
+        worktree: String,
+    },
+    GhStackRecoveryPending {
+        worktree: String,
+        file: String,
     },
     GhStackExtensionNotFound,
     GhStackNotInitialized,
@@ -144,6 +151,7 @@ impl Issue {
             IssueKind::MissingDirectory
                 | IssueKind::RenamedConfigKey { .. }
                 | IssueKind::StaleWorktreeName { .. }
+                | IssueKind::GhStackWorktreeSymlinked { .. }
         )
     }
 
@@ -198,17 +206,20 @@ impl Issue {
                     )
                 }
             }
-            IssueKind::GhStackWorktreeNotLinked {
-                worktree,
-                holds_file,
-            } => {
-                if *holds_file {
-                    format!(
-                        "'{worktree}' has its own gh-stack file, not linked to canonical — run any `gh stack` command to migrate it (gh-stack >=0.2)"
-                    )
-                } else {
-                    format!("'{worktree}' is not linked to the canonical gh-stack file")
-                }
+            IssueKind::GhStackWorktreeSymlinked { worktree } => {
+                format!(
+                    "'{worktree}' has a gh-stack symlink, which breaks gh-stack >=0.2 — run --fix to remove it"
+                )
+            }
+            IssueKind::GhStackLegacyWorktreeFile { worktree } => {
+                format!(
+                    "'{worktree}' has its own gh-stack file — run any `gh stack` command to migrate it (gh-stack >=0.2)"
+                )
+            }
+            IssueKind::GhStackRecoveryPending { worktree, file } => {
+                format!(
+                    "'{worktree}' has a pending {file} — finish or abort the `gh stack` rebase/modify in that worktree (`--continue` / `--abort`) before pruning it"
+                )
             }
             IssueKind::GhStackExtensionNotFound => {
                 "gh-stack extension not found (run: gh extension install github/gh-stack)"
@@ -247,7 +258,9 @@ impl Issue {
             IssueKind::DefaultBranchMissing { .. } => "default_branch_missing",
             IssueKind::GraphiteNotInitialized => "graphite_not_initialized",
             IssueKind::StaleWorktreeName { .. } => "stale_worktree_name",
-            IssueKind::GhStackWorktreeNotLinked { .. } => "gh_stack_worktree_not_linked",
+            IssueKind::GhStackWorktreeSymlinked { .. } => "gh_stack_worktree_symlinked",
+            IssueKind::GhStackLegacyWorktreeFile { .. } => "gh_stack_legacy_worktree_file",
+            IssueKind::GhStackRecoveryPending { .. } => "gh_stack_recovery_pending",
             IssueKind::GhStackExtensionNotFound => "gh_stack_extension_not_found",
             IssueKind::GhStackNotInitialized => "gh_stack_not_initialized",
             IssueKind::GhStackFileUnreadable { .. } => "gh_stack_file_unreadable",
@@ -318,17 +331,39 @@ impl Run for Doctor {
                     }
 
                     if gh_stack_active {
-                        if let GhStackLinkStatus::NotLinked { holds_file } =
-                            gh_stack_worktree_link_status(&repo, name)
-                        {
-                            debug!(
-                                "'{}': gh-stack not linked (holds_file={})",
-                                name, holds_file
-                            );
+                        let state = gh_stack_worktree_state(&repo, name);
+                        if state.symlinked {
+                            debug!("'{}': gh-stack symlink in admin dir", name);
                             let issue = Issue::worktree(
-                                IssueKind::GhStackWorktreeNotLinked {
+                                IssueKind::GhStackWorktreeSymlinked {
                                     worktree: name.to_string(),
-                                    holds_file,
+                                },
+                                name,
+                                path.clone(),
+                            );
+                            output::check_fail(name, &issue.message());
+                            issues.push(issue);
+                            clean = false;
+                        }
+                        if state.legacy_file {
+                            debug!("'{}': legacy gh-stack file in admin dir", name);
+                            let issue = Issue::worktree(
+                                IssueKind::GhStackLegacyWorktreeFile {
+                                    worktree: name.to_string(),
+                                },
+                                name,
+                                path.clone(),
+                            );
+                            output::check_warn(name, &issue.message());
+                            issues.push(issue);
+                            clean = false;
+                        }
+                        for file in state.recovery_files {
+                            debug!("'{}': pending {} in admin dir", name, file);
+                            let issue = Issue::worktree(
+                                IssueKind::GhStackRecoveryPending {
+                                    worktree: name.to_string(),
+                                    file: file.to_string(),
                                 },
                                 name,
                                 path.clone(),
@@ -638,8 +673,8 @@ impl Run for Doctor {
                     if let IssueKind::StaleWorktreeName { expected } = &issue.kind {
                         obj["expected"] = json!(expected);
                     }
-                    if let IssueKind::GhStackWorktreeNotLinked { holds_file, .. } = &issue.kind {
-                        obj["holds_file"] = json!(holds_file);
+                    if let IssueKind::GhStackRecoveryPending { file, .. } = &issue.kind {
+                        obj["file"] = json!(file);
                     }
                     if let IssueKind::GhStackFileUnreadable { reason, .. } = &issue.kind {
                         obj["reason"] = json!(reason);
@@ -999,6 +1034,12 @@ fn fix_issues(repo: &git2::Repository, issues: &[Issue]) -> Result<Vec<String>> 
                             debug!("failed to open config at {}: {}", path.display(), e);
                         }
                     }
+                }
+            }
+            IssueKind::GhStackWorktreeSymlinked { worktree } => {
+                for name in unlink_gh_stack_worktree(repo, worktree).into_diagnostic()? {
+                    debug!("removed gh-stack symlink '{}' from '{}'", name, worktree);
+                    fixed.push(format!("Removed gh-stack symlink: {worktree}/{name}"));
                 }
             }
             _ => {}

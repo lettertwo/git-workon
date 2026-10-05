@@ -164,14 +164,10 @@ enum GhStackOp {
     LockHeld { target: GhStackTarget },
     /// Plant `gh-stack`/`gh-stack.lock` in `worktree`'s admin dir as relative symlinks to the
     /// canonical store.
-    Linked { worktree: String },
-    /// Ensure `worktree`'s admin dir has a real (non-symlink) `gh-stack` file — a stand-in for
-    /// migration-test fixtures when no explicit stack content targets that worktree.
-    Unlinked { worktree: String },
-    /// Ensure `worktree`'s admin dir has a real (non-symlink) `gh-stack.lock` file, replacing
-    /// any symlink a prior `Linked` op planted there — the pre-migration lock layout
-    /// upstream migration must also clean up (see the ADR-028 handoff's Finding A).
-    LockUnlinked { worktree: String },
+    Symlinked { worktree: String },
+    /// Write an empty recovery record (`gh-stack-rebase-state`, `gh-stack-modify-state`) named
+    /// `file` into `worktree`'s admin dir.
+    RecoveryFile { worktree: String, file: String },
 }
 
 /// Represents a remote URL source
@@ -514,34 +510,22 @@ impl<'fixture> FixtureBuilder<'fixture> {
     }
 
     /// Plant `gh-stack`/`gh-stack.lock` in `worktree`'s admin dir as relative symlinks
-    /// (`../../gh-stack`, `../../gh-stack.lock`) resolving to the canonical store — the
-    /// layout earlier workon versions produced via symlinks.
-    pub fn gh_stack_linked(mut self, worktree: &str) -> Self {
-        self.gh_stack_ops.push(GhStackOp::Linked {
+    /// (`../../gh-stack`, `../../gh-stack.lock`) resolving to the canonical store — the layout
+    /// earlier workon versions produced, which gh-stack >=0.2 rejects.
+    pub fn gh_stack_symlinked(mut self, worktree: &str) -> Self {
+        self.gh_stack_ops.push(GhStackOp::Symlinked {
             worktree: worktree.to_string(),
         });
         self
     }
 
-    /// Ensure `worktree`'s admin dir has a real (non-symlink) `gh-stack` file — the
-    /// pre-migration layout `doctor --fix` / `migrate_worktree` targets. A no-op beyond
-    /// ensuring the file exists if [`gh_stack`](Self::gh_stack)/[`gh_stack_at`](Self::gh_stack_at)
-    /// already queued content for this worktree.
-    pub fn gh_stack_unlinked(mut self, worktree: &str) -> Self {
-        self.gh_stack_ops.push(GhStackOp::Unlinked {
+    /// Write an empty recovery record named `file` (`gh-stack-rebase-state` or
+    /// `gh-stack-modify-state`) into `worktree`'s admin dir, as an interrupted `gh stack`
+    /// rebase/modify leaves behind.
+    pub fn gh_stack_recovery_file(mut self, worktree: &str, file: &str) -> Self {
+        self.gh_stack_ops.push(GhStackOp::RecoveryFile {
             worktree: worktree.to_string(),
-        });
-        self
-    }
-
-    /// Ensure `worktree`'s admin dir has a real (non-symlink) `gh-stack.lock` file — the
-    /// pre-migration layout for the lock path, mirroring [`gh_stack_unlinked`](Self::gh_stack_unlinked)
-    /// but for `gh-stack.lock` instead of `gh-stack`. Its content is irrelevant (upstream never
-    /// reads it, it's a pure `flock` target) so this writes an empty file. Runs after `Linked`,
-    /// so it also covers "gh-stack is linked but gh-stack.lock reverted to a real file."
-    pub fn gh_stack_lock_unlinked(mut self, worktree: &str) -> Self {
-        self.gh_stack_ops.push(GhStackOp::LockUnlinked {
-            worktree: worktree.to_string(),
+            file: file.to_string(),
         });
         self
     }
@@ -898,7 +882,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
         // (`<common-dir>/worktrees/<name>/gh-stack`), grouped by target and written after
         // branch refs exist so `resolve_tip` sees live tips. `gh_stack`/`gh_stack_at` calls
         // accumulate into one `stacks` array per target, in call order; `Raw` overwrites
-        // whatever JSON was written for its target; `Linked`/`Unlinked` run last, after every
+        // whatever JSON was written for its target; `Symlinked` runs last, after every
         // file exists, so symlink planting can see (or knowingly precede — dangling is valid)
         // the canonical file.
         if !self.gh_stack_ops.is_empty() {
@@ -1031,26 +1015,6 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 std::fs::write(&path, doc.to_string())?;
             }
 
-            // `Unlinked` ensures a real file exists even when no `Stack`/`GhostBranch` op
-            // targeted that worktree — write a minimal valid empty-stacks doc.
-            for op in &self.gh_stack_ops {
-                if let GhStackOp::Unlinked { worktree } = op {
-                    let target = Some(worktree.clone());
-                    let path = gh_stack_target_path(&repo, &target);
-                    if !path.exists() {
-                        if let Some(parent) = path.parent() {
-                            std::fs::create_dir_all(parent)?;
-                        }
-                        let doc = serde_json::json!({
-                            "schemaVersion": 1,
-                            "repository": "git-workon-fixture/gh-stack",
-                            "stacks": [],
-                        });
-                        std::fs::write(&path, doc.to_string())?;
-                    }
-                }
-            }
-
             // `Raw` overwrites whatever was just written for its target, last write wins.
             for op in &self.gh_stack_ops {
                 if let GhStackOp::Raw { target, bytes } = op {
@@ -1062,11 +1026,11 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 }
             }
 
-            // `Linked` plants relative symlinks resolving to the canonical store. A dangling
+            // `Symlinked` plants relative symlinks resolving to the canonical store. A dangling
             // symlink (canonical not yet written) is intentionally valid — see the ADR-028
             // handoff's "shared canonical file" self-healing note.
             for op in &self.gh_stack_ops {
-                if let GhStackOp::Linked { worktree } = op {
+                if let GhStackOp::Symlinked { worktree } = op {
                     let admin_dir = repo.commondir().join("worktrees").join(worktree);
                     std::fs::create_dir_all(&admin_dir)?;
                     for (name, relative_target) in [
@@ -1080,15 +1044,11 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 }
             }
 
-            // `LockUnlinked` runs after `Linked` so it can also model a `gh-stack.lock` that
-            // reverted from a symlink back to a real file (removing any symlink `Linked` left).
             for op in &self.gh_stack_ops {
-                if let GhStackOp::LockUnlinked { worktree } = op {
+                if let GhStackOp::RecoveryFile { worktree, file } = op {
                     let admin_dir = repo.commondir().join("worktrees").join(worktree);
                     std::fs::create_dir_all(&admin_dir)?;
-                    let lock_path = admin_dir.join("gh-stack.lock");
-                    let _ = std::fs::remove_file(&lock_path);
-                    std::fs::write(&lock_path, [])?;
+                    std::fs::write(admin_dir.join(file), [])?;
                 }
             }
 

@@ -222,12 +222,22 @@ pub fn is_gh_stack_repo(repo: &Repository) -> bool {
     gh_stack::is_gh_stack_repo(repo)
 }
 
-/// Per-worktree gh-stack link status, for `doctor`'s `GhStackWorktreeNotLinked` check.
-pub use gh_stack::LinkStatus as GhStackLinkStatus;
+/// What a worktree's admin dir holds that gh-stack >=0.2 cares about (symlinks workon planted,
+/// a legacy catalog, recovery records), for `doctor`'s per-worktree gh-stack checks.
+pub use gh_stack::WorktreeGhStackState as GhStackWorktreeState;
 
-/// Compute [`GhStackLinkStatus`] for `worktree_name`'s `gh-stack` admin-dir path.
-pub fn gh_stack_worktree_link_status(repo: &Repository, worktree_name: &str) -> GhStackLinkStatus {
-    gh_stack::worktree_link_status(repo, worktree_name)
+/// Compute [`GhStackWorktreeState`] for `worktree_name`'s admin dir.
+pub fn gh_stack_worktree_state(repo: &Repository, worktree_name: &str) -> GhStackWorktreeState {
+    gh_stack::worktree_state(repo, worktree_name)
+}
+
+/// Remove the `gh-stack`/`gh-stack.lock` symlinks workon planted in `worktree_name`'s admin dir,
+/// returning the file names removed. Real files are never touched.
+pub fn unlink_gh_stack_worktree(
+    repo: &Repository,
+    worktree_name: &str,
+) -> Result<Vec<&'static str>> {
+    gh_stack::unlink_worktree(repo, worktree_name)
 }
 
 /// gh-stack files (canonical + unlinked worktree copies) that exist but fail to parse or use

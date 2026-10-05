@@ -1,10 +1,10 @@
 //! Shared lookups behind the gh-stack predicates.
 //!
-//! Mirrors [`super::metadata_common`]'s role for Graphite: the JSON-loading and path/symlink
+//! Mirrors [`super::metadata_common`]'s role for Graphite: the JSON-loading and path
 //! resolution plumbing lives here once instead of duplicated per predicate file.
 
 use git2::Repository;
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 /// `<common-dir>/gh-stack` (canonical) or `<common-dir>/worktrees/<name>/gh-stack`
 /// (per-worktree), matching `git-workon-lib`'s `stack::gh_stack::canonical_path` layout.
@@ -36,27 +36,4 @@ pub(crate) fn flatten_branches(doc: &serde_json::Value) -> Vec<&serde_json::Valu
         .filter_map(|stack| stack.get("branches").and_then(|b| b.as_array()))
         .flatten()
         .collect()
-}
-
-/// Resolve a symlink's target lexically relative to its own parent directory, without
-/// requiring the target to exist (`fs::canonicalize` would fail on a dangling symlink, which
-/// is a deliberately valid gh-stack layout — see the ADR-028 handoff's self-healing note).
-pub(crate) fn resolve_symlink_lexically(link: &Path) -> Option<PathBuf> {
-    let target = std::fs::read_link(link).ok()?;
-    let parent = link.parent()?;
-    Some(normalize_lexically(&parent.join(target)))
-}
-
-pub(crate) fn normalize_lexically(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
