@@ -1,11 +1,13 @@
 //! `gh stack` (`github/gh-stack` CLI extension) stack detection — read path.
 //!
-//! Stack metadata is read without invoking `gh`. Upstream writes one JSON file per git dir
-//! (`schemaVersion: 1`, `{ repository, stacks: [{ id, number, trunk: branchRef, branches:
-//! [branchRef] }] }`, `branchRef = { branch, head, base, pullRequest }`), which for a linked
-//! worktree is per-worktree, not shared. workon keeps one canonical copy at
-//! `<common-dir>/gh-stack` and symlinks each worktree's admin-dir path to it (see
-//! [`link_worktree`]) so it behaves like Graphite's shared store.
+//! Stack metadata is read without invoking `gh`. gh-stack >=0.2 keeps one shared JSON catalog
+//! at `<common-dir>/gh-stack` (`schemaVersion: 1`, `{ repository, stacks: [{ id, number,
+//! trunk: branchRef, branches: [branchRef] }] }`, `branchRef = { branch, head, base,
+//! pullRequest }`), written with temp-and-rename, and migrates any per-worktree file it finds
+//! into it. Upstream owns that store: workon never creates, links, or migrates it. It reads
+//! the catalog, unions in older per-worktree files (see below), and appends new branches via
+//! [`register_branch`]. Earlier workon versions symlinked each worktree's admin-dir path to
+//! the catalog; gh-stack >=0.2 rejects a symlink there, so workon no longer plants any.
 //!
 //! **Never use `repo.path()` here — always `repo.commondir()`.** `get_repo` (`get_repo.rs`)
 //! follows `commondir` back and returns the bare repo, so `repo.path() == repo.commondir()`
@@ -17,12 +19,9 @@
 //!
 //! [`read_metadata`] reads the canonical file first, then unions in [`unlinked_files`] —
 //! worktree admin-dir files that are *not* symlinks resolving to canonical — in directory
-//! order. In a healthy (fully-linked) repo `unlinked_files` is empty and the union never
-//! runs. It exists because write-in-place (upstream truncates its target through the
-//! symlink) is an implementation detail, not a contract: if gh-stack ever switches to
-//! temp-and-rename, the rename replaces a worktree's canonical symlink with a real file, and
-//! that worktree's writes silently stop reaching canonical. The union read means nothing goes
-//! invisible in the meantime — `doctor` (added later) flags any unlinked file it finds.
+//! order. With gh-stack >=0.2 the union is empty once upstream has migrated those files. It
+//! stays as the fallback for gh-stack <0.2, which still writes a real file per worktree, and
+//! for files upstream hasn't migrated yet. `doctor` flags any unlinked file it finds.
 //!
 //! Dedupe when the union fires: identity is `number` when non-zero, else `id` when
 //! non-empty, else `(trunk, first branch)`; **first wins wholesale** — the entire stack
@@ -33,10 +32,9 @@
 //!
 //! ## Truncated reads are tolerated, not fatal
 //!
-//! A partial file is the *expected* steady state during a concurrent `gh stack` command —
-//! upstream's `os.WriteFile` truncates in place rather than writing to a temp file and
-//! renaming, so a reader can observe a half-written file. [`read_metadata`] retries a
-//! read-and-parse up to 3 times, 25ms apart, and skips the file with `log::warn!` if every
+//! A partial file can be observed during a concurrent `gh stack` command that writes in
+//! place, which gh-stack <0.2 still does for its per-worktree files (>=0.2 writes the catalog
+//! with temp-and-rename). [`read_metadata`] retries a read-and-parse up to 3 times, 25ms apart, and skips the file with `log::warn!` if every
 //! attempt still fails to parse. This is the deliberate opposite of Graphite's rule
 //! (`graphite.rs`'s `read_branch_metadata`, where a present-but-unreadable database is a hard
 //! error): sqlite writes are atomic, so unreadable there means corrupt, not mid-write.
@@ -384,9 +382,9 @@ const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Take `<common-dir>/gh-stack.lock` (`flock(LOCK_EX | LOCK_NB)`, retried every 100ms up to
-/// 5s), so a concurrent `gh stack` run in any worktree is genuinely excluded — every
-/// worktree's lock path symlinks to this same file (see [`link_worktree`]). A no-op guard on
-/// non-unix targets, mirroring `graphite.rs`'s `#[cfg(not(unix))]` fallback.
+/// 5s), the same catalog lock gh-stack takes, so a concurrent `gh stack` run is excluded
+/// while [`register_branch`] rewrites the catalog. A no-op guard on non-unix targets,
+/// mirroring `graphite.rs`'s `#[cfg(not(unix))]` fallback.
 #[cfg(unix)]
 fn lock_canonical(repo: &Repository) -> Result<LockGuard, StackError> {
     let lock_path = repo.commondir().join("gh-stack.lock");
@@ -417,99 +415,6 @@ fn lock_canonical(repo: &Repository) -> Result<LockGuard, StackError> {
 #[cfg(not(unix))]
 fn lock_canonical(_repo: &Repository) -> Result<LockGuard, StackError> {
     Ok(LockGuard)
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::unix::fs::symlink(target, link)
-}
-
-#[cfg(windows)]
-fn create_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
-    std::os::windows::fs::symlink_file(target, link)
-}
-
-/// Plant `admin_dir/<filename>` as a relative symlink (`../../<filename>`) to
-/// `<common-dir>/<filename>`. Idempotent — a no-op if the symlink already points there.
-/// Never replaces a regular file: that is [`migrate_worktree`]'s job alone.
-fn plant_link(admin_dir: &Path, filename: &str) -> Result<(), StackError> {
-    let link_path = admin_dir.join(filename);
-    let relative_target = Path::new("..").join("..").join(filename);
-
-    match std::fs::symlink_metadata(&link_path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            if std::fs::read_link(&link_path).ok().as_deref() == Some(relative_target.as_path()) {
-                return Ok(()); // already correctly linked
-            }
-            std::fs::remove_file(&link_path).map_err(|e| StackError::GhStackLinkFailed {
-                path: link_path.clone(),
-                message: e.to_string(),
-            })?;
-            create_symlink(&relative_target, &link_path).map_err(|e| {
-                StackError::GhStackLinkFailed {
-                    path: link_path,
-                    message: e.to_string(),
-                }
-            })
-        }
-        Ok(_) => Ok(()), // a real file is here — never replace it, see migrate_worktree
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            create_symlink(&relative_target, &link_path).map_err(|e| {
-                StackError::GhStackLinkFailed {
-                    path: link_path,
-                    message: e.to_string(),
-                }
-            })
-        }
-        Err(e) => Err(StackError::GhStackLinkFailed {
-            path: link_path,
-            message: e.to_string(),
-        }),
-    }
-}
-
-/// Plant `gh-stack` and `gh-stack.lock` in `<common>/worktrees/<worktree_name>/` as relative
-/// symlinks (`../../gh-stack`) to the canonical store. Idempotent. Never replaces a regular
-/// file — that is [`migrate_worktree`]'s job.
-///
-/// Safe to call before any stack exists: `open()` with `O_CREAT` through a dangling symlink
-/// creates the target, so the first `gh stack init` in any linked worktree creates canonical.
-/// See the module docs.
-pub(crate) fn link_worktree(repo: &Repository, worktree_name: &str) -> Result<(), StackError> {
-    let admin_dir = repo.commondir().join("worktrees").join(worktree_name);
-    plant_link(&admin_dir, "gh-stack")?;
-    plant_link(&admin_dir, "gh-stack.lock")?;
-    Ok(())
-}
-
-/// Identity computed straight from a raw `stacks[]` entry `Value`, mirroring [`identity`] but
-/// without parsing into [`GhStackEntry`] first — used by [`migrate_worktree`], which must
-/// preserve `id`/`pullRequest`/`head` verbatim rather than round-tripping through the
-/// read-path's lossy struct.
-fn raw_identity(entry: &Value) -> StackIdentity {
-    let number = entry.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
-    if number != 0 {
-        return StackIdentity::Number(number);
-    }
-    let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or_default();
-    if !id.is_empty() {
-        return StackIdentity::Id(id.to_string());
-    }
-    let trunk = entry
-        .get("trunk")
-        .and_then(|t| t.get("branch"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let first_branch = entry
-        .get("branches")
-        .and_then(|b| b.as_array())
-        .and_then(|arr| arr.first())
-        .and_then(|b| b.get("branch"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    StackIdentity::TrunkAndFirstBranch(trunk, first_branch)
 }
 
 /// Read `path` as a whole raw `Value` (no [`GhStackEntry`] parsing, so every top-level field —
@@ -552,141 +457,6 @@ fn read_raw_stacks(path: &Path) -> Result<Vec<Value>, StackError> {
     Ok(read_raw_doc(path)?
         .and_then(|doc| doc.get("stacks").and_then(|v| v.as_array()).cloned())
         .unwrap_or_default())
-}
-
-/// Merge a worktree's real `gh-stack` file into canonical, then replace it with a symlink.
-/// Writes `gh-stack.bak` alongside the original before removing it. Takes the canonical lock
-/// throughout.
-///
-/// This is the only place workon replaces a file another tool wrote, so it is reachable only
-/// from `doctor --fix` — never automatically, never from `workon new`. If `worktree_name`'s
-/// `gh-stack` path is missing or already a symlink, this degrades to [`link_worktree`]: there
-/// is no real file to migrate.
-///
-/// Merge order matches [`read_metadata`]'s dedupe rule: canonical entries are seeded first, so
-/// a colliding identity in the worktree file is dropped, never merged field-by-field.
-pub(crate) fn migrate_worktree(repo: &Repository, worktree_name: &str) -> Result<(), StackError> {
-    let admin_dir = repo.commondir().join("worktrees").join(worktree_name);
-    let worktree_file = admin_dir.join("gh-stack");
-
-    let is_regular_file = matches!(
-        std::fs::symlink_metadata(&worktree_file),
-        Ok(meta) if !meta.file_type().is_symlink()
-    );
-    if !is_regular_file {
-        remove_stale_lock_file(&admin_dir)?;
-        return link_worktree(repo, worktree_name);
-    }
-
-    let _lock = lock_canonical(repo)?;
-
-    let canonical = canonical_path(repo);
-    let canonical_doc = read_raw_doc(&canonical)?;
-
-    // Base the merged document on canonical's whole `Value` when it exists, falling back to
-    // the worktree file's, so every top-level field outside `stacks` — `repository` above
-    // all — round-trips instead of being discarded. Mirrors `plan_registered_doc`, which
-    // round-trips the same way for the same reason.
-    let mut doc = match &canonical_doc {
-        Some(v) => v.clone(),
-        None => read_raw_doc(&worktree_file)?
-            .unwrap_or_else(|| serde_json::json!({ "schemaVersion": 1, "stacks": [] })),
-    };
-
-    let mut merged: Vec<Value> = canonical_doc
-        .as_ref()
-        .and_then(|v| v.get("stacks"))
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let mut seen: HashSet<StackIdentity> = merged.iter().map(raw_identity).collect();
-    for entry in read_raw_stacks(&worktree_file)? {
-        if seen.insert(raw_identity(&entry)) {
-            merged.push(entry);
-        }
-    }
-
-    doc["schemaVersion"] = serde_json::json!(1);
-    doc["stacks"] = serde_json::Value::Array(merged);
-
-    // Verify the merged result parses before touching anything on disk or unlinking the
-    // worktree's original — never destroy the only copy of data that failed to round-trip.
-    let bytes = serde_json::to_vec_pretty(&doc).map_err(|e| StackError::GhStackWriteFailed {
-        path: canonical.clone(),
-        message: e.to_string(),
-    })?;
-    serde_json::from_slice::<Value>(&bytes).map_err(|e| StackError::GhStackParseFailed {
-        path: canonical.clone(),
-        message: e.to_string(),
-    })?;
-
-    let tmp_path = canonical.with_extension("tmp");
-    std::fs::write(&tmp_path, &bytes).map_err(|e| StackError::GhStackWriteFailed {
-        path: tmp_path.clone(),
-        message: e.to_string(),
-    })?;
-    std::fs::rename(&tmp_path, &canonical).map_err(|e| StackError::GhStackWriteFailed {
-        path: canonical.clone(),
-        message: e.to_string(),
-    })?;
-
-    // Re-read the bytes actually on disk (not just the in-memory copy) before unlinking the
-    // worktree's original file. `read_raw_stacks`, not `read_doc`: `read_doc` only ever
-    // returns `Err` for a schema mismatch that can't happen on a doc we just wrote with
-    // `schemaVersion: 1`, so it can never fail here and isn't a real guard. `read_raw_stacks`
-    // is single-attempt and genuinely errors on a parse failure.
-    read_raw_stacks(&canonical)?;
-
-    let bak_path = next_available_backup_path(&admin_dir);
-    std::fs::rename(&worktree_file, &bak_path).map_err(|e| StackError::GhStackWriteFailed {
-        path: worktree_file.clone(),
-        message: e.to_string(),
-    })?;
-
-    remove_stale_lock_file(&admin_dir)?;
-    link_worktree(repo, worktree_name)
-}
-
-/// Remove `admin_dir/gh-stack.lock` if it is a regular file, so the following
-/// [`link_worktree`] call can plant a proper symlink — [`plant_link`] never replaces a regular
-/// file. Its contents are irrelevant (upstream never reads them, it is a pure `flock` target;
-/// see the module docs' shared-canonical-file section), so simply discarding it is safe.
-///
-/// A worktree that has already run `gh stack` almost always has a real `gh-stack.lock`
-/// alongside its real `gh-stack` file (upstream opens it `O_CREATE` on every lock attempt), so
-/// this runs on every path through [`migrate_worktree`], not only the merge path — leaving it
-/// behind would silently keep that worktree flocking a private inode instead of the shared
-/// canonical lock, defeating cross-worktree mutual exclusion without [`worktree_link_status`]
-/// (which now checks both paths) reporting it.
-fn remove_stale_lock_file(admin_dir: &Path) -> Result<(), StackError> {
-    let lock_path = admin_dir.join("gh-stack.lock");
-    let is_regular_file = matches!(
-        std::fs::symlink_metadata(&lock_path),
-        Ok(meta) if !meta.file_type().is_symlink()
-    );
-    if is_regular_file {
-        std::fs::remove_file(&lock_path).map_err(|e| StackError::GhStackWriteFailed {
-            path: lock_path,
-            message: e.to_string(),
-        })?;
-    }
-    Ok(())
-}
-
-/// The first of `gh-stack.bak`, `gh-stack.bak.1`, `gh-stack.bak.2`, ... that doesn't already
-/// exist in `admin_dir`. A worktree can legitimately acquire a real `gh-stack` file again
-/// after a prior migration — the write-in-place risk this crate's module docs describe (a
-/// gh-stack release switching to temp-and-rename would cause exactly this) — so re-migrating
-/// must never clobber the backup a previous migration left behind.
-fn next_available_backup_path(admin_dir: &Path) -> PathBuf {
-    let base = admin_dir.join("gh-stack.bak");
-    if std::fs::symlink_metadata(&base).is_err() {
-        return base;
-    }
-    (1u32..)
-        .map(|n| admin_dir.join(format!("gh-stack.bak.{n}")))
-        .find(|candidate| std::fs::symlink_metadata(candidate).is_err())
-        .expect("u32 backup suffixes are effectively inexhaustible")
 }
 
 // ── Registering new branches (write path) ───────────────────────────────────────────────
@@ -845,7 +615,7 @@ fn write_canonical_atomic(canonical: &Path, bytes: &[u8]) -> Result<(), StackErr
 /// `base` is `repo.merge_base(base_branch's tip, branch's tip)` — equal to `base_branch`'s
 /// tip in the normal case, but still correct if `base_branch` moved between worktree creation
 /// and this call. Guarded by [`lock_canonical`], so a concurrent `gh stack` run in any
-/// worktree (every worktree's lock symlinks to the same file) is genuinely excluded.
+/// worktree is genuinely excluded.
 ///
 /// The file is read only after the lock is held. No lock-respecting writer (every `gh stack`
 /// invocation, and every other `git-workon` call into this module) can be mid-write once the
@@ -892,15 +662,13 @@ pub fn register_branch(
 
 // ── `doctor` support ─────────────────────────────────────────────────────────────────────
 
-/// Per-worktree link status, for `doctor`'s `GhStackWorktreeNotLinked` check and its `--fix`.
+/// Per-worktree link status, for `doctor`'s report-only `GhStackWorktreeNotLinked` check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkStatus {
     /// Correctly symlinked to canonical.
     Linked,
-    /// Not linked. `holds_file` distinguishes the two `--fix` actions: `true` means a real
-    /// file is present and must be merged ([`migrate_worktree`]); `false` means the path is
-    /// simply missing (or a symlink pointing somewhere else) and can be planted directly
-    /// ([`link_worktree`]).
+    /// Not linked. `holds_file` is `true` when a real file is present (upstream's migration
+    /// merges it); `false` when the path is missing or a symlink pointing somewhere else.
     NotLinked { holds_file: bool },
 }
 
@@ -927,13 +695,11 @@ fn link_status_for_path(path: &Path, expected_target: &Path) -> LinkStatus {
 
 /// Compute [`LinkStatus`] for `worktree_name`'s `gh-stack` and `gh-stack.lock` admin-dir
 /// paths, `NotLinked` if either is unlinked. `holds_file` reflects only the `gh-stack` path —
-/// whether there is a real stack file needing [`migrate_worktree`]'s merge — never the lock
-/// file, whose contents are irrelevant and whose own staleness is fully handled by
-/// [`migrate_worktree`] discarding it before relinking; a stale lock alone must route through
-/// [`link_worktree`], not `migrate_worktree`.
+/// whether there is a real stack file for upstream to migrate — never the lock file, whose
+/// contents are irrelevant.
 ///
-/// Each path is checked against its own target: `plant_link` symlinks `gh-stack` to
-/// `../../gh-stack` and `gh-stack.lock` to `../../gh-stack.lock`, so comparing both against
+/// Each path is checked against its own target: `gh-stack` links to `../../gh-stack` and
+/// `gh-stack.lock` to `../../gh-stack.lock`, so comparing both against
 /// `canonical_path` alone would mean the `gh-stack.lock` check can never resolve to it —
 /// `is_symlink_resolving_to` compares the *lock's* resolved target against the *stack file's*
 /// path, which are never equal.
@@ -1303,248 +1069,11 @@ mod tests {
         assert_eq!(meta.stack_numbers["shared"], 1);
     }
 
-    // ── link_worktree / migrate_worktree ────────────────────────────────────────
-
-    #[test]
-    fn link_worktree_plants_relative_symlinks() {
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        link_worktree(repo, "feat-a").unwrap();
-
-        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-        let lock_target = std::fs::read_link(
-            repo.commondir()
-                .join("worktrees")
-                .join("feat-a")
-                .join("gh-stack.lock"),
-        )
-        .unwrap();
-        assert_eq!(lock_target, Path::new("../../gh-stack.lock"));
-    }
-
-    #[test]
-    fn link_worktree_is_idempotent() {
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        link_worktree(repo, "feat-a").unwrap();
-        link_worktree(repo, "feat-a").unwrap();
-
-        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-    }
-
-    #[test]
-    fn link_worktree_replaces_a_symlink_pointing_somewhere_wrong() {
-        // plant_link has three arms: already-correct (link_worktree_is_idempotent), missing
-        // (link_worktree_plants_relative_symlinks), and remove-and-recreate for a symlink that
-        // exists but resolves elsewhere. Only the first two had coverage.
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-        let admin_dir = repo.commondir().join("worktrees").join("feat-a");
-
-        create_symlink(Path::new("../../nonsense"), &admin_dir.join("gh-stack")).unwrap();
-
-        link_worktree(repo, "feat-a").unwrap();
-
-        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-    }
-
-    #[test]
-    fn link_worktree_never_replaces_a_real_file() {
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .gh_stack(Some("feat-a"), 3, "main", &["feat-a"])
-            .gh_stack_unlinked("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        link_worktree(repo, "feat-a").unwrap();
-
-        // Still a real file — link_worktree must never clobber it.
-        repo.assert(predicate::repo::gh_stack_contains_branch(
-            Some("feat-a"),
-            "feat-a",
-            0,
-        ));
-        let meta =
-            std::fs::symlink_metadata(repo.commondir().join("worktrees/feat-a/gh-stack")).unwrap();
-        assert!(!meta.file_type().is_symlink());
-    }
-
-    #[test]
-    fn migrate_worktree_merges_into_canonical_and_leaves_backup() {
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .gh_stack(Some("feat-a"), 7, "main", &["feat-a"])
-            .gh_stack_unlinked("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        migrate_worktree(repo, "feat-a").unwrap();
-
-        // Merged into canonical...
-        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
-        // ...and the worktree is now linked to it.
-        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-        // ...with a backup of the original left behind.
-        assert!(repo
-            .commondir()
-            .join("worktrees/feat-a/gh-stack.bak")
-            .exists());
-
-        let meta = read_metadata(repo).unwrap();
-        assert_eq!(meta.stack_numbers["feat-a"], 7);
-    }
-
-    #[test]
-    fn migrate_worktree_preserves_top_level_fields_when_canonical_is_absent() {
-        // No `gh_stack`/`gh_stack_at` call targets `None` (canonical), so canonical doesn't
-        // exist before migration and the merged document must be seeded from the worktree
-        // file's whole `Value` — including `repository` — not synthesized from scratch.
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .gh_stack(Some("feat-a"), 7, "main", &["feat-a"])
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        migrate_worktree(repo, "feat-a").unwrap();
-
-        repo.assert(predicate::repo::gh_stack_preserves(
-            None,
-            "/repository",
-            "git-workon-fixture/gh-stack",
-        ));
-        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
-    }
-
-    #[test]
-    fn migrate_worktree_falls_back_to_link_when_nothing_to_merge() {
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        migrate_worktree(repo, "feat-a").unwrap();
-
-        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-        assert!(!repo
-            .commondir()
-            .join("worktrees/feat-a/gh-stack.bak")
-            .exists());
-    }
-
-    #[test]
-    fn migrate_worktree_never_clobbers_an_existing_backup() {
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .gh_stack(Some("feat-a"), 7, "main", &["feat-a"])
-            .gh_stack_unlinked("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        migrate_worktree(repo, "feat-a").unwrap();
-
-        let admin_dir = repo.commondir().join("worktrees/feat-a");
-        let first_backup = admin_dir.join("gh-stack.bak");
-        assert!(first_backup.exists());
-        let first_backup_contents = std::fs::read(&first_backup).unwrap();
-
-        // Simulate a gh-stack release switching to temp-and-rename: the symlink this
-        // worktree's `gh-stack` path was left as gets replaced with a real file again.
-        std::fs::remove_file(admin_dir.join("gh-stack")).unwrap();
-        std::fs::write(
-            admin_dir.join("gh-stack"),
-            br#"{"schemaVersion":1,"stacks":[]}"#,
-        )
-        .unwrap();
-
-        migrate_worktree(repo, "feat-a").unwrap();
-
-        // The first backup is untouched...
-        assert_eq!(std::fs::read(&first_backup).unwrap(), first_backup_contents);
-        // ...and the second migration's original landed in a numbered backup instead.
-        assert!(admin_dir.join("gh-stack.bak.1").exists());
-        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-    }
-
-    #[test]
-    fn migrate_worktree_also_migrates_a_stale_lock_file() {
-        // A worktree that has already run `gh stack` almost always has a real `gh-stack.lock`
-        // alongside its real `gh-stack` file (upstream opens it O_CREATE on every lock
-        // attempt). Both must end up symlinked, or this worktree's `gh stack` keeps flocking a
-        // private inode while `register_branch` flocks the shared canonical lock.
-        let fixture = FixtureBuilder::new()
-            .bare(true)
-            .default_branch("main")
-            .worktree("main")
-            .worktree("feat-a")
-            .gh_stack(Some("feat-a"), 7, "main", &["feat-a"])
-            .gh_stack_unlinked("feat-a")
-            .gh_stack_lock_unlinked("feat-a")
-            .build()
-            .unwrap();
-        let repo = fixture.repo().unwrap();
-
-        let admin_dir = repo.commondir().join("worktrees/feat-a");
-        let lock_meta_before = std::fs::symlink_metadata(admin_dir.join("gh-stack.lock")).unwrap();
-        assert!(!lock_meta_before.file_type().is_symlink());
-
-        migrate_worktree(repo, "feat-a").unwrap();
-
-        repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-        let lock_meta_after = std::fs::symlink_metadata(admin_dir.join("gh-stack.lock")).unwrap();
-        assert!(
-            lock_meta_after.file_type().is_symlink(),
-            "gh-stack.lock must be a symlink after migration"
-        );
-        let lock_target = std::fs::read_link(admin_dir.join("gh-stack.lock")).unwrap();
-        assert_eq!(lock_target, Path::new("../../gh-stack.lock"));
-    }
-
     #[test]
     fn worktree_link_status_reports_linked_for_a_fully_linked_worktree() {
         // Regression test: link_status_for_path used to compare BOTH the gh-stack and
-        // gh-stack.lock paths against canonical_path (the gh-stack target), but plant_link
-        // symlinks gh-stack.lock to `../../gh-stack.lock`, which can never resolve to
+        // gh-stack.lock paths against canonical_path (the gh-stack target), but the lock
+        // symlinks to `../../gh-stack.lock`, which can never resolve to
         // `../../gh-stack`. A correctly, fully linked worktree reported NotLinked forever, and
         // no test anywhere asserted LinkStatus::Linked, which is why this regression shipped.
         let fixture = FixtureBuilder::new()

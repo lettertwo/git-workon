@@ -39,9 +39,9 @@ use serde_json::json;
 use workon::{
     encode_worktree_name, get_repo, get_worktrees, gh_stack_divergent_stack_numbers,
     gh_stack_readability_errors, gh_stack_worktree_link_status, is_gh_stack_repo,
-    is_graphite_active, is_graphite_repo, link_worktree, migrate_worktree, preferred_remote_order,
-    relative_worktree_path, rename_worktree_metadata, GhStackLinkStatus, Granularity, StackModel,
-    WorkonConfig, WorktreeDescriptor,
+    is_graphite_active, is_graphite_repo, preferred_remote_order, relative_worktree_path,
+    rename_worktree_metadata, GhStackLinkStatus, Granularity, StackModel, WorkonConfig,
+    WorktreeDescriptor,
 };
 
 use crate::cli::Doctor;
@@ -144,7 +144,6 @@ impl Issue {
             IssueKind::MissingDirectory
                 | IssueKind::RenamedConfigKey { .. }
                 | IssueKind::StaleWorktreeName { .. }
-                | IssueKind::GhStackWorktreeNotLinked { .. }
         )
     }
 
@@ -205,10 +204,10 @@ impl Issue {
             } => {
                 if *holds_file {
                     format!(
-                        "'{worktree}' has its own gh-stack file, not linked to canonical — run --fix to merge it in"
+                        "'{worktree}' has its own gh-stack file, not linked to canonical — run any `gh stack` command to migrate it (gh-stack >=0.2)"
                     )
                 } else {
-                    format!("'{worktree}' is not linked to the canonical gh-stack file — run --fix to link it")
+                    format!("'{worktree}' is not linked to the canonical gh-stack file")
                 }
             }
             IssueKind::GhStackExtensionNotFound => {
@@ -975,19 +974,6 @@ fn fix_issues(repo: &git2::Repository, issues: &[Issue]) -> Result<Vec<String>> 
                     debug!("renaming worktree admin dir '{}' -> '{}'", name, expected);
                     rename_worktree_metadata(repo, name, expected, path).into_diagnostic()?;
                     fixed.push(format!("Renamed admin directory: {name} → {expected}"));
-                }
-            }
-            IssueKind::GhStackWorktreeNotLinked { holds_file, .. } => {
-                if let Some(name) = &issue.name {
-                    if *holds_file {
-                        debug!("migrating gh-stack file for worktree '{}'", name);
-                        migrate_worktree(repo, name).into_diagnostic()?;
-                        fixed.push(format!("Migrated gh-stack file into canonical: {name}"));
-                    } else {
-                        debug!("linking gh-stack for worktree '{}'", name);
-                        link_worktree(repo, name).into_diagnostic()?;
-                        fixed.push(format!("Linked to canonical gh-stack file: {name}"));
-                    }
                 }
             }
             IssueKind::RenamedConfigKey {

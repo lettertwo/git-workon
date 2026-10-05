@@ -170,7 +170,7 @@ enum GhStackOp {
     Unlinked { worktree: String },
     /// Ensure `worktree`'s admin dir has a real (non-symlink) `gh-stack.lock` file, replacing
     /// any symlink a prior `Linked` op planted there — the pre-migration lock layout
-    /// `migrate_worktree` must also clean up (see the ADR-028 handoff's Finding A).
+    /// upstream migration must also clean up (see the ADR-028 handoff's Finding A).
     LockUnlinked { worktree: String },
 }
 
@@ -515,7 +515,7 @@ impl<'fixture> FixtureBuilder<'fixture> {
 
     /// Plant `gh-stack`/`gh-stack.lock` in `worktree`'s admin dir as relative symlinks
     /// (`../../gh-stack`, `../../gh-stack.lock`) resolving to the canonical store — the
-    /// healthy-path layout `link_worktree` produces.
+    /// layout earlier workon versions produced via symlinks.
     pub fn gh_stack_linked(mut self, worktree: &str) -> Self {
         self.gh_stack_ops.push(GhStackOp::Linked {
             worktree: worktree.to_string(),

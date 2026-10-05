@@ -593,7 +593,7 @@ fn doctor_json_configuration_includes_stack_keys() -> Result<(), Box<dyn std::er
 // ── gh-stack checks ───────────────────────────────────────────────────────────
 
 #[test]
-fn doctor_detects_unlinked_gh_stack_worktree_and_fixes_with_link(
+fn doctor_detects_unlinked_gh_stack_worktree_without_a_fix(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
@@ -614,26 +614,24 @@ fn doctor_detects_unlinked_gh_stack_worktree_and_fixes_with_link(
             "is not linked to the canonical gh-stack file",
         ));
 
+    // Report-only: `--fix` must not plant a symlink (gh-stack >=0.2 rejects them).
     cargo_bin_cmd!("git-workon")
         .current_dir(&main_path)
         .env("NO_COLOR", "1")
         .arg("doctor")
         .arg("--fix")
         .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "Linked to canonical gh-stack file",
-        ));
+        .success();
 
     let bare_repo = git2::Repository::open_bare(fixture.root()?.join(".bare"))?;
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-a").not());
 
     Ok(())
 }
 
 #[test]
-fn doctor_migrates_worktree_holding_a_real_gh_stack_file() -> Result<(), Box<dyn std::error::Error>>
-{
+fn doctor_reports_worktree_holding_a_real_gh_stack_file_without_touching_it(
+) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -657,18 +655,14 @@ fn doctor_migrates_worktree_holding_a_real_gh_stack_file() -> Result<(), Box<dyn
         .arg("doctor")
         .arg("--fix")
         .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "Migrated gh-stack file into canonical",
-        ));
+        .success();
 
-    let bare_repo = git2::Repository::open_bare(fixture.root()?.join(".bare"))?;
-    bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0));
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-a"));
-    assert!(fixture
-        .root()?
-        .join(".bare/worktrees/feat-a/gh-stack.bak")
-        .exists());
+    // The real file belongs to upstream's migration; `--fix` leaves it where it is.
+    let real_file = fixture.root()?.join(".bare/worktrees/feat-a/gh-stack");
+    assert!(real_file.is_file());
+    assert!(!std::fs::symlink_metadata(&real_file)?
+        .file_type()
+        .is_symlink());
 
     Ok(())
 }

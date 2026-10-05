@@ -1152,10 +1152,11 @@ fn new_attaching_existing_branch_with_slashes_skips_gt_track(
     Ok(())
 }
 
-// ── gh-stack link hook ────────────────────────────────────────────────────────
+// ── gh-stack: no admin-dir symlinks ───────────────────────────────────────────────────────
 
 #[test]
-fn new_links_gh_stack_worktree_after_creation() -> Result<(), Box<dyn std::error::Error>> {
+fn new_plants_no_gh_stack_symlinks_in_worktree_admin_dir() -> Result<(), Box<dyn std::error::Error>>
+{
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -1174,13 +1175,18 @@ fn new_links_gh_stack_worktree_after_creation() -> Result<(), Box<dyn std::error
 
     let bare_path = fixture.root()?.join(".bare");
     let bare_repo = git2::Repository::open_bare(&bare_path)?;
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1"));
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1").not());
+    // gh-stack >=0.2 owns the shared catalog and rejects symlinks here, so nothing at all
+    // (not even a dangling link) may exist at either path.
+    let admin_dir = bare_path.join("worktrees").join("feat-1");
+    assert!(std::fs::symlink_metadata(admin_dir.join("gh-stack")).is_err());
+    assert!(std::fs::symlink_metadata(admin_dir.join("gh-stack.lock")).is_err());
 
     Ok(())
 }
 
 #[test]
-fn new_skips_gh_stack_link_with_no_stack_flag() -> Result<(), Box<dyn std::error::Error>> {
+fn new_with_no_stack_flag_plants_no_gh_stack_symlinks() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -1229,7 +1235,7 @@ fn new_registers_branch_with_gh_stack() -> Result<(), Box<dyn std::error::Error>
 
     let bare_path = fixture.root()?.join(".bare");
     let bare_repo = git2::Repository::open_bare(&bare_path)?;
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1"));
+    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1").not());
     bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0));
 
     Ok(())
@@ -1316,8 +1322,6 @@ fn new_skips_gh_stack_register_when_stack_auto_track_false(
 
     let bare_path = fixture.root()?.join(".bare");
     let bare_repo = git2::Repository::open_bare(&bare_path)?;
-    // The link still gets planted — only registration is gated on stackAutoTrack.
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1"));
     bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0).not());
 
     Ok(())
