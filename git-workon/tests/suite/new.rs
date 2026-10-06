@@ -1174,8 +1174,6 @@ fn new_plants_no_gh_stack_symlinks_in_worktree_admin_dir() -> Result<(), Box<dyn
         .success();
 
     let bare_path = fixture.root()?.join(".bare");
-    let bare_repo = git2::Repository::open_bare(&bare_path)?;
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1").not());
     // gh-stack >=0.2 owns the shared catalog and rejects symlinks here, so nothing at all
     // (not even a dangling link) may exist at either path.
     let admin_dir = bare_path.join("worktrees").join("feat-1");
@@ -1205,8 +1203,8 @@ fn new_with_no_stack_flag_plants_no_gh_stack_symlinks() -> Result<(), Box<dyn st
         .success();
 
     let bare_path = fixture.root()?.join(".bare");
-    let bare_repo = git2::Repository::open_bare(&bare_path)?;
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1").not());
+    let admin_dir = bare_path.join("worktrees").join("feat-1");
+    assert!(std::fs::symlink_metadata(admin_dir.join("gh-stack")).is_err());
 
     Ok(())
 }
@@ -1235,7 +1233,6 @@ fn new_registers_branch_with_gh_stack() -> Result<(), Box<dyn std::error::Error>
 
     let bare_path = fixture.root()?.join(".bare");
     let bare_repo = git2::Repository::open_bare(&bare_path)?;
-    bare_repo.assert(predicate::repo::gh_stack_is_linked("feat-1").not());
     bare_repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-1", 0));
 
     Ok(())
