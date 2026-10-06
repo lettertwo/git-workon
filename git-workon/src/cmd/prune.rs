@@ -47,11 +47,10 @@
 //! branch rewritten locally after its PR merged (restack, amend) loses the signal —
 //! it still surfaces via `--gone` after a fetch, or by naming the worktree. Any
 //! failure — `gh` missing, unauthenticated, or offline — degrades to no signal, with
-//! no warning: same under-report-only guarantee as the fetch above. A per-row failure
-//! alone doesn't stop the pass (a rate limit or DNS blip on one worktree shouldn't
-//! blank the signal for the rest); the pass gives up only after 3 consecutive
-//! failures, which bounds the cost of a repo-level failure (unauthenticated `gh`)
-//! without paying one failing subprocess per worktree.
+//! no warning: same under-report-only guarantee as the fetch above. The lookup is one
+//! batched `gh api graphql` request covering every candidate branch (an alias per
+//! branch), so its cost doesn't scale with branch count; if that request fails, every
+//! row degrades to no signal together.
 //!
 //! ## Protected Branch Matching
 //!
@@ -96,7 +95,7 @@ use miette::{IntoDiagnostic, Report, Result, WrapErr};
 use serde_json::json;
 use workon::{
     branch_has_gone_upstream, branch_is_merged_into, branch_tip_at_or_behind, check_gh_available,
-    find_merged_pr, get_default_branch, get_repo, get_worktrees, has_github_remote,
+    find_merged_prs, get_default_branch, get_repo, get_worktrees, has_github_remote,
     prune_fetch as remote_prune_fetch, remotes_tracked_by_branches, remotes_tracked_by_worktrees,
     PruneError, WorktreeDescriptor,
 };
@@ -238,9 +237,6 @@ impl Run for Prune {
         };
         let merged_active = self.merged.is_some();
 
-        // Worktree rows always come first: the gh pass below visits rows in order,
-        // and existing bound tests count `gh pr list` calls assuming worktree rows
-        // are exhausted before branch rows begin.
         let mut rows: Vec<PruneRow> = scope
             .iter()
             .map(|wt| {
@@ -268,22 +264,9 @@ impl Run for Prune {
         // without a GitHub remote, so skip the pass entirely when there isn't one —
         // this also keeps every pre-existing prune test hermetic, since fixture repos
         // have no GitHub remote. Otherwise gate on `gh` being usable at all, so a
-        // missing/unauthenticated `gh` costs one check instead of one per row. A
-        // bounded run of consecutive per-row failures then stops the pass (see
-        // `fill_pr_merged`'s doc comment), rather than one flaky row blanking the
-        // signal for every row after it.
+        // missing/unauthenticated `gh` costs one check.
         if has_github_remote(&repo) && check_gh_available().is_ok() {
-            let mut consecutive_failures = 0;
-            for row in rows.iter_mut() {
-                if fill_pr_merged(&repo, row) {
-                    consecutive_failures = 0;
-                } else {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= 3 {
-                        break;
-                    }
-                }
-            }
+            fill_pr_merged(&repo, &mut rows);
         }
         pb.finish_and_clear();
 
@@ -586,11 +569,9 @@ fn build_branch_row<'a>(
     }
 }
 
-/// Raise `Signal::PrMerged` for a row with no other signal, if `gh` reports a merged
-/// PR for its branch whose head covers the worktree's current tip. Skips rows that
-/// already carry a signal (no local branch to look up, or the network call would just
-/// be redundant), and any `gh` failure degrades silently, matching the rest of
-/// prune's under-report-only contract.
+/// Raise `Signal::PrMerged` for rows with no other signal, if `gh` reports a merged
+/// PR for their branch whose head covers the row's current tip. One batched lookup
+/// covers every candidate.
 ///
 /// A merged PR alone isn't enough: gitflow-style long-lived branches (`develop`,
 /// `production`) are repeatedly a PR's head and never stop being one, so a bare
@@ -600,34 +581,30 @@ fn build_branch_row<'a>(
 /// before treating it as evidence the work landed. A branch rewritten locally after
 /// its PR merged (restack, amend) loses this signal — it still surfaces via `--gone`
 /// after a fetch, or by naming the worktree.
-///
-/// Returns false when the `gh` call itself failed. A branch with no PR, or a merged
-/// PR whose head doesn't cover the tip, is not a failure — only the `gh` lookup
-/// itself failing is. The caller tracks consecutive failures and gives up after
-/// enough of them in a row that `gh` is probably unusable here, rather than aborting
-/// on the first one and blanking the signal for every row after it.
-fn fill_pr_merged(repo: &git2::Repository, row: &mut PruneRow) -> bool {
-    if !row.signals.is_empty() || row.branch.starts_with('(') {
-        return true;
-    }
-    match find_merged_pr(&row.branch) {
-        Ok(Some(merged)) => {
-            let covers = match row.wt {
-                Some(wt) => wt.is_at_or_behind(&merged.head_oid).unwrap_or(false),
-                None => {
-                    branch_tip_at_or_behind(repo, &row.branch, &merged.head_oid).unwrap_or(false)
-                }
-            };
-            if covers {
-                row.signals.push(Signal::PrMerged(merged.number));
-                // A merged PR is unambiguous evidence the work landed, so the unmerged
-                // check (only meaningful for signal-less rows) no longer applies.
-                row.unmerged = false;
-            }
-            true
+fn fill_pr_merged(repo: &git2::Repository, rows: &mut [PruneRow]) {
+    let candidates: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.signals.is_empty() && !row.branch.starts_with('('))
+        .map(|row| row.branch.as_str())
+        .collect();
+    let Ok(merged_prs) = find_merged_prs(&candidates) else {
+        return;
+    };
+    for row in rows.iter_mut() {
+        if !row.signals.is_empty() || row.branch.starts_with('(') {
+            continue;
         }
-        Ok(None) => true,
-        Err(_) => false,
+        let Some(merged) = merged_prs.get(&row.branch) else {
+            continue;
+        };
+        let covers = match row.wt {
+            Some(wt) => wt.is_at_or_behind(&merged.head_oid).unwrap_or(false),
+            None => branch_tip_at_or_behind(repo, &row.branch, &merged.head_oid).unwrap_or(false),
+        };
+        if covers {
+            row.signals.push(Signal::PrMerged(merged.number));
+            row.unmerged = false;
+        }
     }
 }
 
