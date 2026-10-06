@@ -162,6 +162,12 @@ enum GhStackOp {
     /// Take and hold `target`'s `gh-stack.lock` (unix only) for the fixture's lifetime, to
     /// exercise lock-contention handling.
     LockHeld { target: GhStackTarget },
+    /// Take and hold `<common-dir>/gh-stack-operation.lock` (unix only) for the fixture's
+    /// lifetime, as a concurrent gh-stack >=0.2 command does for its whole run.
+    OperationLockHeld,
+    /// Write an empty `<common-dir>/gh-stack-migration` journal, as an interrupted gh-stack
+    /// >=0.2 migration leaves behind.
+    MigrationJournal,
     /// Plant `gh-stack`/`gh-stack.lock` in `worktree`'s admin dir as relative symlinks to the
     /// canonical store.
     Symlinked { worktree: String },
@@ -506,6 +512,21 @@ impl<'fixture> FixtureBuilder<'fixture> {
         self.gh_stack_ops.push(GhStackOp::LockHeld {
             target: worktree.map(str::to_string),
         });
+        self
+    }
+
+    /// Take and hold `<common-dir>/gh-stack-operation.lock` (`flock(LOCK_EX)`) for the
+    /// fixture's lifetime, the lock gh-stack >=0.2 takes before loading state. Unix only.
+    #[cfg(unix)]
+    pub fn gh_stack_operation_lock_held(mut self) -> Self {
+        self.gh_stack_ops.push(GhStackOp::OperationLockHeld);
+        self
+    }
+
+    /// Write an empty `<common-dir>/gh-stack-migration` journal, which makes gh-stack >=0.2
+    /// refuse every catalog write until its migration finishes.
+    pub fn gh_stack_migration_journal(mut self) -> Self {
+        self.gh_stack_ops.push(GhStackOp::MigrationJournal);
         self
     }
 
@@ -1052,31 +1073,43 @@ impl<'fixture> FixtureBuilder<'fixture> {
                 }
             }
 
+            for op in &self.gh_stack_ops {
+                if let GhStackOp::MigrationJournal = op {
+                    std::fs::write(repo.commondir().join("gh-stack-migration"), [])?;
+                }
+            }
+
             #[cfg(unix)]
             for op in &self.gh_stack_ops {
-                if let GhStackOp::LockHeld { target } = op {
-                    let admin_target = match target {
-                        None => repo.commondir().to_path_buf(),
-                        Some(name) => repo.commondir().join("worktrees").join(name),
-                    };
-                    std::fs::create_dir_all(&admin_target)?;
-                    let lock_path = admin_target.join("gh-stack.lock");
-                    let file = std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&lock_path)?;
-                    // SAFETY: `flock` on a freshly opened fd we own; leaked below so the lock
-                    // is held for the fixture's (process) lifetime, matching a real concurrent
-                    // `gh stack` process for tests exercising lock-contention handling.
-                    let rc = unsafe {
-                        libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX)
-                    };
-                    if rc != 0 {
-                        return Err(std::io::Error::last_os_error().into());
+                let lock_path = match op {
+                    GhStackOp::LockHeld { target } => {
+                        let admin_target = match target {
+                            None => repo.commondir().to_path_buf(),
+                            Some(name) => repo.commondir().join("worktrees").join(name),
+                        };
+                        std::fs::create_dir_all(&admin_target)?;
+                        admin_target.join("gh-stack.lock")
                     }
-                    std::mem::forget(file);
+                    GhStackOp::OperationLockHeld => {
+                        repo.commondir().join("gh-stack-operation.lock")
+                    }
+                    _ => continue,
+                };
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&lock_path)?;
+                // SAFETY: `flock` on a freshly opened fd we own; leaked below so the lock
+                // is held for the fixture's (process) lifetime, matching a real concurrent
+                // `gh stack` process for tests exercising lock-contention handling.
+                let rc = unsafe {
+                    libc::flock(std::os::unix::io::AsRawFd::as_raw_fd(&file), libc::LOCK_EX)
+                };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error().into());
                 }
+                std::mem::forget(file);
             }
         }
 

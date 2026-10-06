@@ -303,6 +303,13 @@ pub enum StackError {
     )]
     GhStackLocked { path: PathBuf },
 
+    #[error("gh-stack migration is pending ('{}' exists)", path.display())]
+    #[diagnostic(
+        code(workon::stack::gh_stack_migration_pending),
+        help("Run any `gh stack` command to finish migration, then retry.")
+    )]
+    GhStackMigrationPending { path: PathBuf },
+
     #[error("Failed to write gh-stack file '{}': {message}", path.display())]
     #[diagnostic(code(workon::stack::gh_stack_write_failed))]
     GhStackWriteFailed { path: PathBuf, message: String },

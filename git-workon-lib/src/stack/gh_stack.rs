@@ -9,6 +9,10 @@
 //! [`register_branch`]. Earlier workon versions symlinked each worktree's admin-dir path to
 //! the catalog; gh-stack >=0.2 rejects a symlink there, so workon no longer plants any.
 //!
+//! The write path ([`register_branch`]) follows upstream's locking: flock
+//! `<common-dir>/gh-stack-operation.lock`, then `<common-dir>/gh-stack.lock`, then refuse if
+//! the `<common-dir>/gh-stack-migration` journal exists, and only then read, plan, and write.
+//!
 //! **Never use `repo.path()` here — always `repo.commondir()`.** `get_repo` (`get_repo.rs`)
 //! follows `commondir` back and returns the bare repo, so `repo.path() == repo.commondir()`
 //! at every CLI call site. But `Fixture::repo()` in tests can be a *worktree* handle where
@@ -361,7 +365,7 @@ pub(crate) fn current_stack(
 
 // ── Linking worktrees to the canonical file ─────────────────────────────────────────────
 
-/// RAII guard holding `<common-dir>/gh-stack.lock`'s `flock`. Released on drop.
+/// RAII guard holding a gh-stack lock file's `flock`. Released on drop.
 #[cfg(unix)]
 struct LockGuard(std::fs::File);
 
@@ -381,13 +385,12 @@ struct LockGuard;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-/// Take `<common-dir>/gh-stack.lock` (`flock(LOCK_EX | LOCK_NB)`, retried every 100ms up to
-/// 5s), the same catalog lock gh-stack takes, so a concurrent `gh stack` run is excluded
-/// while [`register_branch`] rewrites the catalog. A no-op guard on non-unix targets,
-/// mirroring `graphite.rs`'s `#[cfg(not(unix))]` fallback.
+/// Take the `flock(LOCK_EX | LOCK_NB)` on `lock_path`, retried every 100ms up to 5s, the same
+/// policy gh-stack uses for both of its locks. The file is created if missing and never
+/// deleted, matching upstream. A no-op guard on non-unix targets, mirroring `graphite.rs`'s
+/// `#[cfg(not(unix))]` fallback.
 #[cfg(unix)]
-fn lock_canonical(repo: &Repository) -> Result<LockGuard, StackError> {
-    let lock_path = repo.commondir().join("gh-stack.lock");
+fn flock_path(lock_path: PathBuf) -> Result<LockGuard, StackError> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -413,14 +416,28 @@ fn lock_canonical(repo: &Repository) -> Result<LockGuard, StackError> {
 }
 
 #[cfg(not(unix))]
-fn lock_canonical(_repo: &Repository) -> Result<LockGuard, StackError> {
+fn flock_path(_lock_path: PathBuf) -> Result<LockGuard, StackError> {
     Ok(LockGuard)
+}
+
+/// Take `<common-dir>/gh-stack-operation.lock`, which gh-stack >=0.2 holds for a whole command
+/// and acquires before loading state and before the catalog lock. Take it first, always, so
+/// the two processes can't deadlock on opposite orders.
+fn lock_operation(repo: &Repository) -> Result<LockGuard, StackError> {
+    flock_path(repo.commondir().join("gh-stack-operation.lock"))
+}
+
+/// Take `<common-dir>/gh-stack.lock`, the same catalog lock gh-stack takes, so a concurrent
+/// `gh stack` run is excluded while [`register_branch`] rewrites the catalog. Always taken
+/// after [`lock_operation`].
+fn lock_canonical(repo: &Repository) -> Result<LockGuard, StackError> {
+    flock_path(repo.commondir().join("gh-stack.lock"))
 }
 
 /// Read `path` as a whole raw `Value` (no [`GhStackEntry`] parsing, so every top-level field —
 /// `repository`, `id`, `pullRequest`, anything a future gh-stack adds — survives), rejecting
 /// `schemaVersion > 1`. `Ok(None)` for a missing file. A single attempt, no retries: called
-/// only under [`lock_canonical`] during `doctor --fix` or [`register_branch`], not on the hot
+/// only under the locks during `doctor --fix` or [`register_branch`], not on the hot
 /// read path [`read_doc`] serves.
 fn read_raw_doc(path: &Path) -> Result<Option<Value>, StackError> {
     match std::fs::read(path) {
@@ -614,10 +631,13 @@ fn write_canonical_atomic(canonical: &Path, bytes: &[u8]) -> Result<(), StackErr
 ///
 /// `base` is `repo.merge_base(base_branch's tip, branch's tip)` — equal to `base_branch`'s
 /// tip in the normal case, but still correct if `base_branch` moved between worktree creation
-/// and this call. Guarded by [`lock_canonical`], so a concurrent `gh stack` run in any
-/// worktree is genuinely excluded.
+/// and this call. Guarded by [`lock_operation`] then [`lock_canonical`] (upstream's order), so
+/// a concurrent `gh stack` run in any worktree is genuinely excluded. Once both are held, a
+/// present `<common-dir>/gh-stack-migration` journal aborts with
+/// [`StackError::GhStackMigrationPending`]: gh-stack >=0.2 refuses catalog writes mid-migration
+/// and so does workon. Locks release in reverse order on drop.
 ///
-/// The file is read only after the lock is held. No lock-respecting writer (every `gh stack`
+/// The file is read only after both locks are held. No lock-respecting writer (every `gh stack`
 /// invocation, and every other `git-workon` call into this module) can be mid-write once the
 /// lock is ours, so a read-under-lock always sees a complete file — there is nothing to
 /// compare-and-swap against. A pre-lock read would risk observing upstream's non-atomic
@@ -633,7 +653,13 @@ pub fn register_branch(
     let base = repo.merge_base(base_tip, head).unwrap_or(base_tip);
 
     let canonical = canonical_path(repo);
+    let _operation_lock = lock_operation(repo)?;
     let _lock = lock_canonical(repo)?;
+
+    let journal = repo.commondir().join("gh-stack-migration");
+    if journal.exists() {
+        return Err(StackError::GhStackMigrationPending { path: journal });
+    }
 
     let existing = std::fs::read(&canonical).unwrap_or_default();
     let new_bytes = match plan_registered_doc(
@@ -1332,5 +1358,50 @@ mod tests {
             }
             other => panic!("expected GhStackStackInUnlinkedWorktree, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn register_branch_times_out_when_operation_lock_is_held() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .gh_stack(None, 1, "main", &[])
+            .gh_stack_operation_lock_held()
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        match register_branch(repo, "feat-a", "main") {
+            Err(StackError::GhStackLocked { path }) => {
+                assert_eq!(path, repo.commondir().join("gh-stack-operation.lock"));
+            }
+            other => panic!("expected GhStackLocked, got {other:?}"),
+        }
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0).not());
+    }
+
+    #[test]
+    fn register_branch_refuses_while_migration_journal_exists() {
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .branch("feat-a")
+            .gh_stack(None, 1, "main", &[])
+            .gh_stack_migration_journal()
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        match register_branch(repo, "feat-a", "main") {
+            Err(StackError::GhStackMigrationPending { path }) => {
+                assert_eq!(path, repo.commondir().join("gh-stack-migration"));
+            }
+            other => panic!("expected GhStackMigrationPending, got {other:?}"),
+        }
+        repo.assert(predicate::repo::gh_stack_contains_branch(None, "feat-a", 0).not());
     }
 }
