@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.13.2...git-workon-lib-v0.14.0) - 2026-10-06
+
+### Added
+
+- *(lib)* [**breaking**] support mixed Graphite/gh-stack repos ([#101](https://github.com/lettertwo/git-workon/pull/101))
+- [**breaking**] mark merged stack branches ([#100](https://github.com/lettertwo/git-workon/pull/100))
+- *(cli)* prune local branches with no worktree ([#99](https://github.com/lettertwo/git-workon/pull/99))
+
+### Fixed
+
+- *(lib)* honor gh-stack v0.2 operation lock and migration journal ([#107](https://github.com/lettertwo/git-workon/pull/107))
+- *(cli)* doctor removes workon's gh-stack symlinks ([#106](https://github.com/lettertwo/git-workon/pull/106))
+- *(lib)* stop symlinking gh-stack into worktree admin dirs ([#105](https://github.com/lettertwo/git-workon/pull/105))
+
+### Other
+
+- record that gh-stack 0.2 owns the shared catalog ([#108](https://github.com/lettertwo/git-workon/pull/108))
+
 ## [0.13.2](https://github.com/lettertwo/git-workon/compare/git-workon-lib-v0.13.1...git-workon-lib-v0.13.2) - 2026-08-31
 
 ### Fixed
