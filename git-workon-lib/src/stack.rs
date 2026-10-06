@@ -66,7 +66,7 @@ pub enum StackModel {
     /// Graphite (`gt`) manages stacks via `refs/branch-metadata/*`.
     Graphite,
     /// `gh stack` (the `github/gh-stack` extension) manages stacks via a JSON file. See
-    /// `stack/gh_stack.rs`'s module docs for the canonical-file-plus-symlinks model.
+    /// `stack/gh_stack.rs`'s module docs for the shared-catalog model.
     GhStack,
     /// No stack-metadata tool; changesets are inferred purely from git, one per commit in
     /// `upstream..HEAD`. Unlike [`StackModel::Graphite`]/[`StackModel::GhStack`], this carries

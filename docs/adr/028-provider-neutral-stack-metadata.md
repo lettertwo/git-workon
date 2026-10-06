@@ -45,8 +45,7 @@ the implementation; here every call site (`stack.rs`'s `enumerate_stacks`/`curre
 `changeset.rs`'s assembly dispatch, `doctor.rs`'s checks) already matches on `StackModel` and
 picks a concrete provider module by name, because the two providers differ in more than their
 `read_metadata` signature: gh-stack alone has a write path (`register_branch`), a lock
-(`lock_canonical`), and a link/migrate step (`link_worktree`, `migrate_worktree`) that Graphite
-has no equivalent of. Forcing those into a shared trait would mean either a trait with
+(`lock_canonical`), and an operation lock (`lock_operation`) that Graphite has no equivalent of. Forcing those into a shared trait would mean either a trait with
 provider-specific optional methods, or pushing gh-stack-only concepts into Graphite's module. A
 free function per provider plus the shared `StackMetadata` boundary gives the same code reuse
 without either.
@@ -89,17 +88,16 @@ top of the stack, and git's one-worktree-per-branch rule blocks both the new bra
 created). There is no `gh stack` subprocess call that could do this job, so `workon` has to
 write the file.
 
-### 5. One canonical file, symlinked into every worktree
+### 5. One canonical file, shared by every worktree
 
-`<common-dir>/gh-stack` is the one canonical store. `gh-stack` and `gh-stack.lock` are symlinked
-into each worktree's admin dir (`link_worktree`); `gh-stack-rebase-state` and
-`gh-stack-modify-state` stay per-worktree, since they describe an in-progress operation in one
-working tree, and sharing them would make every other worktree believe it is mid-rebase and
-block with upstream's exit 7. `workon new` plants the links after `add_worktree` succeeds, gated
-on `effective_model == StackModel::GhStack && !self.no_stack`; `doctor --fix` migrates
-pre-existing per-worktree files via `migrate_worktree`; the union read in
-`gh_stack::read_metadata` survives as a degraded fallback for whatever isn't yet linked. See
-"The shared canonical file" below for why the symlink approach works at all.
+`<common-dir>/gh-stack` is the one canonical store, and `workon` reads and registers branches
+there. `gh-stack-rebase-state` and `gh-stack-modify-state` stay per-worktree, since they describe
+an in-progress operation in one working tree, and sharing them would make every other worktree
+believe it is mid-rebase and block with upstream's exit 7. This decision originally had `workon`
+symlink `gh-stack` and `gh-stack.lock` into each worktree's admin dir; gh-stack 0.2 made that
+unnecessary and then incompatible. See "Update (2026-10)" below. The union read in
+`gh_stack::read_metadata` survives as a fallback for gh-stack <0.2 and for per-worktree files
+that upstream has not migrated yet.
 
 ## Detection: Graphite wins
 
@@ -114,10 +112,11 @@ tried the other tool once in one worktree. The escape hatch is an explicit
 when both artifacts are present so the user knows to pin the config if `auto` picked the wrong
 one.
 
-## The shared canonical file
+## The shared canonical file (symlink approach, superseded)
 
-Two mechanics in the upstream Go source make the symlink approach work, both read directly out
-of `github/gh-stack`:
+This section records how the symlink approach `workon` shipped before gh-stack 0.2 worked, and
+why. `workon` no longer plants symlinks (see "Update (2026-10)"). Two mechanics in the gh-stack
+0.1 Go source made it work, both read directly out of `github/gh-stack`:
 
 ```go
 // internal/stack/stack.go:440   -- Save
@@ -139,29 +138,24 @@ Two properties fall out of this and matter for correctness:
 - A dangling symlink self-heals. `open()` with `O_CREAT` through a symlink to a path that does
   not yet exist creates the target, so planting links before any stack exists is safe. The
   first `gh stack init` run in any linked worktree creates the canonical file, and `Load` on a
-  still-dangling link gets `ENOENT` and correctly reports "no stack file." There is no ordering
-  constraint on when `link_worktree` runs relative to when the user first initializes gh-stack.
-- Symlinks are self-cleaning. `git worktree remove`/`prune` deletes the admin dir along with
-  whatever symlinks live in it, so there is no separate cleanup step for `workon prune` to own.
+  still-dangling link gets `ENOENT` and correctly reports "no stack file." There was no ordering
+  constraint on when the links were planted relative to when the user first initialized gh-stack.
+- Symlinks were self-cleaning. `git worktree remove`/`prune` deletes the admin dir along with
+  whatever symlinks live in it, so `workon prune` had no cleanup step to own.
 
-`plant_link` (`gh_stack.rs`) uses a relative target (`../../gh-stack`) so the links survive the
-repository being moved on disk.
+The links used a relative target (`../../gh-stack`) so they survived the repository being moved
+on disk.
 
-## The write-in-place risk and the degraded union fallback
+## The union fallback for unmigrated files
 
-Write-in-place is an implementation detail of upstream's `Save`, not a promised contract. If
-gh-stack ever switches to temp-and-rename (a correctness improvement they would be right to
-make, since it is what `register_branch`'s own write path does), the rename replaces the symlink
-in that worktree with a real file, and that worktree's writes stop reaching canonical from that
-point on.
-
-`gh_stack::read_metadata` guards against this by reading canonical first, then unioning in
-`unlinked_files(repo)` (worktree admin-dir files that are not symlinks resolving to canonical) in
-directory-name order. In a healthy, fully-linked repository `unlinked_files` is empty and the
-union never runs; it exists purely so that if a worktree ever drifts out of the symlinked state,
-nothing written there goes invisible. `doctor`'s `GhStackWorktreeNotLinked` check names every
-such worktree and, under `--fix`, calls `link_worktree` (path missing) or `migrate_worktree`
-(path holds a real file) to bring it back in line.
+`gh_stack::read_metadata` reads canonical first, then unions in `unlinked_files(repo)` (worktree
+admin-dir `gh-stack` files that are real files rather than symlinks resolving to canonical) in
+directory-name order. Under gh-stack 0.2 such files are legacy: upstream migrates each one into
+the catalog on the next `gh stack` command and keeps the original as
+`gh-stack.pre-worktree-migration`. Until that command runs, and for users still on gh-stack <0.2
+(which writes per-worktree files), the union keeps anything written there visible. `doctor`'s
+`GhStackLegacyWorktreeFile` check names every such worktree. It is not fixable, since the
+migration belongs to upstream.
 
 ## First-wins dedupe, not field-level merge
 
@@ -172,8 +166,8 @@ identity is discarded wholesale, never merged field-by-field. Merging two disagr
 `branches` arrays has no defined semantics, since an insertion in one array is indistinguishable
 from a deletion in the other, so a field-level merge could synthesize a stack that existed in
 neither worktree's file. `doctor`'s `GhStackDivergentStacks` check names any stack number that
-appears in more than one source, which is only reachable in this degraded, unlinked-worktree
-path.
+appears in more than one source, which is only reachable on this fallback path, while
+per-worktree files still exist.
 
 ## Truncated reads are tolerated, contrary to Graphite's rule
 
@@ -198,10 +192,11 @@ or `0` is treated as `1`, matching Go's zero-value behavior for an unset int fie
 
 ## register_branch's read-under-lock, and the per-worktree-write asymmetry it closes
 
-`register_branch` (`gh_stack.rs`) takes `<common-dir>/gh-stack.lock` via `flock(LOCK_EX |
-LOCK_NB)` before writing, retried every 100ms up to 5s. Because every worktree's lock path
-symlinks to the same file (decision 5), this genuinely excludes a concurrent `gh stack` process
-running in any worktree, not just the one `workon new` is writing from.
+`register_branch` (`gh_stack.rs`) takes `<common-dir>/gh-stack-operation.lock`, then
+`<common-dir>/gh-stack.lock`, each via `flock(LOCK_EX | LOCK_NB)` retried every 100ms up to 5s,
+before writing. Both are the locks gh-stack 0.2 takes, in the order it takes them, so this
+excludes a concurrent `gh stack` process running in any worktree, not just the one `workon new`
+is writing from.
 
 I first paired the lock with a compare-and-swap on raw file bytes: read the canonical file once
 before taking the lock, compare that snapshot against a fresh read taken right after the lock
@@ -219,10 +214,10 @@ writer, every `gh stack` invocation and every other `git-workon` call into this 
 mid-write once the lock is ours, so that read always sees a complete file. There is nothing left
 to compare against.
 
-Decision 5 removes an asymmetry that existed under upstream's own per-worktree layout: `view`,
+Upstream's 0.1 per-worktree layout had an asymmetry that gh-stack 0.2's shared catalog removes: `view`,
 `up`, `down`, `top`, `bottom` worked only in the worktree holding the file that happened to have
 been written to, and a `workon new` (or a plain `gh stack add`) run from a different worktree in
-the same stack would not be visible there. With one canonical file, every worktree in the stack
+the same stack would not be visible there. With one shared catalog, every worktree in the stack
 sees the same state regardless of which worktree wrote it.
 
 ## Consequences
@@ -233,11 +228,12 @@ sees the same state regardless of which worktree wrote it.
 - `list --json` gains an additive `"number"` field per stack object; `diffs`, `checkouts`, and
   `parents` are unchanged.
 - New `StackError` variants: `GhStackSchemaUnsupported`, `GhStackParseFailed`, `GhStackLocked`,
-  `GhStackWriteFailed`, `GhStackLinkFailed`, `GhStackNoStackForBase`, and `DeletedStackNode`
+  `GhStackWriteFailed`, `GhStackNoStackForBase`, and `DeletedStackNode`
   (the provider-neutral twin of `DeletedBranchNode`). `Resolution::DeletedNode`
   carries no model, so `route_branch_to_command` in `git-workon/src/main.rs` now selects between
   the two based on the effective `StackModel` (see ADR-024).
-- New `doctor` checks: `GhStackWorktreeNotLinked` (warn, the `--fix` target),
+- New `doctor` checks: `GhStackWorktreeSymlinked` (error, the `--fix` target),
+  `GhStackLegacyWorktreeFile` (warn), `GhStackRecoveryPending` (warn),
   `GhStackExtensionNotFound` (warn, only when the effective model is `GhStack`, unlike the
   unconditional Graphite equivalent), `GhStackNotInitialized`, `GhStackFileUnreadable` (fail),
   `GhStackDivergentStacks` (warn), and `BothStackToolsDetected` (warn).
@@ -251,6 +247,27 @@ sees the same state regardless of which worktree wrote it.
   as a dependency but no `serde` derive crate, and the write path in particular needs the raw
   `Value` round-trip to preserve `id` and `pullRequest` on stack entries workon itself never
   touches.
+
+## Update (2026-10)
+
+gh-stack [v0.2.0](https://github.com/github/gh-stack/releases/tag/v0.2.0) moved stack tracking
+into one shared catalog at `<common-dir>/gh-stack`, the same file and `schemaVersion: 1` that
+`workon` had been maintaining itself. Upstream writes it with temp-and-rename, takes
+`<common-dir>/gh-stack-operation.lock` before the catalog lock `<common-dir>/gh-stack.lock`, and
+refuses to change the catalog while `<common-dir>/gh-stack-migration` exists. On every command it
+also migrates each real `worktrees/<name>/gh-stack` file into the catalog and keeps the original
+as `gh-stack.pre-worktree-migration`. That migration rejects anything that is not a regular
+file, so the symlinks `workon` planted made every `gh stack` command fail with `migration source
+... is not a regular file`.
+
+`workon` now only reads and registers. It plants no symlinks, and the `link_worktree` and
+`migrate_worktree` steps and `GhStackLinkFailed` are gone. `register_branch` follows upstream's
+locking (operation lock, then catalog lock) and returns `StackError::GhStackMigrationPending`
+while the journal exists. `doctor` reports `GhStackWorktreeSymlinked` as an error and `--fix`
+removes only the `gh-stack`/`gh-stack.lock` symlinks, never a regular file. A real legacy file
+(`GhStackLegacyWorktreeFile`) and a pending rebase/modify record (`GhStackRecoveryPending`) are
+warnings that `--fix` leaves alone, since upstream owns the migration and the user owns the
+recovery. The union read stays for gh-stack <0.2, which still writes per-worktree files.
 
 ## References
 
