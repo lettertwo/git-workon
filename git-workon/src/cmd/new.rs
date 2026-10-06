@@ -57,8 +57,8 @@ use crate::hooks::execute_post_create_hooks;
 use crate::output;
 use workon::{
     add_worktree, copy_untracked, current_stack, current_worktree, get_repo, get_worktrees,
-    graphite_trunk, link_worktree, register_branch, resolve_remote_tracking, workon_root,
-    BranchType, CopyOptions, RemoteResolution, StackModel, WorkonConfig, WorktreeDescriptor,
+    graphite_trunk, register_branch, resolve_remote_tracking, workon_root, BranchType, CopyOptions,
+    RemoteResolution, StackModel, WorkonConfig, WorktreeDescriptor,
 };
 
 use super::Run;
@@ -364,22 +364,11 @@ impl Run for New {
                 }
             }
             StackModel::GhStack => {
-                // Plant the gh-stack canonical-file symlinks for the new worktree first.
-                // Unlike `gt track`, there's nothing to run inside another process: this is
-                // pure filesystem plumbing that makes gh-stack's own writes visible from
-                // every worktree, so it isn't gated on `branch_pre_existed`.
-                if !self.no_stack {
-                    if let Some(name) = worktree.name() {
-                        if let Err(e) = link_worktree(&repo, name) {
-                            output::warn(&format!("gh-stack link failed: {}", e));
-                        }
-                    }
-                }
-
-                // Register the branch in the canonical file, after the symlinks above are
-                // in place. Skipped (not warned) when there's no known base branch — there
-                // is no stack to append onto without one.
-                if !self.no_stack && !branch_pre_existed && config.stack_auto_track(None)? {
+                // Register the branch in the canonical file. Skipped (not warned) when
+                // there's no known base branch — there is no stack to append onto without one.
+                let should_register =
+                    !self.no_stack && !branch_pre_existed && config.stack_auto_track(None)?;
+                if should_register {
                     if let Some(base) = base_branch.as_deref() {
                         if let Err(e) = register_branch(&repo, &effective_branch, base) {
                             output::warn(&format!("gh-stack register failed: {}", e));

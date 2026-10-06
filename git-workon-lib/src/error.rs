@@ -307,10 +307,6 @@ pub enum StackError {
     #[diagnostic(code(workon::stack::gh_stack_write_failed))]
     GhStackWriteFailed { path: PathBuf, message: String },
 
-    #[error("Failed to link gh-stack file '{}': {message}", path.display())]
-    #[diagnostic(code(workon::stack::gh_stack_link_failed))]
-    GhStackLinkFailed { path: PathBuf, message: String },
-
     #[error("No gh-stack stack ends at branch '{base}'")]
     #[diagnostic(
         code(workon::stack::gh_stack_no_stack_for_base),
@@ -325,7 +321,7 @@ pub enum StackError {
         code(workon::stack::gh_stack_stack_in_unlinked_worktree),
         help(
             "'{base}' may be tracked in an unlinked worktree's gh-stack file. \
-             Run `workon doctor --fix` to migrate it into the canonical store, then retry."
+             Run any `gh stack` command (gh-stack >=0.2 migrates it automatically), then retry."
         )
     )]
     GhStackStackInUnlinkedWorktree { base: String },
