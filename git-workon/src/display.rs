@@ -271,6 +271,10 @@ pub struct TreeNode {
     /// trunk root itself — `build_tree` merges every stack on one trunk into a single root
     /// node, so the trunk has no single number to show).
     pub stack_number: Option<u64>,
+    /// Whether this branch's PR has merged (`Stack::merged`). Only ever `true` on a node that
+    /// also `has_worktree()` — a merged branch with no worktree is dropped from the tree
+    /// entirely in `build_children`, its live children reparented up.
+    pub merged: bool,
 }
 
 impl TreeNode {
@@ -314,6 +318,7 @@ pub fn build_tree(
     // populated for descendants further down the tree, so a plain lookup at any depth in
     // `build_children` naturally only matches root children — see `TreeNode::stack_number`.
     let mut direct_child_numbers: HashMap<String, u64> = HashMap::new();
+    let mut merged_branches: HashSet<String> = HashSet::new();
     for group in groups {
         let rev = per_trunk_reverse
             .entry(group.stack.trunk.clone())
@@ -328,6 +333,7 @@ pub fn build_tree(
                 }
             }
         }
+        merged_branches.extend(group.stack.merged.iter().cloned());
     }
     // Sort children for determinism
     for rev_map in per_trunk_reverse.values_mut() {
@@ -372,6 +378,7 @@ pub fn build_tree(
             &mut rows,
             &mut visited,
             &direct_child_numbers,
+            &merged_branches,
         );
 
         let subtree_activity = subtree_max(trunk_activity, &children);
@@ -384,6 +391,7 @@ pub fn build_tree(
             subtree_size,
             children,
             stack_number: None, // never on the trunk root — see `TreeNode::stack_number`.
+            merged: false,      // a trunk is never itself a stack diff.
         });
     }
 
@@ -414,6 +422,7 @@ pub fn build_tree(
             row: Some(row),
             children: vec![],
             stack_number: None, // ungrouped: not part of a numbered stack.
+            merged: false,      // ungrouped: not part of any tracked stack.
         });
     }
 
@@ -452,6 +461,7 @@ fn build_children(
     rows: &mut HashMap<usize, WorktreeDisplayRow>,
     visited: &mut HashSet<String>,
     direct_child_numbers: &HashMap<String, u64>,
+    merged_branches: &HashSet<String>,
 ) -> Vec<TreeNode> {
     let mut nodes = Vec::new();
     for branch in branch_names {
@@ -461,6 +471,7 @@ fn build_children(
         let idx = branch_to_idx.get(branch).copied();
         let row = idx.and_then(|i| rows.remove(&i));
         let epoch = row.as_ref().and_then(|r| r.activity_epoch);
+        let merged = merged_branches.contains(branch);
 
         let grandchildren_names = rev_map.get(branch.as_str()).cloned().unwrap_or_default();
         let children = build_children(
@@ -470,7 +481,17 @@ fn build_children(
             rows,
             visited,
             direct_child_numbers,
+            merged_branches,
         );
+
+        // A merged branch with no worktree has nothing left to show: fold its children up as
+        // if they were direct children of this node's own parent, instead of nesting them
+        // under a node that never renders.
+        if merged && row.is_none() {
+            nodes.extend(children);
+            continue;
+        }
+
         let subtree_activity = subtree_max(epoch, &children);
         let subtree_size = subtree_size(&children);
 
@@ -483,6 +504,7 @@ fn build_children(
             // Only true direct children of a trunk are keys here (see `build_tree`), so a
             // plain lookup at any recursion depth naturally yields `None` past the root.
             stack_number: direct_child_numbers.get(branch).copied(),
+            merged,
         });
     }
     nodes
@@ -549,6 +571,7 @@ fn lane_content_width(own_lane: usize, closing_count: usize, node: &TreeNode) ->
         + stack_number_suffix(node.stack_number)
             .map(|s| s.width())
             .unwrap_or(0)
+        + merged_suffix(node.merged).map(|s| s.width()).unwrap_or(0)
 }
 
 /// The plain (unstyled) `" #N"` suffix for a stack number, or `None` when there isn't one.
@@ -556,6 +579,11 @@ fn lane_content_width(own_lane: usize, closing_count: usize, node: &TreeNode) ->
 /// [`style::dim`]'s color-state side effects.
 fn stack_number_suffix(number: Option<u64>) -> Option<String> {
     number.map(|n| format!(" #{n}"))
+}
+
+/// The plain (unstyled) `" merged"` suffix, or `None` when the branch isn't merged.
+fn merged_suffix(merged: bool) -> Option<String> {
+    merged.then(|| " merged".to_string())
 }
 
 /// Render the gutter string for a lane row.
@@ -792,6 +820,9 @@ pub fn format_tree_lines(
         // `style::dim`), set only on a direct child of a trunk — see `TreeNode::stack_number`.
         let number_ann = stack_number_suffix(node.stack_number).map(|s| style::dim(&s));
 
+        // Merged annotation: dim ` merged`, right after the number in the same slot/style.
+        let merged_ann = merged_suffix(node.merged).map(|s| style::dim(&s));
+
         // Padding to align the indicator column.
         let this_content_w = lane_content_width(lr.own_lane, lr.closing_count, node);
         let content_pad = max_content_w.saturating_sub(this_content_w);
@@ -827,13 +858,15 @@ pub fn format_tree_lines(
         // Assemble line: [gutter] [label][path][number][pad]  [indicators][ind_pad]  [activity][here]
         let path_str = path_ann.unwrap_or_default();
         let number_str = number_ann.unwrap_or_default();
+        let merged_str = merged_ann.unwrap_or_default();
         let line = if node.row.is_some() {
             format!(
-                "{} {}{}{}{}  {}{}  {}{}",
+                "{} {}{}{}{}{}  {}{}  {}{}",
                 gutter,
                 label,
                 path_str,
                 number_str,
+                merged_str,
                 " ".repeat(content_pad),
                 ind_str,
                 " ".repeat(ind_pad),
@@ -990,12 +1023,16 @@ pub fn render_tree(forest: &[TreeNode], query: &str, matcher: &SkimMatcherV2) ->
 
         // No `← here` marker: the picker cursor serves that role.
         let path_str = path_ann.unwrap_or_default();
+        let merged_str = merged_suffix(node.merged)
+            .map(|s| style::dim(&s))
+            .unwrap_or_default();
         let line = if node.row.is_some() {
             format!(
-                "{} {}{}{}  {}{}  {}",
+                "{} {}{}{}{}  {}{}  {}",
                 gutter,
                 label,
                 path_str,
+                merged_str,
                 " ".repeat(content_pad),
                 ind_str,
                 " ".repeat(ind_pad),
@@ -1383,6 +1420,7 @@ mod tests {
             subtree_size: 1,
             children: vec![],
             stack_number: None,
+            merged: false,
         }
     }
 
@@ -1399,6 +1437,7 @@ mod tests {
             subtree_size: 1,
             children: vec![],
             stack_number: None,
+            merged: false,
         }
     }
 
@@ -1708,6 +1747,7 @@ mod tests {
             subtree_size: 1,
             children: vec![],
             stack_number: None,
+            merged: false,
         }
     }
 
@@ -1741,6 +1781,7 @@ mod tests {
                     .map(|(c, p)| (c.to_string(), p.to_string()))
                     .collect(),
                 number: None,
+                merged: HashSet::new(),
             },
             members: vec![],
         }
@@ -1826,6 +1867,85 @@ mod tests {
         assert_eq!(find_node(&forest, "top").stack_number, None);
     }
 
+    /// Like [`find_node`], but `None` instead of panicking — for asserting a branch is absent.
+    fn find_node_opt<'a>(forest: &'a [TreeNode], branch: &str) -> Option<&'a TreeNode> {
+        fn find<'a>(nodes: &'a [TreeNode], branch: &str) -> Option<&'a TreeNode> {
+            for node in nodes {
+                if node.branch == branch {
+                    return Some(node);
+                }
+                if let Some(found) = find(&node.children, branch) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        find(forest, branch)
+    }
+
+    #[test]
+    fn build_tree_drops_merged_metadata_only_node_and_reparents_its_child() {
+        // "mid" is merged and no worktree checks it out (`all_worktrees` is empty), so it must
+        // be dropped entirely and its child "top" reparented under "base" instead of vanishing
+        // with it.
+        let mut group = meta_group(
+            &["base", "mid", "top"],
+            &[("base", "main"), ("mid", "base"), ("top", "mid")],
+        );
+        group.stack.merged = HashSet::from(["mid".to_string()]);
+        let groups = vec![group];
+        let forest = build_tree(&[], &groups, &[], Path::new("/repo"), Path::new("/repo"));
+
+        assert!(
+            find_node_opt(&forest, "mid").is_none(),
+            "merged metadata-only node must be dropped"
+        );
+        let base = find_node(&forest, "base");
+        assert!(
+            base.children.iter().any(|c| c.branch == "top"),
+            "top must be reparented under base once mid is dropped, got children: {:?}",
+            base.children.iter().map(|c| &c.branch).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn build_children_marks_merged_node_with_a_worktree_but_keeps_it() {
+        let mut branch_to_idx = HashMap::new();
+        branch_to_idx.insert("base".to_string(), 0usize);
+        let mut rows = HashMap::new();
+        rows.insert(
+            0,
+            WorktreeDisplayRow {
+                is_active: false,
+                dir_name: "base".to_string(),
+                branch_annotation: None,
+                indicators: vec![],
+                last_activity: String::new(),
+                activity_epoch: None,
+            },
+        );
+        let mut visited = HashSet::new();
+        let merged_branches = HashSet::from(["base".to_string()]);
+
+        let nodes = build_children(
+            &["base".to_string()],
+            &HashMap::new(),
+            &branch_to_idx,
+            &mut rows,
+            &mut visited,
+            &HashMap::new(),
+            &merged_branches,
+        );
+
+        assert_eq!(
+            nodes.len(),
+            1,
+            "a merged node with a worktree still renders"
+        );
+        assert!(nodes[0].has_worktree());
+        assert!(nodes[0].merged);
+    }
+
     #[test]
     fn format_tree_lines_renders_dim_stack_number_suffix() {
         no_color();
@@ -1837,6 +1957,42 @@ mod tests {
             lines[0].ends_with("base #12"),
             "expected a trailing ' #12' suffix (plain text under NO_COLOR), got: {:?}",
             lines[0]
+        );
+    }
+
+    #[test]
+    fn format_tree_lines_renders_dim_merged_suffix_on_worktree_row() {
+        no_color();
+        let mut root = leaf("base", false);
+        root.merged = true;
+        let (lines, _) = format_tree_lines(&[root], false);
+        assert_eq!(lines.len(), 1);
+        assert!(
+            lines[0].contains("base merged"),
+            "expected a ' merged' suffix (plain text under NO_COLOR) right after the label, got: {:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn format_tree_lines_indicator_column_aligned_across_lanes_with_merged_suffix() {
+        no_color();
+        let s1 = leaf_with_data("s1", false, &["*"], "2h ago");
+        let shared = leaf_with_data("shared", false, &[], "3d ago");
+        let mut root = leaf_with_data("main", true, &["↑"], "1d ago");
+        root.merged = true;
+        set_children(&mut root, vec![s1, shared]);
+        let forest = vec![root];
+
+        let (lines, _) = format_tree_lines(&forest, true);
+        assert_eq!(lines.len(), 3, "expected 3 rows");
+
+        let s1_ind_col = display_col_of(&lines[0], "*", "s1");
+        let main_ind_col = display_col_of(&lines[2], "↑", "main");
+        assert_eq!(
+            s1_ind_col, main_ind_col,
+            "indicator column must be aligned despite the merged suffix:\ns1:   {:?}\nmain: {:?}",
+            lines[0], lines[2]
         );
     }
 
