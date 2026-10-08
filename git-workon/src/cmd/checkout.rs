@@ -14,7 +14,9 @@
 //! 4. On "Leave": creates a labeled stash for the current branch, retries checkout.
 //! 5. After a successful HEAD move, attempts to restore any stash previously left
 //!    for `T` in `W` (restore-on-return, gated on `!no_stack`).
-//! 6. Returns `Ok(Some(host_wt))` so `main` prints `W`'s path and the shell `cd`s there.
+//! 6. When the host sits at `T`'s own path (T's hijacked home), prints a notice that the
+//!    branch it evicted no longer has a worktree.
+//! 7. Returns `Ok(Some(host_wt))` so `main` prints `W`'s path and the shell `cd`s there.
 
 use dialoguer::Confirm;
 use miette::{bail, IntoDiagnostic, Report, Result, WrapErr};
@@ -28,6 +30,9 @@ impl Run for Checkout {
     fn run(&self) -> Result<Option<WorktreeDescriptor>> {
         let repo = workon::get_repo(None).into_diagnostic()?;
         let host_wt = workon::find_worktree(&repo, &self.host_worktree).into_diagnostic()?;
+
+        // Captured before the move for the eviction notice below.
+        let prev_branch = host_wt.branch().into_diagnostic()?;
 
         // One handle serves the whole flow: checkout, shelve, retry, restore.
         let mut wt_repo = git2::Repository::open(host_wt.path())
@@ -101,6 +106,19 @@ impl Run for Checkout {
                     ));
                 }
                 workon::StashRestore::NotFound => {}
+            }
+        }
+
+        // Self-home: the host sits at T's own path, so the branch it held lost its
+        // worktree. Rule 2/3 moves are same-stack motion and stay silent.
+        if let Some(prev) = prev_branch {
+            if prev != self.branch
+                && workon::relative_worktree_path(&repo, host_wt.path()).as_deref()
+                    == Some(self.branch.as_str())
+            {
+                output::info(&format!(
+                    "'{prev}' no longer has a worktree; run 'workon {prev}' to create one"
+                ));
             }
         }
 

@@ -1006,3 +1006,43 @@ fn find_dirty_filter_in_stack_repo_bails_when_nothing_matches(
 
     Ok(())
 }
+/// `workon main` while the `main` worktree has `feat` checked out returns `main` to its
+/// home worktree (no `name_conflict`), and tells the user `feat` lost its worktree.
+#[test]
+fn route_hijacked_trunk_worktree_checks_out_in_place() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .branch("feat")
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let main_repo = git2::Repository::open(&main_path)?;
+    workon::checkout_branch_in_worktree(&main_repo, "feat")?;
+    main_repo.assert(predicate::repo::head_matches("feat"));
+
+    let output = cargo_bin_cmd!("git-workon")
+        .current_dir(&main_path)
+        .env("NO_COLOR", "1")
+        .env_remove("FORCE_COLOR")
+        .arg("main")
+        .output()?;
+    let stdout = String::from_utf8(output.stdout)?;
+    let stderr = String::from_utf8(output.stderr)?;
+
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stdout.trim_end().ends_with("main"),
+        "expected main worktree path in stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("'feat' no longer has a worktree"),
+        "expected eviction notice naming feat: {stderr}"
+    );
+
+    let main_repo = git2::Repository::open(&main_path)?;
+    main_repo.assert(predicate::repo::head_matches("main"));
+
+    Ok(())
+}

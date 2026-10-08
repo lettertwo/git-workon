@@ -402,3 +402,176 @@ fn rule3_does_not_use_trunk_as_host() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+// ── self-home: a worktree at T's own path holds another branch → Checkout ────
+
+/// Move the worktree named `wt_name` onto `branch` with an in-place checkout.
+fn switch_worktree(fixture: &Fixture, wt_name: &str, branch: &str) -> Result<(), Box<dyn Error>> {
+    let repo = fixture.repo()?;
+    let wt = workon::find_worktree(repo, wt_name)?;
+    let wt_repo = git2::Repository::open(wt.path())?;
+    assert_eq!(
+        workon::checkout_branch_in_worktree(&wt_repo, branch)?,
+        workon::CheckoutOutcome::Clean
+    );
+    Ok(())
+}
+
+#[test]
+fn self_home_trunk_worktree_on_other_branch_checks_out_graphite() -> Result<(), Box<dyn Error>> {
+    // `main` worktree was hijacked onto `feat` (e.g. by `gt create`). Materializing
+    // `main` would collide with the directory, so it must return to its home.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .branch("feat")
+        .graphite_config(&["main"])
+        .branch_metadata("feat", "main")
+        .build()?;
+    switch_worktree(&fixture, "main", "feat")?;
+
+    let repo = fixture.repo()?;
+    assert_eq!(
+        resolve_action(repo, "main", StackModel::Graphite),
+        Resolution::Checkout {
+            host: "main".to_string()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn self_home_trunk_worktree_on_other_branch_checks_out_no_stack() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .branch("feat")
+        .build()?;
+    switch_worktree(&fixture, "main", "feat")?;
+
+    let repo = fixture.repo()?;
+    assert_eq!(
+        resolve_action(repo, "main", StackModel::None),
+        Resolution::Checkout {
+            host: "main".to_string()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn self_home_non_trunk_checks_out_no_stack() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .branch("other")
+        .build()?;
+    switch_worktree(&fixture, "feat-a", "other")?;
+
+    let repo = fixture.repo()?;
+    assert_eq!(
+        resolve_action(repo, "feat-a", StackModel::None),
+        Resolution::Checkout {
+            host: "feat-a".to_string()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn self_home_skipped_when_branch_deleted() -> Result<(), Box<dyn Error>> {
+    // Worktree feat-a moved to `other`, then the feat-a branch was deleted. A
+    // checkout would fail, so resolution falls through to NotFound and Find's
+    // name match navigates to the worktree.
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .worktree("feat-a")
+        .branch("other")
+        .build()?;
+    switch_worktree(&fixture, "feat-a", "other")?;
+
+    let repo = fixture.repo()?;
+    repo.find_branch("feat-a", git2::BranchType::Local)?
+        .delete()?;
+    assert_eq!(
+        resolve_action(repo, "feat-a", StackModel::None),
+        Resolution::NotFound
+    );
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn self_home_beats_rule2_same_stack_checkout() -> Result<(), Box<dyn Error>> {
+    // Stack a1 -> a2 -> a3. Worktree a1 holds a3; cwd is worktree a2 on a2.
+    // `workon a1` must restore a1's home, not check a1 out into a2 (rule 2).
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("a1")
+        .worktree("a2")
+        .branch("a3")
+        .graphite_config(&["main"])
+        .branch_metadata("a1", "main")
+        .branch_metadata("a2", "a1")
+        .branch_metadata("a3", "a2")
+        .build()?;
+    switch_worktree(&fixture, "a1", "a3")?;
+
+    let a2_path = fixture.root()?.path().join("a2");
+    let saved_cwd = std::env::current_dir()?;
+    std::env::set_current_dir(&a2_path)?;
+
+    let result = (|| -> Result<Resolution, Box<dyn Error>> {
+        let repo = fixture.repo()?;
+        Ok(resolve_action(repo, "a1", StackModel::Graphite))
+    })();
+
+    std::env::set_current_dir(saved_cwd)?;
+
+    assert_eq!(
+        result?,
+        Resolution::Checkout {
+            host: "a1".to_string()
+        }
+    );
+    Ok(())
+}
+
+#[test]
+fn self_home_slash_branch_uses_encoded_worktree_name() -> Result<(), Box<dyn Error>> {
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .worktree("main")
+        .branch("other")
+        .build()?;
+
+    // The fixture builder can't create namespaced worktrees, so go through the library.
+    let repo = fixture.repo()?;
+    let wt = workon::add_worktree(
+        repo,
+        "feature/x",
+        None,
+        workon::BranchType::Orphan,
+        None,
+        false,
+    )?;
+    let host = wt.name().expect("worktree has a name").to_string();
+    let wt_repo = git2::Repository::open(wt.path())?;
+    assert_eq!(
+        workon::checkout_branch_in_worktree(&wt_repo, "other")?,
+        workon::CheckoutOutcome::Clean
+    );
+
+    assert_eq!(
+        resolve_action(repo, "feature/x", StackModel::None),
+        Resolution::Checkout { host }
+    );
+    Ok(())
+}

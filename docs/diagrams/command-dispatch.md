@@ -20,7 +20,9 @@ flowchart TD
 
     IS_PR -->|no| WT_EXISTS["worktree already\nexists for name?"]
     WT_EXISTS -->|yes| ROUTE_FIND2["route → Find(name)"]
-    WT_EXISTS -->|no| BRANCH_EXISTS["local or remote\nbranch exists?"]
+    WT_EXISTS -->|no| SELF_HOME["worktree at name's path\nwith another branch\nchecked out?"]
+    SELF_HOME -->|yes| ROUTE_CHECKOUT["route → Checkout\n(return name to its home)"]
+    SELF_HOME -->|no| BRANCH_EXISTS["local or remote\nbranch exists?"]
     BRANCH_EXISTS -->|yes| ROUTE_NEW_BR["route → New\n(auto-attach branch)"]
     BRANCH_EXISTS -->|no| DELETED_NODE_CHECK["stack metadata\nexists for name?"]
     DELETED_NODE_CHECK -->|yes| ERROR_DELETED["error: DeletedBranchNode\n(points at gt)"]
@@ -31,6 +33,7 @@ flowchart TD
     ROUTE_FIND2 --> JSON_PROP
     ROUTE_FIND3 --> JSON_PROP
     ROUTE_FIND4 --> JSON_PROP
+    ROUTE_CHECKOUT --> JSON_PROP
     ROUTE_NEW_PR --> JSON_PROP
     ROUTE_NEW_BR --> JSON_PROP
     ERROR_DELETED --> MIETTE
@@ -65,9 +68,10 @@ flowchart TD
 `route_branch_to_command()` in `main.rs` calls `workon::resolve_action()`:
 
 1. Check if a worktree already exists for the name — `Navigate` → `None` (let `Find` handle it)
-2. Check for a local or remote tracking branch — `Materialize` → `New` (auto-attach)
-3. Check if the name exists in stack metadata with no local branch — `DeletedNode` → structured error (`StackError::DeletedBranchNode`, points at `gt`)
-4. Otherwise `NotFound` → `None` → `Find` (will error: not found)
+2. Check for a worktree at the name's own path with another branch checked out (self-home) — `Checkout` → `Checkout` in that worktree, under every stack model
+3. Check for a local or remote tracking branch — `Materialize` → `New` (auto-attach)
+4. Check if the name exists in stack metadata with no local branch — `DeletedNode` → structured error (`StackError::DeletedBranchNode`, points at `gt`)
+5. Otherwise `NotFound` → `None` → `Find` (will error: not found)
 
 ## JSON propagation details
 
