@@ -32,8 +32,9 @@ worktree-per-branch behavior.
 Evaluated in order; tie-free by construction:
 
 1. **T has its own worktree** → navigate. (Must be first: git's lock forbids checking out
-   T anywhere else while it is live in its own worktree. This subsumes the trunk case —
-   `main` lives in the `main` worktree, so `workon main` always jumps there.)
+   T anywhere else while it is live in its own worktree. This subsumes the trunk case
+   when `main` is checked out in the `main` worktree; if that worktree has another branch
+   checked out, the self-home rule below returns `main` to it.)
 2. **The current worktree's branch shares T's stack** → checkout T in place (the current
    worktree is the stack's home).
 3. **The deepest non-trunk ancestor of T has a worktree** → navigate there, then checkout
@@ -41,6 +42,20 @@ Evaluated in order; tie-free by construction:
    branching-stack tie-break is reachable. The trunk worktree is never a checkout host.)
 4. **Otherwise** → materialize (auto-attach for an existing branch; new branch / error if
    nothing matches).
+
+**Update (self-home):** rule 3 is "nearest ancestor-or-self". If a worktree sits at the path
+`New` would create for T (`<root>/<T>`) and has a different branch checked out (typically
+the trunk worktree after `gt create` or `git switch` inside it), `workon T` checks T out in
+place there instead of falling to materialize, which would collide with that directory
+(`name_conflict`). "Self" is matched by root-relative path (`relative_worktree_path`), not
+`find_worktree`, which also matches branch and admin names. The check runs right after
+rule 1 and before rule 2, so T's own home wins over a same-stack checkout in the cwd, and
+it runs under every `StackModel`, including `None`. The trunk exclusion applies to the
+ancestor walk only: self-home for T = trunk restores the trunk worktree. Self-home
+requires a local branch T; without one the checkout would fail, so resolution falls
+through and `find` navigates to the worktree by name. The checkout
+command prints a notice that the evicted branch no longer has a worktree and that
+`workon <branch>` creates one.
 
 ### Guard-rail invariant
 
@@ -120,9 +135,10 @@ the point it turns the resolution into an error.
 
 ## Non-stack degradation
 
-Under `--no-stack` or `StackModel::None`, every branch is a stack-of-one: rules 2–3 never
-fire, and resolution collapses to today's navigate-or-materialize (worktree-per-branch)
-behavior with no behavior change.
+Under `--no-stack` or `StackModel::None`, every branch is a stack-of-one: the stack-based
+parts of rules 2–3 never fire, and resolution collapses to navigate-or-materialize
+(worktree-per-branch). The exception is self-home: a hijacked worktree at T's own path
+yields a checkout there, since materializing would collide with it.
 
 ## Consequences
 

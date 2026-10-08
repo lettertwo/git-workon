@@ -1,20 +1,26 @@
 //! Stack-aware worktree resolution for `workon <name>`.
 //!
-//! Implements the four-rule ordered cascade from ADR-024:
+//! Implements the ordered cascade from ADR-024:
 //!
 //! 1. **T has its own worktree** → navigate (`cd`, no new directory).
 //! 2. **Current worktree's branch shares T's stack** → checkout T in place. *(added in PR-2)*
-//! 3. **Deepest non-trunk ancestor of T has a worktree** → checkout T there. *(added in PR-2)*
+//! 3. **Nearest ancestor-or-self of T has a worktree** → checkout T there. *(added in PR-2)*
+//!    "Self" is a worktree sitting at the path `New` would create for T while another
+//!    branch is checked out in it (T's own home, hijacked by `gt create` or `git switch`).
+//!    It is checked right after rule 1, before rule 2, and applies under every model.
+//!    Ancestors exclude the trunk.
 //! 4. **Otherwise** → materialize (auto-attach existing branch or create new branch).
 //!
-//! Non-stack users ([`StackModel::None`]) only ever see [`Resolution::Navigate`],
-//! [`Resolution::Materialize`], or [`Resolution::NotFound`] — rules 2 and 3 never fire,
-//! preserving the original worktree-per-branch behavior with no behavior change.
+//! Non-stack users ([`StackModel::None`]) skip the stack-based part of rules 2 and 3, but
+//! can still get [`Resolution::Checkout`] when T's own home worktree is hijacked; otherwise
+//! they see [`Resolution::Navigate`], [`Resolution::Materialize`], or
+//! [`Resolution::NotFound`], preserving the original worktree-per-branch behavior.
 
 use git2::{BranchType, Repository};
 
 use crate::stack::{current_stack, StackModel};
-use crate::worktree::{current_worktree, find_worktree, find_worktree_by_branch};
+use crate::worktree::{current_worktree, find_worktree, find_worktree_by_branch, get_worktrees};
+use crate::worktree_name::relative_worktree_path;
 
 /// The resolved action for `workon <T>`.
 ///
@@ -51,17 +57,21 @@ pub enum Resolution {
 
 /// Resolve the action for `workon <name>` under the given stack model.
 ///
-/// Implements the four-rule cascade from ADR-024.
+/// Implements the ordered cascade from ADR-024.
 ///
 /// # Rule summary
 ///
 /// 1. T has its own worktree → [`Navigate`]. git's lock makes this correctly first.
 /// 2. Current worktree's branch shares T's stack → [`Checkout`] in current worktree. *(PR-2)*
-/// 3. Deepest non-trunk ancestor of T with a worktree → [`Checkout`] there. *(PR-2)*
+/// 3. Nearest ancestor-or-self of T with a worktree → [`Checkout`] there. *(PR-2)*
+///    Self (a worktree at T's path with another branch checked out) is checked right
+///    after rule 1, before rule 2, and also under [`StackModel::None`]. The trunk is
+///    excluded from the ancestor walk only.
 /// 4. Branch exists with no worktree → [`Materialize`]; metadata without a ref →
 ///    [`DeletedNode`]; nothing matches → [`NotFound`].
 ///
-/// Under [`StackModel::None`] rules 2–3 are skipped and only rule 1 / rule 4 fire.
+/// Under [`StackModel::None`] rule 2 and the ancestor walk are skipped; rule 1, the
+/// self-home check, and rule 4 fire.
 ///
 /// [`Navigate`]: Resolution::Navigate
 /// [`Checkout`]: Resolution::Checkout
@@ -75,16 +85,39 @@ pub fn resolve_action(repo: &Repository, name: &str, model: StackModel) -> Resol
     // name but moves to another branch, and navigating to the stale name would
     // land the user on the wrong branch (and skip T's checkout + stash restore).
     // Name-based navigation still works via Find's NotFound fallthrough.
-    // Subsumes the trunk case: `main` lives in the `main` worktree, so `workon main`
-    // always navigates there. git's lock (it forbids checkout of a branch that is
-    // live in another worktree) makes this check correctly first.
+    // git's lock (it forbids checkout of a branch that is live in another worktree)
+    // makes this check correctly first.
     if find_worktree_by_branch(repo, name).is_ok() {
         return Resolution::Navigate;
     }
 
+    // ── Self-home ────────────────────────────────────────────────────────────
+    // A worktree sits at the path `New` would create for T but has another branch
+    // checked out (e.g. `main` hijacked by `gt create`). `New` would collide with it,
+    // so return T to its home instead. Matched by root-relative path, not
+    // `find_worktree`, which also matches branch and admin names. Runs before rule 2
+    // so T's own home wins over a same-stack checkout in the cwd, and before the
+    // `None` early return so non-stack repos get it too. Requires a local T: with
+    // the branch gone, the checkout would fail, and Find's name match should take
+    // the user to the worktree instead.
+    let local_branch = repo.find_branch(name, BranchType::Local).is_ok();
+    if let (true, Ok(worktrees)) = (local_branch, get_worktrees(repo)) {
+        for wt in worktrees {
+            if relative_worktree_path(repo, wt.path()).as_deref() == Some(name)
+                && wt.branch().ok().flatten().as_deref() != Some(name)
+            {
+                if let Some(n) = wt.name() {
+                    return Resolution::Checkout {
+                        host: n.to_string(),
+                    };
+                }
+            }
+        }
+    }
+
     // ── Non-stack degradation ─────────────────────────────────────────────────
     // Under StackModel::None (or --no-stack), every branch is a stack-of-one.
-    // Rules 2–3 never fire → unchanged worktree-per-branch behavior.
+    // Stack-based rules 2–3 never fire (self-home above aside) → worktree-per-branch behavior.
     if model == StackModel::None {
         return if branch_exists(repo, name) {
             Resolution::Materialize
