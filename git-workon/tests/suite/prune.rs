@@ -2331,50 +2331,82 @@ fn branch_tip(fixture: &Fixture, branch: &str) -> Result<String, Box<dyn std::er
     Ok(oid.to_string())
 }
 
-/// A `gh` stub that answers `--version` with success and `pr list` with a merged PR
-/// for any branch, recording every invocation the fixture builder logs.
+/// A `gh` stub that answers `--version` with success and `api graphql` with one
+/// `bN` member per `hN=<branch>` argument.
+/// `per_branch` is shell that runs once per branch with `$branch` set and assigns the
+/// JSON array to `nodes` (default `[]`, a branch with no merged PR).
+fn gh_stub_graphql(per_branch: &str) -> String {
+    let mut script = String::from(
+        r#"if [ "$1" = "--version" ]; then
+  exit 0
+fi
+out=""
+for arg in "$@"; do
+  case "$arg" in
+    h[0-9]*=*)
+      idx="${arg%%=*}"
+      idx="${idx#h}"
+      branch="${arg#*=}"
+      nodes='[]'
+"#,
+    );
+    script.push_str(per_branch);
+    script.push_str(
+        r#"
+      out="${out:+$out,}\"b$idx\":{\"nodes\":$nodes}"
+      ;;
+  esac
+done
+echo "{\"data\":{\"repository\":{$out}}}"
+"#,
+    );
+    script
+}
+
+/// A `gh` stub that reports the same merged PR for every branch it is asked about.
 fn gh_stub_reports_merged_pr(pr_number: u32, head_oid: &str) -> String {
-    format!(
-        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\necho '[{{\"number\":{pr_number},\"mergedAt\":\"2024-01-01T00:00:00Z\",\"headRefOid\":\"{head_oid}\"}}]'\n"
-    )
+    gh_stub_graphql(&format!(
+        "      nodes='[{{\"number\":{pr_number},\"headRefOid\":\"{head_oid}\"}}]'"
+    ))
 }
 
 /// A `gh` stub whose `--version` succeeds (so the availability gate passes) but
-/// whose `pr list` always fails, for exercising per-row lookup degradation.
-fn gh_stub_pr_list_fails() -> String {
+/// whose `api graphql` always fails, for exercising whole-batch degradation.
+fn gh_stub_graphql_fails() -> String {
     "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nexit 1\n".to_string()
 }
 
-/// What a stubbed `gh pr list` should do for a given branch, keyed by `--head`'s
-/// value (`gh pr list --head <branch> ...`, so the branch lands in `$4`).
+/// What a stubbed `gh api graphql` should report for a given branch.
 enum GhOutcome {
-    /// Exit non-zero, as if the lookup itself failed (rate limit, DNS blip, ...).
-    Fail,
-    /// Print an empty array, as if the branch never had a PR.
+    /// An empty `nodes` list, as if the branch never had a merged PR.
     Empty,
-    /// Print a single merged PR with the given number and `headRefOid`.
+    /// A single merged PR with the given number and `headRefOid`.
     Merged(u32, String),
 }
 
-/// A `gh` stub whose `--version` succeeds and whose `pr list --head <branch>`
-/// response varies per branch, per `mapping`. Lets a single test exercise multiple
-/// rows hitting different outcomes in one pass.
+/// A `gh` stub whose `api graphql` response varies per branch, per `mapping`.
+/// Branches not in `mapping` get no PR.
 fn gh_stub_pr_outcomes(mapping: &[(&str, GhOutcome)]) -> String {
-    let mut script = String::from(
-        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\nbranch=\"$4\"\ncase \"$branch\" in\n",
-    );
+    let mut per_branch = String::from("      case \"$branch\" in\n");
     for (branch, outcome) in mapping {
-        let body = match outcome {
-            GhOutcome::Fail => "    exit 1\n".to_string(),
-            GhOutcome::Empty => "    echo '[]'\n".to_string(),
-            GhOutcome::Merged(number, head_oid) => format!(
-                "    echo '[{{\"number\":{number},\"mergedAt\":\"2024-01-01T00:00:00Z\",\"headRefOid\":\"{head_oid}\"}}]'\n"
-            ),
+        let nodes = match outcome {
+            GhOutcome::Empty => "[]".to_string(),
+            GhOutcome::Merged(number, head_oid) => {
+                format!("[{{\"number\":{number},\"headRefOid\":\"{head_oid}\"}}]")
+            }
         };
-        script.push_str(&format!("  {branch})\n{body}    ;;\n"));
+        per_branch.push_str(&format!("        {branch}) nodes='{nodes}' ;;\n"));
     }
-    script.push_str("esac\n");
-    script
+    per_branch.push_str("      esac");
+    gh_stub_graphql(&per_branch)
+}
+
+/// The `gh api graphql` invocations the stub recorded.
+fn graphql_calls(stub: &PathStub) -> Vec<String> {
+    stub.invocations("gh")
+        .into_iter()
+        .filter(|line| line.starts_with("api graphql"))
+        .collect()
 }
 
 /// A worktree whose branch is diverged from `main` (so `Merged` doesn't fire) with a
@@ -2465,9 +2497,9 @@ fn prune_degrades_quietly_when_gh_missing() -> Result<(), Box<dyn std::error::Er
 }
 
 #[test]
-fn prune_degrades_quietly_when_gh_pr_list_fails() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_degrades_quietly_when_gh_graphql_fails() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_signal_less_diverged_worktree()?;
-    let stub = PathStub::new()?.binary("gh", &gh_stub_pr_list_fails())?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_graphql_fails())?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     let output = prune_cmd
@@ -2485,11 +2517,10 @@ fn prune_degrades_quietly_when_gh_pr_list_fails() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// A `gh` that fails on every call still costs at most 3 subprocesses (the
-/// consecutive-failure bound), rather than one per worktree.
+/// Every signal-less row, worktree or branch-only, rides one `api graphql` call that
+/// names each branch, rather than one `gh` spawn per row.
 #[test]
-fn prune_stops_pr_lookups_after_3_consecutive_gh_failures() -> Result<(), Box<dyn std::error::Error>>
-{
+fn prune_looks_up_all_rows_in_one_graphql_call() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -2499,6 +2530,8 @@ fn prune_stops_pr_lookups_after_3_consecutive_gh_failures() -> Result<(), Box<dy
         .worktree("feature-three")
         .worktree("feature-four")
         .worktree("feature-five")
+        .branch("branch-one")
+        .branch("branch-two")
         .build()?;
 
     for branch in [
@@ -2513,8 +2546,10 @@ fn prune_stops_pr_lookups_after_3_consecutive_gh_failures() -> Result<(), Box<dy
             .file(&format!("{branch}.txt"), branch)
             .create("Feature commit")?;
     }
+    advance_branch_without_worktree(&fixture, "branch-one", "branch-one commit")?;
+    advance_branch_without_worktree(&fixture, "branch-two", "branch-two commit")?;
 
-    let stub = PathStub::new()?.binary("gh", &gh_stub_pr_list_fails())?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_pr_outcomes(&[]))?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
@@ -2524,29 +2559,34 @@ fn prune_stops_pr_lookups_after_3_consecutive_gh_failures() -> Result<(), Box<dy
         .arg("prune")
         .arg("--dry-run")
         .assert()
-        .success()
-        .stderr(predicate::str::contains("No worktrees to prune"));
+        .success();
 
-    // Five worktrees against a stub that always fails, so the bound has to stop the
-    // pass two rows early. Three worktrees wouldn't prove anything here: the count
-    // would be 3 whether the bound existed or not.
-    let pr_list_calls = stub
-        .invocations("gh")
-        .into_iter()
-        .filter(|line| line.starts_with("pr list"))
-        .count();
-    assert_eq!(
-        pr_list_calls, 3,
-        "expected exactly 3 pr list calls at the consecutive-failure bound, got {pr_list_calls}"
-    );
+    let calls = graphql_calls(&stub);
+    assert_eq!(calls.len(), 1, "expected one api graphql call: {calls:?}");
+    for branch in [
+        "feature-one",
+        "feature-two",
+        "feature-three",
+        "feature-four",
+        "feature-five",
+        "branch-one",
+        "branch-two",
+    ] {
+        assert!(
+            calls[0].contains(&format!("={branch} ")),
+            "call should name {branch}: {}",
+            calls[0]
+        );
+    }
 
     Ok(())
 }
 
-/// A single `gh` failure degrades that one row but doesn't stop the pass: it's below
-/// the consecutive-failure bound, so later rows still get looked up.
+/// A failing `gh` costs one subprocess for the whole pass and degrades every row to no
+/// signal, without a warning.
 #[test]
-fn prune_does_not_stop_pass_after_a_single_gh_failure() -> Result<(), Box<dyn std::error::Error>> {
+fn prune_graphql_failure_degrades_all_rows_with_one_call() -> Result<(), Box<dyn std::error::Error>>
+{
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -2563,45 +2603,31 @@ fn prune_does_not_stop_pass_after_a_single_gh_failure() -> Result<(), Box<dyn st
             .create("Feature commit")?;
     }
 
-    let feature_three_tip = branch_tip(&fixture, "feature-three")?;
-    let stub = PathStub::new()?.binary(
-        "gh",
-        &gh_stub_pr_outcomes(&[
-            ("feature-one", GhOutcome::Fail),
-            ("feature-two", GhOutcome::Empty),
-            ("feature-three", GhOutcome::Merged(66, feature_three_tip)),
-        ]),
-    )?;
+    let stub = PathStub::new()?.binary("gh", &gh_stub_graphql_fails())?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
-    prune_cmd
+    let output = prune_cmd
         .current_dir(&fixture)
         .env("PATH", stub.path())
         .env("NO_COLOR", "1")
         .arg("prune")
         .arg("--dry-run")
-        .assert()
-        .success()
-        .stderr(predicate::str::contains("PR #66 merged"));
+        .output()?;
 
-    let pr_list_calls = stub
-        .invocations("gh")
-        .into_iter()
-        .filter(|line| line.starts_with("pr list"))
-        .count();
-    assert_eq!(
-        pr_list_calls, 3,
-        "a single failure should not stop the pass, got {pr_list_calls} pr list calls"
-    );
+    assert!(output.status.success());
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("No worktrees to prune"), "stderr: {stderr}");
+    assert!(!stderr.to_lowercase().contains("warn"), "stderr: {stderr}");
+    assert_eq!(graphql_calls(&stub).len(), 1);
 
     Ok(())
 }
 
 /// An empty result for one branch (the common real case — a branch that never had a
-/// PR) doesn't stop the pass, and `find_merged_pr`'s array extraction handles it.
+/// PR) doesn't hide the merged branch sharing its batch.
 #[test]
-fn prune_gh_empty_list_for_one_branch_does_not_stop_pass() -> Result<(), Box<dyn std::error::Error>>
-{
+fn prune_gh_empty_node_for_one_branch_does_not_hide_the_other(
+) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
         .bare(true)
         .default_branch("main")
@@ -2638,15 +2664,7 @@ fn prune_gh_empty_list_for_one_branch_does_not_stop_pass() -> Result<(), Box<dyn
         .stderr(predicate::str::contains("PR #66 merged"))
         .stderr(predicate::str::contains("no-pr").not());
 
-    let pr_list_calls = stub
-        .invocations("gh")
-        .into_iter()
-        .filter(|line| line.starts_with("pr list"))
-        .count();
-    assert_eq!(
-        pr_list_calls, 2,
-        "expected both branches to be looked up, got {pr_list_calls} pr list calls"
-    );
+    assert_eq!(graphql_calls(&stub).len(), 1);
 
     Ok(())
 }
@@ -2665,8 +2683,8 @@ fn prune_skips_pr_lookup_for_branch_already_deleted() -> Result<(), Box<dyn std:
         .find_reference("refs/heads/feature")?
         .delete()?;
 
-    // The branch is already deleted, so `fill_pr_merged` never calls `gh` for this
-    // row; the head oid here is never read.
+    // The branch is already deleted, so the row carries a signal and the candidate
+    // list is empty: `fill_pr_merged` never calls `gh`.
     let stub = PathStub::new()?.binary(
         "gh",
         &gh_stub_reports_merged_pr(66, "0000000000000000000000000000000000000000"),
@@ -2683,10 +2701,10 @@ fn prune_skips_pr_lookup_for_branch_already_deleted() -> Result<(), Box<dyn std:
         .success()
         .stderr(predicate::str::contains("branch deleted"));
 
-    let invocations = stub.invocations("gh");
+    let calls = graphql_calls(&stub);
     assert!(
-        invocations.iter().all(|line| !line.starts_with("pr")),
-        "gh pr list should not have been invoked for a signal-less-free row: {invocations:?}"
+        calls.is_empty(),
+        "gh api graphql should not have been invoked for a row that already has a signal: {calls:?}"
     );
 
     Ok(())
@@ -2845,10 +2863,8 @@ fn prune_dry_run_reports_merged_pr_when_tip_is_ancestor_of_head(
 #[test]
 fn prune_dry_run_ignores_merged_pr_without_head_oid() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = build_signal_less_diverged_worktree()?;
-    let stub = PathStub::new()?.binary(
-        "gh",
-        "if [ \"$1\" = \"--version\" ]; then\n  exit 0\nfi\necho '[{\"number\":66,\"mergedAt\":\"2024-01-01T00:00:00Z\"}]'\n",
-    )?;
+    let stub =
+        PathStub::new()?.binary("gh", &gh_stub_graphql("      nodes='[{\"number\":66}]'"))?;
 
     let mut prune_cmd = cargo_bin_cmd!("git-workon");
     prune_cmd
@@ -3204,70 +3220,6 @@ fn prune_named_healthy_branch_only_row_skipped_without_force(
         .stderr(predicate::str::contains("deleted 1 branch(es)"));
 
     fixture.assert(predicate::repo::has_branch("healthy").not());
-
-    Ok(())
-}
-
-/// The consecutive-gh-failure bound (see the PR-merged signal tests above) has to
-/// trip before the worktree rows are exhausted, so branch rows appended after them
-/// never get looked up at all in this shape.
-#[test]
-fn prune_gh_bound_holds_with_branch_rows_appended() -> Result<(), Box<dyn std::error::Error>> {
-    let fixture = FixtureBuilder::new()
-        .bare(true)
-        .default_branch("main")
-        .remote("origin", "https://github.com/test/test.git")
-        .worktree("feature-one")
-        .worktree("feature-two")
-        .worktree("feature-three")
-        .worktree("feature-four")
-        .worktree("feature-five")
-        .branch("branch-one")
-        .branch("branch-two")
-        .build()?;
-
-    for branch in [
-        "feature-one",
-        "feature-two",
-        "feature-three",
-        "feature-four",
-        "feature-five",
-    ] {
-        fixture
-            .commit(branch)
-            .file(&format!("{branch}.txt"), branch)
-            .create("Feature commit")?;
-    }
-    advance_branch_without_worktree(&fixture, "branch-one", "branch-one commit")?;
-    advance_branch_without_worktree(&fixture, "branch-two", "branch-two commit")?;
-
-    let stub = PathStub::new()?.binary("gh", &gh_stub_pr_list_fails())?;
-
-    let mut prune_cmd = cargo_bin_cmd!("git-workon");
-    prune_cmd
-        .current_dir(&fixture)
-        .env("PATH", stub.path())
-        .env("NO_COLOR", "1")
-        .arg("prune")
-        .arg("--dry-run")
-        .assert()
-        .success();
-
-    let invocations = stub.invocations("gh");
-    let pr_list_calls = invocations
-        .iter()
-        .filter(|line| line.starts_with("pr list"))
-        .count();
-    assert_eq!(
-        pr_list_calls, 3,
-        "worktree rows should exhaust the bound before any branch row is looked up, got {pr_list_calls}"
-    );
-    assert!(
-        !invocations
-            .iter()
-            .any(|line| line.contains("branch-one") || line.contains("branch-two")),
-        "no gh call should reference a branch-only row once the bound has tripped: {invocations:?}"
-    );
 
     Ok(())
 }

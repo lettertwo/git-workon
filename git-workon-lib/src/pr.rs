@@ -78,6 +78,8 @@
 //! - **Metadata**: Fetches PR title, author, branch names, and state
 //! - **Validation**: Checks PR exists before creating worktree
 
+use std::collections::HashMap;
+
 use git2::{FetchOptions, Repository};
 use log::debug;
 
@@ -342,64 +344,90 @@ pub struct MergedPr {
     pub head_oid: String,
 }
 
-/// Look up the merged PR for `branch`, if any, using the `gh` CLI.
+/// Most branches one GraphQL request carries. Each branch adds an alias and a variable.
+const MERGED_PR_BATCH_SIZE: usize = 100;
+
+/// Look up the merged PR for each of `branches` with batched `gh api graphql` calls.
 ///
-/// Runs `gh pr list --head <branch> --state merged --json number,mergedAt,headRefOid
-/// --limit 1`. Matching is by branch name only, so a same-named branch from a fork is
-/// a false match; callers that care about this should already have ruled out forks
-/// another way.
-///
-/// Returns `Ok(None)` if the branch never had a PR merged under that name, or if the
-/// merged PR's `headRefOid` is missing or unparseable (callers can't compare against
-/// the branch tip without it, so this degrades the same as "no merged PR").
-/// Does not call [`check_gh_available`] itself — callers that intend to
-/// silently degrade when `gh` is unavailable should check once up front
-/// rather than pay for it on every branch.
-pub fn find_merged_pr(branch: &str) -> Result<Option<MergedPr>> {
-    let output = std::process::Command::new("gh")
-        .args([
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "merged",
-            "--json",
-            "number,mergedAt,headRefOid",
-            "--limit",
-            "1",
-        ])
-        .output()
-        .map_err(|e| PrError::GhFetchFailed {
+/// One request covers up to 100 branches (an alias per branch, newest merged PR first).
+pub fn find_merged_prs(branches: &[&str]) -> Result<HashMap<String, MergedPr>> {
+    let mut found = HashMap::new();
+    for batch in branches.chunks(MERGED_PR_BATCH_SIZE) {
+        let mut cmd = std::process::Command::new("gh");
+        cmd.args(["api", "graphql", "-F", "owner={owner}", "-F", "name={repo}"]);
+        for (i, branch) in batch.iter().enumerate() {
+            cmd.arg("-f").arg(format!("h{i}={branch}"));
+        }
+        cmd.arg("-f")
+            .arg(format!("query={}", build_merged_pr_query(batch.len())));
+
+        let output = cmd.output().map_err(|e| PrError::GhFetchFailed {
             message: e.to_string(),
         })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PrError::GhFetchFailed {
-            message: stderr.to_string(),
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(PrError::GhFetchFailed {
+                message: stderr.to_string(),
+            }
+            .into());
         }
-        .into());
-    }
 
-    let json_str = String::from_utf8_lossy(&output.stdout);
-    Ok(parse_merged_pr(&json_str))
+        let json_str = String::from_utf8_lossy(&output.stdout);
+        found.extend(parse_merged_prs(&json_str, batch));
+    }
+    Ok(found)
 }
 
-/// Extract a merged PR's number and head OID from
-/// `gh pr list --json number,mergedAt,headRefOid`'s output.
+/// Build the GraphQL query for `count` branches: variable `$hN` and alias `bN` each.
 ///
-/// Treats any shape mismatch as "no merged PR" rather than an error: an empty array
-/// (never had a PR), missing/non-numeric `number`, missing/non-string `headRefOid`,
-/// a non-array payload, or malformed JSON. [`find_merged_pr`] already treats a `None`
-/// here as a degrade-quietly case, so there is no separate error path to preserve for
-/// these.
-fn parse_merged_pr(json: &str) -> Option<MergedPr> {
-    let json: serde_json::Value = serde_json::from_str(json).ok()?;
-    let entry = json.as_array()?.first()?;
-    let number = entry.get("number")?.as_u64()? as u32;
-    let head_oid = entry.get("headRefOid")?.as_str()?.to_string();
-    Some(MergedPr { number, head_oid })
+/// `orderBy` newest-first is required: without it `first:1` can return the oldest merged
+/// PR for a reused branch name, where `gh pr list` returns the newest.
+fn build_merged_pr_query(count: usize) -> String {
+    let mut vars = String::from("$owner:String!,$name:String!");
+    let mut aliases = String::new();
+    for i in 0..count {
+        vars.push_str(&format!(",$h{i}:String!"));
+        aliases.push_str(&format!(
+            " b{i}: pullRequests(headRefName:$h{i}, states:MERGED, first:1, \
+             orderBy:{{field:CREATED_AT, direction:DESC}}){{ nodes {{ number headRefOid }} }}"
+        ));
+    }
+    format!("query({vars}){{ repository(owner:$owner,name:$name){{{aliases} }} }}")
+}
+
+/// Map `gh api graphql` output from [`build_merged_pr_query`] back to branch names.
+///
+/// Reads `data.repository.b{i}.nodes[0]` for `branches[i]`. Any shape mismatch for a
+/// branch (missing alias, empty `nodes`, missing/non-numeric `number`, missing/non-string
+/// `headRefOid`) leaves that branch out.
+fn parse_merged_prs(json: &str, branches: &[&str]) -> HashMap<String, MergedPr> {
+    let mut found = HashMap::new();
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(json) else {
+        return found;
+    };
+    let Some(repository) = json.pointer("/data/repository").filter(|r| r.is_object()) else {
+        return found;
+    };
+    for (i, branch) in branches.iter().enumerate() {
+        let Some(node) = repository.pointer(&format!("/b{i}/nodes/0")) else {
+            continue;
+        };
+        let Some(number) = node.get("number").and_then(|n| n.as_u64()) else {
+            continue;
+        };
+        let Some(head_oid) = node.get("headRefOid").and_then(|o| o.as_str()) else {
+            continue;
+        };
+        found.insert(
+            (*branch).to_string(),
+            MergedPr {
+                number: number as u32,
+                head_oid: head_oid.to_string(),
+            },
+        );
+    }
+    found
 }
 
 /// Sanitize a string for use in branch/worktree names
@@ -770,17 +798,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_parse_merged_pr_empty_array() {
-        assert_eq!(parse_merged_pr("[]"), None);
+    fn graphql(members: &str) -> String {
+        format!(r#"{{"data":{{"repository":{{{members}}}}}}}"#)
     }
 
     #[test]
-    fn test_parse_merged_pr_populated_array() {
-        let json = r#"[{"number":66,"mergedAt":"2024-01-01T00:00:00Z","headRefOid":"abc123"}]"#;
+    fn test_parse_merged_prs_empty_nodes() {
+        let json = graphql(r#""b0":{"nodes":[]}"#);
+        assert!(parse_merged_prs(&json, &["a"]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_merged_prs_populated() {
+        let json = graphql(r#""b0":{"nodes":[{"number":66,"headRefOid":"abc123"}]}"#);
+        let map = parse_merged_prs(&json, &["a"]);
         assert_eq!(
-            parse_merged_pr(json),
-            Some(MergedPr {
+            map.get("a"),
+            Some(&MergedPr {
                 number: 66,
                 head_oid: "abc123".to_string()
             })
@@ -788,31 +822,61 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_merged_pr_number_missing() {
-        let json = r#"[{"mergedAt":"2024-01-01T00:00:00Z","headRefOid":"abc123"}]"#;
-        assert_eq!(parse_merged_pr(json), None);
+    fn test_parse_merged_prs_two_aliases_one_empty() {
+        let json = graphql(r#""b0":{"nodes":[]},"b1":{"nodes":[{"number":7,"headRefOid":"def"}]}"#);
+        let map = parse_merged_prs(&json, &["a", "b"]);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["b"].number, 7);
     }
 
     #[test]
-    fn test_parse_merged_pr_number_non_numeric() {
-        let json = r#"[{"number":"not-a-number","mergedAt":"2024-01-01T00:00:00Z","headRefOid":"abc123"}]"#;
-        assert_eq!(parse_merged_pr(json), None);
+    fn test_parse_merged_prs_number_missing() {
+        let json = graphql(r#""b0":{"nodes":[{"headRefOid":"abc123"}]}"#);
+        assert!(parse_merged_prs(&json, &["a"]).is_empty());
     }
 
     #[test]
-    fn test_parse_merged_pr_head_oid_missing() {
-        let json = r#"[{"number":66,"mergedAt":"2024-01-01T00:00:00Z"}]"#;
-        assert_eq!(parse_merged_pr(json), None);
+    fn test_parse_merged_prs_number_non_numeric() {
+        let json = graphql(r#""b0":{"nodes":[{"number":"x","headRefOid":"abc123"}]}"#);
+        assert!(parse_merged_prs(&json, &["a"]).is_empty());
     }
 
     #[test]
-    fn test_parse_merged_pr_non_array_payload() {
-        assert_eq!(parse_merged_pr(r#"{"number":66}"#), None);
+    fn test_parse_merged_prs_head_oid_missing() {
+        let json = graphql(r#""b0":{"nodes":[{"number":66}]}"#);
+        assert!(parse_merged_prs(&json, &["a"]).is_empty());
     }
 
     #[test]
-    fn test_parse_merged_pr_malformed_json() {
-        assert_eq!(parse_merged_pr("not json"), None);
+    fn test_parse_merged_prs_missing_alias() {
+        let json = graphql(r#""b1":{"nodes":[{"number":66,"headRefOid":"abc"}]}"#);
+        let map = parse_merged_prs(&json, &["a", "b"]);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("b"));
+    }
+
+    #[test]
+    fn test_parse_merged_prs_null_repository() {
+        let json = r#"{"data":{"repository":null}}"#;
+        assert!(parse_merged_prs(json, &["a"]).is_empty());
+    }
+
+    #[test]
+    fn test_parse_merged_prs_malformed_json() {
+        assert!(parse_merged_prs("not json", &["a"]).is_empty());
+    }
+
+    #[test]
+    fn test_merged_pr_query_declares_variable_and_alias_per_branch() {
+        let query = build_merged_pr_query(3);
+        assert!(query.starts_with(
+            "query($owner:String!,$name:String!,$h0:String!,$h1:String!,$h2:String!){"
+        ));
+        for i in 0..3 {
+            assert!(query.contains(&format!("b{i}: pullRequests(headRefName:$h{i}")));
+        }
+        assert!(!query.contains("$h3"));
+        assert!(query.contains("direction:DESC"));
     }
 
     // Integration tests requiring gh CLI (marked with #[ignore])
