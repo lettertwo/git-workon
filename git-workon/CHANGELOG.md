@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.15.0...git-workon-v0.16.0) - 2026-11-04
+
+### Fixed
+
+- *(lib)* [**breaking**] join gh-stack stacks chained onto a stack branch ([#115](https://github.com/lettertwo/git-workon/pull/115))
+
 ## [0.15.0](https://github.com/lettertwo/git-workon/compare/git-workon-v0.14.0...git-workon-v0.15.0) - 2026-10-08
 
 ### Added
