@@ -341,6 +341,10 @@ pub(crate) fn read_metadata(repo: &Repository) -> Result<StackMetadata, StackErr
         }
     }
 
+    // gh-stack stacks are linear, so a fork is a new stack whose trunk is a branch of another
+    // stack. That branch's parent row makes it a diff.
+    trunks.retain(|trunk| !parents.contains_key(trunk));
+
     Ok(StackMetadata {
         trunks,
         parents,
@@ -1177,6 +1181,35 @@ mod tests {
         let meta = read_metadata(repo).unwrap();
         assert_eq!(meta.parents["shared"].parent, "main");
         assert_eq!(meta.stack_numbers["shared"], 1);
+    }
+
+    #[test]
+    fn stack_chained_onto_another_stacks_branch_joins_one_connected_stack() {
+        // gh-stack stacks are linear, so a fork is a new stack whose trunk is a branch of
+        // another stack. "feat-b" is both a tracked branch and "feat-c"'s trunk.
+        let fixture = FixtureBuilder::new()
+            .bare(true)
+            .default_branch("main")
+            .worktree("main")
+            .worktree("feat-b")
+            .gh_stack(None, 1, "main", &["feat-a", "feat-b"])
+            .gh_stack(None, 2, "feat-b", &["feat-c"])
+            .build()
+            .unwrap();
+        let repo = fixture.repo().unwrap();
+
+        let meta = read_metadata(repo).unwrap();
+        assert_eq!(meta.trunks, vec!["main".to_string()]);
+        assert_eq!(meta.parents["feat-c"].parent, "feat-b");
+
+        let stacks = enumerate_stacks(repo).unwrap();
+        assert_eq!(stacks.len(), 1);
+        assert_eq!(stacks[0].trunk, "main");
+        assert_eq!(stacks[0].diffs, vec!["feat-a", "feat-b", "feat-c"]);
+
+        let stack = current_stack(repo, "feat-b").unwrap().unwrap();
+        assert_eq!(stack.trunk, "main");
+        assert_eq!(stack.current, "feat-b");
     }
 
     #[test]
