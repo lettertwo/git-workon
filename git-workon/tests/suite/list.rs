@@ -1344,6 +1344,81 @@ fn list_tree_gh_stack_two_stacks_on_shared_trunk_forks_with_number_label(
 }
 
 #[test]
+fn list_tree_gh_stack_chained_stacks_render_as_one_tree() -> Result<(), Box<dyn std::error::Error>>
+{
+    // One linear stack, with three more whose trunks are branches of it:
+    // main → item-event → item-notification → source-isolation
+    // source-isolation → event-storage → event-source
+    // source-isolation → notification-storage → notification-source
+    // item-notification → event-lines → notification-lines
+    let fixture = FixtureBuilder::new()
+        .bare(true)
+        .default_branch("main")
+        .config("workon.stackModel", "gh-stack")
+        .worktree("main")
+        .worktree("source-isolation")
+        .worktree("event-source")
+        .gh_stack(
+            None,
+            1,
+            "main",
+            &["item-event", "item-notification", "source-isolation"],
+        )
+        .gh_stack(
+            None,
+            2,
+            "source-isolation",
+            &["event-storage", "event-source"],
+        )
+        .gh_stack(
+            None,
+            3,
+            "source-isolation",
+            &["notification-storage", "notification-source"],
+        )
+        .gh_stack(
+            None,
+            4,
+            "item-notification",
+            &["event-lines", "notification-lines"],
+        )
+        .build()?;
+
+    let main_path = fixture.root()?.join("main");
+    let stdout = String::from_utf8(
+        cargo_bin_cmd!("git-workon")
+            .current_dir(&main_path)
+            .env("NO_COLOR", "1")
+            .arg("list")
+            .output()?
+            .stdout,
+    )?;
+
+    let expected = [
+        "  ◎ event-source",
+        "  ◯ event-storage",
+        "  │ ◯ notification-source",
+        "  │ ◯ notification-storage",
+        "  ◎─╯ source-isolation",
+        "  │ ◯ notification-lines",
+        "  │ ◯ event-lines",
+        "  ◯─╯ item-notification",
+        "  ◯ item-event",
+        "◉─╯ main",
+    ];
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), expected.len(), "unexpected rows: {stdout}");
+    for (line, prefix) in lines.iter().zip(expected) {
+        assert!(
+            line.starts_with(prefix),
+            "expected row {prefix:?}, got {line:?} in: {stdout}"
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
 fn list_json_gh_stack_two_stacks_on_shared_trunk_include_respective_numbers(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let fixture = FixtureBuilder::new()
